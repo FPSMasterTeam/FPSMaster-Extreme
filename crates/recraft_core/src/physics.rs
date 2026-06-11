@@ -68,6 +68,7 @@ pub struct PlayerPhysicsConfig {
     pub ground_acceleration: f32,
     pub base_walk_speed: f32,
     pub sprint_multiplier: f32,
+    pub default_block_slipperiness: f32,
 }
 
 impl Default for PlayerPhysicsConfig {
@@ -82,6 +83,7 @@ impl Default for PlayerPhysicsConfig {
             ground_acceleration: 0.1,
             base_walk_speed: 0.1,
             sprint_multiplier: 1.3,
+            default_block_slipperiness: 0.6,
         }
     }
 }
@@ -99,8 +101,15 @@ impl PlayerPhysics {
             velocity.y = self.config.jump_velocity;
         }
 
+        let horizontal_drag = if player.on_ground {
+            self.config.default_block_slipperiness * 0.91
+        } else {
+            0.91
+        };
+
         let mut acceleration = if player.on_ground {
             self.config.ground_acceleration
+                * (0.16277136 / (horizontal_drag * horizontal_drag * horizontal_drag))
         } else {
             self.config.air_acceleration
         };
@@ -114,35 +123,40 @@ impl PlayerPhysics {
         }
 
         velocity += movement_vector(input.forward, input.strafe, player.yaw) * acceleration;
-        velocity.y -= self.config.gravity;
 
-        let (position, adjusted_velocity, on_ground) =
+        let (position, mut adjusted_velocity, on_ground) =
             move_with_collisions(world, player.aabb, velocity);
+        adjusted_velocity.y -= self.config.gravity;
+        adjusted_velocity.y *= self.config.air_drag_y;
+        adjusted_velocity.x *= horizontal_drag;
+        adjusted_velocity.z *= horizontal_drag;
+
         player.position = position;
         player.velocity = adjusted_velocity;
         player.on_ground = on_ground;
         player.sync_aabb_to_position();
-
-        player.velocity.x *= 0.91;
-        player.velocity.z *= 0.91;
-        player.velocity.y *= self.config.air_drag_y;
     }
 }
 
 fn movement_vector(forward: f32, strafe: f32, yaw_degrees: f32) -> Vec3 {
-    let input = Vec3::new(strafe, 0.0, forward);
-    if input.length_squared() <= f32::EPSILON {
+    let mut length = strafe * strafe + forward * forward;
+    if length < 1.0e-4 {
         return Vec3::ZERO;
     }
+    length = length.sqrt();
+    if length < 1.0 {
+        length = 1.0;
+    }
 
-    let normalized = input.normalize();
+    let strafe = strafe / length;
+    let forward = forward / length;
     let yaw = yaw_degrees.to_radians();
     let sin = yaw.sin();
     let cos = yaw.cos();
     Vec3::new(
-        normalized.x * cos - normalized.z * sin,
+        strafe * cos - forward * sin,
         0.0,
-        normalized.z * cos + normalized.x * sin,
+        forward * cos + strafe * sin,
     )
 }
 
@@ -258,5 +272,24 @@ mod tests {
         let right_at_zero = movement_vector(0.0, 1.0, 0.0);
         assert!(right_at_zero.x > 0.99);
         assert!(right_at_zero.z.abs() < 0.001);
+    }
+
+    #[test]
+    fn jump_moves_before_gravity_drag_for_tick() {
+        let world = World::new();
+        let mut player = EntityState::new_local_player(EntityId(1), Vec3::new(0.5, 1.0, 0.5));
+        player.on_ground = true;
+
+        PlayerPhysics::default().tick(
+            &world,
+            &mut player,
+            PlayerInput {
+                jump: true,
+                ..PlayerInput::default()
+            },
+        );
+
+        assert!((player.position.y - 1.42).abs() < 0.001);
+        assert!((player.velocity.y - 0.3332).abs() < 0.001);
     }
 }

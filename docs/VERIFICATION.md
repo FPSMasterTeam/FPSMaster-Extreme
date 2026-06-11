@@ -108,3 +108,19 @@ Coverage added:
 - `mesh_uses_world_light`
 
 This verifies the data path from decoded 1.8 chunk light nibbles into internal chunk storage and mesh color generation. It does not yet prove vanilla-exact smooth lighting or ambient occlusion.
+
+## 2026-06-11 player physics tick order
+
+Commands run successfully:
+
+```bash
+cargo test -p recraft_core -p recraft_protocol -p recraft_render
+cargo check
+```
+
+Coverage added/updated:
+
+- `jump_moves_before_gravity_drag_for_tick` verifies the jump tick first moves by `0.42` and then stores the post-gravity/post-drag velocity for the next tick.
+- Existing landing and movement-direction tests still pass.
+
+This moves the implementation closer to the 1.8.9 movement order, but it is not yet a full vanilla parity proof.
