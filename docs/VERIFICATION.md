@@ -317,3 +317,49 @@ ReCraftAssets[/127.0.0.1:...] logged in with entity id ... at ([world]..., ..., 
 ReCraftAssets lost connection: Disconnected
 ReCraftAssets left the game.
 ```
+
+## 2026-06-11 expanded block atlas coverage
+
+Demo smoke command without `--assets`:
+
+```bash
+RUST_LOG=info cargo run -p recraft_app -- --scripted-smoke 2
+```
+
+Observed:
+
+```text
+loaded 129 block atlas tiles from local_assets/minecraft-1.8.9
+loaded Minecraft 1.8.9 block atlas from asset directory local_assets/minecraft-1.8.9
+scripted smoke complete
+```
+
+Server smoke command without `--assets`:
+
+```bash
+RUST_LOG=info cargo run -p recraft_app -- \
+  --connect 127.0.0.1:25565 \
+  --username ReCraftAtlas \
+  --scripted-smoke 8
+```
+
+Observed client logs:
+
+```text
+loaded 129 block atlas tiles from local_assets/minecraft-1.8.9
+loaded Minecraft 1.8.9 block atlas from asset directory local_assets/minecraft-1.8.9
+logged in as ReCraftAtlas (...)
+applied chunk bulk: 10 chunks
+...
+scripted smoke complete
+```
+
+Observed server logs:
+
+```text
+ReCraftAtlas[/127.0.0.1:...] logged in with entity id ... at ([world]..., ..., ...)
+ReCraftAtlas lost connection: Disconnected
+ReCraftAtlas left the game.
+```
+
+Coverage expanded from the initial 7-tile atlas to common 1.8.9 block-id/meta textures. This is still not a full blockstate/model/resource-pack implementation.

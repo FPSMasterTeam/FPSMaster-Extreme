@@ -31,19 +31,11 @@ ChunkSectionMeshKey { chunk_x, section_y, chunk_z }
 
 ## Textures
 
-The first atlas contains a small set of 1.8.9 block textures:
-
-- stone
-- grass top
-- grass side
-- dirt
-- sand
-- oak log
-- oak leaves
+The first atlas contains common 1.8.9 terrain/building block textures: stone variants, dirt/grass/podzol, sand/red sand, ores, planks/logs/leaves, sandstone/red sandstone, wool, mineral blocks, bricks, stone bricks, pumpkins/melons, nether/end blocks, quartz, clay/stained clay, snow/ice, and related blocks.
 
 The renderer loads them from a resource-pack-style root containing `assets/minecraft/...`, or from a zip/jar with the same internal layout. The default development path is `local_assets/minecraft-1.8.9`, produced by `scripts/setup_minecraft_1_8_9_assets.py`. That script extracts the original `assets/...` tree without changing its structure, so future resource-pack support can use the same layout. `--assets <resource-pack-root-or-zip>` / `RECRAFT_ASSET_PATH` are only overrides; normal local runs should not need them after setup.
 
-Each tile falls back independently, so one missing texture no longer forces the whole atlas to debug colors. Mojang assets are downloaded only into `local_assets/`, which is ignored by Git, and should not be committed.
+Each tile falls back independently, so one missing texture no longer forces the whole atlas to debug colors. This is still an explicit block-id/meta mapping, not yet a full vanilla blockstate/model loader. Mojang assets are downloaded only into `local_assets/`, which is ignored by Git, and should not be committed.
 
 ## Lighting
 

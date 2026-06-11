@@ -203,17 +203,236 @@ fn block_color(block: BlockState) -> [f32; 3] {
 
 fn block_tile(block: BlockState, face: FaceTile) -> BlockTile {
     match block.id {
-        1 => BlockTile::Stone,
+        1 => stone_tile(block.meta),
         2 => match face {
             FaceTile::Top => BlockTile::GrassTop,
             FaceTile::Bottom => BlockTile::Dirt,
             FaceTile::Side => BlockTile::GrassSide,
         },
-        3 => BlockTile::Dirt,
-        12 => BlockTile::Sand,
-        17 => BlockTile::OakLog,
-        18 => BlockTile::OakLeaves,
+        3 => dirt_tile(block.meta, face),
+        4 => BlockTile::Cobblestone,
+        5 => planks_tile(block.meta),
+        7 => BlockTile::Bedrock,
+        12 => {
+            if block.meta & 0x1 == 1 {
+                BlockTile::RedSand
+            } else {
+                BlockTile::Sand
+            }
+        }
+        13 => BlockTile::Gravel,
+        14 => BlockTile::GoldOre,
+        15 => BlockTile::IronOre,
+        16 => BlockTile::CoalOre,
+        17 => log_tile(block.meta & 0x3, face),
+        18 => leaves_tile(block.meta & 0x3),
+        21 => BlockTile::LapisOre,
+        22 => BlockTile::LapisBlock,
+        24 => sandstone_tile(block.meta, face),
+        35 => wool_tile(block.meta),
+        41 => BlockTile::GoldBlock,
+        42 => BlockTile::IronBlock,
+        45 => BlockTile::Brick,
+        48 => BlockTile::MossyCobblestone,
+        49 => BlockTile::Obsidian,
+        56 => BlockTile::DiamondOre,
+        57 => BlockTile::DiamondBlock,
+        73 | 74 => BlockTile::RedstoneOre,
+        79 => BlockTile::Ice,
+        80 => BlockTile::Snow,
+        82 => BlockTile::Clay,
+        86 => pumpkin_tile(face),
+        87 => BlockTile::Netherrack,
+        88 => BlockTile::SoulSand,
+        89 => BlockTile::Glowstone,
+        98 => stone_brick_tile(block.meta),
+        103 => melon_tile(face),
+        110 => match face {
+            FaceTile::Top => BlockTile::MyceliumTop,
+            FaceTile::Bottom => BlockTile::Dirt,
+            FaceTile::Side => BlockTile::MyceliumSide,
+        },
+        112 => BlockTile::NetherBrick,
+        121 => BlockTile::EndStone,
+        129 => BlockTile::EmeraldOre,
+        133 => BlockTile::EmeraldBlock,
+        152 => BlockTile::RedstoneBlock,
+        155 => quartz_tile(block.meta, face),
+        159 => stained_clay_tile(block.meta),
+        161 => leaves_tile((block.meta & 0x1) + 4),
+        162 => log_tile((block.meta & 0x1) + 4, face),
+        172 => BlockTile::HardenedClay,
+        173 => BlockTile::CoalBlock,
+        174 => BlockTile::PackedIce,
+        179 => red_sandstone_tile(block.meta, face),
         _ => BlockTile::Missing,
+    }
+}
+
+fn stone_tile(meta: u8) -> BlockTile {
+    match meta {
+        1 => BlockTile::Granite,
+        2 => BlockTile::PolishedGranite,
+        3 => BlockTile::Diorite,
+        4 => BlockTile::PolishedDiorite,
+        5 => BlockTile::Andesite,
+        6 => BlockTile::PolishedAndesite,
+        _ => BlockTile::Stone,
+    }
+}
+
+fn dirt_tile(meta: u8, face: FaceTile) -> BlockTile {
+    match meta {
+        1 => BlockTile::CoarseDirt,
+        2 => match face {
+            FaceTile::Top => BlockTile::PodzolTop,
+            FaceTile::Bottom => BlockTile::Dirt,
+            FaceTile::Side => BlockTile::PodzolSide,
+        },
+        _ => BlockTile::Dirt,
+    }
+}
+
+fn planks_tile(meta: u8) -> BlockTile {
+    match meta & 0x7 {
+        1 => BlockTile::PlanksSpruce,
+        2 => BlockTile::PlanksBirch,
+        3 => BlockTile::PlanksJungle,
+        4 => BlockTile::PlanksAcacia,
+        5 => BlockTile::PlanksDarkOak,
+        _ => BlockTile::PlanksOak,
+    }
+}
+
+fn log_tile(kind: u8, face: FaceTile) -> BlockTile {
+    let top = matches!(face, FaceTile::Top | FaceTile::Bottom);
+    match (kind, top) {
+        (1, false) => BlockTile::SpruceLogSide,
+        (1, true) => BlockTile::SpruceLogTop,
+        (2, false) => BlockTile::BirchLogSide,
+        (2, true) => BlockTile::BirchLogTop,
+        (3, false) => BlockTile::JungleLogSide,
+        (3, true) => BlockTile::JungleLogTop,
+        (4, false) => BlockTile::AcaciaLogSide,
+        (4, true) => BlockTile::AcaciaLogTop,
+        (5, false) => BlockTile::DarkOakLogSide,
+        (5, true) => BlockTile::DarkOakLogTop,
+        (_, false) => BlockTile::OakLogSide,
+        (_, true) => BlockTile::OakLogTop,
+    }
+}
+
+fn leaves_tile(kind: u8) -> BlockTile {
+    match kind {
+        1 => BlockTile::SpruceLeaves,
+        2 => BlockTile::BirchLeaves,
+        3 => BlockTile::JungleLeaves,
+        4 => BlockTile::AcaciaLeaves,
+        5 => BlockTile::DarkOakLeaves,
+        _ => BlockTile::OakLeaves,
+    }
+}
+
+fn sandstone_tile(meta: u8, face: FaceTile) -> BlockTile {
+    match (meta, face) {
+        (_, FaceTile::Top) => BlockTile::SandstoneTop,
+        (_, FaceTile::Bottom) => BlockTile::SandstoneBottom,
+        (1, FaceTile::Side) => BlockTile::SandstoneCarved,
+        (2, FaceTile::Side) => BlockTile::SandstoneSmooth,
+        _ => BlockTile::SandstoneSide,
+    }
+}
+
+fn red_sandstone_tile(meta: u8, face: FaceTile) -> BlockTile {
+    match (meta, face) {
+        (_, FaceTile::Top) => BlockTile::RedSandstoneTop,
+        (_, FaceTile::Bottom) => BlockTile::RedSandstoneBottom,
+        (1, FaceTile::Side) => BlockTile::RedSandstoneCarved,
+        (2, FaceTile::Side) => BlockTile::RedSandstoneSmooth,
+        _ => BlockTile::RedSandstoneSide,
+    }
+}
+
+fn wool_tile(meta: u8) -> BlockTile {
+    match meta & 0xf {
+        1 => BlockTile::WoolOrange,
+        2 => BlockTile::WoolMagenta,
+        3 => BlockTile::WoolLightBlue,
+        4 => BlockTile::WoolYellow,
+        5 => BlockTile::WoolLime,
+        6 => BlockTile::WoolPink,
+        7 => BlockTile::WoolGray,
+        8 => BlockTile::WoolSilver,
+        9 => BlockTile::WoolCyan,
+        10 => BlockTile::WoolPurple,
+        11 => BlockTile::WoolBlue,
+        12 => BlockTile::WoolBrown,
+        13 => BlockTile::WoolGreen,
+        14 => BlockTile::WoolRed,
+        15 => BlockTile::WoolBlack,
+        _ => BlockTile::WoolWhite,
+    }
+}
+
+fn pumpkin_tile(face: FaceTile) -> BlockTile {
+    match face {
+        FaceTile::Top | FaceTile::Bottom => BlockTile::PumpkinTop,
+        FaceTile::Side => BlockTile::PumpkinSide,
+    }
+}
+
+fn melon_tile(face: FaceTile) -> BlockTile {
+    match face {
+        FaceTile::Top | FaceTile::Bottom => BlockTile::MelonTop,
+        FaceTile::Side => BlockTile::MelonSide,
+    }
+}
+
+fn stone_brick_tile(meta: u8) -> BlockTile {
+    match meta {
+        1 => BlockTile::StoneBrickMossy,
+        2 => BlockTile::StoneBrickCracked,
+        3 => BlockTile::StoneBrickCarved,
+        _ => BlockTile::StoneBrick,
+    }
+}
+
+fn quartz_tile(meta: u8, face: FaceTile) -> BlockTile {
+    match meta {
+        1 => match face {
+            FaceTile::Top | FaceTile::Bottom => BlockTile::QuartzChiseledTop,
+            FaceTile::Side => BlockTile::QuartzChiseled,
+        },
+        2 => match face {
+            FaceTile::Top | FaceTile::Bottom => BlockTile::QuartzPillarTop,
+            FaceTile::Side => BlockTile::QuartzPillarSide,
+        },
+        _ => match face {
+            FaceTile::Top => BlockTile::QuartzTop,
+            FaceTile::Bottom => BlockTile::QuartzBottom,
+            FaceTile::Side => BlockTile::QuartzSide,
+        },
+    }
+}
+
+fn stained_clay_tile(meta: u8) -> BlockTile {
+    match meta & 0xf {
+        1 => BlockTile::StainedClayOrange,
+        2 => BlockTile::StainedClayMagenta,
+        3 => BlockTile::StainedClayLightBlue,
+        4 => BlockTile::StainedClayYellow,
+        5 => BlockTile::StainedClayLime,
+        6 => BlockTile::StainedClayPink,
+        7 => BlockTile::StainedClayGray,
+        8 => BlockTile::StainedClaySilver,
+        9 => BlockTile::StainedClayCyan,
+        10 => BlockTile::StainedClayPurple,
+        11 => BlockTile::StainedClayBlue,
+        12 => BlockTile::StainedClayBrown,
+        13 => BlockTile::StainedClayGreen,
+        14 => BlockTile::StainedClayRed,
+        15 => BlockTile::StainedClayBlack,
+        _ => BlockTile::StainedClayWhite,
     }
 }
 
