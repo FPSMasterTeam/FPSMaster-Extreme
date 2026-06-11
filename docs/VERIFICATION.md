@@ -178,3 +178,44 @@ Not yet verified:
 
 - Runtime behavior of `C06PacketPlayerPosLook` against the local Paper 1.8.8 test server after this packet-selection change.
 - Full vanilla collision parity; current collision is still a simplified AABB clipper and does not yet implement every `Entity.moveEntity` branch/epsilon.
+
+## 2026-06-11 local server packet smoke test and collision pass
+
+Local server:
+
+```bash
+local_server/paper-1.8-protocol47/run.sh
+```
+
+Client smoke command:
+
+```bash
+RUST_LOG=info cargo run -p recraft_app -- \
+  --connect 127.0.0.1:25565 \
+  --username ReCraftVerify \
+  --assets local_assets/minecraft-1.8.9-client.jar
+```
+
+Observed:
+
+```text
+logged in as ReCraftVerify (...)
+applied chunk bulk: 10 chunks
+...
+applied chunk bulk: 9 chunks
+```
+
+Server observed successful login and only logged `Connection reset` after the client process was manually terminated. The previous immediate `Bad packet id 6` failure was not reproduced during this idle movement-packet smoke test. This does not prove every C06 path yet because no scripted look+position movement was injected.
+
+Commands run successfully:
+
+```bash
+cargo test -p recraft_core
+```
+
+Coverage added/updated:
+
+- Collision now uses a closer MCP-shaped `AxisAlignedBB.addCoord` and `calculateX/Y/ZOffset` path.
+- Player `step_height` defaults to vanilla `0.6`.
+- The step-height branch from `Entity.moveEntity` is implemented while the existing full-block no-auto-climb test still passes.
+- `head_collision_stops_upward_motion_before_gravity` verifies upward head collision zeroes vertical motion before gravity is applied.
