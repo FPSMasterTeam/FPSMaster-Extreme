@@ -9,6 +9,17 @@ pub enum NextState {
     Login = 2,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntityAction {
+    StartSneaking = 0,
+    StopSneaking = 1,
+    StopSleeping = 2,
+    StartSprinting = 3,
+    StopSprinting = 4,
+    RidingJump = 5,
+    OpenInventory = 6,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ServerboundPacket {
     Handshake {
@@ -44,6 +55,11 @@ pub enum ServerboundPacket {
         yaw: f32,
         pitch: f32,
         on_ground: bool,
+    },
+    EntityAction {
+        entity_id: i32,
+        action: EntityAction,
+        aux_data: i32,
     },
 }
 
@@ -203,6 +219,17 @@ impl ServerboundPacket {
                 body.write_f32(pitch);
                 body.write_bool(on_ground);
                 PacketFrame::new(0x06, body.into_inner())
+            }
+            Self::EntityAction {
+                entity_id,
+                action,
+                aux_data,
+            } => {
+                let mut body = PacketWriter::new();
+                body.write_var_i32(entity_id);
+                body.write_var_i32(action as i32);
+                body.write_var_i32(aux_data);
+                PacketFrame::new(0x0b, body.into_inner())
             }
         }
     }
@@ -440,6 +467,23 @@ mod tests {
                 ],
             }
         );
+    }
+
+    #[test]
+    fn entity_action_packet_writes_vanilla_enum_ordinal() {
+        let frame = ServerboundPacket::EntityAction {
+            entity_id: 42,
+            action: EntityAction::StartSprinting,
+            aux_data: 0,
+        }
+        .into_frame();
+
+        assert_eq!(frame.id, 0x0b);
+        let mut reader = PacketReader::new(&frame.body);
+        assert_eq!(reader.read_var_i32().unwrap(), 42);
+        assert_eq!(reader.read_var_i32().unwrap(), 3);
+        assert_eq!(reader.read_var_i32().unwrap(), 0);
+        assert!(reader.is_empty());
     }
 
     #[test]

@@ -25,9 +25,11 @@ Protocol 47 is the first target.
   - Player (`C03`, onGround only)
   - PlayerPosition (`C04`)
   - PlayerLook (`C05`)
-  - PlayerPositionLook
+  - PlayerPositionLook (`C06`)
+  - EntityAction (`C0B`) for sprint/sneak state changes
 - Movement packet selection follows the MCP 1.8.9 `EntityPlayerSP.onUpdateWalkingPlayer` decision:
   position delta squared `> 9.0E-4D` or `positionUpdateTicks >= 20`, plus separate yaw/pitch change detection.
+- Sprint/sneak action packets are emitted before the walking packet when the effective local state changes, matching the ordering in MCP `EntityPlayerSP.onUpdateWalkingPlayer`.
 - 1.8 chunk section block array decoder for protocol 47 chunk data.
 - Block light and sky light nibble-array decoding for chunk data.
 

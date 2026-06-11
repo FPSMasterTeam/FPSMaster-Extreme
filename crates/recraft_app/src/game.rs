@@ -19,6 +19,9 @@ pub struct MovementSnapshot {
     pub yaw: f32,
     pub pitch: f32,
     pub on_ground: bool,
+    pub entity_id: i32,
+    pub sneaking: bool,
+    pub sprinting: bool,
 }
 
 #[derive(Default)]
@@ -63,8 +66,12 @@ impl InputState {
             strafe: f32::from(self.left) - f32::from(self.right),
             jump: self.jump,
             sneak: self.sneak,
-            sprint: self.sprint,
+            sprint: self.effective_sprinting(),
         }
+    }
+
+    fn effective_sprinting(&self) -> bool {
+        self.sprint && self.forward && !self.backward && !self.sneak
     }
 }
 
@@ -76,6 +83,7 @@ pub struct GameState {
     previous_player_position: DVec3,
     physics: PlayerPhysics,
     has_sky_light: bool,
+    joined_game: bool,
     dirty_chunks: HashSet<ChunkPos>,
 }
 
@@ -112,6 +120,7 @@ impl GameState {
             player,
             physics: PlayerPhysics::default(),
             has_sky_light: true,
+            joined_game: false,
             dirty_chunks: HashSet::new(),
         }
     }
@@ -135,6 +144,10 @@ impl GameState {
         self.input.jump = active && elapsed_seconds % 2.0 < 0.25;
         self.input.turn_right = active;
         self.input.look_up = active && elapsed_seconds % 3.0 < 0.5;
+    }
+
+    pub fn can_send_movement_packets(&self) -> bool {
+        self.joined_game
     }
 
     pub fn tick(&mut self, dt: f32) -> MovementSnapshot {
@@ -179,6 +192,7 @@ impl GameState {
             } => {
                 self.player.id = EntityId(entity_id);
                 self.has_sky_light = dimension == 0;
+                self.joined_game = true;
                 self.world.upsert_entity(self.player.clone());
                 false
             }
@@ -352,6 +366,9 @@ impl GameState {
             yaw: self.player.yaw,
             pitch: self.player.pitch,
             on_ground: self.player.on_ground,
+            entity_id: self.player.id.0,
+            sneaking: self.input.sneak,
+            sprinting: self.input.effective_sprinting(),
         }
     }
 }

@@ -484,3 +484,55 @@ Implementation notes:
 - Updates for chunks not present in the client world are ignored instead of creating phantom chunks from isolated block updates.
 
 This verifies packet decoding and build integrity. It does not yet verify a live server action that sends `S22/S23`; that should be covered by a later manual smoke scenario such as placing/breaking blocks from another client.
+
+
+## 2026-06-11 sprint/sneak entity action packets
+
+MCP source checked:
+
+- `C0BPacketEntityAction` writes VarInt entity id, enum ordinal action, and VarInt aux data.
+- `EntityPlayerSP.onUpdateWalkingPlayer` sends sprint state changes before sneak state changes, and sends both before the normal `C03/C04/C05/C06` walking packet.
+
+Commands run successfully:
+
+```bash
+cargo test -p recraft_protocol
+cargo test -p recraft_app
+cargo test -p recraft_core -p recraft_protocol -p recraft_render
+cargo test -p recraft_app
+cargo check
+```
+
+Local server smoke initially exposed a real ordering bug: scripted input could send movement/action packets before the app had applied `JoinGame`. Paper disconnected that first run with `Bad packet id 11` after `C0B` was sent too early. The app now waits for `JoinGame` before sending movement/action packets.
+
+Successful local Paper smoke after the fix:
+
+```bash
+local_server/paper-1.8-protocol47/run.sh
+RUST_LOG=info,recraft_app::network=debug cargo run -p recraft_app -- \
+  --connect 127.0.0.1:25565 \
+  --username ReCraftC0B2 \
+  --scripted-smoke 6
+```
+
+Observed client logs:
+
+```text
+loaded 129 block atlas tiles from local_assets/minecraft-1.8.9
+logged in as ReCraftC0B2 (...)
+sending C0B EntityAction START_SPRINTING
+sending C06 PlayerPositionLook
+...
+sending C0B EntityAction STOP_SPRINTING
+scripted smoke complete
+```
+
+Observed server logs:
+
+```text
+ReCraftC0B2[/127.0.0.1:...] logged in with entity id ... at ([world]145.5, 67.0, 72.5)
+ReCraftC0B2 lost connection: Disconnected
+ReCraftC0B2 left the game.
+```
+
+No `Bad packet id 11` or other server protocol exception occurred in the successful run.

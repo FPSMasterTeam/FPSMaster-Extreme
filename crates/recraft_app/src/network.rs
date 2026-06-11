@@ -7,7 +7,7 @@ use std::{
 use recraft_protocol::{
     io::ProtocolError,
     net::BlockingClient,
-    v1_8_9::packets::{ClientboundPlayPacket, ServerboundPacket},
+    v1_8_9::packets::{ClientboundPlayPacket, EntityAction, ServerboundPacket},
 };
 
 use crate::game::MovementSnapshot;
@@ -32,9 +32,41 @@ struct WalkingPacketState {
     last_reported_yaw: f32,
     last_reported_pitch: f32,
     position_update_ticks: i32,
+    server_sneak_state: bool,
+    server_sprint_state: bool,
 }
 
 impl WalkingPacketState {
+    fn next_packets(&mut self, movement: MovementSnapshot) -> Vec<ServerboundPacket> {
+        let mut packets = Vec::new();
+        if movement.sprinting != self.server_sprint_state {
+            packets.push(ServerboundPacket::EntityAction {
+                entity_id: movement.entity_id,
+                action: if movement.sprinting {
+                    EntityAction::StartSprinting
+                } else {
+                    EntityAction::StopSprinting
+                },
+                aux_data: 0,
+            });
+            self.server_sprint_state = movement.sprinting;
+        }
+        if movement.sneaking != self.server_sneak_state {
+            packets.push(ServerboundPacket::EntityAction {
+                entity_id: movement.entity_id,
+                action: if movement.sneaking {
+                    EntityAction::StartSneaking
+                } else {
+                    EntityAction::StopSneaking
+                },
+                aux_data: 0,
+            });
+            self.server_sneak_state = movement.sneaking;
+        }
+        packets.push(self.next_packet(movement));
+        packets
+    }
+
     fn next_packet(&mut self, movement: MovementSnapshot) -> ServerboundPacket {
         let dx = movement.x - self.last_reported_x;
         let dy = movement.y - self.last_reported_y;
@@ -143,13 +175,14 @@ fn network_thread(
         while let Ok(command) = commands.try_recv() {
             match command {
                 NetworkCommand::Move(movement) => {
-                    let packet = walking_packets.next_packet(movement);
-                    log::debug!("sending {}", packet_debug_name(&packet));
-                    let frame = packet.into_frame();
-                    if let Err(err) = client.write_packet(frame) {
-                        let _ =
-                            events.send(NetworkEvent::Disconnected(format!("write failed: {err}")));
-                        return;
+                    for packet in walking_packets.next_packets(movement) {
+                        log::debug!("sending {}", packet_debug_name(&packet));
+                        let frame = packet.into_frame();
+                        if let Err(err) = client.write_packet(frame) {
+                            let _ = events
+                                .send(NetworkEvent::Disconnected(format!("write failed: {err}")));
+                            return;
+                        }
                     }
                 }
             }
@@ -190,6 +223,15 @@ fn packet_debug_name(packet: &ServerboundPacket) -> &'static str {
         ServerboundPacket::PlayerPosition { .. } => "C04 PlayerPosition",
         ServerboundPacket::PlayerLook { .. } => "C05 PlayerLook",
         ServerboundPacket::PlayerPositionLook { .. } => "C06 PlayerPositionLook",
+        ServerboundPacket::EntityAction { action, .. } => match action {
+            EntityAction::StartSneaking => "C0B EntityAction START_SNEAKING",
+            EntityAction::StopSneaking => "C0B EntityAction STOP_SNEAKING",
+            EntityAction::StopSleeping => "C0B EntityAction STOP_SLEEPING",
+            EntityAction::StartSprinting => "C0B EntityAction START_SPRINTING",
+            EntityAction::StopSprinting => "C0B EntityAction STOP_SPRINTING",
+            EntityAction::RidingJump => "C0B EntityAction RIDING_JUMP",
+            EntityAction::OpenInventory => "C0B EntityAction OPEN_INVENTORY",
+        },
         ServerboundPacket::Handshake { .. } => "Handshake",
         ServerboundPacket::LoginStart { .. } => "LoginStart",
         ServerboundPacket::KeepAlive { .. } => "KeepAlive",
@@ -208,6 +250,9 @@ mod tests {
             yaw,
             pitch,
             on_ground: true,
+            entity_id: 123,
+            sneaking: false,
+            sprinting: false,
         }
     }
 
@@ -230,6 +275,38 @@ mod tests {
         assert!(matches!(
             state.next_packet(movement(0.08, 0.0, 0.0, 20.0, 0.0)),
             ServerboundPacket::PlayerPositionLook { x, yaw: 20.0, .. } if (x - 0.08).abs() < f64::EPSILON
+        ));
+    }
+
+    #[test]
+    fn walking_packets_send_sprint_then_sneak_actions_before_movement() {
+        let mut state = WalkingPacketState::default();
+        let mut movement = movement(0.0, 0.0, 0.0, 0.0, 0.0);
+        movement.sprinting = true;
+        movement.sneaking = true;
+
+        let packets = state.next_packets(movement);
+        assert!(matches!(
+            packets.as_slice(),
+            [
+                ServerboundPacket::EntityAction {
+                    entity_id: 123,
+                    action: EntityAction::StartSprinting,
+                    aux_data: 0,
+                },
+                ServerboundPacket::EntityAction {
+                    entity_id: 123,
+                    action: EntityAction::StartSneaking,
+                    aux_data: 0,
+                },
+                ServerboundPacket::Player { .. },
+            ]
+        ));
+
+        let packets = state.next_packets(movement);
+        assert!(matches!(
+            packets.as_slice(),
+            [ServerboundPacket::Player { .. }]
         ));
     }
 

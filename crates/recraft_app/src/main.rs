@@ -109,7 +109,9 @@ fn main() -> anyhow::Result<()> {
                     while tick_accumulator >= 0.05 {
                         let movement = game.tick(0.05);
                         if let Some(network) = &network {
-                            network.send_movement(movement);
+                            if game.can_send_movement_packets() {
+                                network.send_movement(movement);
+                            }
                         }
                         tick_accumulator -= 0.05;
                     }

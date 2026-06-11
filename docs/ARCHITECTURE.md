@@ -58,7 +58,7 @@ Single-block and multi-block updates mutate already-loaded chunks and mark the a
 
 Rendering uses interpolation between previous and current 20Hz player positions so visual camera motion is smooth while the authoritative player state remains the real tick position. This mirrors the vanilla render path in `EntityRenderer.orientCamera(partialTicks)`; it is not used for physics or packet state.
 
-Serverbound walking packets are selected in `recraft_app::network` using the vanilla `EntityPlayerSP.onUpdateWalkingPlayer` thresholds: send position when delta squared is greater than `9.0E-4D` or after 20 ticks, send look when yaw/pitch changed, otherwise send the onGround-only player packet.
+Serverbound walking packets are selected in `recraft_app::network` using the vanilla `EntityPlayerSP.onUpdateWalkingPlayer` thresholds: send position when delta squared is greater than `9.0E-4D` or after 20 ticks, send look when yaw/pitch changed, otherwise send the onGround-only player packet. Sprint/sneak state changes are sent first as `C0B EntityAction` packets, matching the same MCP method ordering. The app waits for `JoinGame` before sending movement/action packets so the server has transitioned into play state and the local entity id is known.
 
 Before this is considered complete, we need a trace suite comparing against MCP/black-box vanilla behavior for:
 
