@@ -9,11 +9,12 @@ The renderer uses `wgpu` and `winit` for the current Rust implementation. This t
 Current pipeline:
 
 ```text
-World chunks
+World chunks + stored block/sky light
   -> visible-face meshing
   -> Vertex { position, color, uv }
   -> block texture atlas
-  -> wgpu render pass with depth buffer
+  -> sky gradient pass
+  -> wgpu chunk render pass with depth buffer
 ```
 
 ## Chunk meshing
@@ -44,13 +45,14 @@ The renderer loads them from `--assets <zip-or-jar>` / `RECRAFT_ASSET_ZIP` or fr
 
 ## Lighting
 
-Current lighting is directional face shading:
+Current lighting uses decoded 1.8 chunk block-light and sky-light nibble arrays. Mesh generation samples the light level outside each visible face and combines it with directional face shading:
 
 - top: brightest
 - bottom: darkest
 - sides: fixed brightness by axis
+- block/sky light: max(block_light, sky_light), mapped through a simple 0..15 curve
 
-This is only a scaffold. Vanilla-compatible lighting requires decoding/storing block light and sky light nibble arrays from chunk packets, plus local relighting for block updates.
+This is still a scaffold. Vanilla-compatible lighting still requires the exact vanilla light table, ambient occlusion/smooth lighting, and local relighting for block updates.
 
 ## Sky
 

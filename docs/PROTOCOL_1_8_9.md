@@ -19,6 +19,7 @@ Protocol 47 is the first target.
 - Serverbound movement packet:
   - PlayerPositionLook
 - 1.8 chunk section block array decoder for protocol 47 chunk data.
+- Block light and sky light nibble-array decoding for chunk data.
 
 ## Current connection mode
 

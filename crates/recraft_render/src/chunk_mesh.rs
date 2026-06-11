@@ -163,10 +163,11 @@ fn append_visible_faces(
         }
 
         let start = mesh.vertices.len() as u32;
+        let light = face_light(world, x, y, z, face.normal);
         let color = [
-            base_color[0] * face.light,
-            base_color[1] * face.light,
-            base_color[2] * face.light,
+            base_color[0] * face.light * light,
+            base_color[1] * face.light * light,
+            base_color[2] * face.light * light,
         ];
         let uvs = tile_uv(block_tile(block, face.tile_selector));
         for (corner, uv) in face.corners.into_iter().zip(uvs) {
@@ -183,6 +184,14 @@ fn append_visible_faces(
         mesh.indices
             .extend_from_slice(&[start, start + 1, start + 2, start, start + 2, start + 3]);
     }
+}
+
+fn face_light(world: &World, x: i32, y: i32, z: i32, normal: [i32; 3]) -> f32 {
+    let (block_light, sky_light) = world.light_at(x + normal[0], y + normal[1], z + normal[2]);
+    let level = block_light.max(sky_light);
+    // Vanilla uses a non-linear light table. This is a small first pass that
+    // keeps dark areas readable while preserving the 0..15 chunk light signal.
+    0.18 + (level as f32 / 15.0) * 0.82
 }
 
 fn block_color(block: BlockState) -> [f32; 3] {
@@ -230,5 +239,18 @@ mod tests {
         world.set_block(1, 0, 0, BlockState::STONE);
         let mesh = build_world_mesh(&world);
         assert_eq!(mesh.indices.len(), 60);
+    }
+
+    #[test]
+    fn mesh_uses_world_light() {
+        let mut world = World::new();
+        world.set_block(0, 0, 0, BlockState::STONE);
+        world.set_light(0, 1, 0, 0, 0);
+        let mesh = build_world_mesh(&world);
+        let has_dark_lit_vertex = mesh
+            .vertices
+            .iter()
+            .any(|vertex| (vertex.color[0] - 0.18).abs() < 0.001);
+        assert!(has_dark_lit_vertex);
     }
 }

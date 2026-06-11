@@ -43,6 +43,24 @@ impl World {
         chunk.get_block(local_x, y, local_z)
     }
 
+    pub fn set_light(&mut self, x: i32, y: i32, z: i32, block_light: u8, sky_light: u8) {
+        let pos = ChunkPos::new(div_floor(x, 16), div_floor(z, 16));
+        let local_x = mod_floor(x, 16) as u8;
+        let local_z = mod_floor(z, 16) as u8;
+        self.chunk_mut_or_insert(pos)
+            .set_light(local_x, y, local_z, block_light, sky_light);
+    }
+
+    pub fn light_at(&self, x: i32, y: i32, z: i32) -> (u8, u8) {
+        let pos = ChunkPos::new(div_floor(x, 16), div_floor(z, 16));
+        let Some(chunk) = self.chunk(pos) else {
+            return (0, 15);
+        };
+        let local_x = mod_floor(x, 16) as u8;
+        let local_z = mod_floor(z, 16) as u8;
+        chunk.light_at(local_x, y, local_z)
+    }
+
     pub fn upsert_entity(&mut self, entity: EntityState) {
         self.entities.insert(entity.id, entity);
     }
@@ -90,6 +108,20 @@ mod tests {
                 .unwrap()
                 .get_block(15, 64, 15),
             BlockState::DIRT
+        );
+    }
+
+    #[test]
+    fn world_light_handles_negative_chunks() {
+        let mut world = World::new();
+        world.set_light(-1, 64, -1, 3, 14);
+        assert_eq!(world.light_at(-1, 64, -1), (3, 14));
+        assert_eq!(
+            world
+                .chunk(ChunkPos::new(-1, -1))
+                .unwrap()
+                .light_at(15, 64, 15),
+            (3, 14)
         );
     }
 }

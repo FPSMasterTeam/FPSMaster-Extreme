@@ -19,6 +19,8 @@ impl ChunkPos {
 pub struct ChunkSection {
     y: i32,
     blocks: Box<[BlockState; SECTION_VOLUME]>,
+    block_light: Box<[u8; SECTION_VOLUME]>,
+    sky_light: Box<[u8; SECTION_VOLUME]>,
 }
 
 impl ChunkSection {
@@ -26,6 +28,8 @@ impl ChunkSection {
         Self {
             y,
             blocks: Box::new([BlockState::AIR; SECTION_VOLUME]),
+            block_light: Box::new([0; SECTION_VOLUME]),
+            sky_light: Box::new([15; SECTION_VOLUME]),
         }
     }
 
@@ -39,6 +43,22 @@ impl ChunkSection {
 
     pub fn set(&mut self, x: u8, y: u8, z: u8, block: BlockState) {
         self.blocks[Self::index(x, y, z)] = block;
+    }
+
+    pub fn block_light(&self, x: u8, y: u8, z: u8) -> u8 {
+        self.block_light[Self::index(x, y, z)]
+    }
+
+    pub fn set_block_light(&mut self, x: u8, y: u8, z: u8, value: u8) {
+        self.block_light[Self::index(x, y, z)] = value.min(15);
+    }
+
+    pub fn sky_light(&self, x: u8, y: u8, z: u8) -> u8 {
+        self.sky_light[Self::index(x, y, z)]
+    }
+
+    pub fn set_sky_light(&mut self, x: u8, y: u8, z: u8, value: u8) {
+        self.sky_light[Self::index(x, y, z)] = value.min(15);
     }
 
     const fn index(x: u8, y: u8, z: u8) -> usize {
@@ -109,6 +129,33 @@ impl Chunk {
         self.section_mut_or_insert(section_y)
             .set(x, local_y, z, block);
     }
+
+    pub fn light_at(&self, x: u8, y: i32, z: u8) -> (u8, u8) {
+        if !(0..256).contains(&y) {
+            return (0, 15);
+        }
+        let section_y = y >> 4;
+        let local_y = (y & 15) as u8;
+        self.section(section_y)
+            .map(|section| {
+                (
+                    section.block_light(x, local_y, z),
+                    section.sky_light(x, local_y, z),
+                )
+            })
+            .unwrap_or((0, 15))
+    }
+
+    pub fn set_light(&mut self, x: u8, y: i32, z: u8, block_light: u8, sky_light: u8) {
+        if !(0..256).contains(&y) {
+            return;
+        }
+        let section_y = y >> 4;
+        let local_y = (y & 15) as u8;
+        let section = self.section_mut_or_insert(section_y);
+        section.set_block_light(x, local_y, z, block_light);
+        section.set_sky_light(x, local_y, z, sky_light);
+    }
 }
 
 #[cfg(test)]
@@ -121,5 +168,12 @@ mod tests {
         chunk.set_block(1, 64, 2, BlockState::STONE);
         assert_eq!(chunk.get_block(1, 64, 2), BlockState::STONE);
         assert_eq!(chunk.get_block(1, 65, 2), BlockState::AIR);
+    }
+
+    #[test]
+    fn chunk_light_round_trip() {
+        let mut chunk = Chunk::new(ChunkPos::new(0, 0));
+        chunk.set_light(1, 64, 2, 7, 12);
+        assert_eq!(chunk.light_at(1, 64, 2), (7, 12));
     }
 }

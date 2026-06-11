@@ -51,6 +51,8 @@ This matches 1.8.9 and keeps the first milestone small. A later 1.13+ path must 
 
 ## Player physics
 
+Chunk sections store 1.8-style block IDs/meta plus decoded block light and sky light values. Rendering samples this light data at visible faces.
+
 `recraft_core::physics` implements a tick-based AABB path with axis-by-axis collision clipping. This mirrors the shape of the vanilla 1.8.9 `Entity.moveEntity` / living movement path, but exact parity is not proven yet.
 
 Before this is considered complete, we need a trace suite comparing against MCP/black-box vanilla behavior for:

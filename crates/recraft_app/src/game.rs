@@ -239,6 +239,8 @@ impl GameState {
                         let wz = z * 16 + block.z as i32;
                         self.world
                             .set_block(wx, wy, wz, BlockState::new(block.id, block.meta));
+                        self.world
+                            .set_light(wx, wy, wz, block.block_light, block.sky_light);
                     }
                 }
                 true

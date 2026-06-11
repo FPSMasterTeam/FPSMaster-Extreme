@@ -90,3 +90,21 @@ loaded Minecraft 1.8.9 block atlas from local_assets/minecraft-1.8.9-client.jar
 ```
 
 Movement direction is now covered by `movement_forward_matches_minecraft_yaw_convention`. Mouse motion is wired through `DeviceEvent::MouseMotion`; visual feel still needs manual tuning.
+
+## 2026-06-11 chunk lighting path
+
+Commands run successfully:
+
+```bash
+cargo test -p recraft_core -p recraft_protocol -p recraft_render
+cargo check
+```
+
+Coverage added:
+
+- `chunk_light_round_trip`
+- `world_light_handles_negative_chunks`
+- `decodes_light_nibbles_in_xzy_order`
+- `mesh_uses_world_light`
+
+This verifies the data path from decoded 1.8 chunk light nibbles into internal chunk storage and mesh color generation. It does not yet prove vanilla-exact smooth lighting or ambient occlusion.
