@@ -3,3 +3,4 @@
 /references/*
 !/references/README.md
 *.log
+/local_server/
