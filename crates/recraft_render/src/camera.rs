@@ -27,12 +27,22 @@ impl Camera {
     pub fn direction(&self) -> Vec3 {
         let yaw = self.yaw.to_radians();
         let pitch = self.pitch.to_radians();
-        Vec3::new(yaw.cos() * pitch.cos(), pitch.sin(), yaw.sin() * pitch.cos()).normalize()
+        Vec3::new(
+            yaw.cos() * pitch.cos(),
+            pitch.sin(),
+            yaw.sin() * pitch.cos(),
+        )
+        .normalize()
     }
 
     pub fn view_projection(&self) -> Mat4 {
         let view = Mat4::look_to_rh(self.position, self.direction(), Vec3::Y);
-        let projection = Mat4::perspective_rh(self.fovy_degrees.to_radians(), self.aspect.max(0.001), self.z_near, self.z_far);
+        let projection = Mat4::perspective_rh(
+            self.fovy_degrees.to_radians(),
+            self.aspect.max(0.001),
+            self.z_near,
+            self.z_far,
+        );
         projection * view
     }
 }

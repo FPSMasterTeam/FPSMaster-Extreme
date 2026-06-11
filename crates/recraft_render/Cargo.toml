@@ -8,8 +8,10 @@ license.workspace = true
 [dependencies]
 bytemuck.workspace = true
 glam.workspace = true
+image.workspace = true
 log.workspace = true
 recraft_core = { path = "../recraft_core" }
 thiserror.workspace = true
 wgpu.workspace = true
 winit.workspace = true
+zip.workspace = true

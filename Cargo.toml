@@ -19,8 +19,10 @@ bytemuck = { version = "1.15", features = ["derive"] }
 env_logger = "0.11"
 flate2 = "1.0"
 glam = "0.27"
+image = { version = "0.25", default-features = false, features = ["png"] }
 log = "0.4"
 pollster = "0.3"
 thiserror = "1.0"
 wgpu = "0.19"
 winit = "0.29"
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
