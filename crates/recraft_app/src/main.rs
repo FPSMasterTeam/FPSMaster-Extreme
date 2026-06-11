@@ -1,54 +1,26 @@
-use std::time::Instant;
+mod game;
+mod network;
+
+use std::{env, time::Instant};
 
 use anyhow::Context;
-use glam::Vec3;
-use recraft_core::{BlockState, World};
-use recraft_render::{Camera, Renderer};
+use game::GameState;
+use network::{NetworkEvent, NetworkHandle};
+use recraft_render::Renderer;
 use winit::{
-    event::{ElementState, Event, KeyEvent, WindowEvent},
+    event::{Event, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
-    keyboard::{KeyCode, PhysicalKey},
     window::WindowBuilder,
 };
 
-#[derive(Default)]
-struct InputState {
-    forward: bool,
-    backward: bool,
-    left: bool,
-    right: bool,
-    up: bool,
-    down: bool,
-}
-
-impl InputState {
-    fn apply(&self, camera: &mut Camera, dt: f32) {
-        let speed = 12.0 * dt;
-        let forward = camera.direction();
-        let right = forward.cross(Vec3::Y).normalize_or_zero();
-        if self.forward {
-            camera.position += forward * speed;
-        }
-        if self.backward {
-            camera.position -= forward * speed;
-        }
-        if self.right {
-            camera.position += right * speed;
-        }
-        if self.left {
-            camera.position -= right * speed;
-        }
-        if self.up {
-            camera.position += Vec3::Y * speed;
-        }
-        if self.down {
-            camera.position -= Vec3::Y * speed;
-        }
-    }
+struct LaunchConfig {
+    server: Option<(String, u16)>,
+    username: String,
 }
 
 fn main() -> anyhow::Result<()> {
     env_logger::init();
+    let config = LaunchConfig::from_args();
 
     let event_loop = EventLoop::new().context("create event loop")?;
     let window = WindowBuilder::new()
@@ -58,11 +30,20 @@ fn main() -> anyhow::Result<()> {
     let window: &'static winit::window::Window = Box::leak(Box::new(window));
 
     let mut renderer = pollster::block_on(Renderer::new(window)).context("create renderer")?;
-    let world = demo_world();
-    renderer.upload_world(&world);
-    let mut camera = Camera::new(Vec3::new(8.0, 14.0, 28.0), renderer.aspect());
-    let mut input = InputState::default();
+    let mut game = if config.server.is_some() {
+        GameState::empty_for_server(renderer.aspect())
+    } else {
+        GameState::demo(renderer.aspect())
+    };
+    renderer.upload_world(&game.world);
+
+    let network = config.server.map(|(host, port)| {
+        log::info!("connecting to {host}:{port} as {}", config.username);
+        NetworkHandle::connect_offline_1_8_9(host, port, config.username)
+    });
+
     let mut last_frame = Instant::now();
+    let mut tick_accumulator = 0.0f32;
 
     event_loop.run(move |event, target| {
         target.set_control_flow(ControlFlow::Poll);
@@ -71,15 +52,37 @@ fn main() -> anyhow::Result<()> {
                 WindowEvent::CloseRequested => target.exit(),
                 WindowEvent::Resized(size) => {
                     renderer.resize(size);
-                    camera.aspect = renderer.aspect();
+                    game.set_aspect(renderer.aspect());
                 }
-                WindowEvent::KeyboardInput { event, .. } => handle_key(&mut input, event),
+                WindowEvent::KeyboardInput { event, .. } => game.input.handle_key(event),
                 WindowEvent::RedrawRequested => {
+                    let mut mesh_dirty = false;
+                    if let Some(network) = &network {
+                        while let Ok(event) = network.events.try_recv() {
+                            match event {
+                                NetworkEvent::Connected { username, uuid } => log::info!("logged in as {username} ({uuid})"),
+                                NetworkEvent::PlayPacket(packet) => mesh_dirty |= game.apply_play_packet(packet),
+                                NetworkEvent::Disconnected(message) => log::warn!("network disconnected: {message}"),
+                            }
+                        }
+                    }
+                    if mesh_dirty {
+                        renderer.upload_world(&game.world);
+                    }
+
                     let now = Instant::now();
-                    let dt = (now - last_frame).as_secs_f32();
+                    let dt = (now - last_frame).as_secs_f32().min(0.1);
                     last_frame = now;
-                    input.apply(&mut camera, dt);
-                    if let Err(err) = renderer.render(&camera) {
+                    tick_accumulator += dt;
+                    while tick_accumulator >= 0.05 {
+                        let movement = game.tick(0.05);
+                        if let Some(network) = &network {
+                            network.send_movement(movement);
+                        }
+                        tick_accumulator -= 0.05;
+                    }
+
+                    if let Err(err) = renderer.render(&game.camera) {
                         log::error!("render error: {err}");
                     }
                 }
@@ -93,52 +96,33 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn handle_key(input: &mut InputState, event: KeyEvent) {
-    let pressed = event.state == ElementState::Pressed;
-    match event.physical_key {
-        PhysicalKey::Code(KeyCode::KeyW) => input.forward = pressed,
-        PhysicalKey::Code(KeyCode::KeyS) => input.backward = pressed,
-        PhysicalKey::Code(KeyCode::KeyA) => input.left = pressed,
-        PhysicalKey::Code(KeyCode::KeyD) => input.right = pressed,
-        PhysicalKey::Code(KeyCode::Space) => input.up = pressed,
-        PhysicalKey::Code(KeyCode::ShiftLeft) => input.down = pressed,
-        _ => {}
+impl LaunchConfig {
+    fn from_args() -> Self {
+        let mut server = None;
+        let mut username = "ReCraft".to_owned();
+        let mut args = env::args().skip(1);
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--connect" => {
+                    if let Some(value) = args.next() {
+                        server = parse_server(&value);
+                    }
+                }
+                "--username" => {
+                    if let Some(value) = args.next() {
+                        username = value;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Self { server, username }
     }
 }
 
-fn demo_world() -> World {
-    let mut world = World::new();
-    for x in -16..32 {
-        for z in -16..32 {
-            world.set_block(x, 0, z, BlockState::GRASS);
-            for y in -3..0 {
-                world.set_block(x, y, z, BlockState::DIRT);
-            }
-        }
-    }
-    for x in 4..10 {
-        for y in 1..5 {
-            for z in 4..10 {
-                if x == 4 || x == 9 || z == 4 || z == 9 || y == 4 {
-                    world.set_block(x, y, z, BlockState::STONE);
-                }
-            }
-        }
-    }
-    for y in 1..7 {
-        world.set_block(-4, y, -4, BlockState::new(17, 0));
-    }
-    for x in -7..0 {
-        for y in 5..9 {
-            for z in -7..0 {
-                let dx = x + 4;
-                let dy = y - 7;
-                let dz = z + 4;
-                if dx * dx + dy * dy + dz * dz < 12 {
-                    world.set_block(x, y, z, BlockState::new(18, 0));
-                }
-            }
-        }
-    }
-    world
+fn parse_server(value: &str) -> Option<(String, u16)> {
+    let (host, port) = value.rsplit_once(':').map_or((value, 25565), |(host, port)| {
+        (host, port.parse().unwrap_or(25565))
+    });
+    Some((host.to_owned(), port))
 }

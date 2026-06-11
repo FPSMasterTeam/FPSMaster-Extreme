@@ -32,6 +32,7 @@ pub struct Renderer<'window> {
     config: wgpu::SurfaceConfiguration,
     size: PhysicalSize<u32>,
     pipeline: wgpu::RenderPipeline,
+    depth_view: wgpu::TextureView,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     vertex_buffer: wgpu::Buffer,
@@ -115,6 +116,8 @@ impl<'window> Renderer<'window> {
             bind_group_layouts: &[&camera_layout],
             push_constant_ranges: &[],
         });
+        let depth_view = create_depth_view(&device, &config);
+
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("chunk-pipeline"),
             layout: Some(&pipeline_layout),
@@ -141,7 +144,13 @@ impl<'window> Renderer<'window> {
                 unclipped_depth: false,
                 conservative: false,
             },
-            depth_stencil: None,
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
             multisample: wgpu::MultisampleState::default(),
             multiview: None,
         });
@@ -166,6 +175,7 @@ impl<'window> Renderer<'window> {
             config,
             size,
             pipeline,
+            depth_view,
             camera_buffer,
             camera_bind_group,
             vertex_buffer,
@@ -182,6 +192,7 @@ impl<'window> Renderer<'window> {
         self.config.width = size.width;
         self.config.height = size.height;
         self.surface.configure(&self.device, &self.config);
+        self.depth_view = create_depth_view(&self.device, &self.config);
     }
 
     pub fn aspect(&self) -> f32 {
@@ -241,7 +252,14 @@ impl<'window> Renderer<'window> {
                         store: wgpu::StoreOp::Store,
                     },
                 })],
-                depth_stencil_attachment: None,
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
                 occlusion_query_set: None,
                 timestamp_writes: None,
             });
@@ -258,4 +276,24 @@ impl<'window> Renderer<'window> {
         frame.present();
         Ok(())
     }
+}
+
+const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24Plus;
+
+fn create_depth_view(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) -> wgpu::TextureView {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("depth-texture"),
+        size: wgpu::Extent3d {
+            width: config.width.max(1),
+            height: config.height.max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: DEPTH_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    texture.create_view(&wgpu::TextureViewDescriptor::default())
 }

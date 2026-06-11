@@ -1,5 +1,6 @@
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+use std::time::Duration;
 
 use crate::{
     codec::{decode_frame, encode_frame, Compression, PacketFrame},
@@ -56,6 +57,11 @@ impl BlockingClient {
 
     pub fn read_play_packet_1_8_9(&mut self) -> Result<ClientboundPlayPacket> {
         ClientboundPlayPacket::from_frame(self.read_frame()?)
+    }
+
+    pub fn set_read_timeout(&self, timeout: Option<Duration>) -> Result<()> {
+        self.stream.set_read_timeout(timeout)?;
+        Ok(())
     }
 
     pub fn write_packet(&mut self, frame: PacketFrame) -> Result<()> {
