@@ -78,12 +78,10 @@ fn network_thread(
         while let Ok(command) = commands.try_recv() {
             match command {
                 NetworkCommand::Move(movement) => {
-                    let frame = ServerboundPacket::PlayerPositionLook {
+                    let frame = ServerboundPacket::PlayerPosition {
                         x: movement.x,
                         y: movement.y,
                         z: movement.z,
-                        yaw: movement.yaw,
-                        pitch: movement.pitch,
                         on_ground: movement.on_ground,
                     }
                     .into_frame();

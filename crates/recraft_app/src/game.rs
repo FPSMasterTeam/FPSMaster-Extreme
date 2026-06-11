@@ -12,8 +12,6 @@ pub struct MovementSnapshot {
     pub x: f64,
     pub y: f64,
     pub z: f64,
-    pub yaw: f32,
-    pub pitch: f32,
     pub on_ground: bool,
 }
 
@@ -181,24 +179,30 @@ impl GameState {
                 ground_up,
                 primary_bit_mask,
                 data,
-            } => match decode_chunk_data(&data, primary_bit_mask, ground_up, self.has_sky_light) {
-                Ok(decoded) => {
-                    for section in decoded.sections {
-                        for block in section.blocks {
-                            let wx = x * 16 + block.x as i32;
-                            let wy = section.y as i32 * 16 + block.y as i32;
-                            let wz = z * 16 + block.z as i32;
-                            self.world
-                                .set_block(wx, wy, wz, BlockState::new(block.id, block.meta));
-                        }
-                    }
-                    true
+            } => {
+                self.apply_chunk_data(x, z, ground_up, primary_bit_mask, &data, self.has_sky_light)
+            }
+            ClientboundPlayPacket::ChunkBulk {
+                sky_light_sent,
+                chunks,
+            } => {
+                let mut changed = false;
+                let count = chunks.len();
+                for chunk in chunks {
+                    changed |= self.apply_chunk_data(
+                        chunk.x,
+                        chunk.z,
+                        true,
+                        chunk.primary_bit_mask,
+                        &chunk.data,
+                        sky_light_sent,
+                    );
                 }
-                Err(err) => {
-                    log::warn!("failed to decode chunk {x},{z}: {err}");
-                    false
+                if changed {
+                    log::info!("applied chunk bulk: {count} chunks");
                 }
-            },
+                changed
+            }
             ClientboundPlayPacket::Disconnect { reason_json } => {
                 log::warn!("server disconnected: {reason_json}");
                 false
@@ -209,13 +213,40 @@ impl GameState {
         }
     }
 
+    fn apply_chunk_data(
+        &mut self,
+        x: i32,
+        z: i32,
+        ground_up: bool,
+        primary_bit_mask: u16,
+        data: &[u8],
+        has_sky_light: bool,
+    ) -> bool {
+        match decode_chunk_data(data, primary_bit_mask, ground_up, has_sky_light) {
+            Ok(decoded) => {
+                for section in decoded.sections {
+                    for block in section.blocks {
+                        let wx = x * 16 + block.x as i32;
+                        let wy = section.y as i32 * 16 + block.y as i32;
+                        let wz = z * 16 + block.z as i32;
+                        self.world
+                            .set_block(wx, wy, wz, BlockState::new(block.id, block.meta));
+                    }
+                }
+                true
+            }
+            Err(err) => {
+                log::warn!("failed to decode chunk {x},{z}: {err}");
+                false
+            }
+        }
+    }
+
     fn movement_snapshot(&self) -> MovementSnapshot {
         MovementSnapshot {
             x: self.player.position.x as f64,
             y: self.player.position.y as f64,
             z: self.player.position.z as f64,
-            yaw: self.player.yaw,
-            pitch: self.player.pitch,
             on_ground: self.player.on_ground,
         }
     }

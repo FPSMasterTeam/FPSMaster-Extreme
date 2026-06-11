@@ -64,6 +64,14 @@ pub enum ClientboundLoginPacket {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct BulkChunkData {
+    pub x: i32,
+    pub z: i32,
+    pub primary_bit_mask: u16,
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum ClientboundPlayPacket {
     KeepAlive {
         id: i32,
@@ -91,6 +99,10 @@ pub enum ClientboundPlayPacket {
         ground_up: bool,
         primary_bit_mask: u16,
         data: Vec<u8>,
+    },
+    ChunkBulk {
+        sky_light_sent: bool,
+        chunks: Vec<BulkChunkData>,
     },
     Disconnect {
         reason_json: String,
@@ -232,6 +244,28 @@ impl ClientboundPlayPacket {
                     body.read_bytes(len)?.to_vec()
                 },
             }),
+            0x26 => {
+                let sky_light_sent = body.read_bool()?;
+                let count = body.read_var_i32()? as usize;
+                let mut meta = Vec::with_capacity(count);
+                for _ in 0..count {
+                    meta.push((body.read_i32()?, body.read_i32()?, body.read_u16()?));
+                }
+                let mut chunks = Vec::with_capacity(count);
+                for (x, z, primary_bit_mask) in meta {
+                    let len = bulk_chunk_data_len(primary_bit_mask, sky_light_sent);
+                    chunks.push(BulkChunkData {
+                        x,
+                        z,
+                        primary_bit_mask,
+                        data: body.read_bytes(len)?.to_vec(),
+                    });
+                }
+                Ok(Self::ChunkBulk {
+                    sky_light_sent,
+                    chunks,
+                })
+            }
             0x40 => Ok(Self::Disconnect {
                 reason_json: body.read_string(32767)?,
             }),
@@ -293,4 +327,13 @@ mod tests {
             }
         );
     }
+}
+
+fn bulk_chunk_data_len(primary_bit_mask: u16, sky_light_sent: bool) -> usize {
+    let sections = primary_bit_mask.count_ones() as usize;
+    let mut len = sections * (4096 * 2 + 2048);
+    if sky_light_sent {
+        len += sections * 2048;
+    }
+    len + 256
 }
