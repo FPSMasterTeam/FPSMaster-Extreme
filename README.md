@@ -19,7 +19,7 @@ Demo world with local vanilla textures:
 
 ```bash
 python3 scripts/setup_minecraft_1_8_9_assets.py
-cargo run -p recraft_app -- --assets local_assets/minecraft-1.8.9-client.jar
+cargo run -p recraft_app
 ```
 
 Demo world without downloaded assets:
@@ -31,7 +31,7 @@ cargo run -p recraft_app
 Offline-mode 1.8.9 server skeleton:
 
 ```bash
-cargo run -p recraft_app -- --connect 127.0.0.1:25565 --username ReCraft --assets local_assets/minecraft-1.8.9-client.jar
+cargo run -p recraft_app -- --connect 127.0.0.1:25565 --username ReCraft
 ```
 
 The app currently supports keyboard movement:

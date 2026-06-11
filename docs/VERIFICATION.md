@@ -402,3 +402,60 @@ ReCraftMesh left the game.
 ```
 
 No wgpu validation or protocol error was observed during the scripted smoke run. This is a runtime smoke check, not a visual-performance benchmark.
+
+## 2026-06-11 default extracted assets and chunk unload follow-up
+
+Commands run successfully:
+
+```bash
+python3 scripts/setup_minecraft_1_8_9_assets.py
+cargo fmt --all
+cargo check
+cargo test -p recraft_core -p recraft_protocol -p recraft_render
+cargo test -p recraft_app
+RUST_LOG=info cargo run -p recraft_app -- --scripted-smoke 2
+```
+
+Observed default asset log without `--assets`:
+
+```text
+loaded 129 block atlas tiles from local_assets/minecraft-1.8.9
+loaded Minecraft 1.8.9 block atlas from asset directory local_assets/minecraft-1.8.9
+scripted smoke complete
+```
+
+Local Paper server smoke command without `--assets`:
+
+```bash
+local_server/paper-1.8-protocol47/run.sh
+RUST_LOG=info cargo run -p recraft_app -- \
+  --connect 127.0.0.1:25565 \
+  --username ReCraftAssets2 \
+  --scripted-smoke 8
+```
+
+Observed client logs:
+
+```text
+loaded 129 block atlas tiles from local_assets/minecraft-1.8.9
+loaded Minecraft 1.8.9 block atlas from asset directory local_assets/minecraft-1.8.9
+logged in as ReCraftAssets2 (...)
+applied chunk bulk: 10 chunks
+...
+scripted smoke complete
+```
+
+Observed server logs:
+
+```text
+ReCraftAssets2[/127.0.0.1:...] logged in with entity id ... at ([world]144.5, 67.0, 71.5)
+ReCraftAssets2 lost connection: Disconnected
+ReCraftAssets2 left the game.
+```
+
+MCP source checked for chunk unload behavior:
+
+- `NetHandlerPlayClient.handleChunkData(S21PacketChunkData)` calls `doPreChunk(x, z, false)` and returns when `func_149274_i()` is true and `getExtractedSize() == 0`.
+- `S21PacketChunkData.getExtractedSize()` returns `extractedData.dataSize`, the primary section bitmask.
+
+Implementation now treats `ChunkData` with `ground_up == true` and primary bitmask `0` as an unload, removes the chunk from the internal world, and marks the chunk plus horizontal neighbors dirty so the renderer removes/rebuilds affected chunk meshes. No extra tests were added for this path; this was kept as a small MCP-backed runtime/protocol fix.

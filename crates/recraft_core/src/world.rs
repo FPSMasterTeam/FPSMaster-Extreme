@@ -21,6 +21,10 @@ impl World {
         self.chunks.get(&pos)
     }
 
+    pub fn remove_chunk(&mut self, pos: ChunkPos) {
+        self.chunks.remove(&pos);
+    }
+
     pub fn chunk_mut_or_insert(&mut self, pos: ChunkPos) -> &mut Chunk {
         self.chunks.entry(pos).or_insert_with(|| Chunk::new(pos))
     }

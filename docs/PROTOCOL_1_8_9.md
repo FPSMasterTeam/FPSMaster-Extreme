@@ -17,6 +17,7 @@ Protocol 47 is the first target.
   - ChunkData
   - ChunkBulk / MapChunkBulk
   - Disconnect
+- `ChunkData` ground-up packets with primary bitmask `0` are handled as vanilla chunk unloads, matching MCP `NetHandlerPlayClient.handleChunkData`.
 - Serverbound movement packets:
   - Player (`C03`, onGround only)
   - PlayerPosition (`C04`)

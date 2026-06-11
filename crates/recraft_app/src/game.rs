@@ -273,6 +273,14 @@ impl GameState {
         data: &[u8],
         has_sky_light: bool,
     ) -> bool {
+        let pos = ChunkPos::new(x, z);
+        if ground_up && primary_bit_mask == 0 {
+            self.world.remove_chunk(pos);
+            self.mark_chunk_dirty(pos);
+            log::info!("unloaded chunk {x},{z}");
+            return true;
+        }
+
         match decode_chunk_data(data, primary_bit_mask, ground_up, has_sky_light) {
             Ok(decoded) => {
                 for section in decoded.sections {
@@ -286,7 +294,7 @@ impl GameState {
                             .set_light(wx, wy, wz, block.block_light, block.sky_light);
                     }
                 }
-                self.mark_chunk_dirty(ChunkPos::new(x, z));
+                self.mark_chunk_dirty(pos);
                 true
             }
             Err(err) => {
