@@ -15,9 +15,12 @@ Protocol 47 is the first target.
   - JoinGame
   - PlayerPositionLook
   - ChunkData
+  - MultiBlockChange (`S22`)
+  - BlockChange (`S23`)
   - ChunkBulk / MapChunkBulk
   - Disconnect
 - `ChunkData` ground-up packets with primary bitmask `0` are handled as vanilla chunk unloads, matching MCP `NetHandlerPlayClient.handleChunkData`.
+- Block changes decode 1.8.9 legacy block-state IDs as `block_id << 4 | metadata`, matching `Block.BLOCK_STATE_IDS`.
 - Serverbound movement packets:
   - Player (`C03`, onGround only)
   - PlayerPosition (`C04`)
@@ -52,7 +55,6 @@ cargo run -p recraft_app -- --connect 127.0.0.1:25565 --username ReCraft
 - Online-mode Microsoft/Yggdrasil session flow and AES-CFB8 encryption.
 - Full Play-state packet coverage.
 - Entity spawn/move/metadata packets.
-- Block update and multi-block change application.
 - Inventory/window packets.
 - Chat and command packets.
 - Packet-level integration tests against a real 1.8.9 server.

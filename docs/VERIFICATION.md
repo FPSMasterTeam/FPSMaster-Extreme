@@ -459,3 +459,28 @@ MCP source checked for chunk unload behavior:
 - `S21PacketChunkData.getExtractedSize()` returns `extractedData.dataSize`, the primary section bitmask.
 
 Implementation now treats `ChunkData` with `ground_up == true` and primary bitmask `0` as an unload, removes the chunk from the internal world, and marks the chunk plus horizontal neighbors dirty so the renderer removes/rebuilds affected chunk meshes. No extra tests were added for this path; this was kept as a small MCP-backed runtime/protocol fix.
+
+
+## 2026-06-11 block update packet pass
+
+MCP source checked:
+
+- `S23PacketBlockChange` reads `BlockPos` and `Block.BLOCK_STATE_IDS` VarInt.
+- `S22PacketMultiBlockChange` reads chunk X/Z, VarInt count, then crammed local positions and `Block.BLOCK_STATE_IDS` VarInts.
+- `NetHandlerPlayClient.handleBlockChange` / `handleMultiBlockChange` call `invalidateRegionAndSetBlock` for each update.
+- `Block.BLOCK_STATE_IDS` is populated as `block_id << 4 | metadata` in MCP 1.8.9 registration.
+
+Commands run successfully:
+
+```bash
+cargo test -p recraft_protocol
+cargo check
+```
+
+Implementation notes:
+
+- Clientbound play `0x22` / `0x23` now decode into stable block-change events.
+- The app applies those changes to already-loaded chunks and marks affected chunk meshes dirty.
+- Updates for chunks not present in the client world are ignored instead of creating phantom chunks from isolated block updates.
+
+This verifies packet decoding and build integrity. It does not yet verify a live server action that sends `S22/S23`; that should be covered by a later manual smoke scenario such as placing/breaking blocks from another client.

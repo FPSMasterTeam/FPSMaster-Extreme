@@ -74,6 +74,15 @@ pub struct BulkChunkData {
     pub data: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockChangeRecord {
+    pub x: u8,
+    pub y: u8,
+    pub z: u8,
+    pub id: u16,
+    pub meta: u8,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ClientboundPlayPacket {
     KeepAlive {
@@ -102,6 +111,18 @@ pub enum ClientboundPlayPacket {
         ground_up: bool,
         primary_bit_mask: u16,
         data: Vec<u8>,
+    },
+    MultiBlockChange {
+        chunk_x: i32,
+        chunk_z: i32,
+        changes: Vec<BlockChangeRecord>,
+    },
+    BlockChange {
+        x: i32,
+        y: i32,
+        z: i32,
+        id: u16,
+        meta: u8,
     },
     ChunkBulk {
         sky_light_sent: bool,
@@ -252,6 +273,33 @@ impl ClientboundPlayPacket {
                     body.read_bytes(len)?.to_vec()
                 },
             }),
+            0x22 => {
+                let chunk_x = body.read_i32()?;
+                let chunk_z = body.read_i32()?;
+                let count = body.read_var_i32()? as usize;
+                let mut changes = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let packed = body.read_u16()?;
+                    let (id, meta) = decode_legacy_block_state_id(body.read_var_i32()?)?;
+                    changes.push(BlockChangeRecord {
+                        x: ((packed >> 12) & 15) as u8,
+                        y: (packed & 255) as u8,
+                        z: ((packed >> 8) & 15) as u8,
+                        id,
+                        meta,
+                    });
+                }
+                Ok(Self::MultiBlockChange {
+                    chunk_x,
+                    chunk_z,
+                    changes,
+                })
+            }
+            0x23 => {
+                let (x, y, z) = read_block_pos(&mut body)?;
+                let (id, meta) = decode_legacy_block_state_id(body.read_var_i32()?)?;
+                Ok(Self::BlockChange { x, y, z, id, meta })
+            }
             0x26 => {
                 let sky_light_sent = body.read_bool()?;
                 let count = body.read_var_i32()? as usize;
@@ -337,11 +385,76 @@ mod tests {
     }
 
     #[test]
+    fn clientbound_block_change_decodes_position_and_legacy_state() {
+        let mut body = PacketWriter::new();
+        body.write_bytes(&encoded_block_pos(-1, 64, 2));
+        body.write_var_i32((1 << 4) | 0);
+
+        let packet =
+            ClientboundPlayPacket::from_frame(PacketFrame::new(0x23, body.into_inner())).unwrap();
+        assert_eq!(
+            packet,
+            ClientboundPlayPacket::BlockChange {
+                x: -1,
+                y: 64,
+                z: 2,
+                id: 1,
+                meta: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn clientbound_multi_block_change_decodes_crammed_positions() {
+        let mut body = PacketWriter::new();
+        body.write_i32(-2);
+        body.write_i32(3);
+        body.write_var_i32(2);
+        body.write_u16((1 << 12) | (2 << 8) | 64);
+        body.write_var_i32((2 << 4) | 0);
+        body.write_u16((15 << 12) | 255);
+        body.write_var_i32((5 << 4) | 3);
+
+        let packet =
+            ClientboundPlayPacket::from_frame(PacketFrame::new(0x22, body.into_inner())).unwrap();
+        assert_eq!(
+            packet,
+            ClientboundPlayPacket::MultiBlockChange {
+                chunk_x: -2,
+                chunk_z: 3,
+                changes: vec![
+                    BlockChangeRecord {
+                        x: 1,
+                        y: 64,
+                        z: 2,
+                        id: 2,
+                        meta: 0,
+                    },
+                    BlockChangeRecord {
+                        x: 15,
+                        y: 255,
+                        z: 0,
+                        id: 5,
+                        meta: 3,
+                    },
+                ],
+            }
+        );
+    }
+
+    #[test]
     fn player_packet_writes_on_ground_only() {
         let frame = ServerboundPacket::Player { on_ground: true }.into_frame();
 
         assert_eq!(frame.id, 0x03);
         assert_eq!(frame.body, vec![1]);
+    }
+
+    fn encoded_block_pos(x: i32, y: i32, z: i32) -> [u8; 8] {
+        let value = ((x as u64) & 0x03ff_ffff) << 38
+            | ((y as u64) & 0x0fff) << 26
+            | ((z as u64) & 0x03ff_ffff);
+        value.to_be_bytes()
     }
 }
 
@@ -352,4 +465,27 @@ fn bulk_chunk_data_len(primary_bit_mask: u16, sky_light_sent: bool) -> usize {
         len += sections * 2048;
     }
     len + 256
+}
+
+fn read_block_pos(reader: &mut PacketReader<'_>) -> Result<(i32, i32, i32)> {
+    let value = reader.read_i64()? as u64;
+    let x = sign_extend((value >> 38) & 0x03ff_ffff, 26);
+    let y = sign_extend((value >> 26) & 0x0fff, 12);
+    let z = sign_extend(value & 0x03ff_ffff, 26);
+    Ok((x, y, z))
+}
+
+fn sign_extend(value: u64, bits: u32) -> i32 {
+    let shift = 64 - bits;
+    ((value << shift) as i64 >> shift) as i32
+}
+
+fn decode_legacy_block_state_id(state_id: i32) -> Result<(u16, u8)> {
+    if !(0..=0xffff).contains(&state_id) {
+        return Err(ProtocolError::InvalidData(
+            "legacy block state id out of range",
+        ));
+    }
+    let value = state_id as u16;
+    Ok((value >> 4, (value & 15) as u8))
 }

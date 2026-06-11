@@ -229,6 +229,22 @@ impl GameState {
             } => {
                 self.apply_chunk_data(x, z, ground_up, primary_bit_mask, &data, self.has_sky_light)
             }
+            ClientboundPlayPacket::MultiBlockChange {
+                chunk_x,
+                chunk_z,
+                changes,
+            } => {
+                let mut changed = false;
+                for block in changes {
+                    let x = chunk_x * 16 + block.x as i32;
+                    let z = chunk_z * 16 + block.z as i32;
+                    changed |= self.apply_block_change(x, block.y as i32, z, block.id, block.meta);
+                }
+                changed
+            }
+            ClientboundPlayPacket::BlockChange { x, y, z, id, meta } => {
+                self.apply_block_change(x, y, z, id, meta)
+            }
             ClientboundPlayPacket::ChunkBulk {
                 sky_light_sent,
                 chunks,
@@ -262,6 +278,18 @@ impl GameState {
 
     pub fn take_dirty_chunks(&mut self) -> Vec<ChunkPos> {
         self.dirty_chunks.drain().collect()
+    }
+
+    fn apply_block_change(&mut self, x: i32, y: i32, z: i32, id: u16, meta: u8) -> bool {
+        if !self
+            .world
+            .set_block_if_chunk_loaded(x, y, z, BlockState::new(id, meta))
+        {
+            log::debug!("ignored block change for unloaded chunk at {x},{y},{z}");
+            return false;
+        }
+        self.mark_chunk_dirty(ChunkPos::new(x.div_euclid(16), z.div_euclid(16)));
+        true
     }
 
     fn apply_chunk_data(

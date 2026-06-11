@@ -37,6 +37,17 @@ impl World {
             .set_block(local_x, y, local_z, block);
     }
 
+    pub fn set_block_if_chunk_loaded(&mut self, x: i32, y: i32, z: i32, block: BlockState) -> bool {
+        let pos = ChunkPos::new(div_floor(x, 16), div_floor(z, 16));
+        let Some(chunk) = self.chunks.get_mut(&pos) else {
+            return false;
+        };
+        let local_x = mod_floor(x, 16) as u8;
+        let local_z = mod_floor(z, 16) as u8;
+        chunk.set_block(local_x, y, local_z, block);
+        true
+    }
+
     pub fn block_at(&self, x: i32, y: i32, z: i32) -> BlockState {
         let pos = ChunkPos::new(div_floor(x, 16), div_floor(z, 16));
         let Some(chunk) = self.chunk(pos) else {
