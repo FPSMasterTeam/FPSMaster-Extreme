@@ -106,7 +106,11 @@ mod tests {
         let encoded = encode_frame(&frame, Compression::Enabled { threshold: 32 }).unwrap();
         let mut reader = PacketReader::new(&encoded);
         let len = reader.read_var_i32().unwrap() as usize;
-        let decoded = decode_frame(reader.read_bytes(len).unwrap(), Compression::Enabled { threshold: 32 }).unwrap();
+        let decoded = decode_frame(
+            reader.read_bytes(len).unwrap(),
+            Compression::Enabled { threshold: 32 },
+        )
+        .unwrap();
         assert_eq!(decoded, frame);
     }
 }

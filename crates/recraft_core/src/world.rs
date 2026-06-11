@@ -29,7 +29,8 @@ impl World {
         let pos = ChunkPos::new(div_floor(x, 16), div_floor(z, 16));
         let local_x = mod_floor(x, 16) as u8;
         let local_z = mod_floor(z, 16) as u8;
-        self.chunk_mut_or_insert(pos).set_block(local_x, y, local_z, block);
+        self.chunk_mut_or_insert(pos)
+            .set_block(local_x, y, local_z, block);
     }
 
     pub fn block_at(&self, x: i32, y: i32, z: i32) -> BlockState {
@@ -83,6 +84,12 @@ mod tests {
         let mut world = World::new();
         world.set_block(-1, 64, -1, BlockState::DIRT);
         assert_eq!(world.block_at(-1, 64, -1), BlockState::DIRT);
-        assert_eq!(world.chunk(ChunkPos::new(-1, -1)).unwrap().get_block(15, 64, 15), BlockState::DIRT);
+        assert_eq!(
+            world
+                .chunk(ChunkPos::new(-1, -1))
+                .unwrap()
+                .get_block(15, 64, 15),
+            BlockState::DIRT
+        );
     }
 }

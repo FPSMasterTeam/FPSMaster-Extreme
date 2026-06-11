@@ -2,7 +2,10 @@ use glam::Vec3;
 use recraft_core::{BlockState, EntityId, EntityState, PlayerInput, PlayerPhysics, World};
 use recraft_protocol::v1_8_9::{chunk::decode_chunk_data, packets::ClientboundPlayPacket};
 use recraft_render::Camera;
-use winit::{event::{ElementState, KeyEvent}, keyboard::{KeyCode, PhysicalKey}};
+use winit::{
+    event::{ElementState, KeyEvent},
+    keyboard::{KeyCode, PhysicalKey},
+};
 
 #[derive(Debug, Clone, Copy)]
 pub struct MovementSnapshot {
@@ -114,7 +117,8 @@ impl GameState {
             self.player.pitch = (self.player.pitch - turn_speed).max(-89.0);
         }
 
-        self.physics.tick(&self.world, &mut self.player, self.input.player_input());
+        self.physics
+            .tick(&self.world, &mut self.player, self.input.player_input());
         self.world.upsert_entity(self.player.clone());
         self.camera.position = self.player.position + Vec3::new(0.0, 1.62, 0.0);
         self.camera.yaw = self.player.yaw;
@@ -124,46 +128,84 @@ impl GameState {
 
     pub fn apply_play_packet(&mut self, packet: ClientboundPlayPacket) -> bool {
         match packet {
-            ClientboundPlayPacket::JoinGame { entity_id, dimension, .. } => {
+            ClientboundPlayPacket::JoinGame {
+                entity_id,
+                dimension,
+                ..
+            } => {
                 self.player.id = EntityId(entity_id);
                 self.has_sky_light = dimension == 0;
                 self.world.upsert_entity(self.player.clone());
                 false
             }
-            ClientboundPlayPacket::PlayerPositionLook { x, y, z, yaw, pitch, flags } => {
-                if flags & 0x01 != 0 { self.player.position.x += x as f32; } else { self.player.position.x = x as f32; }
-                if flags & 0x02 != 0 { self.player.position.y += y as f32; } else { self.player.position.y = y as f32; }
-                if flags & 0x04 != 0 { self.player.position.z += z as f32; } else { self.player.position.z = z as f32; }
-                if flags & 0x08 != 0 { self.player.yaw += yaw; } else { self.player.yaw = yaw; }
-                if flags & 0x10 != 0 { self.player.pitch += pitch; } else { self.player.pitch = pitch; }
+            ClientboundPlayPacket::PlayerPositionLook {
+                x,
+                y,
+                z,
+                yaw,
+                pitch,
+                flags,
+            } => {
+                if flags & 0x01 != 0 {
+                    self.player.position.x += x as f32;
+                } else {
+                    self.player.position.x = x as f32;
+                }
+                if flags & 0x02 != 0 {
+                    self.player.position.y += y as f32;
+                } else {
+                    self.player.position.y = y as f32;
+                }
+                if flags & 0x04 != 0 {
+                    self.player.position.z += z as f32;
+                } else {
+                    self.player.position.z = z as f32;
+                }
+                if flags & 0x08 != 0 {
+                    self.player.yaw += yaw;
+                } else {
+                    self.player.yaw = yaw;
+                }
+                if flags & 0x10 != 0 {
+                    self.player.pitch += pitch;
+                } else {
+                    self.player.pitch = pitch;
+                }
                 self.player.sync_aabb_to_position();
                 self.world.upsert_entity(self.player.clone());
                 false
             }
-            ClientboundPlayPacket::ChunkData { x, z, ground_up, primary_bit_mask, data } => {
-                match decode_chunk_data(&data, primary_bit_mask, ground_up, self.has_sky_light) {
-                    Ok(decoded) => {
-                        for section in decoded.sections {
-                            for block in section.blocks {
-                                let wx = x * 16 + block.x as i32;
-                                let wy = section.y as i32 * 16 + block.y as i32;
-                                let wz = z * 16 + block.z as i32;
-                                self.world.set_block(wx, wy, wz, BlockState::new(block.id, block.meta));
-                            }
+            ClientboundPlayPacket::ChunkData {
+                x,
+                z,
+                ground_up,
+                primary_bit_mask,
+                data,
+            } => match decode_chunk_data(&data, primary_bit_mask, ground_up, self.has_sky_light) {
+                Ok(decoded) => {
+                    for section in decoded.sections {
+                        for block in section.blocks {
+                            let wx = x * 16 + block.x as i32;
+                            let wy = section.y as i32 * 16 + block.y as i32;
+                            let wz = z * 16 + block.z as i32;
+                            self.world
+                                .set_block(wx, wy, wz, BlockState::new(block.id, block.meta));
                         }
-                        true
                     }
-                    Err(err) => {
-                        log::warn!("failed to decode chunk {x},{z}: {err}");
-                        false
-                    }
+                    true
                 }
-            }
+                Err(err) => {
+                    log::warn!("failed to decode chunk {x},{z}: {err}");
+                    false
+                }
+            },
             ClientboundPlayPacket::Disconnect { reason_json } => {
                 log::warn!("server disconnected: {reason_json}");
                 false
             }
-            ClientboundPlayPacket::KeepAlive { .. } | ClientboundPlayPacket::Unknown { .. } => false,
+            ClientboundPlayPacket::KeepAlive { .. } | ClientboundPlayPacket::Unknown { .. } => {
+                false
+            }
         }
     }
 

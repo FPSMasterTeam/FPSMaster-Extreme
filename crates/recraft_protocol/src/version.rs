@@ -41,7 +41,10 @@ mod tests {
 
     #[test]
     fn version_47_selects_1_8_9() {
-        assert_eq!(ProtocolVersion::from_number(47), Some(ProtocolVersion::V1_8_9));
+        assert_eq!(
+            ProtocolVersion::from_number(47),
+            Some(ProtocolVersion::V1_8_9)
+        );
         assert_eq!(ProtocolVersion::V1_8_9.number(), 47);
     }
 }

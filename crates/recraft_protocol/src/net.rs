@@ -5,7 +5,10 @@ use std::time::Duration;
 use crate::{
     codec::{decode_frame, encode_frame, Compression, PacketFrame},
     io::{PacketReader, ProtocolError, Result},
-    v1_8_9::{packets::{ClientboundLoginPacket, ClientboundPlayPacket, NextState, ServerboundPacket}, PROTOCOL_VERSION},
+    v1_8_9::{
+        packets::{ClientboundLoginPacket, ClientboundPlayPacket, NextState, ServerboundPacket},
+        PROTOCOL_VERSION,
+    },
 };
 
 #[derive(Debug)]
@@ -24,17 +27,33 @@ impl BlockingClient {
     pub fn connect<A: ToSocketAddrs>(addr: A) -> Result<Self> {
         let stream = TcpStream::connect(addr)?;
         stream.set_nodelay(true)?;
-        Ok(Self { stream, compression: Compression::Disabled })
+        Ok(Self {
+            stream,
+            compression: Compression::Disabled,
+        })
     }
 
-    pub fn login_offline_1_8_9(&mut self, host: &str, port: u16, username: &str) -> Result<OfflineLoginResult> {
-        self.write_packet(ServerboundPacket::Handshake {
-            protocol_version: PROTOCOL_VERSION,
-            host: host.to_owned(),
-            port,
-            next_state: NextState::Login,
-        }.into_frame())?;
-        self.write_packet(ServerboundPacket::LoginStart { username: username.to_owned() }.into_frame())?;
+    pub fn login_offline_1_8_9(
+        &mut self,
+        host: &str,
+        port: u16,
+        username: &str,
+    ) -> Result<OfflineLoginResult> {
+        self.write_packet(
+            ServerboundPacket::Handshake {
+                protocol_version: PROTOCOL_VERSION,
+                host: host.to_owned(),
+                port,
+                next_state: NextState::Login,
+            }
+            .into_frame(),
+        )?;
+        self.write_packet(
+            ServerboundPacket::LoginStart {
+                username: username.to_owned(),
+            }
+            .into_frame(),
+        )?;
 
         loop {
             let frame = self.read_frame()?;
@@ -43,13 +62,19 @@ impl BlockingClient {
                     self.compression = Compression::Enabled { threshold };
                 }
                 ClientboundLoginPacket::LoginSuccess { uuid, username } => {
-                    return Ok(OfflineLoginResult { uuid, username, compression: self.compression });
+                    return Ok(OfflineLoginResult {
+                        uuid,
+                        username,
+                        compression: self.compression,
+                    });
                 }
                 ClientboundLoginPacket::Disconnect { reason_json } => {
                     return Err(ProtocolError::Compression(reason_json));
                 }
                 ClientboundLoginPacket::EncryptionRequest { .. } => {
-                    return Err(ProtocolError::InvalidData("online-mode encryption is not implemented yet"));
+                    return Err(ProtocolError::InvalidData(
+                        "online-mode encryption is not implemented yet",
+                    ));
                 }
             }
         }

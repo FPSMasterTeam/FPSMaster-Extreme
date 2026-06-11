@@ -1,4 +1,7 @@
-use crate::{codec::PacketFrame, io::{PacketReader, PacketWriter, ProtocolError, Result}};
+use crate::{
+    codec::PacketFrame,
+    io::{PacketReader, PacketWriter, ProtocolError, Result},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NextState {
@@ -43,14 +46,21 @@ pub enum ServerboundPacket {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ClientboundLoginPacket {
-    Disconnect { reason_json: String },
+    Disconnect {
+        reason_json: String,
+    },
     EncryptionRequest {
         server_id: String,
         public_key: Vec<u8>,
         verify_token: Vec<u8>,
     },
-    LoginSuccess { uuid: String, username: String },
-    SetCompression { threshold: i32 },
+    LoginSuccess {
+        uuid: String,
+        username: String,
+    },
+    SetCompression {
+        threshold: i32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -82,14 +92,24 @@ pub enum ClientboundPlayPacket {
         primary_bit_mask: u16,
         data: Vec<u8>,
     },
-    Disconnect { reason_json: String },
-    Unknown { id: i32, body: Vec<u8> },
+    Disconnect {
+        reason_json: String,
+    },
+    Unknown {
+        id: i32,
+        body: Vec<u8>,
+    },
 }
 
 impl ServerboundPacket {
     pub fn into_frame(self) -> PacketFrame {
         match self {
-            Self::Handshake { protocol_version, host, port, next_state } => {
+            Self::Handshake {
+                protocol_version,
+                host,
+                port,
+                next_state,
+            } => {
                 let mut body = PacketWriter::new();
                 body.write_var_i32(protocol_version);
                 body.write_string(&host);
@@ -115,14 +135,25 @@ impl ServerboundPacket {
                 body.write_bool(on_ground);
                 PacketFrame::new(0x04, body.into_inner())
             }
-            Self::PlayerLook { yaw, pitch, on_ground } => {
+            Self::PlayerLook {
+                yaw,
+                pitch,
+                on_ground,
+            } => {
                 let mut body = PacketWriter::new();
                 body.write_f32(yaw);
                 body.write_f32(pitch);
                 body.write_bool(on_ground);
                 PacketFrame::new(0x05, body.into_inner())
             }
-            Self::PlayerPositionLook { x, y, z, yaw, pitch, on_ground } => {
+            Self::PlayerPositionLook {
+                x,
+                y,
+                z,
+                yaw,
+                pitch,
+                on_ground,
+            } => {
                 let mut body = PacketWriter::new();
                 body.write_f64(x);
                 body.write_f64(y);
@@ -140,20 +171,28 @@ impl ClientboundLoginPacket {
     pub fn from_frame(frame: PacketFrame) -> Result<Self> {
         let mut body = PacketReader::new(&frame.body);
         match frame.id {
-            0x00 => Ok(Self::Disconnect { reason_json: body.read_string(32767)? }),
+            0x00 => Ok(Self::Disconnect {
+                reason_json: body.read_string(32767)?,
+            }),
             0x01 => {
                 let server_id = body.read_string(20)?;
                 let public_key_len = body.read_var_i32()? as usize;
                 let public_key = body.read_bytes(public_key_len)?.to_vec();
                 let verify_token_len = body.read_var_i32()? as usize;
                 let verify_token = body.read_bytes(verify_token_len)?.to_vec();
-                Ok(Self::EncryptionRequest { server_id, public_key, verify_token })
+                Ok(Self::EncryptionRequest {
+                    server_id,
+                    public_key,
+                    verify_token,
+                })
             }
             0x02 => Ok(Self::LoginSuccess {
                 uuid: body.read_string(36)?,
                 username: body.read_string(16)?,
             }),
-            0x03 => Ok(Self::SetCompression { threshold: body.read_var_i32()? }),
+            0x03 => Ok(Self::SetCompression {
+                threshold: body.read_var_i32()?,
+            }),
             id => Err(ProtocolError::InvalidPacketId(id, "login/clientbound")),
         }
     }
@@ -163,7 +202,9 @@ impl ClientboundPlayPacket {
     pub fn from_frame(frame: PacketFrame) -> Result<Self> {
         let mut body = PacketReader::new(&frame.body);
         match frame.id {
-            0x00 => Ok(Self::KeepAlive { id: body.read_var_i32()? }),
+            0x00 => Ok(Self::KeepAlive {
+                id: body.read_var_i32()?,
+            }),
             0x01 => Ok(Self::JoinGame {
                 entity_id: body.read_i32()?,
                 game_mode: body.read_u8()?,
@@ -191,8 +232,13 @@ impl ClientboundPlayPacket {
                     body.read_bytes(len)?.to_vec()
                 },
             }),
-            0x40 => Ok(Self::Disconnect { reason_json: body.read_string(32767)? }),
-            id => Ok(Self::Unknown { id, body: frame.body }),
+            0x40 => Ok(Self::Disconnect {
+                reason_json: body.read_string(32767)?,
+            }),
+            id => Ok(Self::Unknown {
+                id,
+                body: frame.body,
+            }),
         }
     }
 }
@@ -232,15 +278,19 @@ mod tests {
         body.write_string("default");
         body.write_bool(false);
 
-        let packet = ClientboundPlayPacket::from_frame(PacketFrame::new(0x01, body.into_inner())).unwrap();
-        assert_eq!(packet, ClientboundPlayPacket::JoinGame {
-            entity_id: 123,
-            game_mode: 0,
-            dimension: 0,
-            difficulty: 2,
-            max_players: 20,
-            level_type: "default".to_owned(),
-            reduced_debug_info: false,
-        });
+        let packet =
+            ClientboundPlayPacket::from_frame(PacketFrame::new(0x01, body.into_inner())).unwrap();
+        assert_eq!(
+            packet,
+            ClientboundPlayPacket::JoinGame {
+                entity_id: 123,
+                game_mode: 0,
+                dimension: 0,
+                difficulty: 2,
+                max_players: 20,
+                level_type: "default".to_owned(),
+                reduced_debug_info: false,
+            }
+        );
     }
 }

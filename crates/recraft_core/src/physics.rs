@@ -104,7 +104,11 @@ impl PlayerPhysics {
         } else {
             self.config.air_acceleration
         };
-        acceleration *= if input.sprint { self.config.sprint_multiplier } else { 1.0 };
+        acceleration *= if input.sprint {
+            self.config.sprint_multiplier
+        } else {
+            1.0
+        };
         if input.sneak {
             acceleration *= 0.3;
         }
@@ -112,7 +116,8 @@ impl PlayerPhysics {
         velocity += movement_vector(input.forward, input.strafe, player.yaw) * acceleration;
         velocity.y -= self.config.gravity;
 
-        let (position, adjusted_velocity, on_ground) = move_with_collisions(world, player.aabb, velocity);
+        let (position, adjusted_velocity, on_ground) =
+            move_with_collisions(world, player.aabb, velocity);
         player.position = position;
         player.velocity = adjusted_velocity;
         player.on_ground = on_ground;
@@ -158,7 +163,11 @@ fn move_with_collisions(world: &World, aabb: Aabb, velocity: Vec3) -> (Vec3, Vec
     adjusted.z = clip_axis(world, moved, adjusted.z, Axis::Z);
     moved = moved.offset(Vec3::new(0.0, 0.0, adjusted.z));
 
-    let feet = Vec3::new((moved.min.x + moved.max.x) * 0.5, moved.min.y, (moved.min.z + moved.max.z) * 0.5);
+    let feet = Vec3::new(
+        (moved.min.x + moved.max.x) * 0.5,
+        moved.min.y,
+        (moved.min.z + moved.max.z) * 0.5,
+    );
     (feet, adjusted, on_ground)
 }
 

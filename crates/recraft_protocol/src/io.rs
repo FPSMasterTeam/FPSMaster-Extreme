@@ -114,7 +114,10 @@ impl<'a> PacketReader<'a> {
         let bytes = self.take(byte_len)?;
         let value = std::str::from_utf8(bytes).map_err(|_| ProtocolError::InvalidUtf8)?;
         if value.chars().count() > max_chars {
-            return Err(ProtocolError::StringTooLong(value.chars().count(), max_chars));
+            return Err(ProtocolError::StringTooLong(
+                value.chars().count(),
+                max_chars,
+            ));
         }
         Ok(value.to_owned())
     }
@@ -214,7 +217,18 @@ mod tests {
 
     #[test]
     fn var_int_round_trip_known_values() {
-        let values = [0, 1, 2, 127, 128, 255, 2_097_151, 2_147_483_647, -1, -2_147_483_648];
+        let values = [
+            0,
+            1,
+            2,
+            127,
+            128,
+            255,
+            2_097_151,
+            2_147_483_647,
+            -1,
+            -2_147_483_648,
+        ];
         for value in values {
             let encoded = encode_var_i32(value);
             let mut reader = PacketReader::new(&encoded);
@@ -229,7 +243,10 @@ mod tests {
         assert_eq!(encode_var_i32(127), &[0x7f]);
         assert_eq!(encode_var_i32(128), &[0x80, 0x01]);
         assert_eq!(encode_var_i32(255), &[0xff, 0x01]);
-        assert_eq!(encode_var_i32(2_147_483_647), &[0xff, 0xff, 0xff, 0xff, 0x07]);
+        assert_eq!(
+            encode_var_i32(2_147_483_647),
+            &[0xff, 0xff, 0xff, 0xff, 0x07]
+        );
         assert_eq!(encode_var_i32(-1), &[0xff, 0xff, 0xff, 0xff, 0x0f]);
     }
 }

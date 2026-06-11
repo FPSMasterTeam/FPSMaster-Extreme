@@ -1,4 +1,8 @@
-use std::{sync::mpsc::{self, Receiver, Sender}, thread, time::Duration};
+use std::{
+    sync::mpsc::{self, Receiver, Sender},
+    thread,
+    time::Duration,
+};
 
 use recraft_protocol::{
     io::ProtocolError,
@@ -30,7 +34,10 @@ impl NetworkHandle {
         let (event_tx, event_rx) = mpsc::channel();
         let (command_tx, command_rx) = mpsc::channel();
         thread::spawn(move || network_thread(host, port, username, event_tx, command_rx));
-        Self { events: event_rx, commands: command_tx }
+        Self {
+            events: event_rx,
+            commands: command_tx,
+        }
     }
 
     pub fn send_movement(&self, movement: MovementSnapshot) {
@@ -38,7 +45,13 @@ impl NetworkHandle {
     }
 }
 
-fn network_thread(host: String, port: u16, username: String, events: Sender<NetworkEvent>, commands: Receiver<NetworkCommand>) {
+fn network_thread(
+    host: String,
+    port: u16,
+    username: String,
+    events: Sender<NetworkEvent>,
+    commands: Receiver<NetworkCommand>,
+) {
     let addr = format!("{host}:{port}");
     let mut client = match BlockingClient::connect(addr.as_str()) {
         Ok(client) => client,
@@ -55,7 +68,10 @@ fn network_thread(host: String, port: u16, username: String, events: Sender<Netw
             return;
         }
     };
-    let _ = events.send(NetworkEvent::Connected { username: login.username, uuid: login.uuid });
+    let _ = events.send(NetworkEvent::Connected {
+        username: login.username,
+        uuid: login.uuid,
+    });
     let _ = client.set_read_timeout(Some(Duration::from_millis(10)));
 
     loop {
@@ -72,7 +88,8 @@ fn network_thread(host: String, port: u16, username: String, events: Sender<Netw
                     }
                     .into_frame();
                     if let Err(err) = client.write_packet(frame) {
-                        let _ = events.send(NetworkEvent::Disconnected(format!("write failed: {err}")));
+                        let _ =
+                            events.send(NetworkEvent::Disconnected(format!("write failed: {err}")));
                         return;
                     }
                 }
@@ -81,8 +98,12 @@ fn network_thread(host: String, port: u16, username: String, events: Sender<Netw
 
         match client.read_play_packet_1_8_9() {
             Ok(ClientboundPlayPacket::KeepAlive { id }) => {
-                if let Err(err) = client.write_packet(ServerboundPacket::KeepAlive { id }.into_frame()) {
-                    let _ = events.send(NetworkEvent::Disconnected(format!("keepalive write failed: {err}")));
+                if let Err(err) =
+                    client.write_packet(ServerboundPacket::KeepAlive { id }.into_frame())
+                {
+                    let _ = events.send(NetworkEvent::Disconnected(format!(
+                        "keepalive write failed: {err}"
+                    )));
                     return;
                 }
             }
@@ -99,5 +120,7 @@ fn network_thread(host: String, port: u16, username: String, events: Sender<Netw
 }
 
 fn is_timeout(message: &str) -> bool {
-    message.contains("timed out") || message.contains("would block") || message.contains("Resource temporarily unavailable")
+    message.contains("timed out")
+        || message.contains("would block")
+        || message.contains("Resource temporarily unavailable")
 }

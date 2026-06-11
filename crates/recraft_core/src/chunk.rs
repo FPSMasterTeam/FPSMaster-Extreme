@@ -65,7 +65,11 @@ impl Chunk {
     }
 
     pub fn section_mut_or_insert(&mut self, section_y: i32) -> &mut ChunkSection {
-        if let Some(index) = self.sections.iter().position(|section| section.y() == section_y) {
+        if let Some(index) = self
+            .sections
+            .iter()
+            .position(|section| section.y() == section_y)
+        {
             return &mut self.sections[index];
         }
 
@@ -80,7 +84,9 @@ impl Chunk {
     }
 
     pub fn section(&self, section_y: i32) -> Option<&ChunkSection> {
-        self.sections.iter().find(|section| section.y() == section_y)
+        self.sections
+            .iter()
+            .find(|section| section.y() == section_y)
     }
 
     pub fn get_block(&self, x: u8, y: i32, z: u8) -> BlockState {
@@ -100,7 +106,8 @@ impl Chunk {
         }
         let section_y = y >> 4;
         let local_y = (y & 15) as u8;
-        self.section_mut_or_insert(section_y).set(x, local_y, z, block);
+        self.section_mut_or_insert(section_y)
+            .set(x, local_y, z, block);
     }
 }
 

@@ -21,7 +21,12 @@ pub struct DecodedChunkData {
     pub biomes: Option<Vec<u8>>,
 }
 
-pub fn decode_chunk_data(data: &[u8], primary_bit_mask: u16, ground_up: bool, has_sky_light: bool) -> Result<DecodedChunkData> {
+pub fn decode_chunk_data(
+    data: &[u8],
+    primary_bit_mask: u16,
+    ground_up: bool,
+    has_sky_light: bool,
+) -> Result<DecodedChunkData> {
     let mut reader = PacketReader::new(data);
     let section_count = primary_bit_mask.count_ones() as usize;
     let mut sections = Vec::with_capacity(section_count);
@@ -46,7 +51,10 @@ pub fn decode_chunk_data(data: &[u8], primary_bit_mask: u16, ground_up: bool, ha
                 }
             }
         }
-        sections.push(DecodedSection { y: section_y, blocks });
+        sections.push(DecodedSection {
+            y: section_y,
+            blocks,
+        });
     }
 
     for _ in 0..section_count {
@@ -66,7 +74,9 @@ pub fn decode_chunk_data(data: &[u8], primary_bit_mask: u16, ground_up: bool, ha
     };
 
     if !reader.is_empty() {
-        return Err(ProtocolError::InvalidData("chunk packet has trailing bytes"));
+        return Err(ProtocolError::InvalidData(
+            "chunk packet has trailing bytes",
+        ));
     }
 
     Ok(DecodedChunkData { sections, biomes })

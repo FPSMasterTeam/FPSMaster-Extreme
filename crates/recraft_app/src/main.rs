@@ -60,9 +60,15 @@ fn main() -> anyhow::Result<()> {
                     if let Some(network) = &network {
                         while let Ok(event) = network.events.try_recv() {
                             match event {
-                                NetworkEvent::Connected { username, uuid } => log::info!("logged in as {username} ({uuid})"),
-                                NetworkEvent::PlayPacket(packet) => mesh_dirty |= game.apply_play_packet(packet),
-                                NetworkEvent::Disconnected(message) => log::warn!("network disconnected: {message}"),
+                                NetworkEvent::Connected { username, uuid } => {
+                                    log::info!("logged in as {username} ({uuid})")
+                                }
+                                NetworkEvent::PlayPacket(packet) => {
+                                    mesh_dirty |= game.apply_play_packet(packet)
+                                }
+                                NetworkEvent::Disconnected(message) => {
+                                    log::warn!("network disconnected: {message}")
+                                }
                             }
                         }
                     }
@@ -121,8 +127,10 @@ impl LaunchConfig {
 }
 
 fn parse_server(value: &str) -> Option<(String, u16)> {
-    let (host, port) = value.rsplit_once(':').map_or((value, 25565), |(host, port)| {
-        (host, port.parse().unwrap_or(25565))
-    });
+    let (host, port) = value
+        .rsplit_once(':')
+        .map_or((value, 25565), |(host, port)| {
+            (host, port.parse().unwrap_or(25565))
+        });
     Some((host.to_owned(), port))
 }
