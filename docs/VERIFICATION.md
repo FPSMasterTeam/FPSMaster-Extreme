@@ -124,3 +124,23 @@ Coverage added/updated:
 - Existing landing and movement-direction tests still pass.
 
 This moves the implementation closer to the 1.8.9 movement order, but it is not yet a full vanilla parity proof.
+
+## 2026-06-11 left/right controls and render interpolation
+
+Commands run successfully:
+
+```bash
+cargo test -p recraft_core -p recraft_protocol -p recraft_render
+cargo check
+```
+
+Changes verified by tests:
+
+- `movement_forward_matches_minecraft_yaw_convention` now covers vanilla strafe signs: left is positive X at yaw 0, right is negative X.
+- `player_does_not_auto_climb_full_block` verifies a full block is not auto-climbed without jump input.
+- `player_can_jump_onto_full_block` verifies holding jump while moving forward can get onto a one-block step.
+
+Runtime behavior changed:
+
+- Mouse X and arrow left/right yaw signs were inverted to match Minecraft-style yaw.
+- Render camera position is interpolated between 20Hz physics ticks. Packet sending remains tied to the tick loop.

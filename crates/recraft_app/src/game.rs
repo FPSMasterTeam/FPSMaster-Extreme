@@ -52,7 +52,9 @@ impl InputState {
     fn player_input(&self) -> PlayerInput {
         PlayerInput {
             forward: f32::from(self.forward) - f32::from(self.backward),
-            strafe: f32::from(self.right) - f32::from(self.left),
+            // Match vanilla 1.8 MovementInput semantics: left is positive,
+            // right is negative. Entity.moveFlying then applies yaw.
+            strafe: f32::from(self.left) - f32::from(self.right),
             jump: self.jump,
             sneak: self.sneak,
             sprint: self.sprint,
@@ -65,6 +67,7 @@ pub struct GameState {
     pub input: InputState,
     pub camera: Camera,
     player: EntityState,
+    previous_player_position: Vec3,
     physics: PlayerPhysics,
     has_sky_light: bool,
 }
@@ -90,6 +93,7 @@ impl GameState {
             world,
             input: InputState::default(),
             camera,
+            previous_player_position: player.position,
             player,
             physics: PlayerPhysics::default(),
             has_sky_light: true,
@@ -102,19 +106,20 @@ impl GameState {
 
     pub fn rotate_view(&mut self, mouse_dx: f32, mouse_dy: f32) {
         const SENSITIVITY: f32 = 0.15;
-        self.player.yaw -= mouse_dx * SENSITIVITY;
+        self.player.yaw += mouse_dx * SENSITIVITY;
         self.player.pitch = (self.player.pitch - mouse_dy * SENSITIVITY).clamp(-89.0, 89.0);
         self.camera.yaw = self.player.yaw;
         self.camera.pitch = self.player.pitch;
     }
 
     pub fn tick(&mut self, dt: f32) -> MovementSnapshot {
+        self.previous_player_position = self.player.position;
         let turn_speed = 110.0 * dt;
         if self.input.turn_left {
-            self.player.yaw += turn_speed;
+            self.player.yaw -= turn_speed;
         }
         if self.input.turn_right {
-            self.player.yaw -= turn_speed;
+            self.player.yaw += turn_speed;
         }
         if self.input.look_up {
             self.player.pitch = (self.player.pitch + turn_speed).min(89.0);
@@ -126,10 +131,18 @@ impl GameState {
         self.physics
             .tick(&self.world, &mut self.player, self.input.player_input());
         self.world.upsert_entity(self.player.clone());
-        self.camera.position = self.player.position + Vec3::new(0.0, 1.62, 0.0);
+        self.update_camera(1.0);
+        self.movement_snapshot()
+    }
+
+    pub fn update_camera(&mut self, tick_alpha: f32) {
+        let alpha = tick_alpha.clamp(0.0, 1.0);
+        let position = self
+            .previous_player_position
+            .lerp(self.player.position, alpha);
+        self.camera.position = position + Vec3::new(0.0, 1.62, 0.0);
         self.camera.yaw = self.player.yaw;
         self.camera.pitch = self.player.pitch;
-        self.movement_snapshot()
     }
 
     pub fn apply_play_packet(&mut self, packet: ClientboundPlayPacket) -> bool {
@@ -177,6 +190,7 @@ impl GameState {
                 } else {
                     self.player.pitch = pitch;
                 }
+                self.previous_player_position = self.player.position;
                 self.player.sync_aabb_to_position();
                 self.world.upsert_entity(self.player.clone());
                 false

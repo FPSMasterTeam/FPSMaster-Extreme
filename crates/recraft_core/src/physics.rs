@@ -269,8 +269,12 @@ mod tests {
         assert!(forward_at_ninety.x < -0.99);
         assert!(forward_at_ninety.z.abs() < 0.001);
 
-        let right_at_zero = movement_vector(0.0, 1.0, 0.0);
-        assert!(right_at_zero.x > 0.99);
+        let left_at_zero = movement_vector(0.0, 1.0, 0.0);
+        assert!(left_at_zero.x > 0.99);
+        assert!(left_at_zero.z.abs() < 0.001);
+
+        let right_at_zero = movement_vector(0.0, -1.0, 0.0);
+        assert!(right_at_zero.x < -0.99);
         assert!(right_at_zero.z.abs() < 0.001);
     }
 
@@ -291,5 +295,61 @@ mod tests {
 
         assert!((player.position.y - 1.42).abs() < 0.001);
         assert!((player.velocity.y - 0.3332).abs() < 0.001);
+    }
+
+    #[test]
+    fn player_does_not_auto_climb_full_block() {
+        let world = flat_world_with_one_block_step();
+        let mut player = EntityState::new_local_player(EntityId(1), Vec3::new(0.5, 1.0, 0.2));
+        player.on_ground = true;
+        let physics = PlayerPhysics::default();
+
+        for _ in 0..20 {
+            physics.tick(
+                &world,
+                &mut player,
+                PlayerInput {
+                    forward: 1.0,
+                    ..PlayerInput::default()
+                },
+            );
+        }
+
+        assert!(player.position.y < 1.01);
+        assert!(player.position.z <= 1.701);
+    }
+
+    #[test]
+    fn player_can_jump_onto_full_block() {
+        let world = flat_world_with_one_block_step();
+        let mut player = EntityState::new_local_player(EntityId(1), Vec3::new(0.5, 1.0, 0.2));
+        player.on_ground = true;
+        let physics = PlayerPhysics::default();
+
+        for _ in 0..30 {
+            physics.tick(
+                &world,
+                &mut player,
+                PlayerInput {
+                    forward: 1.0,
+                    jump: true,
+                    ..PlayerInput::default()
+                },
+            );
+        }
+
+        assert!(player.position.y >= 1.99);
+        assert!(player.position.z > 2.0);
+    }
+
+    fn flat_world_with_one_block_step() -> World {
+        let mut world = World::new();
+        for x in -2..=2 {
+            for z in -2..=4 {
+                world.set_block(x, 0, z, BlockState::STONE);
+            }
+        }
+        world.set_block(0, 1, 2, BlockState::STONE);
+        world
     }
 }

@@ -105,6 +105,7 @@ fn main() -> anyhow::Result<()> {
                         }
                         tick_accumulator -= 0.05;
                     }
+                    game.update_camera(tick_accumulator / 0.05);
 
                     if let Err(err) = renderer.render(&game.camera) {
                         log::error!("render error: {err}");

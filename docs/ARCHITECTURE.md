@@ -53,7 +53,9 @@ This matches 1.8.9 and keeps the first milestone small. A later 1.13+ path must 
 
 Chunk sections store 1.8-style block IDs/meta plus decoded block light and sky light values. Rendering samples this light data at visible faces.
 
-`recraft_core::physics` implements a tick-based AABB path with axis-by-axis collision clipping. The current tick order follows the vanilla 1.8.9 movement shape more closely: apply jump/input movement, move with collisions, then apply gravity and drag for the next tick. This mirrors the shape of the vanilla 1.8.9 `Entity.moveEntity` / `EntityLivingBase.moveEntityWithHeading` path, but exact parity is not proven yet.
+`recraft_core::physics` implements a tick-based AABB path with axis-by-axis collision clipping. The current tick order follows the vanilla 1.8.9 movement shape more closely: apply jump/input movement, move with collisions, then apply gravity and drag for the next tick. Input signs follow vanilla `MovementInput` / `moveFlying`: forward is positive, left strafe is positive, right strafe is negative, and yaw increases when turning right. This mirrors the shape of the vanilla 1.8.9 `Entity.moveEntity` / `EntityLivingBase.moveEntityWithHeading` path, but exact parity is not proven yet.
+
+Rendering uses interpolation between previous and current 20Hz player positions so visual camera motion is smooth while movement packets remain 20TPS.
 
 Before this is considered complete, we need a trace suite comparing against MCP/black-box vanilla behavior for:
 
