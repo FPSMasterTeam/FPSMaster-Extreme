@@ -1,0 +1,15 @@
+[package]
+name = "recraft_render"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+bytemuck.workspace = true
+glam.workspace = true
+log.workspace = true
+recraft_core = { path = "../recraft_core" }
+thiserror.workspace = true
+wgpu.workspace = true
+winit.workspace = true

@@ -1,0 +1,26 @@
+[workspace]
+members = [
+    "crates/recraft_app",
+    "crates/recraft_core",
+    "crates/recraft_protocol",
+    "crates/recraft_render",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.82"
+license = "MIT OR Apache-2.0"
+repository = "https://example.invalid/recraft"
+
+[workspace.dependencies]
+anyhow = "1.0"
+bytemuck = { version = "1.15", features = ["derive"] }
+env_logger = "0.11"
+flate2 = "1.0"
+glam = "0.27"
+log = "0.4"
+pollster = "0.3"
+thiserror = "1.0"
+wgpu = "0.19"
+winit = "0.29"
