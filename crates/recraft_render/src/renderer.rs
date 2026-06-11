@@ -400,11 +400,20 @@ fn create_texture_bind_group(
 ) -> (wgpu::BindGroupLayout, wgpu::BindGroup) {
     let atlas = TextureAtlasImage::load_default();
     match &atlas.source {
-        TextureAtlasSource::MinecraftJar(path) => {
-            log::info!("loaded Minecraft 1.8.9 block atlas from {}", path.display())
+        TextureAtlasSource::Directory(path) => {
+            log::info!(
+                "loaded Minecraft 1.8.9 block atlas from asset directory {}",
+                path.display()
+            )
+        }
+        TextureAtlasSource::Archive(path) => {
+            log::info!(
+                "loaded Minecraft 1.8.9 block atlas from asset archive {}",
+                path.display()
+            )
         }
         TextureAtlasSource::Fallback => {
-            log::warn!("Minecraft 1.8.9 jar was not found; using fallback debug block atlas")
+            log::warn!("Minecraft 1.8.9 assets were not found; using fallback debug block atlas")
         }
     }
 

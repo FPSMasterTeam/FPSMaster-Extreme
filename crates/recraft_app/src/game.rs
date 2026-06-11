@@ -122,6 +122,15 @@ impl GameState {
         self.camera.pitch = self.player.pitch;
     }
 
+    pub fn apply_scripted_smoke_input(&mut self, elapsed_seconds: f32, total_seconds: f32) {
+        let active = elapsed_seconds < total_seconds - 1.0;
+        self.input.forward = active;
+        self.input.sprint = active;
+        self.input.jump = active && elapsed_seconds % 2.0 < 0.25;
+        self.input.turn_right = active;
+        self.input.look_up = active && elapsed_seconds % 3.0 < 0.5;
+    }
+
     pub fn tick(&mut self, dt: f32) -> MovementSnapshot {
         self.previous_player_position = self.player.position;
         let turn_speed = 110.0 * dt;

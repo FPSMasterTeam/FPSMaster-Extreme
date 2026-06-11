@@ -54,10 +54,23 @@ cargo check
 
 ## Assets
 
-At startup the renderer tries to load vanilla block textures from `--assets <zip-or-jar>` / `RECRAFT_ASSET_ZIP` first, then from common user-owned 1.8.9 jar locations:
+For local development, extract the vanilla 1.8.9 assets once:
+
+```bash
+python3 scripts/setup_minecraft_1_8_9_assets.py
+```
+
+This creates `local_assets/minecraft-1.8.9/assets/minecraft/...`, preserving the original resource-pack directory structure. After that, the default app commands load textures without extra flags:
+
+```bash
+cargo run -p recraft_app
+cargo run -p recraft_app -- --connect 127.0.0.1:25565 --username ReCraft
+```
+
+At startup the renderer tries to load vanilla block textures from `RECRAFT_ASSET_PATH` / `--assets <resource-pack-root-or-zip>`, then the default extracted directory, then common user-owned 1.8.9 jar locations:
 
 - Windows: `%APPDATA%/.minecraft/versions/1.8.9/1.8.9.jar`
 - macOS: `~/Library/Application Support/minecraft/versions/1.8.9/1.8.9.jar`
 - Linux: `~/.minecraft/versions/1.8.9/1.8.9.jar`
 
-If no jar/resource pack is found, it uses a debug fallback atlas. Mojang assets are downloaded only into `local_assets/`, which is ignored by Git, and should not be committed to this repository.
+If no extracted assets, jar, or resource pack is found, it uses a debug fallback atlas. Mojang assets are downloaded only into `local_assets/`, which is ignored by Git, and should not be committed to this repository.

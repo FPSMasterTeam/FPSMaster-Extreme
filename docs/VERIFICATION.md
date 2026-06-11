@@ -176,7 +176,6 @@ Coverage added/updated:
 
 Not yet verified:
 
-- Runtime behavior of `C06PacketPlayerPosLook` against the local Paper 1.8.8 test server after this packet-selection change.
 - Full vanilla collision parity; current collision is still a simplified AABB clipper and does not yet implement every `Entity.moveEntity` branch/epsilon.
 
 ## 2026-06-11 local server packet smoke test and collision pass
@@ -219,3 +218,102 @@ Coverage added/updated:
 - Player `step_height` defaults to vanilla `0.6`.
 - The step-height branch from `Entity.moveEntity` is implemented while the existing full-block no-auto-climb test still passes.
 - `head_collision_stops_upward_motion_before_gravity` verifies upward head collision zeroes vertical motion before gravity is applied.
+
+## 2026-06-11 scripted C06 movement smoke test
+
+Client smoke command:
+
+```bash
+RUST_LOG=info,recraft_app::network=debug cargo run -p recraft_app -- \
+  --connect 127.0.0.1:25565 \
+  --username ReCraftC06 \
+  --assets local_assets/minecraft-1.8.9-client.jar \
+  --scripted-smoke 20
+```
+
+The `--scripted-smoke` mode is a verification-only app entry point. It drives forward sprint movement, yaw changes, short jump pulses, and pitch changes, then exits automatically.
+
+Observed client logs:
+
+```text
+logged in as ReCraftC06 (...)
+applied chunk bulk: 10 chunks
+...
+sending C06 PlayerPositionLook
+...
+scripted smoke complete
+```
+
+Observed server logs:
+
+```text
+ReCraftC06[/127.0.0.1:...] logged in with entity id ... at ([world]..., ..., ...)
+ReCraftC06 lost connection: Disconnected
+ReCraftC06 left the game.
+```
+
+No `Bad packet id 6` or protocol exception was observed during the scripted C06 path.
+
+## 2026-06-11 extracted default assets
+
+Asset setup command:
+
+```bash
+python3 scripts/setup_minecraft_1_8_9_assets.py
+```
+
+Observed:
+
+```text
+Asset jar ready: .../local_assets/minecraft-1.8.9-client.jar
+Extracted 3085 asset files to: .../local_assets/minecraft-1.8.9
+Run with: cargo run -p recraft_app
+```
+
+The extracted directory preserves the vanilla/resource-pack root layout:
+
+```text
+local_assets/minecraft-1.8.9/assets/minecraft/textures/blocks/...
+```
+
+Demo smoke command without `--assets`:
+
+```bash
+RUST_LOG=info cargo run -p recraft_app -- --scripted-smoke 2
+```
+
+Observed:
+
+```text
+loaded 7 block atlas tiles from local_assets/minecraft-1.8.9
+loaded Minecraft 1.8.9 block atlas from asset directory local_assets/minecraft-1.8.9
+scripted smoke complete
+```
+
+Server smoke command without `--assets`:
+
+```bash
+RUST_LOG=info cargo run -p recraft_app -- \
+  --connect 127.0.0.1:25565 \
+  --username ReCraftAssets \
+  --scripted-smoke 8
+```
+
+Observed client logs:
+
+```text
+loaded 7 block atlas tiles from local_assets/minecraft-1.8.9
+loaded Minecraft 1.8.9 block atlas from asset directory local_assets/minecraft-1.8.9
+logged in as ReCraftAssets (...)
+applied chunk bulk: 10 chunks
+...
+scripted smoke complete
+```
+
+Observed server logs:
+
+```text
+ReCraftAssets[/127.0.0.1:...] logged in with entity id ... at ([world]..., ..., ...)
+ReCraftAssets lost connection: Disconnected
+ReCraftAssets left the game.
+```

@@ -143,7 +143,9 @@ fn network_thread(
         while let Ok(command) = commands.try_recv() {
             match command {
                 NetworkCommand::Move(movement) => {
-                    let frame = walking_packets.next_packet(movement).into_frame();
+                    let packet = walking_packets.next_packet(movement);
+                    log::debug!("sending {}", packet_debug_name(&packet));
+                    let frame = packet.into_frame();
                     if let Err(err) = client.write_packet(frame) {
                         let _ =
                             events.send(NetworkEvent::Disconnected(format!("write failed: {err}")));
@@ -180,6 +182,18 @@ fn is_timeout(message: &str) -> bool {
     message.contains("timed out")
         || message.contains("would block")
         || message.contains("Resource temporarily unavailable")
+}
+
+fn packet_debug_name(packet: &ServerboundPacket) -> &'static str {
+    match packet {
+        ServerboundPacket::Player { .. } => "C03 Player",
+        ServerboundPacket::PlayerPosition { .. } => "C04 PlayerPosition",
+        ServerboundPacket::PlayerLook { .. } => "C05 PlayerLook",
+        ServerboundPacket::PlayerPositionLook { .. } => "C06 PlayerPositionLook",
+        ServerboundPacket::Handshake { .. } => "Handshake",
+        ServerboundPacket::LoginStart { .. } => "LoginStart",
+        ServerboundPacket::KeepAlive { .. } => "KeepAlive",
+    }
 }
 
 #[cfg(test)]

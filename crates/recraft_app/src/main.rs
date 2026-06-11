@@ -18,13 +18,14 @@ struct LaunchConfig {
     server: Option<(String, u16)>,
     username: String,
     assets: Option<PathBuf>,
+    scripted_smoke_seconds: Option<f32>,
 }
 
 fn main() -> anyhow::Result<()> {
     env_logger::init();
     let config = LaunchConfig::from_args();
     if let Some(path) = &config.assets {
-        env::set_var("RECRAFT_ASSET_ZIP", path);
+        env::set_var("RECRAFT_ASSET_PATH", path);
     }
 
     let event_loop = EventLoop::new().context("create event loop")?;
@@ -49,7 +50,9 @@ fn main() -> anyhow::Result<()> {
     });
 
     let mut last_frame = Instant::now();
+    let app_start = Instant::now();
     let mut tick_accumulator = 0.0f32;
+    let scripted_smoke_seconds = config.scripted_smoke_seconds;
 
     event_loop.run(move |event, target| {
         target.set_control_flow(ControlFlow::Poll);
@@ -97,6 +100,9 @@ fn main() -> anyhow::Result<()> {
                     let now = Instant::now();
                     let dt = (now - last_frame).as_secs_f32().min(0.1);
                     last_frame = now;
+                    if let Some(seconds) = scripted_smoke_seconds {
+                        game.apply_scripted_smoke_input((now - app_start).as_secs_f32(), seconds);
+                    }
                     tick_accumulator += dt;
                     while tick_accumulator >= 0.05 {
                         let movement = game.tick(0.05);
@@ -109,6 +115,12 @@ fn main() -> anyhow::Result<()> {
 
                     if let Err(err) = renderer.render(&game.camera) {
                         log::error!("render error: {err}");
+                    }
+                    if scripted_smoke_seconds
+                        .is_some_and(|seconds| (now - app_start).as_secs_f32() >= seconds)
+                    {
+                        log::info!("scripted smoke complete");
+                        target.exit();
                     }
                 }
                 _ => {}
@@ -130,6 +142,7 @@ impl LaunchConfig {
         let mut server = None;
         let mut username = "ReCraft".to_owned();
         let mut assets = None;
+        let mut scripted_smoke_seconds = None;
         let mut args = env::args().skip(1);
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -148,6 +161,10 @@ impl LaunchConfig {
                         assets = Some(PathBuf::from(value));
                     }
                 }
+                "--scripted-smoke" => {
+                    scripted_smoke_seconds =
+                        args.next().and_then(|value| value.parse::<f32>().ok());
+                }
                 _ => {}
             }
         }
@@ -155,6 +172,7 @@ impl LaunchConfig {
             server,
             username,
             assets,
+            scripted_smoke_seconds,
         }
     }
 }
