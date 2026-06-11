@@ -15,7 +15,14 @@ This is not complete yet. Physics constants and collision ordering are structure
 
 ## Run
 
-Demo world:
+Demo world with local vanilla textures:
+
+```bash
+python3 scripts/setup_minecraft_1_8_9_assets.py
+cargo run -p recraft_app -- --assets local_assets/minecraft-1.8.9-client.jar
+```
+
+Demo world without downloaded assets:
 
 ```bash
 cargo run -p recraft_app
@@ -24,7 +31,7 @@ cargo run -p recraft_app
 Offline-mode 1.8.9 server skeleton:
 
 ```bash
-cargo run -p recraft_app -- --connect 127.0.0.1:25565 --username ReCraft
+cargo run -p recraft_app -- --connect 127.0.0.1:25565 --username ReCraft --assets local_assets/minecraft-1.8.9-client.jar
 ```
 
 The app currently supports keyboard movement:
@@ -33,7 +40,10 @@ The app currently supports keyboard movement:
 - Space: jump
 - Left Shift: sneak
 - Left Ctrl: sprint
-- Arrow keys: turn/look
+- Mouse: turn/look
+- Arrow keys: fallback turn/look
+- Esc: release mouse cursor
+- Click window: capture mouse cursor
 
 ## Verify
 
@@ -44,10 +54,10 @@ cargo check
 
 ## Assets
 
-At startup the renderer tries to load vanilla block textures from a user-owned 1.8.9 jar:
+At startup the renderer tries to load vanilla block textures from `--assets <zip-or-jar>` / `RECRAFT_ASSET_ZIP` first, then from common user-owned 1.8.9 jar locations:
 
 - Windows: `%APPDATA%/.minecraft/versions/1.8.9/1.8.9.jar`
 - macOS: `~/Library/Application Support/minecraft/versions/1.8.9/1.8.9.jar`
 - Linux: `~/.minecraft/versions/1.8.9/1.8.9.jar`
 
-If the jar is missing, it uses a debug fallback atlas. Mojang assets should not be committed to this repository.
+If no jar/resource pack is found, it uses a debug fallback atlas. Mojang assets are downloaded only into `local_assets/`, which is ignored by Git, and should not be committed to this repository.

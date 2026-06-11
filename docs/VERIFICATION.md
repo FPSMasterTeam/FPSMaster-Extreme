@@ -70,3 +70,23 @@ Not yet verified:
 - Vanilla-exact player physics parity.
 - Block light / sky light rendering.
 - Online-mode authentication/encryption.
+
+## 2026-06-11 asset/mouse/movement fix
+
+Commands run successfully:
+
+```bash
+python3 scripts/setup_minecraft_1_8_9_assets.py
+RUST_LOG=info cargo run -p recraft_app -- --assets local_assets/minecraft-1.8.9-client.jar
+cargo test -p recraft_core -p recraft_protocol -p recraft_render
+cargo check
+```
+
+Observed asset log:
+
+```text
+loaded 7 block atlas tiles from local_assets/minecraft-1.8.9-client.jar
+loaded Minecraft 1.8.9 block atlas from local_assets/minecraft-1.8.9-client.jar
+```
+
+Movement direction is now covered by `movement_forward_matches_minecraft_yaw_convention`. Mouse motion is wired through `DeviceEvent::MouseMotion`; visual feel still needs manual tuning.

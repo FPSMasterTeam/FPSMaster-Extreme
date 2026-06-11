@@ -40,7 +40,7 @@ The first atlas contains a small set of 1.8.9 block textures:
 - oak log
 - oak leaves
 
-The renderer tries to load them from the user's local 1.8.9 jar. Missing assets fall back to debug colors. Mojang assets are not committed.
+The renderer loads them from `--assets <zip-or-jar>` / `RECRAFT_ASSET_ZIP` or from common local 1.8.9 launcher jar paths. Each tile falls back independently, so one missing texture no longer forces the whole atlas to debug colors. `scripts/setup_minecraft_1_8_9_assets.py` can download a local 1.8.9 client jar into ignored `local_assets/` for development. Mojang assets are not committed.
 
 ## Lighting
 

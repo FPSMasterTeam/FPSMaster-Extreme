@@ -4,3 +4,4 @@
 !/references/README.md
 *.log
 /local_server/
+/local_assets/

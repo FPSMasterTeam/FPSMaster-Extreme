@@ -41,8 +41,9 @@ pub enum TextureAtlasSource {
 
 impl TextureAtlasImage {
     pub fn load_default() -> Self {
-        if let Some(path) = default_minecraft_jar_path() {
-            match Self::from_minecraft_jar(path.clone()) {
+        let candidates = candidate_asset_zip_paths();
+        for path in &candidates {
+            match Self::from_asset_zip(path.clone()) {
                 Ok(atlas) => return atlas,
                 Err(err) => log::warn!(
                     "failed to load Minecraft textures from {}: {err}",
@@ -50,56 +51,79 @@ impl TextureAtlasImage {
                 ),
             }
         }
+        if candidates.is_empty() {
+            log::warn!(
+                "no Minecraft asset zip configured; pass --assets <1.8.9.jar/resourcepack.zip> or set RECRAFT_ASSET_ZIP"
+            );
+        } else {
+            log::warn!("tried Minecraft asset zip paths: {candidates:?}");
+        }
         Self::fallback()
     }
 
     pub fn from_minecraft_jar(path: PathBuf) -> Result<Self, String> {
+        Self::from_asset_zip(path)
+    }
+
+    pub fn from_asset_zip(path: PathBuf) -> Result<Self, String> {
         let file = File::open(&path).map_err(|err| err.to_string())?;
         let mut zip = ZipArchive::new(file).map_err(|err| err.to_string())?;
-        let mut atlas = empty_atlas();
+        let mut atlas = fallback_atlas();
 
-        copy_zip_tile(
+        let mut loaded = 0;
+        loaded += copy_first_zip_tile(
             &mut zip,
             &mut atlas,
             BlockTile::Stone,
-            "assets/minecraft/textures/blocks/stone.png",
-        )?;
-        copy_zip_tile(
+            &["assets/minecraft/textures/blocks/stone.png"],
+        );
+        loaded += copy_first_zip_tile(
             &mut zip,
             &mut atlas,
             BlockTile::GrassTop,
-            "assets/minecraft/textures/blocks/grass_top.png",
-        )?;
-        copy_zip_tile(
+            &["assets/minecraft/textures/blocks/grass_top.png"],
+        );
+        loaded += copy_first_zip_tile(
             &mut zip,
             &mut atlas,
             BlockTile::GrassSide,
-            "assets/minecraft/textures/blocks/grass_side.png",
-        )?;
-        copy_zip_tile(
+            &["assets/minecraft/textures/blocks/grass_side.png"],
+        );
+        loaded += copy_first_zip_tile(
             &mut zip,
             &mut atlas,
             BlockTile::Dirt,
-            "assets/minecraft/textures/blocks/dirt.png",
-        )?;
-        copy_zip_tile(
+            &["assets/minecraft/textures/blocks/dirt.png"],
+        );
+        loaded += copy_first_zip_tile(
             &mut zip,
             &mut atlas,
             BlockTile::Sand,
-            "assets/minecraft/textures/blocks/sand.png",
-        )?;
-        copy_zip_tile(
+            &["assets/minecraft/textures/blocks/sand.png"],
+        );
+        loaded += copy_first_zip_tile(
             &mut zip,
             &mut atlas,
             BlockTile::OakLog,
-            "assets/minecraft/textures/blocks/log_oak.png",
-        )?;
-        copy_zip_tile(
+            &[
+                "assets/minecraft/textures/blocks/log_oak.png",
+                "assets/minecraft/textures/blocks/log_oak_top.png",
+            ],
+        );
+        loaded += copy_first_zip_tile(
             &mut zip,
             &mut atlas,
             BlockTile::OakLeaves,
-            "assets/minecraft/textures/blocks/leaves_oak.png",
-        )?;
+            &[
+                "assets/minecraft/textures/blocks/leaves_oak.png",
+                "assets/minecraft/textures/blocks/leaves_oak_opaque.png",
+            ],
+        );
+
+        if loaded == 0 {
+            return Err("zip did not contain 1.8-style block textures".to_owned());
+        }
+        log::info!("loaded {loaded} block atlas tiles from {}", path.display());
 
         Ok(Self {
             width: atlas.width(),
@@ -110,14 +134,7 @@ impl TextureAtlasImage {
     }
 
     fn fallback() -> Self {
-        let mut atlas = empty_atlas();
-        fill_tile(&mut atlas, BlockTile::Stone, [116, 116, 116, 255]);
-        fill_tile(&mut atlas, BlockTile::GrassTop, [82, 158, 45, 255]);
-        fill_tile(&mut atlas, BlockTile::GrassSide, [94, 132, 48, 255]);
-        fill_tile(&mut atlas, BlockTile::Dirt, [115, 76, 39, 255]);
-        fill_tile(&mut atlas, BlockTile::Sand, [194, 178, 128, 255]);
-        fill_tile(&mut atlas, BlockTile::OakLog, [89, 55, 28, 255]);
-        fill_tile(&mut atlas, BlockTile::OakLeaves, [46, 115, 40, 220]);
+        let atlas = fallback_atlas();
         Self {
             width: atlas.width(),
             height: atlas.height(),
@@ -145,8 +162,16 @@ pub fn tile_uv(tile: BlockTile) -> [[f32; 2]; 4] {
     ]
 }
 
-fn default_minecraft_jar_path() -> Option<PathBuf> {
+fn candidate_asset_zip_paths() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
+    if let Some(path) = env::var_os("RECRAFT_ASSET_ZIP") {
+        candidates.push(PathBuf::from(path));
+    }
+    if let Some(path) = env::var_os("RECRAFT_MINECRAFT_JAR") {
+        candidates.push(PathBuf::from(path));
+    }
+    candidates.push(PathBuf::from("1.8.9.jar"));
+    candidates.push(PathBuf::from("assets/1.8.9.jar"));
     if let Some(appdata) = env::var_os("APPDATA") {
         candidates.push(PathBuf::from(appdata).join(".minecraft/versions/1.8.9/1.8.9.jar"));
     }
@@ -156,7 +181,10 @@ fn default_minecraft_jar_path() -> Option<PathBuf> {
             .push(home.join("Library/Application Support/minecraft/versions/1.8.9/1.8.9.jar"));
         candidates.push(home.join(".minecraft/versions/1.8.9/1.8.9.jar"));
     }
-    candidates.into_iter().find(|path| path.exists())
+    candidates
+        .into_iter()
+        .filter(|path| path.exists())
+        .collect()
 }
 
 fn empty_atlas() -> RgbaImage {
@@ -178,21 +206,43 @@ fn empty_atlas() -> RgbaImage {
     image
 }
 
-fn copy_zip_tile<R: Read + std::io::Seek>(
+fn fallback_atlas() -> RgbaImage {
+    let mut atlas = empty_atlas();
+    fill_tile(&mut atlas, BlockTile::Stone, [116, 116, 116, 255]);
+    fill_tile(&mut atlas, BlockTile::GrassTop, [82, 158, 45, 255]);
+    fill_tile(&mut atlas, BlockTile::GrassSide, [94, 132, 48, 255]);
+    fill_tile(&mut atlas, BlockTile::Dirt, [115, 76, 39, 255]);
+    fill_tile(&mut atlas, BlockTile::Sand, [194, 178, 128, 255]);
+    fill_tile(&mut atlas, BlockTile::OakLog, [89, 55, 28, 255]);
+    fill_tile(&mut atlas, BlockTile::OakLeaves, [46, 115, 40, 220]);
+    atlas
+}
+
+fn copy_first_zip_tile<R: Read + std::io::Seek>(
     zip: &mut ZipArchive<R>,
     atlas: &mut RgbaImage,
     tile: BlockTile,
-    path: &str,
-) -> Result<(), String> {
-    let mut file = zip
-        .by_name(path)
-        .map_err(|err| format!("missing {path}: {err}"))?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
-        .map_err(|err| err.to_string())?;
-    let image = image::load_from_memory(&bytes).map_err(|err| err.to_string())?;
-    copy_tile(atlas, tile, image);
-    Ok(())
+    paths: &[&str],
+) -> usize {
+    for path in paths {
+        let Ok(mut file) = zip.by_name(path) else {
+            continue;
+        };
+        let mut bytes = Vec::new();
+        if let Err(err) = file.read_to_end(&mut bytes) {
+            log::warn!("failed to read texture {path}: {err}");
+            continue;
+        }
+        match image::load_from_memory(&bytes) {
+            Ok(image) => {
+                copy_tile(atlas, tile, image);
+                return 1;
+            }
+            Err(err) => log::warn!("failed to decode texture {path}: {err}"),
+        }
+    }
+    log::warn!("missing texture candidates for {tile:?}: {paths:?}");
+    0
 }
 
 fn copy_tile(atlas: &mut RgbaImage, tile: BlockTile, image: DynamicImage) {

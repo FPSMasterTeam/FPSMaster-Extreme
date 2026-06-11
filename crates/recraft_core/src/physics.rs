@@ -244,4 +244,19 @@ mod tests {
         assert!(player.on_ground);
         assert!((player.position.y - 1.0).abs() < 0.001);
     }
+
+    #[test]
+    fn movement_forward_matches_minecraft_yaw_convention() {
+        let forward_at_zero = movement_vector(1.0, 0.0, 0.0);
+        assert!(forward_at_zero.z > 0.99);
+        assert!(forward_at_zero.x.abs() < 0.001);
+
+        let forward_at_ninety = movement_vector(1.0, 0.0, 90.0);
+        assert!(forward_at_ninety.x < -0.99);
+        assert!(forward_at_ninety.z.abs() < 0.001);
+
+        let right_at_zero = movement_vector(0.0, 1.0, 0.0);
+        assert!(right_at_zero.x > 0.99);
+        assert!(right_at_zero.z.abs() < 0.001);
+    }
 }

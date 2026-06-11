@@ -28,9 +28,9 @@ impl Camera {
         let yaw = self.yaw.to_radians();
         let pitch = self.pitch.to_radians();
         Vec3::new(
-            yaw.cos() * pitch.cos(),
+            -yaw.sin() * pitch.cos(),
             pitch.sin(),
-            yaw.sin() * pitch.cos(),
+            yaw.cos() * pitch.cos(),
         )
         .normalize()
     }

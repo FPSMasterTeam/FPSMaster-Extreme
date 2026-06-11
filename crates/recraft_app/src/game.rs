@@ -52,7 +52,7 @@ impl InputState {
     fn player_input(&self) -> PlayerInput {
         PlayerInput {
             forward: f32::from(self.forward) - f32::from(self.backward),
-            strafe: f32::from(self.left) - f32::from(self.right),
+            strafe: f32::from(self.right) - f32::from(self.left),
             jump: self.jump,
             sneak: self.sneak,
             sprint: self.sprint,
@@ -98,6 +98,14 @@ impl GameState {
 
     pub fn set_aspect(&mut self, aspect: f32) {
         self.camera.aspect = aspect;
+    }
+
+    pub fn rotate_view(&mut self, mouse_dx: f32, mouse_dy: f32) {
+        const SENSITIVITY: f32 = 0.15;
+        self.player.yaw -= mouse_dx * SENSITIVITY;
+        self.player.pitch = (self.player.pitch - mouse_dy * SENSITIVITY).clamp(-89.0, 89.0);
+        self.camera.yaw = self.player.yaw;
+        self.camera.pitch = self.player.pitch;
     }
 
     pub fn tick(&mut self, dt: f32) -> MovementSnapshot {

@@ -1,26 +1,31 @@
 mod game;
 mod network;
 
-use std::{env, time::Instant};
+use std::{env, path::PathBuf, time::Instant};
 
 use anyhow::Context;
 use game::GameState;
 use network::{NetworkEvent, NetworkHandle};
 use recraft_render::Renderer;
 use winit::{
-    event::{Event, WindowEvent},
+    event::{DeviceEvent, ElementState, Event, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
-    window::WindowBuilder,
+    keyboard::{KeyCode, PhysicalKey},
+    window::{CursorGrabMode, WindowBuilder},
 };
 
 struct LaunchConfig {
     server: Option<(String, u16)>,
     username: String,
+    assets: Option<PathBuf>,
 }
 
 fn main() -> anyhow::Result<()> {
     env_logger::init();
     let config = LaunchConfig::from_args();
+    if let Some(path) = &config.assets {
+        env::set_var("RECRAFT_ASSET_ZIP", path);
+    }
 
     let event_loop = EventLoop::new().context("create event loop")?;
     let window = WindowBuilder::new()
@@ -28,6 +33,7 @@ fn main() -> anyhow::Result<()> {
         .build(&event_loop)
         .context("create window")?;
     let window: &'static winit::window::Window = Box::leak(Box::new(window));
+    capture_cursor(window);
 
     let mut renderer = pollster::block_on(Renderer::new(window)).context("create renderer")?;
     let mut game = if config.server.is_some() {
@@ -54,7 +60,19 @@ fn main() -> anyhow::Result<()> {
                     renderer.resize(size);
                     game.set_aspect(renderer.aspect());
                 }
-                WindowEvent::KeyboardInput { event, .. } => game.input.handle_key(event),
+                WindowEvent::KeyboardInput { event, .. } => {
+                    if event.state == ElementState::Pressed
+                        && matches!(event.physical_key, PhysicalKey::Code(KeyCode::Escape))
+                    {
+                        release_cursor(window);
+                    } else {
+                        game.input.handle_key(event);
+                    }
+                }
+                WindowEvent::MouseInput {
+                    state: ElementState::Pressed,
+                    ..
+                } => capture_cursor(window),
                 WindowEvent::RedrawRequested => {
                     let mut mesh_dirty = false;
                     if let Some(network) = &network {
@@ -94,6 +112,10 @@ fn main() -> anyhow::Result<()> {
                 }
                 _ => {}
             },
+            Event::DeviceEvent {
+                event: DeviceEvent::MouseMotion { delta },
+                ..
+            } => game.rotate_view(delta.0 as f32, delta.1 as f32),
             Event::AboutToWait => window.request_redraw(),
             _ => {}
         }
@@ -106,6 +128,7 @@ impl LaunchConfig {
     fn from_args() -> Self {
         let mut server = None;
         let mut username = "ReCraft".to_owned();
+        let mut assets = None;
         let mut args = env::args().skip(1);
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -119,10 +142,19 @@ impl LaunchConfig {
                         username = value;
                     }
                 }
+                "--assets" => {
+                    if let Some(value) = args.next() {
+                        assets = Some(PathBuf::from(value));
+                    }
+                }
                 _ => {}
             }
         }
-        Self { server, username }
+        Self {
+            server,
+            username,
+            assets,
+        }
     }
 }
 
@@ -133,4 +165,21 @@ fn parse_server(value: &str) -> Option<(String, u16)> {
             (host, port.parse().unwrap_or(25565))
         });
     Some((host.to_owned(), port))
+}
+
+fn capture_cursor(window: &winit::window::Window) {
+    if let Err(err) = window
+        .set_cursor_grab(CursorGrabMode::Locked)
+        .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined))
+    {
+        log::warn!("failed to grab cursor: {err}");
+    }
+    window.set_cursor_visible(false);
+}
+
+fn release_cursor(window: &winit::window::Window) {
+    if let Err(err) = window.set_cursor_grab(CursorGrabMode::None) {
+        log::warn!("failed to release cursor: {err}");
+    }
+    window.set_cursor_visible(true);
 }
