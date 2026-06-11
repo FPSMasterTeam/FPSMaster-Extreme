@@ -1,0 +1,5 @@
+/target/
+/.DS_Store
+/references/*
+!/references/README.md
+*.log
