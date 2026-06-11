@@ -1,5 +1,5 @@
 use bytemuck::{Pod, Zeroable};
-use recraft_core::{BlockState, World};
+use recraft_core::{BlockState, ChunkPos, World};
 
 use crate::texture::{tile_uv, BlockTile};
 
@@ -123,28 +123,41 @@ pub fn build_world_mesh(world: &World) -> ChunkMesh {
     let mut mesh = ChunkMesh::default();
 
     for chunk in world.chunks() {
-        let base_x = chunk.position.x * 16;
-        let base_z = chunk.position.z * 16;
-        for section in chunk.sections() {
-            let base_y = section.y() * 16;
-            for y in 0..16i32 {
-                for z in 0..16i32 {
-                    for x in 0..16i32 {
-                        let block = section.get(x as u8, y as u8, z as u8);
-                        if block.is_air() {
-                            continue;
-                        }
-                        let wx = base_x + x;
-                        let wy = base_y + y;
-                        let wz = base_z + z;
-                        append_visible_faces(world, &mut mesh, wx, wy, wz, block);
+        append_chunk_mesh(world, &mut mesh, chunk.position);
+    }
+
+    mesh
+}
+
+pub fn build_chunk_mesh(world: &World, pos: ChunkPos) -> ChunkMesh {
+    let mut mesh = ChunkMesh::default();
+    append_chunk_mesh(world, &mut mesh, pos);
+    mesh
+}
+
+fn append_chunk_mesh(world: &World, mesh: &mut ChunkMesh, pos: ChunkPos) {
+    let Some(chunk) = world.chunk(pos) else {
+        return;
+    };
+    let base_x = chunk.position.x * 16;
+    let base_z = chunk.position.z * 16;
+    for section in chunk.sections() {
+        let base_y = section.y() * 16;
+        for y in 0..16i32 {
+            for z in 0..16i32 {
+                for x in 0..16i32 {
+                    let block = section.get(x as u8, y as u8, z as u8);
+                    if block.is_air() {
+                        continue;
                     }
+                    let wx = base_x + x;
+                    let wy = base_y + y;
+                    let wz = base_z + z;
+                    append_visible_faces(world, mesh, wx, wy, wz, block);
                 }
             }
         }
     }
-
-    mesh
 }
 
 fn append_visible_faces(

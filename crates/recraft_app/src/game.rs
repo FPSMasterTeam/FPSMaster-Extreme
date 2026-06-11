@@ -1,5 +1,9 @@
+use std::collections::HashSet;
+
 use glam::{DVec3, Vec3};
-use recraft_core::{BlockState, EntityId, EntityState, PlayerInput, PlayerPhysics, World};
+use recraft_core::{
+    BlockState, ChunkPos, EntityId, EntityState, PlayerInput, PlayerPhysics, World,
+};
 use recraft_protocol::v1_8_9::{chunk::decode_chunk_data, packets::ClientboundPlayPacket};
 use recraft_render::Camera;
 use winit::{
@@ -72,6 +76,7 @@ pub struct GameState {
     previous_player_position: DVec3,
     physics: PlayerPhysics,
     has_sky_light: bool,
+    dirty_chunks: HashSet<ChunkPos>,
 }
 
 impl GameState {
@@ -107,6 +112,7 @@ impl GameState {
             player,
             physics: PlayerPhysics::default(),
             has_sky_light: true,
+            dirty_chunks: HashSet::new(),
         }
     }
 
@@ -254,6 +260,10 @@ impl GameState {
         }
     }
 
+    pub fn take_dirty_chunks(&mut self) -> Vec<ChunkPos> {
+        self.dirty_chunks.drain().collect()
+    }
+
     fn apply_chunk_data(
         &mut self,
         x: i32,
@@ -276,12 +286,25 @@ impl GameState {
                             .set_light(wx, wy, wz, block.block_light, block.sky_light);
                     }
                 }
+                self.mark_chunk_dirty(ChunkPos::new(x, z));
                 true
             }
             Err(err) => {
                 log::warn!("failed to decode chunk {x},{z}: {err}");
                 false
             }
+        }
+    }
+
+    fn mark_chunk_dirty(&mut self, pos: ChunkPos) {
+        for dirty in [
+            pos,
+            ChunkPos::new(pos.x - 1, pos.z),
+            ChunkPos::new(pos.x + 1, pos.z),
+            ChunkPos::new(pos.x, pos.z - 1),
+            ChunkPos::new(pos.x, pos.z + 1),
+        ] {
+            self.dirty_chunks.insert(dirty);
         }
     }
 

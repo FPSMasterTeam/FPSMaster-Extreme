@@ -74,6 +74,6 @@ Before this is considered complete, we need a trace suite comparing against MCP/
 
 - Online-mode encryption/authentication is not implemented.
 - Inventory, block breaking/placing, entities other than local player, chat, and GUI are not complete.
-- Chunk meshing rebuilds the entire world mesh after every chunk packet.
+- Chunk meshing is chunk-incremental, but still not section-incremental and has no frustum culling.
 - Lighting is currently face-direction lighting, not vanilla block/sky light propagation.
 - Sky is a clear color, not a full skybox/sun/moon/stars implementation.

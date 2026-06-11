@@ -363,3 +363,42 @@ ReCraftAtlas left the game.
 ```
 
 Coverage expanded from the initial 7-tile atlas to common 1.8.9 block-id/meta textures. This is still not a full blockstate/model/resource-pack implementation.
+
+## 2026-06-11 incremental chunk mesh upload
+
+Runtime renderer change:
+
+- GPU meshes are now stored per `ChunkPos`.
+- Full `upload_world` is still used for the initial demo/full load path.
+- Server chunk packets mark the changed chunk and four horizontal neighbor chunks dirty.
+- Runtime server chunk loading calls `upload_dirty_chunks` instead of rebuilding one global world mesh after every chunk packet.
+
+Server smoke command without `--assets`:
+
+```bash
+RUST_LOG=info cargo run -p recraft_app -- \
+  --connect 127.0.0.1:25565 \
+  --username ReCraftMesh \
+  --scripted-smoke 8
+```
+
+Observed client logs:
+
+```text
+loaded 129 block atlas tiles from local_assets/minecraft-1.8.9
+loaded Minecraft 1.8.9 block atlas from asset directory local_assets/minecraft-1.8.9
+logged in as ReCraftMesh (...)
+applied chunk bulk: 10 chunks
+...
+scripted smoke complete
+```
+
+Observed server logs:
+
+```text
+ReCraftMesh[/127.0.0.1:...] logged in with entity id ... at ([world]..., ..., ...)
+ReCraftMesh lost connection: Disconnected
+ReCraftMesh left the game.
+```
+
+No wgpu validation or protocol error was observed during the scripted smoke run. This is a runtime smoke check, not a visual-performance benchmark.

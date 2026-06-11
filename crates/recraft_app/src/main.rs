@@ -53,6 +53,7 @@ fn main() -> anyhow::Result<()> {
     let app_start = Instant::now();
     let mut tick_accumulator = 0.0f32;
     let scripted_smoke_seconds = config.scripted_smoke_seconds;
+    let mut scripted_smoke_done = false;
 
     event_loop.run(move |event, target| {
         target.set_control_flow(ControlFlow::Poll);
@@ -94,7 +95,8 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                     if mesh_dirty {
-                        renderer.upload_world(&game.world);
+                        let dirty_chunks = game.take_dirty_chunks();
+                        renderer.upload_dirty_chunks(&game.world, dirty_chunks);
                     }
 
                     let now = Instant::now();
@@ -116,9 +118,11 @@ fn main() -> anyhow::Result<()> {
                     if let Err(err) = renderer.render(&game.camera) {
                         log::error!("render error: {err}");
                     }
-                    if scripted_smoke_seconds
-                        .is_some_and(|seconds| (now - app_start).as_secs_f32() >= seconds)
+                    if !scripted_smoke_done
+                        && scripted_smoke_seconds
+                            .is_some_and(|seconds| (now - app_start).as_secs_f32() >= seconds)
                     {
+                        scripted_smoke_done = true;
                         log::info!("scripted smoke complete");
                         target.exit();
                     }

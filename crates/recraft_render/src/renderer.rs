@@ -1,12 +1,14 @@
+use std::collections::HashMap;
+
 use bytemuck::{Pod, Zeroable};
 use glam::Mat4;
-use recraft_core::World;
+use recraft_core::{ChunkPos, World};
 use thiserror::Error;
 use wgpu::util::DeviceExt;
 use winit::{dpi::PhysicalSize, window::Window};
 
 use crate::{
-    build_world_mesh,
+    build_chunk_mesh,
     texture::{TextureAtlasImage, TextureAtlasSource},
     Camera, ChunkMesh, Vertex,
 };
@@ -29,6 +31,12 @@ struct CameraUniform {
     view_proj: [[f32; 4]; 4],
 }
 
+struct GpuChunkMesh {
+    vertex_buffer: wgpu::Buffer,
+    index_buffer: wgpu::Buffer,
+    index_count: u32,
+}
+
 pub struct Renderer<'window> {
     surface: wgpu::Surface<'window>,
     device: wgpu::Device,
@@ -41,9 +49,7 @@ pub struct Renderer<'window> {
     texture_bind_group: wgpu::BindGroup,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
-    vertex_buffer: wgpu::Buffer,
-    index_buffer: wgpu::Buffer,
-    index_count: u32,
+    chunk_meshes: HashMap<ChunkPos, GpuChunkMesh>,
 }
 
 impl<'window> Renderer<'window> {
@@ -223,19 +229,6 @@ impl<'window> Renderer<'window> {
             multiview: None,
         });
 
-        let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("empty-vertex-buffer"),
-            size: 4,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("empty-index-buffer"),
-            size: 4,
-            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
         Ok(Self {
             surface,
             device,
@@ -248,9 +241,7 @@ impl<'window> Renderer<'window> {
             texture_bind_group,
             camera_buffer,
             camera_bind_group,
-            vertex_buffer,
-            index_buffer,
-            index_count: 0,
+            chunk_meshes: HashMap::new(),
         })
     }
 
@@ -270,30 +261,49 @@ impl<'window> Renderer<'window> {
     }
 
     pub fn upload_world(&mut self, world: &World) {
-        let mesh = build_world_mesh(world);
-        self.upload_mesh(&mesh);
+        self.chunk_meshes.clear();
+        let positions: Vec<_> = world.chunks().map(|chunk| chunk.position).collect();
+        self.upload_dirty_chunks(world, positions);
     }
 
-    pub fn upload_mesh(&mut self, mesh: &ChunkMesh) {
-        self.index_count = mesh.indices.len() as u32;
+    pub fn upload_dirty_chunks<I>(&mut self, world: &World, positions: I)
+    where
+        I: IntoIterator<Item = ChunkPos>,
+    {
+        for pos in positions {
+            let mesh = build_chunk_mesh(world, pos);
+            self.upload_chunk_mesh(pos, &mesh);
+        }
+    }
+
+    fn upload_chunk_mesh(&mut self, pos: ChunkPos, mesh: &ChunkMesh) {
         if mesh.is_empty() {
+            self.chunk_meshes.remove(&pos);
             return;
         }
 
-        self.vertex_buffer = self
+        let vertex_buffer = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("chunk-vertices"),
                 contents: bytemuck::cast_slice(&mesh.vertices),
                 usage: wgpu::BufferUsages::VERTEX,
             });
-        self.index_buffer = self
+        let index_buffer = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("chunk-indices"),
                 contents: bytemuck::cast_slice(&mesh.indices),
                 usage: wgpu::BufferUsages::INDEX,
             });
+        self.chunk_meshes.insert(
+            pos,
+            GpuChunkMesh {
+                vertex_buffer,
+                index_buffer,
+                index_count: mesh.indices.len() as u32,
+            },
+        );
     }
 
     pub fn render(&mut self, camera: &Camera) -> Result<(), RendererError> {
@@ -355,13 +365,18 @@ impl<'window> Renderer<'window> {
             pass.set_bind_group(1, &self.texture_bind_group, &[]);
             pass.draw(0..3, 0..1);
 
-            if self.index_count > 0 {
+            if !self.chunk_meshes.is_empty() {
                 pass.set_pipeline(&self.pipeline);
                 pass.set_bind_group(0, &self.camera_bind_group, &[]);
                 pass.set_bind_group(1, &self.texture_bind_group, &[]);
-                pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-                pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..self.index_count, 0, 0..1);
+                for chunk_mesh in self.chunk_meshes.values() {
+                    pass.set_vertex_buffer(0, chunk_mesh.vertex_buffer.slice(..));
+                    pass.set_index_buffer(
+                        chunk_mesh.index_buffer.slice(..),
+                        wgpu::IndexFormat::Uint32,
+                    );
+                    pass.draw_indexed(0..chunk_mesh.index_count, 0, 0..1);
+                }
             }
         }
 

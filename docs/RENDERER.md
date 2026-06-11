@@ -19,15 +19,17 @@ World chunks + stored block/sky light
 
 ## Chunk meshing
 
-`build_world_mesh` walks loaded chunks and emits one quad per visible block face. Internal faces between opaque cube blocks are culled.
+`build_chunk_mesh` walks one loaded chunk and emits one quad per visible block face. Internal faces between opaque cube blocks are culled, including across chunk boundaries when the neighbor chunk is loaded.
 
-Current mesh is global. The next step is per-chunk-section GPU buffers:
+The renderer stores one GPU vertex/index buffer pair per `ChunkPos`. When a chunk packet changes world data, the app marks that chunk and its four horizontal neighbors dirty, then only those GPU meshes are rebuilt:
 
 ```text
-ChunkSectionMeshKey { chunk_x, section_y, chunk_z }
+ChunkPos { chunk_x, chunk_z }
   -> vertex/index buffers
-  -> dirty rebuild when neighbor or local section changes
+  -> dirty rebuild when local or horizontal-neighbor chunk changes
 ```
+
+`build_world_mesh` still exists for simple whole-world paths and tests, but runtime server chunk loading uses the incremental chunk upload path.
 
 ## Textures
 
