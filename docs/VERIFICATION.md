@@ -144,3 +144,37 @@ Runtime behavior changed:
 
 - Mouse X and arrow left/right yaw signs were inverted to match Minecraft-style yaw.
 - Render camera position is interpolated between 20Hz physics ticks. Packet sending remains tied to the tick loop.
+
+## 2026-06-11 MCP movement/packet audit
+
+MCP reference availability:
+
+- Local reference repo: `references/MCP-919`
+- Current commit checked by Git object access: `1717f75`
+- Used MCP files:
+  - `EntityRenderer.java`
+  - `Entity.java`
+  - `EntityLivingBase.java`
+  - `EntityPlayerSP.java`
+  - `MovementInputFromOptions.java`
+  - `C03PacketPlayer.java`
+
+Commands run successfully:
+
+```bash
+cargo test -p recraft_core -p recraft_protocol -p recraft_render
+cargo test -p recraft_app
+cargo check
+```
+
+Coverage added/updated:
+
+- Player position and velocity storage now uses `f64` to match vanilla `posX/posY/posZ` and `motionX/motionY/motionZ`.
+- Render camera interpolation remains render-only: previous/current tick positions are interpolated for the camera, while authoritative player state and movement snapshots keep the real tick position.
+- Serverbound walking packets now follow the MCP `EntityPlayerSP.onUpdateWalkingPlayer` decision across `C03`/`C04`/`C05`/`C06`, including the `9.0E-4D` movement threshold and 20 tick forced position update.
+- Physics tick moved closer to MCP by applying input `0.98F`, sneak input scaling before `moveFlying`, sprint speed/air multiplier, sprint jump impulse, and vanilla gravity/vertical drag constants.
+
+Not yet verified:
+
+- Runtime behavior of `C06PacketPlayerPosLook` against the local Paper 1.8.8 test server after this packet-selection change.
+- Full vanilla collision parity; current collision is still a simplified AABB clipper and does not yet implement every `Entity.moveEntity` branch/epsilon.

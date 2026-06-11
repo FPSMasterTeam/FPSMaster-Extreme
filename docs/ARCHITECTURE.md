@@ -53,9 +53,11 @@ This matches 1.8.9 and keeps the first milestone small. A later 1.13+ path must 
 
 Chunk sections store 1.8-style block IDs/meta plus decoded block light and sky light values. Rendering samples this light data at visible faces.
 
-`recraft_core::physics` implements a tick-based AABB path with axis-by-axis collision clipping. The current tick order follows the vanilla 1.8.9 movement shape more closely: apply jump/input movement, move with collisions, then apply gravity and drag for the next tick. Input signs follow vanilla `MovementInput` / `moveFlying`: forward is positive, left strafe is positive, right strafe is negative, and yaw increases when turning right. This mirrors the shape of the vanilla 1.8.9 `Entity.moveEntity` / `EntityLivingBase.moveEntityWithHeading` path, but exact parity is not proven yet.
+`recraft_core::physics` implements a tick-based AABB path with axis-by-axis collision clipping. Player position and velocity are stored as `f64`, matching vanilla `posX/posY/posZ` and `motionX/motionY/motionZ`. The current tick order follows the vanilla 1.8.9 movement shape more closely: apply jump/input movement, move with collisions, then apply gravity and drag for the next tick. Input signs follow vanilla `MovementInput` / `moveFlying`: forward is positive, left strafe is positive, right strafe is negative, and yaw increases when turning right. This mirrors the shape of the vanilla 1.8.9 `Entity.moveEntity` / `EntityLivingBase.moveEntityWithHeading` path, but exact collision parity is not proven yet.
 
-Rendering uses interpolation between previous and current 20Hz player positions so visual camera motion is smooth while movement packets remain 20TPS.
+Rendering uses interpolation between previous and current 20Hz player positions so visual camera motion is smooth while the authoritative player state remains the real tick position. This mirrors the vanilla render path in `EntityRenderer.orientCamera(partialTicks)`; it is not used for physics or packet state.
+
+Serverbound walking packets are selected in `recraft_app::network` using the vanilla `EntityPlayerSP.onUpdateWalkingPlayer` thresholds: send position when delta squared is greater than `9.0E-4D` or after 20 ticks, send look when yaw/pitch changed, otherwise send the onGround-only player packet.
 
 Before this is considered complete, we need a trace suite comparing against MCP/black-box vanilla behavior for:
 

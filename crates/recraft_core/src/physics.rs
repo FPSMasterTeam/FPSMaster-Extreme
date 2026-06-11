@@ -1,27 +1,27 @@
-use glam::Vec3;
+use glam::DVec3;
 
 use crate::{EntityState, World};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Aabb {
-    pub min: Vec3,
-    pub max: Vec3,
+    pub min: DVec3,
+    pub max: DVec3,
 }
 
 impl Aabb {
-    pub fn new(min: Vec3, max: Vec3) -> Self {
+    pub fn new(min: DVec3, max: DVec3) -> Self {
         Self { min, max }
     }
 
-    pub fn player_at(feet: Vec3) -> Self {
+    pub fn player_at(feet: DVec3) -> Self {
         let half_width = 0.3;
         Self {
-            min: Vec3::new(feet.x - half_width, feet.y, feet.z - half_width),
-            max: Vec3::new(feet.x + half_width, feet.y + 1.8, feet.z + half_width),
+            min: DVec3::new(feet.x - half_width, feet.y, feet.z - half_width),
+            max: DVec3::new(feet.x + half_width, feet.y + 1.8, feet.z + half_width),
         }
     }
 
-    pub fn offset(self, delta: Vec3) -> Self {
+    pub fn offset(self, delta: DVec3) -> Self {
         Self {
             min: self.min + delta,
             max: self.max + delta,
@@ -61,9 +61,9 @@ impl Default for PlayerInput {
 
 #[derive(Debug, Clone, Copy)]
 pub struct PlayerPhysicsConfig {
-    pub gravity: f32,
-    pub jump_velocity: f32,
-    pub air_drag_y: f32,
+    pub gravity: f64,
+    pub jump_velocity: f64,
+    pub air_drag_y: f64,
     pub air_acceleration: f32,
     pub ground_acceleration: f32,
     pub base_walk_speed: f32,
@@ -73,12 +73,10 @@ pub struct PlayerPhysicsConfig {
 
 impl Default for PlayerPhysicsConfig {
     fn default() -> Self {
-        // These constants match the broad shape of the 1.8.9 EntityLivingBase path.
-        // Exact parity will be verified against MCP/black-box traces before the goal is complete.
         Self {
             gravity: 0.08,
             jump_velocity: 0.42,
-            air_drag_y: 0.98,
+            air_drag_y: 0.9800000190734863,
             air_acceleration: 0.02,
             ground_acceleration: 0.1,
             base_walk_speed: 0.1,
@@ -97,8 +95,23 @@ impl PlayerPhysics {
     pub fn tick(&self, world: &World, player: &mut EntityState, input: PlayerInput) {
         let mut velocity = player.velocity;
 
+        if velocity.x.abs() < 0.005 {
+            velocity.x = 0.0;
+        }
+        if velocity.y.abs() < 0.005 {
+            velocity.y = 0.0;
+        }
+        if velocity.z.abs() < 0.005 {
+            velocity.z = 0.0;
+        }
+
         if input.jump && player.on_ground {
             velocity.y = self.config.jump_velocity;
+            if input.sprint {
+                let yaw = player.yaw.to_radians();
+                velocity.x -= (yaw.sin() * 0.2) as f64;
+                velocity.z += (yaw.cos() * 0.2) as f64;
+            }
         }
 
         let horizontal_drag = if player.on_ground {
@@ -107,29 +120,40 @@ impl PlayerPhysics {
             0.91
         };
 
-        let mut acceleration = if player.on_ground {
-            self.config.ground_acceleration
-                * (0.16277136 / (horizontal_drag * horizontal_drag * horizontal_drag))
+        let move_speed = self.config.base_walk_speed
+            * if input.sprint {
+                self.config.sprint_multiplier
+            } else {
+                1.0
+            };
+        let acceleration = if player.on_ground {
+            move_speed * (0.16277136 / (horizontal_drag * horizontal_drag * horizontal_drag))
         } else {
             self.config.air_acceleration
+                * if input.sprint {
+                    self.config.sprint_multiplier
+                } else {
+                    1.0
+                }
         };
-        acceleration *= if input.sprint {
-            self.config.sprint_multiplier
-        } else {
-            1.0
-        };
-        if input.sneak {
-            acceleration *= 0.3;
-        }
 
-        velocity += movement_vector(input.forward, input.strafe, player.yaw) * acceleration;
+        let mut forward = input.forward;
+        let mut strafe = input.strafe;
+        if input.sneak {
+            forward *= 0.3;
+            strafe *= 0.3;
+        }
+        forward *= 0.98;
+        strafe *= 0.98;
+
+        velocity += movement_vector(forward, strafe, player.yaw, acceleration);
 
         let (position, mut adjusted_velocity, on_ground) =
             move_with_collisions(world, player.aabb, velocity);
         adjusted_velocity.y -= self.config.gravity;
         adjusted_velocity.y *= self.config.air_drag_y;
-        adjusted_velocity.x *= horizontal_drag;
-        adjusted_velocity.z *= horizontal_drag;
+        adjusted_velocity.x *= horizontal_drag as f64;
+        adjusted_velocity.z *= horizontal_drag as f64;
 
         player.position = position;
         player.velocity = adjusted_velocity;
@@ -138,46 +162,47 @@ impl PlayerPhysics {
     }
 }
 
-fn movement_vector(forward: f32, strafe: f32, yaw_degrees: f32) -> Vec3 {
+fn movement_vector(forward: f32, strafe: f32, yaw_degrees: f32, friction: f32) -> DVec3 {
     let mut length = strafe * strafe + forward * forward;
     if length < 1.0e-4 {
-        return Vec3::ZERO;
+        return DVec3::ZERO;
     }
     length = length.sqrt();
     if length < 1.0 {
         length = 1.0;
     }
 
-    let strafe = strafe / length;
-    let forward = forward / length;
+    let scale = friction / length;
+    let strafe = strafe * scale;
+    let forward = forward * scale;
     let yaw = yaw_degrees.to_radians();
     let sin = yaw.sin();
     let cos = yaw.cos();
-    Vec3::new(
-        strafe * cos - forward * sin,
+    DVec3::new(
+        (strafe * cos - forward * sin) as f64,
         0.0,
-        forward * cos + strafe * sin,
+        (forward * cos + strafe * sin) as f64,
     )
 }
 
-fn move_with_collisions(world: &World, aabb: Aabb, velocity: Vec3) -> (Vec3, Vec3, bool) {
+fn move_with_collisions(world: &World, aabb: Aabb, velocity: DVec3) -> (DVec3, DVec3, bool) {
     let mut moved = aabb;
     let mut adjusted = velocity;
     let mut on_ground = false;
 
     adjusted.y = clip_axis(world, moved, adjusted.y, Axis::Y);
-    moved = moved.offset(Vec3::new(0.0, adjusted.y, 0.0));
+    moved = moved.offset(DVec3::new(0.0, adjusted.y, 0.0));
     if velocity.y < 0.0 && adjusted.y != velocity.y {
         on_ground = true;
     }
 
     adjusted.x = clip_axis(world, moved, adjusted.x, Axis::X);
-    moved = moved.offset(Vec3::new(adjusted.x, 0.0, 0.0));
+    moved = moved.offset(DVec3::new(adjusted.x, 0.0, 0.0));
 
     adjusted.z = clip_axis(world, moved, adjusted.z, Axis::Z);
-    moved = moved.offset(Vec3::new(0.0, 0.0, adjusted.z));
+    moved = moved.offset(DVec3::new(0.0, 0.0, adjusted.z));
 
-    let feet = Vec3::new(
+    let feet = DVec3::new(
         (moved.min.x + moved.max.x) * 0.5,
         moved.min.y,
         (moved.min.z + moved.max.z) * 0.5,
@@ -192,15 +217,15 @@ enum Axis {
     Z,
 }
 
-fn clip_axis(world: &World, aabb: Aabb, delta: f32, axis: Axis) -> f32 {
+fn clip_axis(world: &World, aabb: Aabb, delta: f64, axis: Axis) -> f64 {
     if delta == 0.0 {
         return 0.0;
     }
 
     let moved = match axis {
-        Axis::X => aabb.offset(Vec3::new(delta, 0.0, 0.0)),
-        Axis::Y => aabb.offset(Vec3::new(0.0, delta, 0.0)),
-        Axis::Z => aabb.offset(Vec3::new(0.0, 0.0, delta)),
+        Axis::X => aabb.offset(DVec3::new(delta, 0.0, 0.0)),
+        Axis::Y => aabb.offset(DVec3::new(0.0, delta, 0.0)),
+        Axis::Z => aabb.offset(DVec3::new(0.0, 0.0, delta)),
     };
 
     let min_x = moved.min.x.floor() as i32;
@@ -218,8 +243,8 @@ fn clip_axis(world: &World, aabb: Aabb, delta: f32, axis: Axis) -> f32 {
                     continue;
                 }
                 let block = Aabb::new(
-                    Vec3::new(x as f32, y as f32, z as f32),
-                    Vec3::new(x as f32 + 1.0, y as f32 + 1.0, z as f32 + 1.0),
+                    DVec3::new(x as f64, y as f64, z as f64),
+                    DVec3::new(x as f64 + 1.0, y as f64 + 1.0, z as f64 + 1.0),
                 );
                 if !moved.intersects(block) {
                     continue;
@@ -241,7 +266,7 @@ fn clip_axis(world: &World, aabb: Aabb, delta: f32, axis: Axis) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use glam::Vec3;
+    use glam::DVec3;
 
     use super::*;
     use crate::{BlockState, EntityId};
@@ -250,8 +275,8 @@ mod tests {
     fn falling_player_lands_on_solid_block() {
         let mut world = World::new();
         world.set_block(0, 0, 0, BlockState::STONE);
-        let mut player = EntityState::new_local_player(EntityId(1), Vec3::new(0.5, 1.2, 0.5));
-        player.velocity = Vec3::new(0.0, -0.5, 0.0);
+        let mut player = EntityState::new_local_player(EntityId(1), DVec3::new(0.5, 1.2, 0.5));
+        player.velocity = DVec3::new(0.0, -0.5, 0.0);
 
         PlayerPhysics::default().tick(&world, &mut player, PlayerInput::default());
 
@@ -261,19 +286,19 @@ mod tests {
 
     #[test]
     fn movement_forward_matches_minecraft_yaw_convention() {
-        let forward_at_zero = movement_vector(1.0, 0.0, 0.0);
+        let forward_at_zero = movement_vector(1.0, 0.0, 0.0, 1.0);
         assert!(forward_at_zero.z > 0.99);
         assert!(forward_at_zero.x.abs() < 0.001);
 
-        let forward_at_ninety = movement_vector(1.0, 0.0, 90.0);
+        let forward_at_ninety = movement_vector(1.0, 0.0, 90.0, 1.0);
         assert!(forward_at_ninety.x < -0.99);
         assert!(forward_at_ninety.z.abs() < 0.001);
 
-        let left_at_zero = movement_vector(0.0, 1.0, 0.0);
+        let left_at_zero = movement_vector(0.0, 1.0, 0.0, 1.0);
         assert!(left_at_zero.x > 0.99);
         assert!(left_at_zero.z.abs() < 0.001);
 
-        let right_at_zero = movement_vector(0.0, -1.0, 0.0);
+        let right_at_zero = movement_vector(0.0, -1.0, 0.0, 1.0);
         assert!(right_at_zero.x < -0.99);
         assert!(right_at_zero.z.abs() < 0.001);
     }
@@ -281,7 +306,7 @@ mod tests {
     #[test]
     fn jump_moves_before_gravity_drag_for_tick() {
         let world = World::new();
-        let mut player = EntityState::new_local_player(EntityId(1), Vec3::new(0.5, 1.0, 0.5));
+        let mut player = EntityState::new_local_player(EntityId(1), DVec3::new(0.5, 1.0, 0.5));
         player.on_ground = true;
 
         PlayerPhysics::default().tick(
@@ -300,7 +325,7 @@ mod tests {
     #[test]
     fn player_does_not_auto_climb_full_block() {
         let world = flat_world_with_one_block_step();
-        let mut player = EntityState::new_local_player(EntityId(1), Vec3::new(0.5, 1.0, 0.2));
+        let mut player = EntityState::new_local_player(EntityId(1), DVec3::new(0.5, 1.0, 0.2));
         player.on_ground = true;
         let physics = PlayerPhysics::default();
 
@@ -322,7 +347,7 @@ mod tests {
     #[test]
     fn player_can_jump_onto_full_block() {
         let world = flat_world_with_one_block_step();
-        let mut player = EntityState::new_local_player(EntityId(1), Vec3::new(0.5, 1.0, 0.2));
+        let mut player = EntityState::new_local_player(EntityId(1), DVec3::new(0.5, 1.0, 0.2));
         player.on_ground = true;
         let physics = PlayerPhysics::default();
 

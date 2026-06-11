@@ -15,9 +15,15 @@ Protocol 47 is the first target.
   - JoinGame
   - PlayerPositionLook
   - ChunkData
+  - ChunkBulk / MapChunkBulk
   - Disconnect
-- Serverbound movement packet:
+- Serverbound movement packets:
+  - Player (`C03`, onGround only)
+  - PlayerPosition (`C04`)
+  - PlayerLook (`C05`)
   - PlayerPositionLook
+- Movement packet selection follows the MCP 1.8.9 `EntityPlayerSP.onUpdateWalkingPlayer` decision:
+  position delta squared `> 9.0E-4D` or `positionUpdateTicks >= 20`, plus separate yaw/pitch change detection.
 - 1.8 chunk section block array decoder for protocol 47 chunk data.
 - Block light and sky light nibble-array decoding for chunk data.
 
@@ -44,7 +50,6 @@ cargo run -p recraft_app -- --connect 127.0.0.1:25565 --username ReCraft
 
 - Online-mode Microsoft/Yggdrasil session flow and AES-CFB8 encryption.
 - Full Play-state packet coverage.
-- MapChunkBulk support.
 - Entity spawn/move/metadata packets.
 - Block update and multi-block change application.
 - Inventory/window packets.

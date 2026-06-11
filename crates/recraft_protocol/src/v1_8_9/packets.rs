@@ -23,6 +23,9 @@ pub enum ServerboundPacket {
     KeepAlive {
         id: i32,
     },
+    Player {
+        on_ground: bool,
+    },
     PlayerPosition {
         x: f64,
         y: f64,
@@ -138,6 +141,11 @@ impl ServerboundPacket {
                 let mut body = PacketWriter::new();
                 body.write_var_i32(id);
                 PacketFrame::new(0x00, body.into_inner())
+            }
+            Self::Player { on_ground } => {
+                let mut body = PacketWriter::new();
+                body.write_bool(on_ground);
+                PacketFrame::new(0x03, body.into_inner())
             }
             Self::PlayerPosition { x, y, z, on_ground } => {
                 let mut body = PacketWriter::new();
@@ -326,6 +334,14 @@ mod tests {
                 reduced_debug_info: false,
             }
         );
+    }
+
+    #[test]
+    fn player_packet_writes_on_ground_only() {
+        let frame = ServerboundPacket::Player { on_ground: true }.into_frame();
+
+        assert_eq!(frame.id, 0x03);
+        assert_eq!(frame.body, vec![1]);
     }
 }
 

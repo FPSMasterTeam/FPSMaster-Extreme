@@ -1,4 +1,4 @@
-use glam::Vec3;
+use glam::{DVec3, Vec3};
 use recraft_core::{BlockState, EntityId, EntityState, PlayerInput, PlayerPhysics, World};
 use recraft_protocol::v1_8_9::{chunk::decode_chunk_data, packets::ClientboundPlayPacket};
 use recraft_render::Camera;
@@ -12,6 +12,8 @@ pub struct MovementSnapshot {
     pub x: f64,
     pub y: f64,
     pub z: f64,
+    pub yaw: f32,
+    pub pitch: f32,
     pub on_ground: bool,
 }
 
@@ -67,7 +69,7 @@ pub struct GameState {
     pub input: InputState,
     pub camera: Camera,
     player: EntityState,
-    previous_player_position: Vec3,
+    previous_player_position: DVec3,
     physics: PlayerPhysics,
     has_sky_light: bool,
 }
@@ -76,17 +78,25 @@ impl GameState {
     pub fn demo(aspect: f32) -> Self {
         let mut world = World::new();
         build_demo_world(&mut world);
-        Self::new(world, EntityId(0), Vec3::new(0.5, 2.0, 0.5), aspect)
+        Self::new(world, EntityId(0), DVec3::new(0.5, 2.0, 0.5), aspect)
     }
 
     pub fn empty_for_server(aspect: f32) -> Self {
-        Self::new(World::new(), EntityId(0), Vec3::new(0.5, 80.0, 0.5), aspect)
+        Self::new(
+            World::new(),
+            EntityId(0),
+            DVec3::new(0.5, 80.0, 0.5),
+            aspect,
+        )
     }
 
-    fn new(mut world: World, player_id: EntityId, position: Vec3, aspect: f32) -> Self {
+    fn new(mut world: World, player_id: EntityId, position: DVec3, aspect: f32) -> Self {
         let player = EntityState::new_local_player(player_id, position);
         world.upsert_entity(player.clone());
-        let mut camera = Camera::new(position + Vec3::new(0.0, 1.62, 0.0), aspect);
+        let mut camera = Camera::new(
+            to_render_vec3(position + DVec3::new(0.0, 1.62, 0.0)),
+            aspect,
+        );
         camera.yaw = 0.0;
         camera.pitch = 0.0;
         Self {
@@ -136,11 +146,11 @@ impl GameState {
     }
 
     pub fn update_camera(&mut self, tick_alpha: f32) {
-        let alpha = tick_alpha.clamp(0.0, 1.0);
+        let alpha = tick_alpha.clamp(0.0, 1.0) as f64;
         let position = self
             .previous_player_position
             .lerp(self.player.position, alpha);
-        self.camera.position = position + Vec3::new(0.0, 1.62, 0.0);
+        self.camera.position = to_render_vec3(position + DVec3::new(0.0, 1.62, 0.0));
         self.camera.yaw = self.player.yaw;
         self.camera.pitch = self.player.pitch;
     }
@@ -166,19 +176,19 @@ impl GameState {
                 flags,
             } => {
                 if flags & 0x01 != 0 {
-                    self.player.position.x += x as f32;
+                    self.player.position.x += x;
                 } else {
-                    self.player.position.x = x as f32;
+                    self.player.position.x = x;
                 }
                 if flags & 0x02 != 0 {
-                    self.player.position.y += y as f32;
+                    self.player.position.y += y;
                 } else {
-                    self.player.position.y = y as f32;
+                    self.player.position.y = y;
                 }
                 if flags & 0x04 != 0 {
-                    self.player.position.z += z as f32;
+                    self.player.position.z += z;
                 } else {
-                    self.player.position.z = z as f32;
+                    self.player.position.z = z;
                 }
                 if flags & 0x08 != 0 {
                     self.player.yaw += yaw;
@@ -268,12 +278,18 @@ impl GameState {
 
     fn movement_snapshot(&self) -> MovementSnapshot {
         MovementSnapshot {
-            x: self.player.position.x as f64,
-            y: self.player.position.y as f64,
-            z: self.player.position.z as f64,
+            x: self.player.position.x,
+            y: self.player.position.y,
+            z: self.player.position.z,
+            yaw: self.player.yaw,
+            pitch: self.player.pitch,
             on_ground: self.player.on_ground,
         }
     }
+}
+
+fn to_render_vec3(position: DVec3) -> Vec3 {
+    Vec3::new(position.x as f32, position.y as f32, position.z as f32)
 }
 
 fn build_demo_world(world: &mut World) {
