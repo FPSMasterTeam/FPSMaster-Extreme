@@ -36,6 +36,7 @@ pub struct Renderer<'window> {
     config: wgpu::SurfaceConfiguration,
     size: PhysicalSize<u32>,
     pipeline: wgpu::RenderPipeline,
+    sky_pipeline: wgpu::RenderPipeline,
     depth_view: wgpu::TextureView,
     texture_bind_group: wgpu::BindGroup,
     camera_buffer: wgpu::Buffer,
@@ -138,6 +139,10 @@ impl<'window> Renderer<'window> {
             label: Some("chunk-shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader/chunk.wgsl").into()),
         });
+        let sky_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("sky-shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shader/sky.wgsl").into()),
+        });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("chunk-pipeline-layout"),
             bind_group_layouts: &[&camera_layout, &texture_layout],
@@ -181,6 +186,42 @@ impl<'window> Renderer<'window> {
             multisample: wgpu::MultisampleState::default(),
             multiview: None,
         });
+        let sky_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("sky-pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &sky_shader,
+                entry_point: "vs_main",
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &sky_shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::Always,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+        });
 
         let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("empty-vertex-buffer"),
@@ -202,6 +243,7 @@ impl<'window> Renderer<'window> {
             config,
             size,
             pipeline,
+            sky_pipeline,
             depth_view,
             texture_bind_group,
             camera_buffer,
@@ -308,6 +350,11 @@ impl<'window> Renderer<'window> {
                 occlusion_query_set: None,
                 timestamp_writes: None,
             });
+            pass.set_pipeline(&self.sky_pipeline);
+            pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            pass.set_bind_group(1, &self.texture_bind_group, &[]);
+            pass.draw(0..3, 0..1);
+
             if self.index_count > 0 {
                 pass.set_pipeline(&self.pipeline);
                 pass.set_bind_group(0, &self.camera_bind_group, &[]);

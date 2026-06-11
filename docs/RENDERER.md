@@ -54,7 +54,7 @@ This is only a scaffold. Vanilla-compatible lighting requires decoding/storing b
 
 ## Sky
 
-The current sky is a clear color. A real 1.8.9 sky pass should be separate from chunk rendering and should implement:
+The current sky pass renders a full-screen blue gradient before chunk rendering. A fuller 1.8.9 sky implementation should add:
 
 - sky gradient
 - sun/moon quads
