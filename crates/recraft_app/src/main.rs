@@ -158,6 +158,9 @@ fn main() -> anyhow::Result<()> {
     let mut renderer = pollster::block_on(Renderer::new(window)).context("create renderer")?;
     let settings = Settings::default();
     renderer.set_vsync(settings.vsync);
+    // Atlas UV table snapshot for first-person item geometry (cheap clone of
+    // the name→tile map, taken once).
+    let atlas_uv = renderer.atlas_uv().clone();
 
     let auto_connect = config.server.clone();
     let auto_demo = config.scripted_smoke_seconds.is_some() && auto_connect.is_none();
@@ -485,6 +488,7 @@ fn main() -> anyhow::Result<()> {
                     &mut renderer,
                     &mut app,
                     window,
+                    &atlas_uv,
                     &mut fps_counter,
                     &mut last_frame,
                     tick_accumulator,
@@ -714,6 +718,7 @@ fn render_frame(
     renderer: &mut Renderer,
     app: &mut App,
     window: &winit::window::Window,
+    atlas_uv: &recraft_render::AtlasUv,
     fps_counter: &mut FpsCounter,
     last_frame: &mut Instant,
     tick_accumulator: f32,
@@ -722,7 +727,6 @@ fn render_frame(
 ) {
     let now = Instant::now();
     fps_counter.tick(now);
-    let frame_dt = (now - *last_frame).as_secs_f32().min(0.1);
     *last_frame = now;
 
     // Hand a bounded number of dirty chunks to the background mesher, then
@@ -738,21 +742,24 @@ fn render_frame(
             .screen
             .as_ref()
             .is_none_or(|screen| screen.draws_over_hud());
+    let tick_alpha = (tick_accumulator / 0.05).clamp(0.0, 1.0);
     if app.in_world {
-        app.game.update_camera(tick_accumulator / 0.05);
-        app.game.advance_animations(frame_dt);
-        let mut model = app.game.build_entity_model(tick_accumulator / 0.05);
+        app.game.update_camera(tick_alpha);
+        let swing = app.game.swing_progress(tick_alpha);
+        let held = app.game.held_item();
+        let mut model = app.game.build_entity_model(tick_alpha);
         if hud_visible {
-            ItemRenderer::render_first_person(
-                &mut model,
-                &app.game.camera,
-                app.game.swing_progress(),
-                app.game.held_item(),
-            );
+            ItemRenderer::render_arm(&mut model, &app.game.camera, swing, held);
+            let (vertices, indices) =
+                ItemRenderer::build_held_item(&app.game.camera, swing, held, atlas_uv);
+            renderer.set_first_person_item(&vertices, &indices);
+        } else {
+            renderer.set_first_person_item(&[], &[]);
         }
         renderer.upload_model(&model);
     } else {
         renderer.upload_model(&recraft_render::ModelMesh::new());
+        renderer.set_first_person_item(&[], &[]);
     }
     // Mining crack overlay (vanilla destroy_stage_N textures over the dig target).
     renderer.set_break_overlay(app.game.breaking_overlay());

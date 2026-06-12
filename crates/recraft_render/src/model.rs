@@ -117,12 +117,14 @@ impl ModelMesh {
         let arc = (swing.sqrt() * pi).sin();
         let pull = (swing * swing * pi).sin();
 
-        // Hand (box center): rest pose at the lower right; the swing raises
-        // it, pushes it forward and pulls it across toward the view center.
+        // Hand (box center): rest pose at the lower right, matching vanilla's
+        // renderPlayerArm anchor (~0.64 right, 0.6 down, 0.72 forward in view
+        // space); the swing raises it, pushes it forward and pulls it across
+        // toward the view center.
         let center = camera.position
-            + forward * (0.52 + 0.18 * arc)
-            + right * (0.42 - 0.32 * pull)
-            + up * (-0.45 + 0.28 * arc);
+            + forward * (0.58 + 0.18 * arc)
+            + right * (0.52 - 0.34 * pull)
+            + up * (-0.54 + 0.30 * arc);
 
         // The forearm's long axis runs from the off-screen elbow (lower
         // right, near the camera) up toward the hand; it rotates with the

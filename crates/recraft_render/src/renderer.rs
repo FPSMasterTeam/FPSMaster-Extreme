@@ -108,6 +108,8 @@ pub struct Renderer<'window> {
     transparent_pipeline: wgpu::RenderPipeline,
     model_pipeline: wgpu::RenderPipeline,
     model_mesh: Option<DynamicMesh>,
+    /// First-person held-item geometry (block-atlas textured), per frame.
+    first_person_item: Option<DynamicMesh>,
     /// Crack overlay over the block being mined (vanilla destroy_stage_N).
     break_overlay: Option<DynamicMesh>,
     last_break_overlay: Option<(i32, i32, i32, u8)>,
@@ -501,6 +503,7 @@ impl<'window> Renderer<'window> {
             transparent_pipeline,
             model_pipeline,
             model_mesh: None,
+            first_person_item: None,
             break_overlay: None,
             last_break_overlay: None,
             entity_bind_group,
@@ -647,6 +650,26 @@ impl<'window> Renderer<'window> {
             bytemuck::cast_slice(&mesh.indices),
             mesh.indices.len() as u32,
             "model",
+        );
+    }
+
+    /// The block/item atlas UV table, for building first-person item geometry.
+    pub fn atlas_uv(&self) -> &AtlasUv {
+        &self.atlas_uv
+    }
+
+    /// Replace the first-person held-item geometry (block-atlas textured
+    /// `Vertex` data), drawn with the cutout pipeline after the world. Pass
+    /// empty slices to hide it.
+    pub fn set_first_person_item(&mut self, vertices: &[Vertex], indices: &[u32]) {
+        fill_dynamic_mesh(
+            &self.device,
+            &self.queue,
+            &mut self.first_person_item,
+            bytemuck::cast_slice(vertices),
+            bytemuck::cast_slice(indices),
+            indices.len() as u32,
+            "first-person-item",
         );
     }
 
@@ -852,6 +875,17 @@ impl<'window> Renderer<'window> {
                 pass.set_vertex_buffer(0, model.vertex_buffer.slice(..));
                 pass.set_index_buffer(model.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..model.index_count, 0, 0..1);
+                draw_calls += 1;
+            }
+
+            // First-person held item, textured from the block/item atlas.
+            if let Some(item) = self.first_person_item.as_ref().filter(|m| m.index_count > 0) {
+                pass.set_pipeline(&self.cutout_pipeline);
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                pass.set_bind_group(1, &self.texture_bind_group, &[]);
+                pass.set_vertex_buffer(0, item.vertex_buffer.slice(..));
+                pass.set_index_buffer(item.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..item.index_count, 0, 0..1);
                 draw_calls += 1;
             }
         }

@@ -143,6 +143,17 @@ impl TextureAtlasImage {
         for color in STAINED_COLORS {
             names.push(format!("glass_pane_top_{color}"));
         }
+        // Item sprites (under textures/items/) join the atlas so the
+        // first-person item renderer can draw real held items; their atlas
+        // names keep the "items/" prefix.
+        let mut seen = std::collections::HashSet::new();
+        for id in (256..432).chain(2256..2268) {
+            if let Some(name) = item_texture_name(id) {
+                if seen.insert(name) {
+                    names.push(format!("items/{name}"));
+                }
+            }
+        }
         for path in candidate_asset_paths() {
             match Self::from_asset_path(path.clone(), &names) {
                 Ok(atlas) => return atlas,
@@ -234,7 +245,13 @@ fn build_atlas(
     for (offset, name) in names.iter().enumerate() {
         let index = offset as u32 + 1;
         name_to_index.insert(name.clone(), index);
-        let asset = format!("assets/minecraft/textures/blocks/{name}.png");
+        // Plain names live under textures/blocks/; names with a path (e.g.
+        // "items/diamond_sword") resolve relative to textures/.
+        let asset = if name.contains('/') {
+            format!("assets/minecraft/textures/{name}.png")
+        } else {
+            format!("assets/minecraft/textures/blocks/{name}.png")
+        };
         if let Some(source) = read(&asset) {
             copy_tile(&mut image, index, source);
             loaded += 1;

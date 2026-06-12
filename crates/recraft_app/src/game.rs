@@ -338,8 +338,13 @@ pub struct GameState {
     previous_sneak_amount: f32,
     sprint_amount: f32,
     previous_sprint_amount: f32,
-    // Seconds remaining in the arm-swing animation (0 == idle).
-    swing_timer: f32,
+    // Vanilla arm-swing state: tick counter through the 6-tick animation,
+    // whether a swing is in progress, and the prev/current 0..1 progress for
+    // partial-tick interpolation (EntityLivingBase.swingProgress).
+    swing_progress_int: i32,
+    is_swinging: bool,
+    swing_progress: f32,
+    prev_swing_progress: f32,
     // Selected hotbar slot, 0..9.
     selected_slot: i32,
     /// The block currently being mined (survival), with accumulated progress.
@@ -380,8 +385,8 @@ struct BreakProgress {
     per_tick: f32,
 }
 
-/// Duration of one hand swing, ~6 ticks like vanilla.
-const SWING_DURATION: f32 = 0.3;
+/// Vanilla arm-swing length in ticks (getArmSwingAnimationEnd, no haste).
+const ARM_SWING_END_TICKS: i32 = 6;
 
 impl GameState {
     pub fn demo(aspect: f32) -> Self {
@@ -439,7 +444,10 @@ impl GameState {
             previous_sneak_amount: 0.0,
             sprint_amount: 0.0,
             previous_sprint_amount: 0.0,
-            swing_timer: 0.0,
+            swing_progress_int: 0,
+            is_swinging: false,
+            swing_progress: 0.0,
+            prev_swing_progress: 0.0,
             selected_slot: 0,
             breaking: None,
             sprinting: false,
@@ -633,6 +641,8 @@ impl GameState {
             self.player.pitch = (self.player.pitch + turn_speed).min(89.0);
         }
 
+        self.update_arm_swing();
+
         // Advance remote-entity interpolation: one lerp step per tick toward
         // the latest server target (vanilla newPosRotationIncrements).
         let player_id = self.player.id;
@@ -745,15 +755,32 @@ impl GameState {
         self.camera.pitch = self.player.pitch;
     }
 
-    /// Start (or restart) the hand-swing animation.
+    /// Start the hand-swing animation (vanilla `swingItem`): a new swing only
+    /// restarts when idle or past the half-way point, so swinging every tick
+    /// while mining yields smooth full swings instead of resetting each tick.
     pub fn swing_arm(&mut self) {
-        self.swing_timer = SWING_DURATION;
+        if !self.is_swinging
+            || self.swing_progress_int >= ARM_SWING_END_TICKS / 2
+            || self.swing_progress_int < 0
+        {
+            self.swing_progress_int = -1;
+            self.is_swinging = true;
+        }
     }
 
-    /// Advance time-based view animations (the hand swing). Called once per
-    /// rendered frame with the real frame delta.
-    pub fn advance_animations(&mut self, dt: f32) {
-        self.swing_timer = (self.swing_timer - dt).max(0.0);
+    /// Per-tick swing stepping (vanilla `updateArmSwingProgress`).
+    fn update_arm_swing(&mut self) {
+        self.prev_swing_progress = self.swing_progress;
+        if self.is_swinging {
+            self.swing_progress_int += 1;
+            if self.swing_progress_int >= ARM_SWING_END_TICKS {
+                self.swing_progress_int = 0;
+                self.is_swinging = false;
+            }
+        } else {
+            self.swing_progress_int = 0;
+        }
+        self.swing_progress = self.swing_progress_int as f32 / ARM_SWING_END_TICKS as f32;
     }
 
     /// Build the per-frame entity model geometry: a textured model per tracked
@@ -783,13 +810,14 @@ impl GameState {
         mesh
     }
 
-    /// Current 0..1 hand-swing progress (0 when idle).
-    pub fn swing_progress(&self) -> f32 {
-        if self.swing_timer > 0.0 {
-            1.0 - self.swing_timer / SWING_DURATION
-        } else {
-            0.0
+    /// Swing progress interpolated between ticks (vanilla `getSwingProgress`
+    /// with its wrap-around handling).
+    pub fn swing_progress(&self, partial_ticks: f32) -> f32 {
+        let mut delta = self.swing_progress - self.prev_swing_progress;
+        if delta < 0.0 {
+            delta += 1.0;
         }
+        self.prev_swing_progress + delta * partial_ticks.clamp(0.0, 1.0)
     }
 
     /// The item in the selected hotbar slot, if any.
@@ -2403,6 +2431,30 @@ mod interaction_tests {
         gs.tick(0.05);
         gs.tick(0.05);
         assert!((x(&gs) - 13.0).abs() < 1.0e-9, "settled on the target");
+    }
+
+    #[test]
+    fn continuous_swinging_cycles_instead_of_pinning_at_the_start() {
+        let mut gs = GameState::demo(1.0);
+        // Swinging every tick (hold-to-mine) must advance through the vanilla
+        // half-cycle (restart allowed past the midpoint), not reset to zero
+        // every tick.
+        let mut max_progress: f32 = 0.0;
+        let mut distinct = std::collections::BTreeSet::new();
+        for _ in 0..12 {
+            gs.swing_arm();
+            gs.tick(0.05);
+            let p = gs.swing_progress(1.0);
+            max_progress = max_progress.max(p);
+            distinct.insert((p * 1000.0) as i32);
+        }
+        // The cycle must reach at least the vanilla midpoint restart (the
+        // wrap-around interpolation passes through 1.0 on the restart tick).
+        assert!(
+            (0.5..=1.0).contains(&max_progress),
+            "swing never progressed: {max_progress}"
+        );
+        assert!(distinct.len() >= 3, "swing progress never animated");
     }
 
     #[test]
