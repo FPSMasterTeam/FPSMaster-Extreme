@@ -478,11 +478,13 @@ impl GameState {
         self.swing_timer = (self.swing_timer - dt).max(0.0);
     }
 
-    /// Build the per-frame model geometry: a textured model per tracked entity
-    /// (a skinned humanoid for players, a colored model for mobs/objects) and,
-    /// when `show_hand` is set, the first-person hand. Entities are drawn even
-    /// while paused/dead so they stay visible behind menu overlays.
-    pub fn build_entity_model(&self, show_hand: bool) -> ModelMesh {
+    /// Build the per-frame entity model geometry: a textured model per tracked
+    /// entity (a skinned humanoid for players, a colored model for mobs and
+    /// objects). Entities are drawn even while paused/dead so they stay
+    /// visible behind menu overlays. The first-person hand/held item is
+    /// appended by [`crate::item_renderer::ItemRenderer`]; the mining crack
+    /// overlay is drawn by the renderer from `breaking_overlay()`.
+    pub fn build_entity_model(&self) -> ModelMesh {
         let mut mesh = ModelMesh::new();
         for entity in self.world.entities() {
             if entity.id == self.player.id {
@@ -498,18 +500,24 @@ impl GameState {
                 entity.yaw,
             );
         }
-        if show_hand {
-            let swing = if self.swing_timer > 0.0 {
-                1.0 - self.swing_timer / SWING_DURATION
-            } else {
-                0.0
-            };
-            // Skin-toned first-person arm.
-            mesh.push_hand(&self.camera, swing, [0.86, 0.71, 0.58, 1.0]);
-        }
-        // The mining crack overlay is drawn by the renderer from
-        // `breaking_overlay()` (textured destroy stages), not as model geometry.
         mesh
+    }
+
+    /// Current 0..1 hand-swing progress (0 when idle).
+    pub fn swing_progress(&self) -> f32 {
+        if self.swing_timer > 0.0 {
+            1.0 - self.swing_timer / SWING_DURATION
+        } else {
+            0.0
+        }
+    }
+
+    /// The item in the selected hotbar slot, if any.
+    pub fn held_item(&self) -> Option<SlotItem> {
+        self.inventory
+            .get(36 + self.selected_slot.clamp(0, 8) as usize)
+            .copied()
+            .flatten()
     }
 
     /// Block-interaction reach: 5.0 in creative, 4.5 otherwise (vanilla

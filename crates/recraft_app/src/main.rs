@@ -1,14 +1,15 @@
 mod auth;
 mod chat;
 mod game;
+mod gui;
+mod item_renderer;
 mod network;
 mod scoreboard;
-mod ui;
+mod servers;
+mod settings;
 
 use std::{
-    cmp::Reverse,
     env,
-    net::IpAddr,
     path::PathBuf,
     sync::mpsc::{self, Receiver},
     time::{Duration, Instant},
@@ -17,10 +18,20 @@ use std::{
 use anyhow::Context;
 use auth::{AuthEvent, Session};
 use game::GameState;
+use gui::accounts::GuiAccounts;
+use gui::chat_screen::GuiChat;
+use gui::game_over::GuiGameOver;
+use gui::ingame::{GuiIngame, HudState};
+use gui::ingame_menu::GuiIngameMenu;
+use gui::inventory::GuiInventory;
+use gui::main_menu::GuiMainMenu;
+use gui::progress::{GuiAuthCode, GuiConnecting, GuiDisconnected, GuiProgress, Parent};
+use gui::{AccountEntry, DrawCtx, GuiAction, GuiScreen, ScreenCtx};
+use item_renderer::ItemRenderer;
 use network::{NetworkEvent, NetworkHandle};
 use recraft_protocol::{net::PremiumSession, v1_8_9::packets::ServerboundPacket};
 use recraft_render::Renderer;
-use ui::{AppScreen, FpsCounter, HudState, Settings, SettingsSlider};
+use settings::{FpsCounter, Settings};
 
 /// Dirty chunks snapshotted and handed to the background mesher each frame. The
 /// snapshot clone is the only main-thread cost; the mesh build runs off-thread.
@@ -31,7 +42,7 @@ use winit::{
     dpi::LogicalSize,
     event::{DeviceEvent, ElementState, Event, MouseButton, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
-    keyboard::{Key, KeyCode, PhysicalKey},
+    keyboard::{KeyCode, PhysicalKey},
     window::{CursorGrabMode, WindowBuilder},
 };
 
@@ -42,6 +53,81 @@ struct LaunchConfig {
     scripted_smoke_seconds: Option<f32>,
     headless_smoke_seconds: Option<f32>,
     headless_interact_seconds: Option<f32>,
+}
+
+/// All mutable application state the screens and actions operate on (the
+/// vanilla `Minecraft` singleton equivalent).
+struct App {
+    game: GameState,
+    network: Option<NetworkHandle>,
+    /// The open screen (`mc.currentScreen`); None = gameplay input.
+    screen: Option<Box<dyn GuiScreen>>,
+    /// Whether a world session (demo or server) is active.
+    in_world: bool,
+    /// Waiting for the server join to finish (first chunks).
+    connecting: bool,
+    settings: Settings,
+    ms_session: Option<Session>,
+    auth_rx: Option<Receiver<AuthEvent>>,
+    accounts: auth::AccountStore,
+    clipboard: Option<arboard::Clipboard>,
+    username: String,
+    quit: bool,
+}
+
+impl App {
+    fn session_username(&self) -> Option<&str> {
+        self.ms_session.as_ref().map(|s| s.username.as_str())
+    }
+
+    fn account_entries(&self) -> Vec<AccountEntry> {
+        self.accounts
+            .accounts
+            .iter()
+            .map(|account| AccountEntry {
+                username: account.username.clone(),
+                uuid: account.uuid.clone(),
+                active: self
+                    .ms_session
+                    .as_ref()
+                    .is_some_and(|session| session.uuid == account.uuid),
+            })
+            .collect()
+    }
+
+    /// Release held movement keys and abort any in-progress dig — called when
+    /// a screen opens over gameplay.
+    fn suspend_gameplay_input(&mut self, left_held: &mut bool) {
+        self.game.input.release_all();
+        *left_held = false;
+        if let Some(packet) = self.game.cancel_breaking() {
+            if let Some(network) = &self.network {
+                network.send_packet(packet);
+            }
+        }
+    }
+
+    /// Start an auth flow and show its progress screen.
+    fn begin_login(&mut self, token: Option<String>) {
+        let (tx, rx) = mpsc::channel();
+        self.auth_rx = Some(rx);
+        match token {
+            Some(token) => {
+                auth::start_login_with_refresh_token(token, tx);
+                self.screen = Some(Box::new(GuiProgress::new(
+                    "Signing in...",
+                    "Redeeming refresh token",
+                )));
+            }
+            None => {
+                auth::start_login(tx);
+                self.screen = Some(Box::new(GuiProgress::new(
+                    "Microsoft Login",
+                    "Contacting Microsoft...",
+                )));
+            }
+        }
+    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -70,42 +156,47 @@ fn main() -> anyhow::Result<()> {
     release_cursor(window);
 
     let mut renderer = pollster::block_on(Renderer::new(window)).context("create renderer")?;
-    let mut settings = Settings::default();
+    let settings = Settings::default();
     renderer.set_vsync(settings.vsync);
+
     let auto_connect = config.server.clone();
     let auto_demo = config.scripted_smoke_seconds.is_some() && auto_connect.is_none();
-    let mut game = if auto_connect.is_some() {
-        GameState::empty_for_server(renderer.aspect())
-    } else {
-        GameState::demo(renderer.aspect())
-    };
-    renderer.upload_world(&game.world);
-
-    // ── Auth state ────────────────────────────────────────────────────────────
-    // The currently logged-in session, if any.
-    let mut ms_session: Option<Session> = None;
-    // Channel receiving auth events from the background login thread.
-    let mut auth_rx: Option<Receiver<AuthEvent>> = None;
-    // Saved accounts (persisted refresh tokens) and the system clipboard.
-    let mut accounts = auth::AccountStore::load();
-    let mut clipboard = arboard::Clipboard::new().ok();
-
     let username = config.username.clone();
-    let mut network = auto_connect.as_ref().map(|(host, port)| {
-        log::info!("connecting to {host}:{port} as {username}");
-        NetworkHandle::connect_offline_1_8_9(host.clone(), *port, username.clone())
-    });
-    let mut screen = if let Some((host, port)) = auto_connect {
-        AppScreen::Connecting { host, port }
-    } else if auto_demo {
-        capture_cursor(window);
-        AppScreen::InGame
-    } else {
-        AppScreen::MainMenu
+
+    let mut app = App {
+        game: if auto_connect.is_some() {
+            GameState::empty_for_server(renderer.aspect())
+        } else {
+            GameState::demo(renderer.aspect())
+        },
+        network: auto_connect.as_ref().map(|(host, port)| {
+            log::info!("connecting to {host}:{port} as {username}");
+            NetworkHandle::connect_offline_1_8_9(host.clone(), *port, username.clone())
+        }),
+        screen: match &auto_connect {
+            Some((host, port)) => Some(Box::new(GuiConnecting {
+                host: host.clone(),
+                port: *port,
+            })),
+            None if auto_demo => None,
+            None => Some(Box::new(GuiMainMenu::new())),
+        },
+        in_world: auto_demo,
+        connecting: auto_connect.is_some(),
+        settings,
+        ms_session: None,
+        auth_rx: None,
+        accounts: auth::AccountStore::load(),
+        clipboard: arboard::Clipboard::new().ok(),
+        username,
+        quit: false,
     };
+    renderer.upload_world(&app.game.world);
+
+    let mut cursor_captured = false;
     let mut cursor_position = (0.0f64, 0.0f64);
-    let mut dragging: Option<SettingsSlider> = None;
-    // Whether the left mouse button is held (drives continuous block mining).
+    let mut mouse_down_left = false;
+    // Whether the left mouse button is held in gameplay (continuous mining).
     let mut left_held = false;
     // Per-tick input intents. Frame events only RECORD intent here; the tick loop
     // turns them into packets in vanilla order (held-item, then click actions, then
@@ -117,11 +208,11 @@ fn main() -> anyhow::Result<()> {
     let mut use_pressed = false;
     let mut slot_select: Option<i32> = None;
     let mut slot_scroll = 0i32;
+    let mut was_dead = false;
 
     let mut last_frame = Instant::now();
     // The physics/network simulation advances on its own wall-clock so it runs
-    // at a fixed 20 Hz regardless of how often the window actually redraws (the
-    // OS throttles redraws for unfocused windows, which must not slow physics).
+    // at a fixed 20 Hz regardless of how often the window actually redraws.
     let mut last_sim = Instant::now();
     let app_start = Instant::now();
     let mut fps_counter = FpsCounter::new(app_start);
@@ -133,648 +224,212 @@ fn main() -> anyhow::Result<()> {
         target.set_control_flow(ControlFlow::Poll);
 
         // ── Poll auth events ────────────────────────────────────────────────
-        {
-            let mut clear_auth = false;
-            if let Some(rx) = &auth_rx {
-                loop {
-                    match rx.try_recv() {
-                        Ok(AuthEvent::DeviceCode {
-                            user_code,
-                            verification_uri,
-                        }) => {
-                            screen = AppScreen::Authenticating {
-                                user_code,
-                                verification_uri,
-                            };
-                        }
-                        Ok(AuthEvent::Status(message)) => {
-                            screen = AppScreen::AuthProgress { message };
-                        }
-                        Ok(AuthEvent::Success(session)) => {
-                            log::info!("MS login success: {} ({})", session.username, session.uuid);
-                            // Persist the (rotated) refresh token for this account.
-                            accounts.record_session(&session);
-                            ms_session = Some(session);
-                            clear_auth = true;
-                            screen = AppScreen::Accounts;
-                            break;
-                        }
-                        Ok(AuthEvent::Failed(err)) => {
-                            log::warn!("MS login failed: {err}");
-                            clear_auth = true;
-                            screen = AppScreen::Error { message: err };
-                            break;
-                        }
-                        Err(_) => break,
-                    }
-                }
-            }
-            if clear_auth {
-                auth_rx = None;
-            }
-        }
+        poll_auth_events(&mut app);
 
         match event {
             Event::WindowEvent { event, window_id } if window_id == window.id() => match event {
                 WindowEvent::CloseRequested => target.exit(),
                 WindowEvent::Resized(size) => {
                     renderer.resize(size);
-                    game.set_aspect(renderer.aspect());
+                    app.game.set_aspect(renderer.aspect());
                 }
                 WindowEvent::KeyboardInput { event, .. } => {
-                    let escape_pressed = event.state == ElementState::Pressed
-                        && matches!(event.physical_key, PhysicalKey::Code(KeyCode::Escape));
-                    if escape_pressed {
-                        match &screen {
-                            AppScreen::InGame => {
-                                screen = AppScreen::Paused;
-                                game.input.release_all();
-                                left_held = false;
-                                if let (Some(packet), Some(network)) =
-                                    (game.cancel_breaking(), &network)
-                                {
-                                    network.send_packet(packet);
-                                }
-                                dragging = None;
-                                release_cursor(window);
-                            }
-                            AppScreen::Paused => {
-                                screen = AppScreen::InGame;
-                                capture_cursor(window);
-                            }
-                            AppScreen::Inventory => {
-                                screen = AppScreen::InGame;
-                                capture_cursor(window);
-                            }
-                            AppScreen::Chat { .. } => {
-                                screen = AppScreen::InGame;
-                                capture_cursor(window);
-                            }
-                            AppScreen::Settings => {
-                                dragging = None;
-                                screen = AppScreen::Paused;
-                            }
-                            AppScreen::ServerSelect { .. } => {
-                                screen = AppScreen::MainMenu;
-                            }
-                            AppScreen::Accounts => {
-                                screen = AppScreen::MainMenu;
-                            }
-                            AppScreen::AddAccountToken { .. } => {
-                                screen = AppScreen::Accounts;
-                            }
-                            _ => {}
-                        }
-                    } else if inventory_key_pressed(&event)
-                        && matches!(screen, AppScreen::InGame | AppScreen::Inventory)
-                    {
-                        // 'E' opens/closes the inventory — but only in-game, so it
-                        // doesn't get swallowed while typing in a text field.
-                        match screen {
-                            AppScreen::InGame => {
-                                screen = AppScreen::Inventory;
-                                game.input.release_all();
-                                left_held = false;
-                                if let (Some(packet), Some(network)) =
-                                    (game.cancel_breaking(), &network)
-                                {
-                                    network.send_packet(packet);
-                                }
-                                release_cursor(window);
-                            }
-                            AppScreen::Inventory => {
-                                screen = AppScreen::InGame;
-                                capture_cursor(window);
-                            }
-                            _ => {}
-                        }
-                    } else if let AppScreen::ServerSelect { ref mut input } = screen {
-                        // Handle text input for the server address field.
-                        if event.state == ElementState::Pressed {
-                            match event.physical_key {
-                                PhysicalKey::Code(KeyCode::Backspace) => {
-                                    input.pop();
-                                }
-                                PhysicalKey::Code(KeyCode::Enter)
-                                | PhysicalKey::Code(KeyCode::NumpadEnter) => {
-                                    let addr = input.clone();
-                                    if !addr.trim().is_empty() {
-                                        let (host, port) = parse_server(&addr)
-                                            .unwrap_or_else(|| ("127.0.0.1".to_owned(), 25565));
-                                        game = GameState::empty_for_server(renderer.aspect());
-                                        renderer.upload_world(&game.world);
-                                        network = Some(start_network(
-                                            host.clone(),
-                                            port,
-                                            &ms_session,
-                                            &username,
-                                        ));
-                                        screen = AppScreen::Connecting { host, port };
-                                        release_cursor(window);
-                                    }
-                                }
-                                _ => {
-                                    // Append printable characters.
-                                    if let Key::Character(s) = &event.logical_key {
-                                        for c in s.chars() {
-                                            if !c.is_control() {
-                                                input.push(c);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    } else if let AppScreen::AddAccountToken { ref mut input } = screen {
-                        // Refresh-token entry (usually pre-filled from the clipboard).
-                        if event.state == ElementState::Pressed {
-                            match event.physical_key {
-                                PhysicalKey::Code(KeyCode::Backspace) => {
-                                    input.pop();
-                                }
-                                PhysicalKey::Code(KeyCode::Enter)
-                                | PhysicalKey::Code(KeyCode::NumpadEnter) => {
-                                    let token = input.trim().to_owned();
-                                    if !token.is_empty() {
-                                        let (tx, rx) = mpsc::channel();
-                                        auth_rx = Some(rx);
-                                        auth::start_login_with_refresh_token(token, tx);
-                                        screen = AppScreen::Accounts;
-                                    }
-                                }
-                                _ => {
-                                    if let Key::Character(s) = &event.logical_key {
-                                        for c in s.chars() {
-                                            if !c.is_control() {
-                                                input.push(c);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    } else if let AppScreen::Chat { ref mut input } = screen {
-                        // Chat box: type, recall history, send with Enter.
-                        if event.state == ElementState::Pressed {
-                            match event.physical_key {
-                                PhysicalKey::Code(KeyCode::Backspace) => {
-                                    input.pop();
-                                }
-                                PhysicalKey::Code(KeyCode::Enter)
-                                | PhysicalKey::Code(KeyCode::NumpadEnter) => {
-                                    let message = input.trim().to_owned();
-                                    if !message.is_empty() {
-                                        game.chat.record_sent(message.clone());
-                                        match &network {
-                                            Some(network) => network.send_packet(
-                                                ServerboundPacket::ChatMessage { message },
-                                            ),
-                                            None => {
-                                                // Demo world: echo locally so the
-                                                // chat box stays usable offline.
-                                                let name = ms_session
-                                                    .as_deref()
-                                                    .unwrap_or(&username)
-                                                    .to_owned();
-                                                game.chat
-                                                    .push_message(format!("<{name}> {message}"));
-                                            }
-                                        }
-                                    }
-                                    screen = AppScreen::InGame;
-                                    capture_cursor(window);
-                                }
-                                PhysicalKey::Code(KeyCode::ArrowUp) => {
-                                    if let Some(previous) = game.chat.recall_previous() {
-                                        *input = previous;
-                                    }
-                                }
-                                PhysicalKey::Code(KeyCode::ArrowDown) => {
-                                    if let Some(next) = game.chat.recall_next() {
-                                        *input = next;
-                                    }
-                                }
-                                // Space arrives as Key::Named(Space), not as a
-                                // Character — handle it explicitly.
-                                PhysicalKey::Code(KeyCode::Space) => {
-                                    if input.chars().count() < chat::MAX_CHAT_INPUT {
-                                        input.push(' ');
-                                    }
-                                }
-                                _ => {
-                                    if let Key::Character(s) = &event.logical_key {
-                                        for c in s.chars() {
-                                            if !c.is_control()
-                                                && input.chars().count() < chat::MAX_CHAT_INPUT
-                                            {
-                                                input.push(c);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    } else if matches!(screen, AppScreen::InGame) {
-                        // Hotbar number keys (1-9) request a slot; the actual
-                        // HeldItemChange is sent inside the tick (before the flying
-                        // packet). Everything else is movement/look input.
-                        if let Some(slot) = hotbar_slot_key(&event) {
-                            slot_select = Some(slot);
-                        } else if let Some(prefill) = chat_open_key(&event) {
-                            // T or '/' opens the chat box; the world keeps running
-                            // but movement keys release and mining stops.
-                            screen = AppScreen::Chat { input: prefill };
-                            game.input.release_all();
-                            left_held = false;
-                            if let (Some(packet), Some(network)) =
-                                (game.cancel_breaking(), &network)
-                            {
-                                network.send_packet(packet);
-                            }
-                            game.chat.reset_recall();
-                            release_cursor(window);
+                    if app.screen.is_some() {
+                        // Screen input: route through the screen, collect actions.
+                        let mut taken = app.screen.take();
+                        let actions = if let Some(screen) = taken.as_mut() {
+                            let mut ctx = ScreenCtx {
+                                game: &mut app.game,
+                                settings: &mut app.settings,
+                                clipboard: app.clipboard.as_mut(),
+                            };
+                            screen.key_pressed(&event, &mut ctx)
                         } else {
-                            game.input.handle_key(event);
+                            Vec::new()
+                        };
+                        app.screen = taken;
+                        handle_actions(&mut app, &mut renderer, actions);
+                    } else if app.in_world {
+                        // Gameplay input.
+                        let pressed = event.state == ElementState::Pressed;
+                        if pressed
+                            && matches!(event.physical_key, PhysicalKey::Code(KeyCode::Escape))
+                        {
+                            app.suspend_gameplay_input(&mut left_held);
+                            app.screen = Some(Box::new(GuiIngameMenu::new()));
+                        } else if pressed
+                            && matches!(event.physical_key, PhysicalKey::Code(KeyCode::KeyE))
+                        {
+                            app.suspend_gameplay_input(&mut left_held);
+                            app.screen = Some(Box::new(GuiInventory::new()));
+                        } else if let Some(prefill) = chat_open_key(&event) {
+                            app.suspend_gameplay_input(&mut left_held);
+                            app.game.chat.reset_recall();
+                            app.screen = Some(Box::new(GuiChat::new(prefill)));
+                        } else if let Some(slot) = hotbar_slot_key(&event) {
+                            slot_select = Some(slot);
+                        } else {
+                            app.game.input.handle_key(event);
                         }
                     }
+                    sync_cursor(window, &mut cursor_captured, &app);
                 }
                 WindowEvent::MouseWheel { delta, .. } => {
-                    if matches!(screen, AppScreen::InGame) {
+                    let steps = match delta {
+                        winit::event::MouseScrollDelta::LineDelta(_, y) => y,
+                        winit::event::MouseScrollDelta::PixelDelta(pos) => pos.y as f32,
+                    };
+                    if let Some(screen) = app.screen.as_mut() {
+                        screen.mouse_scrolled(steps);
+                    } else if app.in_world {
                         // Scroll wheel cycles the hotbar (down = next slot); the
                         // packet is sent inside the tick.
-                        let steps = match delta {
-                            winit::event::MouseScrollDelta::LineDelta(_, y) => -y.signum() as i32,
-                            winit::event::MouseScrollDelta::PixelDelta(pos) => {
-                                -(pos.y.signum() as i32)
-                            }
-                        };
-                        slot_scroll += steps;
+                        slot_scroll += -steps.signum() as i32;
                     }
                 }
                 WindowEvent::CursorMoved { position, .. } => {
                     cursor_position = (position.x, position.y);
-                    if let (AppScreen::Settings, Some(slider)) = (&screen, dragging) {
-                        let controls = ui::settings_controls(window.inner_size());
-                        match slider {
-                            SettingsSlider::Sensitivity => settings.set_sensitivity_from01(
-                                ui::slider_fraction(controls.sensitivity, position.x),
-                            ),
-                            SettingsSlider::FpsCap => settings
-                                .set_fps_from01(ui::slider_fraction(controls.fps_cap, position.x)),
+                    if mouse_down_left {
+                        let mut taken = app.screen.take();
+                        if let Some(screen) = taken.as_mut() {
+                            let mut ctx = ScreenCtx {
+                                game: &mut app.game,
+                                settings: &mut app.settings,
+                                clipboard: app.clipboard.as_mut(),
+                            };
+                            screen.mouse_dragged(position.x, position.y, &mut ctx);
                         }
+                        app.screen = taken;
                     }
                 }
                 WindowEvent::MouseInput { state, button, .. } => {
                     if state == ElementState::Released {
-                        dragging = None;
                         if button == MouseButton::Left {
+                            mouse_down_left = false;
                             left_held = false;
-                            // Record the release; the cancel-dig packet (if any) is
-                            // sent inside the tick, before the flying packet.
-                            if matches!(screen, AppScreen::InGame) {
+                            if let Some(screen) = app.screen.as_mut() {
+                                screen.mouse_released(cursor_position.0, cursor_position.1);
+                            } else if app.in_world {
+                                // Record the release; the cancel-dig packet (if
+                                // any) is sent inside the tick.
                                 attack_released = true;
                             }
                         }
-                    } else {
-                        match &screen.clone() {
-                            AppScreen::MainMenu => {
-                                let buttons = ui::menu_buttons(window.inner_size());
-                                let (cx, cy) = cursor_position;
-                                if buttons.login.contains(cx, cy) {
-                                    // Open the account-management screen.
-                                    screen = AppScreen::Accounts;
-                                } else if buttons.demo.contains(cx, cy) {
-                                    network = None;
-                                    game = GameState::demo(renderer.aspect());
-                                    renderer.upload_world(&game.world);
-                                    screen = AppScreen::InGame;
-                                    capture_cursor(window);
-                                } else if buttons.multiplayer.contains(cx, cy) {
-                                    screen = AppScreen::ServerSelect {
-                                        input: String::new(),
-                                    };
-                                } else if buttons.quit.contains(cx, cy) {
-                                    target.exit();
-                                }
-                            }
-                            AppScreen::ServerSelect { input } => {
-                                let btns = ui::server_select_buttons(window.inner_size());
-                                let (cx, cy) = cursor_position;
-                                if btns.join.contains(cx, cy) {
-                                    let addr = input.clone();
-                                    if !addr.trim().is_empty() {
-                                        let (host, port) = parse_server(&addr)
-                                            .unwrap_or_else(|| ("127.0.0.1".to_owned(), 25565));
-                                        game = GameState::empty_for_server(renderer.aspect());
-                                        renderer.upload_world(&game.world);
-                                        network = Some(start_network(
-                                            host.clone(),
-                                            port,
-                                            &ms_session,
-                                            &username,
-                                        ));
-                                        screen = AppScreen::Connecting { host, port };
-                                        release_cursor(window);
-                                    }
-                                } else if btns.back.contains(cx, cy) {
-                                    screen = AppScreen::MainMenu;
-                                }
-                            }
-                            AppScreen::Error { .. } => {
-                                let buttons = ui::error_buttons(window.inner_size());
-                                if buttons.back.contains(cursor_position.0, cursor_position.1) {
-                                    network = None;
-                                    game = GameState::demo(renderer.aspect());
-                                    renderer.upload_world(&game.world);
-                                    screen = AppScreen::MainMenu;
-                                    release_cursor(window);
-                                }
-                            }
-                            AppScreen::Paused => {
-                                let buttons = ui::pause_buttons(window.inner_size());
-                                if buttons
-                                    .resume
-                                    .contains(cursor_position.0, cursor_position.1)
-                                {
-                                    screen = AppScreen::InGame;
-                                    capture_cursor(window);
-                                } else if buttons
-                                    .settings
-                                    .contains(cursor_position.0, cursor_position.1)
-                                {
-                                    screen = AppScreen::Settings;
-                                } else if buttons
-                                    .quit
-                                    .contains(cursor_position.0, cursor_position.1)
-                                {
-                                    network = None;
-                                    game = GameState::demo(renderer.aspect());
-                                    renderer.upload_world(&game.world);
-                                    screen = AppScreen::MainMenu;
-                                }
-                            }
-                            AppScreen::Settings => {
-                                let controls = ui::settings_controls(window.inner_size());
-                                let (cx, cy) = cursor_position;
-                                if controls.sensitivity.contains(cx, cy) {
-                                    settings.set_sensitivity_from01(ui::slider_fraction(
-                                        controls.sensitivity,
-                                        cx,
-                                    ));
-                                    dragging = Some(SettingsSlider::Sensitivity);
-                                } else if controls.fps_cap.contains(cx, cy) {
-                                    settings
-                                        .set_fps_from01(ui::slider_fraction(controls.fps_cap, cx));
-                                    dragging = Some(SettingsSlider::FpsCap);
-                                } else if controls.vsync.contains(cx, cy) {
-                                    settings.vsync = !settings.vsync;
-                                    renderer.set_vsync(settings.vsync);
-                                } else if controls.done.contains(cx, cy) {
-                                    screen = AppScreen::Paused;
-                                }
-                            }
-                            AppScreen::InGame => {
-                                // Keep the pointer grabbed and run the click as
-                                // an interaction. Left = attack/dig, right = use.
-                                capture_cursor(window);
-                                // Record the click edge; the tick turns it into the
-                                // dig/use packets in vanilla order.
-                                match button {
-                                    MouseButton::Left => {
-                                        left_held = true;
-                                        attack_pressed = true;
-                                    }
-                                    MouseButton::Right => use_pressed = true,
-                                    _ => {}
-                                }
-                            }
-                            AppScreen::Dead => {
-                                let buttons = ui::dead_buttons(window.inner_size());
-                                if buttons
-                                    .respawn
-                                    .contains(cursor_position.0, cursor_position.1)
-                                {
-                                    // Ask the server to respawn us and return to
-                                    // the world (the world is already loaded).
-                                    game.request_respawn();
-                                    screen = AppScreen::InGame;
-                                    capture_cursor(window);
-                                } else if buttons
-                                    .title
-                                    .contains(cursor_position.0, cursor_position.1)
-                                {
-                                    network = None;
-                                    game = GameState::demo(renderer.aspect());
-                                    renderer.upload_world(&game.world);
-                                    screen = AppScreen::MainMenu;
-                                    release_cursor(window);
-                                }
-                            }
-                            AppScreen::Accounts => {
-                                let (cx, cy) = cursor_position;
-                                let btns = ui::account_buttons(
-                                    window.inner_size(),
-                                    accounts.accounts.len(),
-                                );
-                                if btns.add_microsoft.contains(cx, cy) {
-                                    // Interactive device-code login.
-                                    let (tx, rx) = mpsc::channel();
-                                    auth_rx = Some(rx);
-                                    auth::start_login(tx);
-                                } else if btns.add_token.contains(cx, cy) {
-                                    // Pre-fill the token field from the clipboard.
-                                    let input = clipboard
-                                        .as_mut()
-                                        .and_then(|c| c.get_text().ok())
-                                        .map(|t| t.trim().to_owned())
-                                        .unwrap_or_default();
-                                    screen = AppScreen::AddAccountToken { input };
-                                } else if btns.copy_token.contains(cx, cy) {
-                                    // Copy the latest (active) refresh token.
-                                    let token = ms_session
-                                        .as_ref()
-                                        .and_then(|s| s.refresh_token.clone())
-                                        .or_else(|| {
-                                            accounts
-                                                .accounts
-                                                .first()
-                                                .map(|a| a.refresh_token.clone())
-                                        });
-                                    if let (Some(token), Some(cb)) = (token, clipboard.as_mut()) {
-                                        if cb.set_text(token).is_ok() {
-                                            log::info!("copied refresh token to clipboard");
-                                        }
-                                    }
-                                } else if btns.back.contains(cx, cy) {
-                                    screen = AppScreen::MainMenu;
-                                } else {
-                                    // Per-account USE / DEL buttons.
-                                    for (i, row) in btns.rows.iter().enumerate() {
-                                        if row.use_btn.contains(cx, cy) {
-                                            if let Some(acc) = accounts.accounts.get(i) {
-                                                let (tx, rx) = mpsc::channel();
-                                                auth_rx = Some(rx);
-                                                auth::start_login_with_refresh_token(
-                                                    acc.refresh_token.clone(),
-                                                    tx,
-                                                );
-                                            }
-                                            break;
-                                        }
-                                        if row.remove_btn.contains(cx, cy) {
-                                            if let Some(acc) = accounts.accounts.get(i) {
-                                                let uuid = acc.uuid.clone();
-                                                accounts.remove(&uuid);
-                                                accounts.save();
-                                            }
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                            AppScreen::AddAccountToken { input } => {
-                                let (cx, cy) = cursor_position;
-                                let btns = ui::add_token_buttons(window.inner_size());
-                                if btns.add.contains(cx, cy) {
-                                    let token = input.trim().to_owned();
-                                    if !token.is_empty() {
-                                        let (tx, rx) = mpsc::channel();
-                                        auth_rx = Some(rx);
-                                        auth::start_login_with_refresh_token(token, tx);
-                                        screen = AppScreen::Accounts;
-                                    }
-                                } else if btns.back.contains(cx, cy) {
-                                    screen = AppScreen::Accounts;
-                                }
-                            }
-                            // The inventory is display-only; clicks don't move items.
-                            AppScreen::Inventory => {}
-                            // Clicks don't interact while the chat box is open.
-                            AppScreen::Chat { .. } => {}
-                            AppScreen::Connecting { .. }
-                            | AppScreen::LoadingWorld { .. }
-                            | AppScreen::Authenticating { .. }
-                            | AppScreen::AuthProgress { .. } => {}
+                    } else if app.screen.is_some() {
+                        if button == MouseButton::Left {
+                            mouse_down_left = true;
+                            let mut taken = app.screen.take();
+                            let actions = if let Some(screen) = taken.as_mut() {
+                                let mut ctx = ScreenCtx {
+                                    game: &mut app.game,
+                                    settings: &mut app.settings,
+                                    clipboard: app.clipboard.as_mut(),
+                                };
+                                screen.mouse_clicked(
+                                    cursor_position.0,
+                                    cursor_position.1,
+                                    &mut ctx,
+                                )
+                            } else {
+                                Vec::new()
+                            };
+                            app.screen = taken;
+                            handle_actions(&mut app, &mut renderer, actions);
+                            sync_cursor(window, &mut cursor_captured, &app);
                         }
+                    } else if app.in_world {
+                        // Record the click edge; the tick turns it into the
+                        // dig/use packets in vanilla order.
+                        match button {
+                            MouseButton::Left => {
+                                mouse_down_left = true;
+                                left_held = true;
+                                attack_pressed = true;
+                            }
+                            MouseButton::Right => use_pressed = true,
+                            _ => {}
+                        }
+                        sync_cursor(window, &mut cursor_captured, &app);
                     }
                 }
                 WindowEvent::RedrawRequested => {
-                    // Rendering is driven from AboutToWait (see `render_frame`) so
-                    // the frame rate isn't pinned to the display refresh by macOS
-                    // Core Animation throttling RedrawRequested.
+                    // Rendering is driven from AboutToWait (see `render_frame`).
                 }
                 _ => {}
             },
             Event::DeviceEvent {
                 event: DeviceEvent::MouseMotion { delta },
                 ..
-            } if matches!(screen, AppScreen::InGame) => {
-                game.rotate_view(delta.0 as f32, delta.1 as f32, settings.mouse_factor())
-            }
+            } if app.in_world && app.screen.is_none() => app.game.rotate_view(
+                delta.0 as f32,
+                delta.1 as f32,
+                app.settings.mouse_factor(),
+            ),
             Event::AboutToWait => {
-                // --- Simulation step: network + physics at a fixed 20 Hz. ---
-                if let Some(network) = &network {
-                    // Process a bounded number of packets per iteration so the
-                    // chunk-data burst on join can't stall the loop for seconds;
-                    // the rest drain on following iterations.
-                    let mut packet_budget = 64;
-                    while packet_budget > 0 {
-                        match network.events.try_recv() {
-                            Ok(NetworkEvent::Connected { username, uuid }) => {
-                                log::info!("logged in as {username} ({uuid})");
-                                if let AppScreen::Connecting { host, port } = &screen {
-                                    screen = AppScreen::LoadingWorld {
-                                        host: host.clone(),
-                                        port: *port,
-                                    };
-                                }
-                            }
-                            Ok(NetworkEvent::PlayPacket(packet)) => {
-                                game.apply_play_packet(packet);
-                                packet_budget -= 1;
-                                if matches!(screen, AppScreen::LoadingWorld { .. })
-                                    && game.loaded_chunk_count() > 0
-                                {
-                                    screen = AppScreen::InGame;
-                                    capture_cursor(window);
-                                }
-                            }
-                            Ok(NetworkEvent::ChunkColumn { x, z, column }) => {
-                                game.apply_chunk_column(x, z, &column);
-                                packet_budget -= 1;
-                                if matches!(screen, AppScreen::LoadingWorld { .. })
-                                    && game.loaded_chunk_count() > 0
-                                {
-                                    screen = AppScreen::InGame;
-                                    capture_cursor(window);
-                                }
-                            }
-                            Ok(NetworkEvent::ChunkUnload { x, z }) => {
-                                game.unload_chunk(x, z);
-                            }
-                            Ok(NetworkEvent::Disconnected(message)) => {
-                                log::warn!("network disconnected: {message}");
-                                screen = AppScreen::Error { message };
-                                release_cursor(window);
-                            }
-                            Err(_) => break,
-                        }
-                    }
+                // --- Network event pump (bounded per iteration). ---
+                pump_network(&mut app, window, &mut cursor_captured);
+
+                // Per-frame screen upkeep (ping results, auto-close).
+                let mut taken = app.screen.take();
+                let actions = if let Some(screen) = taken.as_mut() {
+                    let mut ctx = ScreenCtx {
+                        game: &mut app.game,
+                        settings: &mut app.settings,
+                        clipboard: app.clipboard.as_mut(),
+                    };
+                    screen.update(&mut ctx)
+                } else {
+                    Vec::new()
+                };
+                app.screen = taken;
+                handle_actions(&mut app, &mut renderer, actions);
+
+                // Scripted runs auto-respawn so the smoke driver keeps moving.
+                if scripted_smoke_seconds.is_some() && app.game.is_dead() {
+                    app.game.request_respawn();
                 }
 
-                // Scripted runs auto-respawn so the smoke driver keeps moving;
-                // interactive play shows the death screen and waits for a click.
-                if scripted_smoke_seconds.is_some() && game.is_dead() {
-                    game.request_respawn();
-                }
-
-                // Enter the death screen when the server reports we died, and
-                // leave it once we're alive again (clicked respawn or revived).
-                if game.is_dead() && matches!(screen, AppScreen::InGame | AppScreen::Chat { .. }) {
-                    screen = AppScreen::Dead;
-                    game.input.release_all();
-                    left_held = false;
-                    if let (Some(packet), Some(network)) = (game.cancel_breaking(), &network) {
-                        network.send_packet(packet);
+                // Death screen on the rising edge (gameplay or chat overlay).
+                let dead = app.in_world && app.game.is_dead();
+                if dead && !was_dead {
+                    let interruptible = app
+                        .screen
+                        .as_ref()
+                        .is_none_or(|screen| screen.chat_input().is_some());
+                    if interruptible {
+                        app.screen = Some(Box::new(GuiGameOver::new()));
                     }
-                    release_cursor(window);
-                } else if !game.is_dead() && matches!(screen, AppScreen::Dead) {
-                    screen = AppScreen::InGame;
-                    capture_cursor(window);
                 }
+                was_dead = dead;
 
                 // If we asked to respawn, tell the server — a dead player is
                 // frozen server-side and cannot move until it respawns.
-                if game.take_respawn_request() {
-                    if let Some(network) = &network {
+                if app.game.take_respawn_request() {
+                    if let Some(network) = &app.network {
                         network.send_packet(ServerboundPacket::ClientStatus { action: 0 });
                     }
                 }
 
-                // Teleport acks are now sent synchronously by the network thread
-                // (in packet order); just drain the game-side pending flag.
-                let _ = game.take_position_confirm();
+                // Teleport acks are sent synchronously by the network thread;
+                // just drain the game-side pending flag.
+                let _ = app.game.take_position_confirm();
 
                 let now = Instant::now();
                 let sim_dt = (now - last_sim).as_secs_f32().min(0.25);
                 last_sim = now;
                 if let Some(seconds) = scripted_smoke_seconds {
-                    game.apply_scripted_smoke_input((now - app_start).as_secs_f32(), seconds);
+                    app.game
+                        .apply_scripted_smoke_input((now - app_start).as_secs_f32(), seconds);
                 }
-                // The world keeps ticking (and reporting movement) while the
-                // chat box is open, exactly like vanilla.
-                if matches!(screen, AppScreen::InGame | AppScreen::Chat { .. }) {
+                // The world keeps ticking (and reporting movement) while any
+                // overlay screen is open, exactly like vanilla multiplayer.
+                if app.in_world {
                     tick_accumulator += sim_dt;
                     while tick_accumulator >= 0.05 {
                         // `None` on the teleport-ack tick: hold, send no movement.
-                        if let Some(movement) = game.tick(0.05) {
-                            // Build this tick's gameplay packets in vanilla order
-                            // (held-item, then click actions) using the tick's
-                            // player state, then the flying packet last — mirroring
-                            // runTick → onUpdateWalkingPlayer. The edges are consumed
-                            // once; while held, mining continues via on_attack_hold.
+                        if let Some(movement) = app.game.tick(0.05) {
                             let actions = collect_tick_actions(
-                                &mut game,
+                                &mut app.game,
                                 slot_select.take(),
                                 &mut slot_scroll,
                                 &mut attack_pressed,
@@ -782,8 +437,8 @@ fn main() -> anyhow::Result<()> {
                                 &mut use_pressed,
                                 left_held,
                             );
-                            if let Some(network) = &network {
-                                if game.can_send_movement_packets() {
+                            if let Some(network) = &app.network {
+                                if app.game.can_send_movement_packets() {
                                     for packet in actions {
                                         network.send_packet(packet);
                                     }
@@ -803,30 +458,13 @@ fn main() -> anyhow::Result<()> {
                     target.exit();
                 }
 
+                if app.quit {
+                    target.exit();
+                }
+                sync_cursor(window, &mut cursor_captured, &app);
+
                 // --- Render + pacing. ---
-                // Render here (not from RedrawRequested) so the frame rate is
-                // paced by our cap / present mode, not pinned to the display
-                // refresh. Enforce a finite cap with an explicit sleep and keep
-                // ControlFlow::Poll, rather than ControlFlow::WaitUntil: on macOS
-                // the run-loop timer behind WaitUntil gets coalesced with the
-                // display vblank, which intermittently re-pins FPS to the refresh
-                // rate (the "sometimes capped at 60" symptom).
-                let session_username = ms_session.as_deref();
-                // Only the accounts screen needs the account list; build it lazily.
-                let account_entries: Vec<ui::AccountEntry> =
-                    if matches!(screen, AppScreen::Accounts) {
-                        accounts
-                            .accounts
-                            .iter()
-                            .map(|a| ui::AccountEntry {
-                                username: a.username.clone(),
-                                active: ms_session.as_ref().is_some_and(|s| s.uuid == a.uuid),
-                            })
-                            .collect()
-                    } else {
-                        Vec::new()
-                    };
-                if let Some(cap) = settings.fps_limit() {
+                if let Some(cap) = app.settings.fps_limit() {
                     let deadline = last_frame + Duration::from_secs_f64(1.0 / cap as f64);
                     let now = Instant::now();
                     if now < deadline {
@@ -835,15 +473,13 @@ fn main() -> anyhow::Result<()> {
                 }
                 render_frame(
                     &mut renderer,
-                    &mut game,
+                    &mut app,
                     window,
-                    &screen,
-                    &settings,
                     &mut fps_counter,
                     &mut last_frame,
                     tick_accumulator,
-                    session_username,
-                    &account_entries,
+                    cursor_position,
+                    mouse_down_left,
                 );
                 target.set_control_flow(ControlFlow::Poll);
             }
@@ -854,23 +490,224 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Render one frame. Driven from `AboutToWait` rather than `RedrawRequested` so
-/// the frame rate is paced by our own vsync/FPS-cap logic instead of being
-/// pinned to the display refresh by macOS Core Animation (which throttles
-/// `RedrawRequested`). This is what lets vsync-off / a raised cap exceed the
-/// display's refresh rate.
+/// Apply screen actions to the application (navigation, connects, auth, …).
+fn handle_actions(app: &mut App, renderer: &mut Renderer, actions: Vec<GuiAction>) {
+    for action in actions {
+        match action {
+            GuiAction::SetScreen(screen) => app.screen = Some(screen),
+            GuiAction::CloseScreen => {
+                if app.in_world {
+                    app.screen = None;
+                } else {
+                    app.screen = Some(Box::new(GuiMainMenu::new()));
+                }
+            }
+            GuiAction::StartDemo => {
+                app.network = None;
+                app.connecting = false;
+                app.game = GameState::demo(renderer.aspect());
+                renderer.upload_world(&app.game.world);
+                app.in_world = true;
+                app.screen = None;
+            }
+            GuiAction::Connect { host, port } => {
+                app.game = GameState::empty_for_server(renderer.aspect());
+                renderer.upload_world(&app.game.world);
+                app.network = Some(start_network(
+                    host.clone(),
+                    port,
+                    &app.ms_session,
+                    &app.username,
+                ));
+                app.connecting = true;
+                app.in_world = false;
+                app.screen = Some(Box::new(GuiConnecting { host, port }));
+            }
+            GuiAction::QuitToTitle => {
+                app.network = None;
+                app.connecting = false;
+                app.in_world = false;
+                app.game = GameState::demo(renderer.aspect());
+                renderer.upload_world(&app.game.world);
+                app.screen = Some(Box::new(GuiMainMenu::new()));
+            }
+            GuiAction::Quit => app.quit = true,
+            GuiAction::SendChat(message) => {
+                app.game.chat.record_sent(message.clone());
+                match &app.network {
+                    Some(network) => {
+                        network.send_packet(ServerboundPacket::ChatMessage { message })
+                    }
+                    None => {
+                        // Demo world: echo locally so the chat stays usable.
+                        let name = app
+                            .session_username()
+                            .unwrap_or(&app.username)
+                            .to_owned();
+                        app.game.chat.push_message(format!("<{name}> {message}"));
+                    }
+                }
+            }
+            GuiAction::RequestRespawn => app.game.request_respawn(),
+            GuiAction::StartMicrosoftLogin => app.begin_login(None),
+            GuiAction::LoginWithToken(token) => app.begin_login(Some(token)),
+            GuiAction::UseAccount(uuid) => {
+                let token = app
+                    .accounts
+                    .accounts
+                    .iter()
+                    .find(|account| account.uuid == uuid)
+                    .map(|account| account.refresh_token.clone());
+                if let Some(token) = token {
+                    app.begin_login(Some(token));
+                }
+            }
+            GuiAction::RemoveAccount(uuid) => {
+                app.accounts.remove(&uuid);
+                app.accounts.save();
+            }
+            GuiAction::CopyActiveToken => {
+                let token = app
+                    .ms_session
+                    .as_ref()
+                    .and_then(|session| session.refresh_token.clone())
+                    .or_else(|| {
+                        app.accounts
+                            .accounts
+                            .first()
+                            .map(|account| account.refresh_token.clone())
+                    });
+                if let (Some(token), Some(clipboard)) = (token, app.clipboard.as_mut()) {
+                    if clipboard.set_text(token).is_ok() {
+                        log::info!("copied refresh token to clipboard");
+                    }
+                }
+            }
+            GuiAction::SetVsync(on) => renderer.set_vsync(on),
+        }
+    }
+}
+
+/// Drain auth-thread events into screen transitions.
+fn poll_auth_events(app: &mut App) {
+    let Some(rx) = &app.auth_rx else { return };
+    let mut clear = false;
+    loop {
+        match rx.try_recv() {
+            Ok(AuthEvent::DeviceCode {
+                user_code,
+                verification_uri,
+            }) => {
+                app.screen = Some(Box::new(GuiAuthCode {
+                    user_code,
+                    verification_uri,
+                }));
+            }
+            Ok(AuthEvent::Status(message)) => {
+                app.screen = Some(Box::new(GuiProgress::new("Signing in...", message)));
+            }
+            Ok(AuthEvent::Success(session)) => {
+                log::info!("MS login success: {} ({})", session.username, session.uuid);
+                app.accounts.record_session(&session);
+                app.ms_session = Some(session);
+                app.screen = Some(Box::new(GuiAccounts::new()));
+                clear = true;
+                break;
+            }
+            Ok(AuthEvent::Failed(err)) => {
+                log::warn!("MS login failed: {err}");
+                app.screen = Some(Box::new(GuiDisconnected::new(
+                    "Login Failed",
+                    err,
+                    Parent::Accounts,
+                )));
+                clear = true;
+                break;
+            }
+            Err(_) => break,
+        }
+    }
+    if clear {
+        app.auth_rx = None;
+    }
+}
+
+/// Process a bounded number of network events per iteration so the join-time
+/// chunk burst can't stall the loop; the rest drain on following iterations.
+fn pump_network(app: &mut App, window: &winit::window::Window, cursor_captured: &mut bool) {
+    let Some(network) = &app.network else { return };
+    let mut packet_budget = 64;
+    let mut disconnect: Option<String> = None;
+    while packet_budget > 0 {
+        match network.events.try_recv() {
+            Ok(NetworkEvent::Connected { username, uuid }) => {
+                log::info!("logged in as {username} ({uuid})");
+            }
+            Ok(NetworkEvent::PlayPacket(packet)) => {
+                app.game.apply_play_packet(packet);
+                packet_budget -= 1;
+            }
+            Ok(NetworkEvent::ChunkColumn { x, z, column }) => {
+                app.game.apply_chunk_column(x, z, &column);
+                packet_budget -= 1;
+            }
+            Ok(NetworkEvent::ChunkUnload { x, z }) => {
+                app.game.unload_chunk(x, z);
+            }
+            Ok(NetworkEvent::Disconnected(message)) => {
+                log::warn!("network disconnected: {message}");
+                disconnect = Some(message);
+                break;
+            }
+            Err(_) => break,
+        }
+    }
+
+    if let Some(message) = disconnect {
+        app.network = None;
+        app.in_world = false;
+        app.connecting = false;
+        app.screen = Some(Box::new(GuiDisconnected::new(
+            "Connection Lost",
+            message,
+            Parent::Multiplayer,
+        )));
+    } else if app.connecting && app.game.loaded_chunk_count() > 0 {
+        // World data has arrived: enter gameplay.
+        app.connecting = false;
+        app.in_world = true;
+        app.screen = None;
+    }
+    sync_cursor(window, cursor_captured, app);
+}
+
+/// Keep the OS cursor grab in sync: captured exactly while playing with no
+/// screen open.
+fn sync_cursor(window: &winit::window::Window, captured: &mut bool, app: &App) {
+    let want = app.in_world && app.screen.is_none();
+    if want != *captured {
+        if want {
+            capture_cursor(window);
+        } else {
+            release_cursor(window);
+        }
+        *captured = want;
+    }
+}
+
+/// Render one frame: world, entities + first-person hand, HUD and the open
+/// screen. Driven from `AboutToWait` so the frame rate is paced by our own
+/// vsync/FPS-cap logic instead of macOS Core Animation throttling.
 #[allow(clippy::too_many_arguments)]
 fn render_frame(
     renderer: &mut Renderer,
-    game: &mut GameState,
+    app: &mut App,
     window: &winit::window::Window,
-    screen: &AppScreen,
-    settings: &Settings,
     fps_counter: &mut FpsCounter,
     last_frame: &mut Instant,
     tick_accumulator: f32,
-    session_username: Option<&str>,
-    accounts: &[ui::AccountEntry],
+    cursor_position: (f64, f64),
+    mouse_down: bool,
 ) {
     let now = Instant::now();
     fps_counter.tick(now);
@@ -879,37 +716,49 @@ fn render_frame(
 
     // Hand a bounded number of dirty chunks to the background mesher, then
     // upload whatever finished — both off the frame's critical path.
-    let dirty_chunks = game.take_dirty_chunks_budget(MESH_SUBMITS_PER_FRAME);
+    let dirty_chunks = app.game.take_dirty_chunks_budget(MESH_SUBMITS_PER_FRAME);
     if !dirty_chunks.is_empty() {
-        renderer.queue_chunk_meshes(&game.world, dirty_chunks);
+        renderer.queue_chunk_meshes(&app.game.world, dirty_chunks);
     }
-    renderer.process_ready_meshes(&game.world, MESH_UPLOADS_PER_FRAME);
+    renderer.process_ready_meshes(&app.game.world, MESH_UPLOADS_PER_FRAME);
 
-    // Entities stay visible behind menu/death overlays; only the in-game state
-    // animates the camera and draws the hand.
-    let in_world = matches!(
-        screen,
-        AppScreen::InGame
-            | AppScreen::Chat { .. }
-            | AppScreen::Paused
-            | AppScreen::Settings
-            | AppScreen::Inventory
-            | AppScreen::Dead
-    );
-    // The chat screen keeps simulating, so keep interpolating the camera too.
-    if matches!(screen, AppScreen::InGame | AppScreen::Chat { .. }) {
-        game.update_camera(tick_accumulator / 0.05);
-        game.advance_animations(frame_dt);
-    }
-    if in_world {
-        let show_hand = matches!(screen, AppScreen::InGame | AppScreen::Chat { .. });
-        renderer.upload_model(&game.build_entity_model(show_hand));
+    let hud_visible = app.in_world
+        && app
+            .screen
+            .as_ref()
+            .is_none_or(|screen| screen.draws_over_hud());
+    if app.in_world {
+        app.game.update_camera(tick_accumulator / 0.05);
+        app.game.advance_animations(frame_dt);
+        let mut model = app.game.build_entity_model();
+        if hud_visible {
+            ItemRenderer::render_first_person(
+                &mut model,
+                &app.game.camera,
+                app.game.swing_progress(),
+                app.game.held_item(),
+            );
+        }
+        renderer.upload_model(&model);
     } else {
         renderer.upload_model(&recraft_render::ModelMesh::new());
     }
     // Mining crack overlay (vanilla destroy_stage_N textures over the dig target).
-    renderer.set_break_overlay(game.breaking_overlay());
+    renderer.set_break_overlay(app.game.breaking_overlay());
 
+    // Build the frame's UI: HUD beneath, screen on top.
+    let size = window.inner_size();
+    let (width, height) = (size.width as i32, size.height as i32);
+    let account_entries = app.account_entries();
+    let mut ui = recraft_render::UiFrame::new();
+
+    let App {
+        screen,
+        game,
+        settings,
+        ms_session,
+        ..
+    } = app;
     let hud = HudState {
         health: game.health(),
         food: game.food(),
@@ -921,24 +770,44 @@ fn render_frame(
         chat: &game.chat,
         scoreboard: &game.scoreboard,
     };
-    let ui_frame = ui::build_ui(
-        screen,
-        window.inner_size(),
-        fps_counter.fps(),
-        game.loaded_chunk_count(),
-        settings,
-        hud,
-        session_username,
-        accounts,
-    );
+    if hud_visible {
+        let chat_input: Option<String> = screen
+            .as_ref()
+            .and_then(|screen| screen.chat_input().map(str::to_owned));
+        GuiIngame::render(
+            &mut ui,
+            width,
+            height,
+            fps_counter.fps(),
+            game.loaded_chunk_count(),
+            &hud,
+            chat_input.as_deref(),
+        );
+    }
+    if let Some(screen) = screen.as_mut() {
+        let ctx = DrawCtx {
+            width,
+            height,
+            scale: gui::gui_scale(height),
+            mouse: cursor_position,
+            mouse_down,
+            chunk_count: game.loaded_chunk_count(),
+            in_world: app.in_world,
+            settings,
+            session_username: ms_session.as_ref().map(|s| s.username.as_str()),
+            accounts: &account_entries,
+            hud: Some(&hud),
+        };
+        screen.draw(&mut ui, &ctx);
+    }
 
-    if let Err(err) = renderer.render_with_ui(&game.camera, &ui_frame) {
+    if let Err(err) = renderer.render_with_ui(&app.game.camera, &ui) {
         log::error!("render error: {err}");
     }
 }
 
 /// Start a network connection, choosing premium or offline mode based on the
-/// available session.  The `ms_session` type is `Option<Session>` from `auth`.
+/// available session.
 fn start_network(
     host: String,
     port: u16,
@@ -978,7 +847,7 @@ impl LaunchConfig {
             match arg.as_str() {
                 "--connect" => {
                     if let Some(value) = args.next() {
-                        server = parse_server(&value);
+                        server = servers::parse_server_address(&value);
                     }
                 }
                 "--username" => {
@@ -1017,11 +886,6 @@ impl LaunchConfig {
     }
 }
 
-/// Run the network + physics simulation in a plain fixed-rate loop with no
-/// window or renderer. macOS app-naps unfocused windows (throttling both
-/// redraws *and* the event loop), so a windowed smoke test can't exercise
-/// movement at a real 20 Hz; this can. Connects, joins, walks via the scripted
-/// driver, and reports server corrections — the ground truth for join/movement.
 /// Build a tick's serverbound gameplay packets in vanilla order — held-item
 /// change first (which, like `PlayerControllerMP.resetBlockRemoving`, cancels any
 /// in-progress dig when the item changes), then the click actions. The caller
@@ -1161,9 +1025,6 @@ fn run_headless_interact(config: &LaunchConfig, seconds: f32) -> anyhow::Result<
                         started_attack = true;
                     }
                     let left_held = want_mine;
-                    // Switch hotbar slot periodically — mid-dig on slow (stone)
-                    // blocks this aborts the dig, exercising the cancel→start
-                    // sequence Grim's PositionBreakB validates.
                     let slot_select = if tick_count % 30 == 15 {
                         Some((tick_count / 30 % 9) as i32)
                     } else {
@@ -1223,9 +1084,7 @@ fn run_headless_smoke(config: &LaunchConfig, seconds: f32) -> anyhow::Result<()>
         }
 
         // Process at most a bounded number of packets per tick so a burst of
-        // chunk data on join can't stall the simulation: we keep ticking and
-        // sending movement/teleport-confirms promptly instead of blocking for
-        // seconds while the whole chunk flood decodes.
+        // chunk data on join can't stall the simulation.
         let mut budget = 40;
         while budget > 0 {
             match network.events.try_recv() {
@@ -1262,11 +1121,9 @@ fn run_headless_smoke(config: &LaunchConfig, seconds: f32) -> anyhow::Result<()>
             network.send_packet(ServerboundPacket::ClientStatus { action: 0 });
         }
 
-        // Teleport acks are sent synchronously by the network thread now.
         let _ = game.take_position_confirm();
         game.apply_scripted_smoke_input(elapsed, seconds);
         if in_game {
-            // `None` on the teleport-ack tick: hold, send no movement.
             if let Some(movement) = game.tick(0.05) {
                 if game.can_send_movement_packets() {
                     network.send_movement(movement);
@@ -1282,44 +1139,6 @@ fn run_headless_smoke(config: &LaunchConfig, seconds: f32) -> anyhow::Result<()>
             next_tick = now;
         }
     }
-}
-
-fn parse_server(value: &str) -> Option<(String, u16)> {
-    let value = value.trim();
-    if value.is_empty() {
-        return None;
-    }
-
-    if let Some((host, port)) = value.rsplit_once(':') {
-        return Some((host.to_owned(), port.parse().unwrap_or(25565)));
-    }
-
-    resolve_minecraft_srv(value).or_else(|| Some((value.to_owned(), 25565)))
-}
-
-fn resolve_minecraft_srv(host: &str) -> Option<(String, u16)> {
-    if host.parse::<IpAddr>().is_ok() {
-        return None;
-    }
-
-    let resolver = hickory_resolver::Resolver::from_system_conf().ok()?;
-    let lookup = resolver
-        .srv_lookup(format!("_minecraft._tcp.{host}.").as_str())
-        .ok()?;
-    let record = lookup
-        .iter()
-        .min_by_key(|record| (record.priority(), Reverse(record.weight())))?;
-    let target = record.target().to_utf8();
-    let target = target.trim_end_matches('.');
-    if target.is_empty() {
-        return None;
-    }
-
-    log::info!(
-        "resolved Minecraft SRV {host} -> {target}:{}",
-        record.port()
-    );
-    Some((target.to_owned(), record.port()))
 }
 
 /// Map a number-row key (1-9) to a 0-based hotbar slot.
@@ -1339,12 +1158,6 @@ fn hotbar_slot_key(event: &winit::event::KeyEvent) -> Option<i32> {
         PhysicalKey::Code(KeyCode::Digit9) => Some(8),
         _ => None,
     }
-}
-
-/// Whether this key event is a press of the inventory key ('E').
-fn inventory_key_pressed(event: &winit::event::KeyEvent) -> bool {
-    event.state == ElementState::Pressed
-        && matches!(event.physical_key, PhysicalKey::Code(KeyCode::KeyE))
 }
 
 /// If this key press opens the chat box, the text to pre-fill it with:
@@ -1375,16 +1188,4 @@ fn release_cursor(window: &winit::window::Window) {
         log::warn!("failed to release cursor: {err}");
     }
     window.set_cursor_visible(true);
-}
-
-// ─── `Option<Session>` deref helper so we can pass `Option<&str>` for the
-//     username display without a full `use` import everywhere.
-trait OptionSessionExt {
-    fn as_deref(&self) -> Option<&str>;
-}
-
-impl OptionSessionExt for Option<Session> {
-    fn as_deref(&self) -> Option<&str> {
-        self.as_ref().map(|s| s.username.as_str())
-    }
 }

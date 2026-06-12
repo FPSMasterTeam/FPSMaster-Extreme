@@ -1,15 +1,77 @@
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::{
     codec::{decode_frame, encode_frame, Compression, PacketFrame},
-    io::{ProtocolError, Result},
+    io::{PacketReader, PacketWriter, ProtocolError, Result},
     v1_8_9::{
         packets::{ClientboundLoginPacket, ClientboundPlayPacket, NextState, ServerboundPacket},
         PROTOCOL_VERSION,
     },
 };
+
+/// Result of a 1.8 server-list ping: the raw status JSON (version, players,
+/// MOTD "description") plus the measured round-trip latency.
+#[derive(Debug, Clone)]
+pub struct StatusPing {
+    pub json: String,
+    pub latency_ms: u32,
+}
+
+/// Ping a server with the 1.8 status handshake: Handshake(next_state=Status),
+/// Status Request (0x00) → Status Response JSON, then Ping (0x01) → Pong for
+/// the latency. The whole exchange is bounded by `timeout`.
+pub fn ping_status_1_8_9(host: &str, port: u16, timeout: Duration) -> Result<StatusPing> {
+    let addr = (host, port)
+        .to_socket_addrs()?
+        .next()
+        .ok_or(ProtocolError::InvalidData("address resolved to nothing"))?;
+    let stream = TcpStream::connect_timeout(&addr, timeout)?;
+    stream.set_nodelay(true)?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    let mut client = BlockingClient {
+        stream,
+        compression: Compression::Disabled,
+        read_buf: Vec::new(),
+        encryptor: None,
+        decryptor: None,
+    };
+
+    client.write_packet(
+        ServerboundPacket::Handshake {
+            protocol_version: PROTOCOL_VERSION,
+            host: host.to_owned(),
+            port,
+            next_state: NextState::Status,
+        }
+        .into_frame(),
+    )?;
+    client.write_packet(PacketFrame::new(0x00, Vec::new()))?; // status request
+    let request_sent = Instant::now();
+    let frame = client.read_frame()?;
+    if frame.id != 0x00 {
+        return Err(ProtocolError::InvalidPacketId(frame.id, "status/clientbound"));
+    }
+    let json = PacketReader::new(&frame.body).read_string(32767)?;
+
+    // Ping/pong round trip for the latency; fall back to the status round
+    // trip when the server skips the pong.
+    let mut ping = PacketWriter::new();
+    ping.write_i64(0);
+    let latency_ms = match client
+        .write_packet(PacketFrame::new(0x01, ping.into_inner()))
+        .and_then(|()| {
+            let sent = Instant::now();
+            client.read_frame().map(|frame| (frame, sent))
+        }) {
+        Ok((frame, sent)) if frame.id == 0x01 => sent.elapsed().as_millis() as u32,
+        _ => request_sent.elapsed().as_millis() as u32,
+    };
+
+    Ok(StatusPing { json, latency_ms })
+}
 
 #[derive(Debug)]
 pub struct OfflineLoginResult {

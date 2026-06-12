@@ -11,6 +11,8 @@ pub enum GuiTexture {
     Icons,
     /// gui/container/inventory.png — the survival inventory window background.
     Inventory,
+    /// gui/options_background.png — the tiled dirt menu background.
+    OptionsBackground,
 }
 
 /// Loaded vanilla GUI textures (hotbar widget, status icons, inventory window)
@@ -21,6 +23,7 @@ pub struct GuiAtlas {
     pub widgets: Option<RgbaImage>,
     pub icons: Option<RgbaImage>,
     pub inventory: Option<RgbaImage>,
+    pub options_background: Option<RgbaImage>,
     /// The 16×16-tile block atlas, used as item-icon source for block items.
     blocks: Option<RgbaImage>,
     block_uv: AtlasUv,
@@ -36,6 +39,7 @@ impl GuiAtlas {
             widgets: crate::texture::load_gui_image("widgets"),
             icons: crate::texture::load_gui_image("icons"),
             inventory: crate::texture::load_gui_image("container/inventory"),
+            options_background: crate::texture::load_gui_image("options_background"),
             blocks,
             block_uv,
             items: ItemAtlasImage::load_default(),
@@ -47,6 +51,7 @@ impl GuiAtlas {
             GuiTexture::Widgets => self.widgets.as_ref(),
             GuiTexture::Icons => self.icons.as_ref(),
             GuiTexture::Inventory => self.inventory.as_ref(),
+            GuiTexture::OptionsBackground => self.options_background.as_ref(),
         }
     }
 
@@ -72,7 +77,7 @@ impl GuiAtlas {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct UiRect {
     pub x: i32,
     pub y: i32,
@@ -141,6 +146,14 @@ pub enum UiCommand {
     ItemIcon {
         dst: UiRect,
         item_id: i16,
+    },
+    /// Tile a GUI texture across `dst` at `tile_px` screen pixels per repeat,
+    /// multiplied by `tint` (the vanilla dirt background uses gray 64).
+    TiledImage {
+        dst: UiRect,
+        texture: GuiTexture,
+        tile_px: i32,
+        tint: UiColor,
     },
 }
 
@@ -223,6 +236,16 @@ impl UiFrame {
         self.commands.push(UiCommand::ItemIcon { dst, item_id });
     }
 
+    /// Tile `texture` across `dst` (`tile_px` screen px per repeat) with `tint`.
+    pub fn tiled_image(&mut self, dst: UiRect, texture: GuiTexture, tile_px: i32, tint: UiColor) {
+        self.commands.push(UiCommand::TiledImage {
+            dst,
+            texture,
+            tile_px: tile_px.max(1),
+            tint,
+        });
+    }
+
     pub fn rasterize(&self, width: u32, height: u32, gui: &GuiAtlas) -> Vec<u8> {
         let mut pixels = vec![0; width as usize * height as usize * 4];
         for command in &self.commands {
@@ -275,6 +298,25 @@ impl UiFrame {
                 } => {
                     if let Some(src) = gui.get(*texture) {
                         blit_image(&mut pixels, width, height, *dst, src, *sx, *sy, *sw, *sh);
+                    }
+                }
+                UiCommand::TiledImage {
+                    dst,
+                    texture,
+                    tile_px,
+                    tint,
+                } => {
+                    if let Some(src) = gui.get(*texture) {
+                        tile_image(&mut pixels, width, height, *dst, src, *tile_px, *tint);
+                    } else {
+                        // Missing texture: a flat dark fill keeps menus readable.
+                        fill_rect(
+                            &mut pixels,
+                            width,
+                            height,
+                            *dst,
+                            UiColor::rgba(28, 22, 18, 255),
+                        );
                     }
                 }
                 UiCommand::ItemIcon { dst, item_id } => {
@@ -352,6 +394,39 @@ fn fill_rect(pixels: &mut [u8], width: u32, height: u32, rect: UiRect, color: Ui
     for y in y0..y1 {
         for x in x0..x1 {
             blend_pixel(pixels, width, x, y, color);
+        }
+    }
+}
+
+/// Tile `src` across `dst` at `tile_px` screen pixels per texture repeat,
+/// multiplying `tint` into every texel (vanilla dirt background tint).
+fn tile_image(
+    pixels: &mut [u8],
+    width: u32,
+    height: u32,
+    dst: UiRect,
+    src: &RgbaImage,
+    tile_px: i32,
+    tint: UiColor,
+) {
+    let (sw, sh) = src.dimensions();
+    if sw == 0 || sh == 0 {
+        return;
+    }
+    let y0 = dst.y.max(0);
+    let y1 = (dst.y + dst.height).clamp(0, height as i32);
+    let x0 = dst.x.max(0);
+    let x1 = (dst.x + dst.width).clamp(0, width as i32);
+    for ty in y0..y1 {
+        let v = ((ty - dst.y) % tile_px) as u32 * sh / tile_px as u32;
+        for tx in x0..x1 {
+            let u = ((tx - dst.x) % tile_px) as u32 * sw / tile_px as u32;
+            let texel = src.get_pixel(u.min(sw - 1), v.min(sh - 1)).0;
+            let index = ((ty as u32 * width + tx as u32) * 4) as usize;
+            pixels[index] = (texel[0] as u16 * tint.r as u16 / 255) as u8;
+            pixels[index + 1] = (texel[1] as u16 * tint.g as u16 / 255) as u8;
+            pixels[index + 2] = (texel[2] as u16 * tint.b as u16 / 255) as u8;
+            pixels[index + 3] = tint.a;
         }
     }
 }

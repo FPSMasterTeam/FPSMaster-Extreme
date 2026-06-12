@@ -478,14 +478,20 @@ impl AccountStore {
     }
 }
 
-/// Path of the accounts file: `<config dir>/recraft/accounts.json`.
-fn store_path() -> PathBuf {
+/// The recraft config directory (`<config dir>/recraft/`), shared by the
+/// accounts and server-list stores.
+pub fn config_dir() -> PathBuf {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("APPDATA").map(PathBuf::from))
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
         .unwrap_or_else(|| PathBuf::from("."));
-    base.join("recraft").join("accounts.json")
+    base.join("recraft")
+}
+
+/// Path of the accounts file: `<config dir>/recraft/accounts.json`.
+fn store_path() -> PathBuf {
+    config_dir().join("accounts.json")
 }
 
 /// Percent-encode a string for `application/x-www-form-urlencoded` bodies.
