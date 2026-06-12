@@ -1,4 +1,5 @@
 pub mod codec;
+pub mod crypto;
 pub mod io;
 pub mod net;
 pub mod v1_8_9;

@@ -6,10 +6,9 @@ struct Camera {
 var<uniform> camera: Camera;
 
 @group(1) @binding(0)
-var block_atlas: texture_2d<f32>;
-
+var entity_texture: texture_2d<f32>;
 @group(1) @binding(1)
-var block_sampler: sampler;
+var entity_sampler: sampler;
 
 struct VertexInput {
     @location(0) position: vec3<f32>,
@@ -34,17 +33,11 @@ fn vs_main(input: VertexInput) -> VertexOutput {
 
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    let texel = textureSample(block_atlas, block_sampler, input.uv);
-    return vec4<f32>(texel.rgb * input.color.rgb, texel.a * input.color.a);
-}
-
-// Cutout pass: respect the texture's alpha channel (e.g. leaf gaps) by
-// discarding near-transparent texels, keeping the rest fully opaque.
-@fragment
-fn fs_cutout(input: VertexOutput) -> @location(0) vec4<f32> {
-    let texel = textureSample(block_atlas, block_sampler, input.uv);
-    if (texel.a * input.color.a < 0.5) {
+    let texel = textureSample(entity_texture, entity_sampler, input.uv);
+    let result = texel * input.color;
+    // Discard fully transparent texels so skin overlay gaps don't draw.
+    if (result.a < 0.01) {
         discard;
     }
-    return vec4<f32>(texel.rgb * input.color.rgb, 1.0);
+    return result;
 }

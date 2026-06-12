@@ -20,6 +20,30 @@ pub enum EntityAction {
     OpenInventory = 6,
 }
 
+/// 1.8 C02 UseEntity action discriminant.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum UseEntityKind {
+    Interact,
+    Attack,
+    /// Right-click at a specific point on the entity (cursor offset).
+    InteractAt {
+        x: f32,
+        y: f32,
+        z: f32,
+    },
+}
+
+/// 1.8 C07 PlayerDigging status values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiggingStatus {
+    StartDestroy = 0,
+    CancelDestroy = 1,
+    FinishDestroy = 2,
+    DropItemStack = 3,
+    DropItem = 4,
+    ReleaseUseItem = 5,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ServerboundPacket {
     Handshake {
@@ -33,6 +57,20 @@ pub enum ServerboundPacket {
     },
     KeepAlive {
         id: i32,
+    },
+    /// C15 ClientSettings — sent once after JoinGame so the server treats us as
+    /// a fully initialised client (locale, view distance, shown skin parts).
+    ClientSettings {
+        locale: String,
+        view_distance: i8,
+        chat_mode: i8,
+        chat_colors: bool,
+        skin_parts: u8,
+    },
+    /// C17 PluginMessage — used here to announce the client brand on MC|Brand.
+    PluginMessage {
+        channel: String,
+        data: Vec<u8>,
     },
     Player {
         on_ground: bool,
@@ -61,6 +99,60 @@ pub enum ServerboundPacket {
         action: EntityAction,
         aux_data: i32,
     },
+    UseEntity {
+        target: i32,
+        kind: UseEntityKind,
+    },
+    PlayerDigging {
+        status: DiggingStatus,
+        x: i32,
+        y: i32,
+        z: i32,
+        face: u8,
+    },
+    PlayerBlockPlacement {
+        x: i32,
+        y: i32,
+        z: i32,
+        face: u8,
+        /// Held item slot; `None` encodes the "empty slot" (-1) the vanilla
+        /// client sends when the hand carries no trackable item.
+        held_item: Option<HeldItem>,
+        cursor_x: u8,
+        cursor_y: u8,
+        cursor_z: u8,
+    },
+    HeldItemChange {
+        slot: i16,
+    },
+    /// C0A Animation — swing the main arm (no payload in 1.8).
+    SwingArm,
+    /// C16 ClientStatus — action 0 performs a respawn (sent after death).
+    ClientStatus {
+        action: i32,
+    },
+    /// C0F ConfirmTransaction — echoes a server transaction (window-confirm)
+    /// back so the server can measure round-trip timing. Vanilla replies to any
+    /// unaccepted transaction with `accepted = true`; anti-cheats (Grim) rely on
+    /// this pong for their timing and setback machinery.
+    ConfirmTransaction {
+        window_id: i8,
+        action_number: i16,
+        accepted: bool,
+    },
+    /// C01 ChatMessage — a plain chat string (commands start with '/'); the
+    /// 1.8 server kicks for messages longer than 100 characters.
+    ChatMessage {
+        message: String,
+    },
+}
+
+/// Minimal Slot data for a held item in a block-placement packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeldItem {
+    pub id: i16,
+    pub count: u8,
+    pub damage: i16,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -99,10 +191,69 @@ pub struct BlockChangeRecord {
     pub meta: u8,
 }
 
+/// S3E Teams action, decoded from the packet's mode byte. Display name,
+/// friendly-fire, visibility and color are skipped — only the prefix/suffix
+/// (which carry the visible sidebar text on most servers) and membership
+/// matter to the client HUD.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TeamAction {
+    Create {
+        prefix: String,
+        suffix: String,
+        players: Vec<String>,
+    },
+    Remove,
+    Update {
+        prefix: String,
+        suffix: String,
+    },
+    AddPlayers {
+        players: Vec<String>,
+    },
+    RemovePlayers {
+        players: Vec<String>,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ClientboundPlayPacket {
     KeepAlive {
         id: i32,
+    },
+    /// S02 ChatMessage — a JSON chat component plus its display position
+    /// (0 = chat, 1 = system message, 2 = action bar above the hotbar).
+    ChatMessage {
+        json: String,
+        position: i8,
+    },
+    /// S3B ScoreboardObjective — create (0), remove (1) or retitle (2) an
+    /// objective. `display_name` is empty for removals; the render-type
+    /// string ("integer"/"hearts") is skipped.
+    ScoreboardObjective {
+        name: String,
+        mode: u8,
+        display_name: String,
+    },
+    /// S3C UpdateScore — set (`value` = Some) or remove (`value` = None) a
+    /// score entry. On removal the objective name may be empty, meaning
+    /// "remove the entry from every objective".
+    UpdateScore {
+        name: String,
+        objective: String,
+        value: Option<i32>,
+    },
+    /// S3D DisplayScoreboard — bind an objective to a display slot
+    /// (0 = player list, 1 = sidebar, 2 = below name); empty name clears it.
+    DisplayScoreboard {
+        position: i8,
+        objective: String,
+    },
+    /// S3E Teams — team lifecycle and membership. Sidebar lines on most
+    /// servers are fake "players" whose visible text lives in the team
+    /// prefix/suffix.
+    Teams {
+        name: String,
+        action: TeamAction,
     },
     JoinGame {
         entity_id: i32,
@@ -120,6 +271,22 @@ pub enum ClientboundPlayPacket {
         yaw: f32,
         pitch: f32,
         flags: i8,
+    },
+    UpdateHealth {
+        health: f32,
+        food: i32,
+        food_saturation: f32,
+    },
+    /// C1F SetExperience — the XP bar fill (0..1) and current level.
+    SetExperience {
+        bar: f32,
+        level: i32,
+    },
+    Respawn {
+        dimension: i32,
+        difficulty: u8,
+        game_mode: u8,
+        level_type: String,
     },
     ChunkData {
         x: i32,
@@ -147,10 +314,104 @@ pub enum ClientboundPlayPacket {
     Disconnect {
         reason_json: String,
     },
+    SpawnPlayer {
+        entity_id: i32,
+        x: f64,
+        y: f64,
+        z: f64,
+        yaw: f32,
+        pitch: f32,
+    },
+    SpawnMob {
+        entity_id: i32,
+        kind: u8,
+        x: f64,
+        y: f64,
+        z: f64,
+        yaw: f32,
+        pitch: f32,
+    },
+    SpawnObject {
+        entity_id: i32,
+        kind: i8,
+        x: f64,
+        y: f64,
+        z: f64,
+    },
+    /// Relative move deltas, already converted from fixed-point to blocks.
+    EntityRelativeMove {
+        entity_id: i32,
+        dx: f64,
+        dy: f64,
+        dz: f64,
+    },
+    EntityLookMove {
+        entity_id: i32,
+        dx: f64,
+        dy: f64,
+        dz: f64,
+        yaw: f32,
+        pitch: f32,
+    },
+    EntityLook {
+        entity_id: i32,
+        yaw: f32,
+        pitch: f32,
+    },
+    EntityTeleport {
+        entity_id: i32,
+        x: f64,
+        y: f64,
+        z: f64,
+        yaw: f32,
+        pitch: f32,
+    },
+    DestroyEntities {
+        entity_ids: Vec<i32>,
+    },
+    /// S12 EntityVelocity — velocity already converted from 1/8000 block per
+    /// tick shorts to blocks per tick.
+    EntityVelocity {
+        entity_id: i32,
+        vx: f64,
+        vy: f64,
+        vz: f64,
+    },
+    /// S2F SetSlot — the server updates a single window slot.
+    SetSlot {
+        window_id: i8,
+        slot: i16,
+        item: Option<SlotItem>,
+    },
+    /// S30 WindowItems — the server replaces the whole window contents.
+    WindowItems {
+        window_id: u8,
+        items: Vec<Option<SlotItem>>,
+    },
+    /// S09 HeldItemChange — the server changes our selected hotbar slot.
+    HeldItemChange {
+        slot: i8,
+    },
+    /// S32 ConfirmTransaction — a server transaction (window-confirm) the client
+    /// must echo back. `accepted` is false for the server-initiated transactions
+    /// that anti-cheats use as a timing ping.
+    ConfirmTransaction {
+        window_id: i8,
+        action_number: i16,
+        accepted: bool,
+    },
     Unknown {
         id: i32,
         body: Vec<u8>,
     },
+}
+
+/// Minimal decoded Slot data (id/count/damage; NBT is skipped).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlotItem {
+    pub id: i16,
+    pub count: u8,
+    pub damage: i16,
 }
 
 impl ServerboundPacket {
@@ -178,6 +439,27 @@ impl ServerboundPacket {
                 let mut body = PacketWriter::new();
                 body.write_var_i32(id);
                 PacketFrame::new(0x00, body.into_inner())
+            }
+            Self::ClientSettings {
+                locale,
+                view_distance,
+                chat_mode,
+                chat_colors,
+                skin_parts,
+            } => {
+                let mut body = PacketWriter::new();
+                body.write_string(&locale);
+                body.write_i8(view_distance);
+                body.write_i8(chat_mode);
+                body.write_bool(chat_colors);
+                body.write_u8(skin_parts);
+                PacketFrame::new(0x15, body.into_inner())
+            }
+            Self::PluginMessage { channel, data } => {
+                let mut body = PacketWriter::new();
+                body.write_string(&channel);
+                body.write_bytes(&data);
+                PacketFrame::new(0x17, body.into_inner())
             }
             Self::Player { on_ground } => {
                 let mut body = PacketWriter::new();
@@ -231,8 +513,95 @@ impl ServerboundPacket {
                 body.write_var_i32(aux_data);
                 PacketFrame::new(0x0b, body.into_inner())
             }
+            Self::UseEntity { target, kind } => {
+                let mut body = PacketWriter::new();
+                body.write_var_i32(target);
+                match kind {
+                    UseEntityKind::Interact => body.write_var_i32(0),
+                    UseEntityKind::Attack => body.write_var_i32(1),
+                    UseEntityKind::InteractAt { x, y, z } => {
+                        body.write_var_i32(2);
+                        body.write_f32(x);
+                        body.write_f32(y);
+                        body.write_f32(z);
+                    }
+                }
+                PacketFrame::new(0x02, body.into_inner())
+            }
+            Self::PlayerDigging {
+                status,
+                x,
+                y,
+                z,
+                face,
+            } => {
+                let mut body = PacketWriter::new();
+                body.write_u8(status as u8);
+                body.write_i64(encode_block_pos(x, y, z));
+                body.write_u8(face);
+                PacketFrame::new(0x07, body.into_inner())
+            }
+            Self::PlayerBlockPlacement {
+                x,
+                y,
+                z,
+                face,
+                held_item,
+                cursor_x,
+                cursor_y,
+                cursor_z,
+            } => {
+                let mut body = PacketWriter::new();
+                body.write_i64(encode_block_pos(x, y, z));
+                body.write_u8(face);
+                match held_item {
+                    None => body.write_i16(-1),
+                    Some(item) => {
+                        body.write_i16(item.id);
+                        body.write_u8(item.count);
+                        body.write_i16(item.damage);
+                        body.write_u8(0); // empty NBT
+                    }
+                }
+                body.write_u8(cursor_x);
+                body.write_u8(cursor_y);
+                body.write_u8(cursor_z);
+                PacketFrame::new(0x08, body.into_inner())
+            }
+            Self::HeldItemChange { slot } => {
+                let mut body = PacketWriter::new();
+                body.write_i16(slot);
+                PacketFrame::new(0x09, body.into_inner())
+            }
+            Self::SwingArm => PacketFrame::new(0x0a, Vec::new()),
+            Self::ClientStatus { action } => {
+                let mut body = PacketWriter::new();
+                body.write_var_i32(action);
+                PacketFrame::new(0x16, body.into_inner())
+            }
+            Self::ConfirmTransaction {
+                window_id,
+                action_number,
+                accepted,
+            } => {
+                let mut body = PacketWriter::new();
+                body.write_i8(window_id);
+                body.write_i16(action_number);
+                body.write_bool(accepted);
+                PacketFrame::new(0x0f, body.into_inner())
+            }
+            Self::ChatMessage { message } => {
+                let mut body = PacketWriter::new();
+                body.write_string(&message);
+                PacketFrame::new(0x01, body.into_inner())
+            }
         }
     }
+}
+
+/// Encode a block position into the 1.8 packed long (26/12/26 bits).
+fn encode_block_pos(x: i32, y: i32, z: i32) -> i64 {
+    (((x as i64) & 0x03ff_ffff) << 38) | (((y as i64) & 0x0fff) << 26) | ((z as i64) & 0x03ff_ffff)
 }
 
 impl ClientboundLoginPacket {
@@ -281,6 +650,22 @@ impl ClientboundPlayPacket {
                 max_players: body.read_u8()?,
                 level_type: body.read_string(16)?,
                 reduced_debug_info: body.read_bool()?,
+            }),
+            0x06 => Ok(Self::UpdateHealth {
+                health: body.read_f32()?,
+                food: body.read_var_i32()?,
+                food_saturation: body.read_f32()?,
+            }),
+            0x1f => Ok(Self::SetExperience {
+                bar: body.read_f32()?,
+                level: body.read_var_i32()?,
+                // trailing total-experience varint is ignored
+            }),
+            0x07 => Ok(Self::Respawn {
+                dimension: body.read_i32()?,
+                difficulty: body.read_u8()?,
+                game_mode: body.read_u8()?,
+                level_type: body.read_string(16)?,
             }),
             0x08 => Ok(Self::PlayerPositionLook {
                 x: body.read_f64()?,
@@ -348,6 +733,213 @@ impl ClientboundPlayPacket {
                     sky_light_sent,
                     chunks,
                 })
+            }
+            0x0c => {
+                let entity_id = body.read_var_i32()?;
+                body.read_bytes(16)?; // player UUID
+                let x = fixed_point(body.read_i32()?);
+                let y = fixed_point(body.read_i32()?);
+                let z = fixed_point(body.read_i32()?);
+                let yaw = angle(body.read_i8()?);
+                let pitch = angle(body.read_i8()?);
+                Ok(Self::SpawnPlayer {
+                    entity_id,
+                    x,
+                    y,
+                    z,
+                    yaw,
+                    pitch,
+                })
+            }
+            0x0e => {
+                let entity_id = body.read_var_i32()?;
+                let kind = body.read_i8()?;
+                let x = fixed_point(body.read_i32()?);
+                let y = fixed_point(body.read_i32()?);
+                let z = fixed_point(body.read_i32()?);
+                Ok(Self::SpawnObject {
+                    entity_id,
+                    kind,
+                    x,
+                    y,
+                    z,
+                })
+            }
+            0x0f => {
+                let entity_id = body.read_var_i32()?;
+                let kind = body.read_u8()?;
+                let x = fixed_point(body.read_i32()?);
+                let y = fixed_point(body.read_i32()?);
+                let z = fixed_point(body.read_i32()?);
+                let yaw = angle(body.read_i8()?);
+                let pitch = angle(body.read_i8()?);
+                Ok(Self::SpawnMob {
+                    entity_id,
+                    kind,
+                    x,
+                    y,
+                    z,
+                    yaw,
+                    pitch,
+                })
+            }
+            0x15 => Ok(Self::EntityRelativeMove {
+                entity_id: body.read_var_i32()?,
+                dx: fixed_point_delta(body.read_i8()?),
+                dy: fixed_point_delta(body.read_i8()?),
+                dz: fixed_point_delta(body.read_i8()?),
+            }),
+            0x16 => {
+                let entity_id = body.read_var_i32()?;
+                Ok(Self::EntityLook {
+                    entity_id,
+                    yaw: angle(body.read_i8()?),
+                    pitch: angle(body.read_i8()?),
+                })
+            }
+            0x17 => Ok(Self::EntityLookMove {
+                entity_id: body.read_var_i32()?,
+                dx: fixed_point_delta(body.read_i8()?),
+                dy: fixed_point_delta(body.read_i8()?),
+                dz: fixed_point_delta(body.read_i8()?),
+                yaw: angle(body.read_i8()?),
+                pitch: angle(body.read_i8()?),
+            }),
+            0x18 => Ok(Self::EntityTeleport {
+                entity_id: body.read_var_i32()?,
+                x: fixed_point(body.read_i32()?),
+                y: fixed_point(body.read_i32()?),
+                z: fixed_point(body.read_i32()?),
+                yaw: angle(body.read_i8()?),
+                pitch: angle(body.read_i8()?),
+            }),
+            0x13 => {
+                let count = body.read_var_i32()? as usize;
+                let mut entity_ids = Vec::with_capacity(count);
+                for _ in 0..count {
+                    entity_ids.push(body.read_var_i32()?);
+                }
+                Ok(Self::DestroyEntities { entity_ids })
+            }
+            0x12 => Ok(Self::EntityVelocity {
+                entity_id: body.read_var_i32()?,
+                vx: body.read_i16()? as f64 / 8000.0,
+                vy: body.read_i16()? as f64 / 8000.0,
+                vz: body.read_i16()? as f64 / 8000.0,
+            }),
+            0x2f => Ok(Self::SetSlot {
+                window_id: body.read_i8()?,
+                slot: body.read_i16()?,
+                item: read_slot(&mut body)?,
+            }),
+            0x30 => {
+                let window_id = body.read_u8()?;
+                let count = body.read_i16()?;
+                if count < 0 {
+                    return Err(ProtocolError::InvalidData(
+                        "negative WindowItems slot count",
+                    ));
+                }
+                let mut items = Vec::with_capacity(count as usize);
+                for _ in 0..count {
+                    items.push(read_slot(&mut body)?);
+                }
+                Ok(Self::WindowItems { window_id, items })
+            }
+            0x09 => Ok(Self::HeldItemChange {
+                slot: body.read_i8()?,
+            }),
+            0x32 => Ok(Self::ConfirmTransaction {
+                window_id: body.read_i8()?,
+                action_number: body.read_i16()?,
+                accepted: body.read_bool()?,
+            }),
+            0x02 => Ok(Self::ChatMessage {
+                json: body.read_string(32767)?,
+                position: body.read_i8()?,
+            }),
+            0x3b => {
+                let name = body.read_string(64)?;
+                let mode = body.read_u8()?;
+                let display_name = if mode == 0 || mode == 2 {
+                    let display = body.read_string(128)?;
+                    body.read_string(64)?; // render type ("integer"/"hearts")
+                    display
+                } else {
+                    String::new()
+                };
+                Ok(Self::ScoreboardObjective {
+                    name,
+                    mode,
+                    display_name,
+                })
+            }
+            0x3c => {
+                let name = body.read_string(64)?;
+                let action = body.read_u8()?;
+                let objective = body.read_string(64)?;
+                let value = if action != 1 {
+                    Some(body.read_var_i32()?)
+                } else {
+                    None
+                };
+                Ok(Self::UpdateScore {
+                    name,
+                    objective,
+                    value,
+                })
+            }
+            0x3d => Ok(Self::DisplayScoreboard {
+                position: body.read_i8()?,
+                objective: body.read_string(64)?,
+            }),
+            0x3e => {
+                let name = body.read_string(64)?;
+                let mode = body.read_u8()?;
+                let read_players = |body: &mut PacketReader<'_>| -> Result<Vec<String>> {
+                    let count = body.read_var_i32()?;
+                    if count < 0 {
+                        return Err(ProtocolError::InvalidData("negative team player count"));
+                    }
+                    let mut players = Vec::with_capacity(count as usize);
+                    for _ in 0..count {
+                        players.push(body.read_string(64)?);
+                    }
+                    Ok(players)
+                };
+                let action = match mode {
+                    0 => {
+                        body.read_string(128)?; // display name
+                        let prefix = body.read_string(64)?;
+                        let suffix = body.read_string(64)?;
+                        body.read_u8()?; // friendly fire
+                        body.read_string(64)?; // name tag visibility
+                        body.read_i8()?; // color
+                        TeamAction::Create {
+                            prefix,
+                            suffix,
+                            players: read_players(&mut body)?,
+                        }
+                    }
+                    1 => TeamAction::Remove,
+                    2 => {
+                        body.read_string(128)?; // display name
+                        let prefix = body.read_string(64)?;
+                        let suffix = body.read_string(64)?;
+                        body.read_u8()?;
+                        body.read_string(64)?;
+                        body.read_i8()?;
+                        TeamAction::Update { prefix, suffix }
+                    }
+                    3 => TeamAction::AddPlayers {
+                        players: read_players(&mut body)?,
+                    },
+                    4 => TeamAction::RemovePlayers {
+                        players: read_players(&mut body)?,
+                    },
+                    _ => return Err(ProtocolError::InvalidData("unknown team mode")),
+                };
+                Ok(Self::Teams { name, action })
             }
             0x40 => Ok(Self::Disconnect {
                 reason_json: body.read_string(32767)?,
@@ -494,12 +1086,443 @@ mod tests {
         assert_eq!(frame.body, vec![1]);
     }
 
+    #[test]
+    fn use_entity_attack_writes_target_and_action() {
+        let frame = ServerboundPacket::UseEntity {
+            target: 99,
+            kind: UseEntityKind::Attack,
+        }
+        .into_frame();
+        assert_eq!(frame.id, 0x02);
+        let mut reader = PacketReader::new(&frame.body);
+        assert_eq!(reader.read_var_i32().unwrap(), 99);
+        assert_eq!(reader.read_var_i32().unwrap(), 1);
+        assert!(reader.is_empty());
+    }
+
+    #[test]
+    fn player_digging_writes_status_position_face() {
+        let frame = ServerboundPacket::PlayerDigging {
+            status: DiggingStatus::StartDestroy,
+            x: -1,
+            y: 64,
+            z: 2,
+            face: 1,
+        }
+        .into_frame();
+        assert_eq!(frame.id, 0x07);
+        let mut reader = PacketReader::new(&frame.body);
+        assert_eq!(reader.read_u8().unwrap(), 0);
+        let (x, y, z) = read_block_pos(&mut reader).unwrap();
+        assert_eq!((x, y, z), (-1, 64, 2));
+        assert_eq!(reader.read_u8().unwrap(), 1);
+    }
+
+    #[test]
+    fn block_placement_empty_hand_writes_negative_slot() {
+        let frame = ServerboundPacket::PlayerBlockPlacement {
+            x: 0,
+            y: 0,
+            z: 0,
+            face: 255,
+            held_item: None,
+            cursor_x: 8,
+            cursor_y: 8,
+            cursor_z: 8,
+        }
+        .into_frame();
+        assert_eq!(frame.id, 0x08);
+        let mut reader = PacketReader::new(&frame.body);
+        read_block_pos(&mut reader).unwrap();
+        assert_eq!(reader.read_u8().unwrap(), 255);
+        assert_eq!(reader.read_i16().unwrap(), -1);
+    }
+
+    #[test]
+    fn swing_arm_has_no_payload() {
+        let frame = ServerboundPacket::SwingArm.into_frame();
+        assert_eq!(frame.id, 0x0a);
+        assert!(frame.body.is_empty());
+    }
+
+    #[test]
+    fn spawn_mob_decodes_fixed_point_and_angles() {
+        let mut body = PacketWriter::new();
+        body.write_var_i32(42); // entity id
+        body.write_u8(54); // zombie
+        body.write_i32(32 * 10); // x = 10.0
+        body.write_i32(32 * 64); // y = 64.0
+        body.write_i32(32 * -5); // z = -5.0
+        body.write_i8(64); // yaw = 90 deg
+        body.write_i8(0); // pitch
+        body.write_i8(0); // head pitch
+                          // velocity + metadata omitted; decoder ignores trailing bytes.
+
+        let packet =
+            ClientboundPlayPacket::from_frame(PacketFrame::new(0x0f, body.into_inner())).unwrap();
+        match packet {
+            ClientboundPlayPacket::SpawnMob {
+                entity_id,
+                kind,
+                x,
+                y,
+                z,
+                yaw,
+                ..
+            } => {
+                assert_eq!(entity_id, 42);
+                assert_eq!(kind, 54);
+                assert!((x - 10.0).abs() < 1e-9);
+                assert!((y - 64.0).abs() < 1e-9);
+                assert!((z + 5.0).abs() < 1e-9);
+                assert!((yaw - 90.0).abs() < 0.01);
+            }
+            other => panic!("expected SpawnMob, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn destroy_entities_decodes_id_list() {
+        let mut body = PacketWriter::new();
+        body.write_var_i32(2);
+        body.write_var_i32(7);
+        body.write_var_i32(9);
+        let packet =
+            ClientboundPlayPacket::from_frame(PacketFrame::new(0x13, body.into_inner())).unwrap();
+        assert_eq!(
+            packet,
+            ClientboundPlayPacket::DestroyEntities {
+                entity_ids: vec![7, 9]
+            }
+        );
+    }
+
+    #[test]
+    fn read_slot_decodes_empty_slot() {
+        let mut reader = PacketReader::new(&[0xff, 0xff]);
+        assert_eq!(read_slot(&mut reader).unwrap(), None);
+        assert!(reader.is_empty());
+    }
+
+    #[test]
+    fn read_slot_decodes_item_without_nbt() {
+        // id=1, count=1, damage=0, TAG_End (no NBT)
+        let bytes = [0x00, 0x01, 0x01, 0x00, 0x00, 0x00];
+        let mut reader = PacketReader::new(&bytes);
+        assert_eq!(
+            read_slot(&mut reader).unwrap(),
+            Some(SlotItem {
+                id: 1,
+                count: 1,
+                damage: 0,
+            })
+        );
+        assert!(reader.is_empty());
+    }
+
+    #[test]
+    fn read_slot_skips_empty_compound_nbt() {
+        // id=1, count=1, damage=0, then TAG_Compound, empty name, TAG_End.
+        let bytes = [0x00, 0x01, 0x01, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00];
+        let mut reader = PacketReader::new(&bytes);
+        assert_eq!(
+            read_slot(&mut reader).unwrap(),
+            Some(SlotItem {
+                id: 1,
+                count: 1,
+                damage: 0,
+            })
+        );
+        assert!(reader.is_empty());
+    }
+
+    #[test]
+    fn read_slot_skips_nested_nbt_children() {
+        // id=276, count=1, damage=3, then a compound with a string and a list.
+        let mut bytes = vec![0x01, 0x14, 0x01, 0x00, 0x03];
+        bytes.extend_from_slice(&[0x0a, 0x00, 0x00]); // TAG_Compound "" {
+        bytes.extend_from_slice(&[0x08, 0x00, 0x01, b'x', 0x00, 0x02, b'h', b'i']); // String x: "hi"
+        bytes.extend_from_slice(&[0x09, 0x00, 0x01, b'l', 0x03, 0x00, 0x00, 0x00, 0x02]); // List l: 2x Int
+        bytes.extend_from_slice(&[0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x08]);
+        bytes.push(0x00); // TAG_End }
+        let mut reader = PacketReader::new(&bytes);
+        assert_eq!(
+            read_slot(&mut reader).unwrap(),
+            Some(SlotItem {
+                id: 276,
+                count: 1,
+                damage: 3,
+            })
+        );
+        assert!(reader.is_empty());
+    }
+
+    #[test]
+    fn clientbound_window_items_decodes_slot_list() {
+        let mut body = PacketWriter::new();
+        body.write_u8(0); // window id
+        body.write_i16(2); // slot count
+        body.write_i16(-1); // slot 0: empty
+        body.write_i16(1); // slot 1: stone x1
+        body.write_u8(1);
+        body.write_i16(0);
+        body.write_u8(0); // no NBT
+
+        let packet =
+            ClientboundPlayPacket::from_frame(PacketFrame::new(0x30, body.into_inner())).unwrap();
+        assert_eq!(
+            packet,
+            ClientboundPlayPacket::WindowItems {
+                window_id: 0,
+                items: vec![
+                    None,
+                    Some(SlotItem {
+                        id: 1,
+                        count: 1,
+                        damage: 0,
+                    }),
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn clientbound_set_slot_decodes_item() {
+        let mut body = PacketWriter::new();
+        body.write_i8(0); // window id
+        body.write_i16(36); // slot
+        body.write_i16(4); // cobblestone
+        body.write_u8(64);
+        body.write_i16(0);
+        body.write_u8(0); // no NBT
+
+        let packet =
+            ClientboundPlayPacket::from_frame(PacketFrame::new(0x2f, body.into_inner())).unwrap();
+        assert_eq!(
+            packet,
+            ClientboundPlayPacket::SetSlot {
+                window_id: 0,
+                slot: 36,
+                item: Some(SlotItem {
+                    id: 4,
+                    count: 64,
+                    damage: 0,
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn clientbound_held_item_change_decodes_slot() {
+        let packet = ClientboundPlayPacket::from_frame(PacketFrame::new(0x09, vec![3])).unwrap();
+        assert_eq!(packet, ClientboundPlayPacket::HeldItemChange { slot: 3 });
+    }
+
+    #[test]
+    fn clientbound_entity_velocity_converts_shorts() {
+        let mut body = PacketWriter::new();
+        body.write_var_i32(7);
+        body.write_i16(8000); // 1.0 block/tick
+        body.write_i16(-4000); // -0.5 block/tick
+        body.write_i16(0);
+
+        let packet =
+            ClientboundPlayPacket::from_frame(PacketFrame::new(0x12, body.into_inner())).unwrap();
+        assert_eq!(
+            packet,
+            ClientboundPlayPacket::EntityVelocity {
+                entity_id: 7,
+                vx: 1.0,
+                vy: -0.5,
+                vz: 0.0,
+            }
+        );
+    }
+
+    #[test]
+    fn serverbound_chat_writes_plain_string() {
+        let frame = ServerboundPacket::ChatMessage {
+            message: "hello".to_owned(),
+        }
+        .into_frame();
+        assert_eq!(frame.id, 0x01);
+        let mut reader = PacketReader::new(&frame.body);
+        assert_eq!(reader.read_string(100).unwrap(), "hello");
+        assert!(reader.is_empty());
+    }
+
+    #[test]
+    fn clientbound_chat_decodes_json_and_position() {
+        let mut body = PacketWriter::new();
+        body.write_string(r#"{"text":"hi"}"#);
+        body.write_i8(2);
+        let packet =
+            ClientboundPlayPacket::from_frame(PacketFrame::new(0x02, body.into_inner())).unwrap();
+        assert_eq!(
+            packet,
+            ClientboundPlayPacket::ChatMessage {
+                json: r#"{"text":"hi"}"#.to_owned(),
+                position: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn scoreboard_objective_create_decodes_display_name() {
+        let mut body = PacketWriter::new();
+        body.write_string("obj");
+        body.write_u8(0);
+        body.write_string("Title");
+        body.write_string("integer");
+        let packet =
+            ClientboundPlayPacket::from_frame(PacketFrame::new(0x3b, body.into_inner())).unwrap();
+        assert_eq!(
+            packet,
+            ClientboundPlayPacket::ScoreboardObjective {
+                name: "obj".to_owned(),
+                mode: 0,
+                display_name: "Title".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn scoreboard_objective_remove_has_no_display_name() {
+        let mut body = PacketWriter::new();
+        body.write_string("obj");
+        body.write_u8(1);
+        let packet =
+            ClientboundPlayPacket::from_frame(PacketFrame::new(0x3b, body.into_inner())).unwrap();
+        assert_eq!(
+            packet,
+            ClientboundPlayPacket::ScoreboardObjective {
+                name: "obj".to_owned(),
+                mode: 1,
+                display_name: String::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn update_score_decodes_set_and_remove() {
+        let mut body = PacketWriter::new();
+        body.write_string("line1");
+        body.write_u8(0);
+        body.write_string("obj");
+        body.write_var_i32(42);
+        let packet =
+            ClientboundPlayPacket::from_frame(PacketFrame::new(0x3c, body.into_inner())).unwrap();
+        assert_eq!(
+            packet,
+            ClientboundPlayPacket::UpdateScore {
+                name: "line1".to_owned(),
+                objective: "obj".to_owned(),
+                value: Some(42),
+            }
+        );
+
+        let mut body = PacketWriter::new();
+        body.write_string("line1");
+        body.write_u8(1);
+        body.write_string("");
+        let packet =
+            ClientboundPlayPacket::from_frame(PacketFrame::new(0x3c, body.into_inner())).unwrap();
+        assert_eq!(
+            packet,
+            ClientboundPlayPacket::UpdateScore {
+                name: "line1".to_owned(),
+                objective: String::new(),
+                value: None,
+            }
+        );
+    }
+
+    #[test]
+    fn display_scoreboard_decodes_sidebar_slot() {
+        let mut body = PacketWriter::new();
+        body.write_i8(1);
+        body.write_string("obj");
+        let packet =
+            ClientboundPlayPacket::from_frame(PacketFrame::new(0x3d, body.into_inner())).unwrap();
+        assert_eq!(
+            packet,
+            ClientboundPlayPacket::DisplayScoreboard {
+                position: 1,
+                objective: "obj".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn teams_create_decodes_prefix_suffix_players() {
+        let mut body = PacketWriter::new();
+        body.write_string("team1");
+        body.write_u8(0);
+        body.write_string("Team One"); // display name (skipped)
+        body.write_string("\u{a7}aPRE ");
+        body.write_string(" \u{a7}cSUF");
+        body.write_u8(3); // friendly fire
+        body.write_string("always"); // visibility
+        body.write_i8(2); // color
+        body.write_var_i32(2);
+        body.write_string("line1");
+        body.write_string("line2");
+        let packet =
+            ClientboundPlayPacket::from_frame(PacketFrame::new(0x3e, body.into_inner())).unwrap();
+        assert_eq!(
+            packet,
+            ClientboundPlayPacket::Teams {
+                name: "team1".to_owned(),
+                action: TeamAction::Create {
+                    prefix: "\u{a7}aPRE ".to_owned(),
+                    suffix: " \u{a7}cSUF".to_owned(),
+                    players: vec!["line1".to_owned(), "line2".to_owned()],
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn teams_membership_updates_decode() {
+        let mut body = PacketWriter::new();
+        body.write_string("team1");
+        body.write_u8(4);
+        body.write_var_i32(1);
+        body.write_string("line1");
+        let packet =
+            ClientboundPlayPacket::from_frame(PacketFrame::new(0x3e, body.into_inner())).unwrap();
+        assert_eq!(
+            packet,
+            ClientboundPlayPacket::Teams {
+                name: "team1".to_owned(),
+                action: TeamAction::RemovePlayers {
+                    players: vec!["line1".to_owned()],
+                },
+            }
+        );
+    }
+
     fn encoded_block_pos(x: i32, y: i32, z: i32) -> [u8; 8] {
         let value = ((x as u64) & 0x03ff_ffff) << 38
             | ((y as u64) & 0x0fff) << 26
             | ((z as u64) & 0x03ff_ffff);
         value.to_be_bytes()
     }
+}
+
+/// 1.8 sends absolute entity coordinates as fixed-point integers (block * 32).
+fn fixed_point(value: i32) -> f64 {
+    value as f64 / 32.0
+}
+
+/// Relative-move deltas are the same fixed-point scale in a signed byte.
+fn fixed_point_delta(value: i8) -> f64 {
+    value as f64 / 32.0
+}
+
+/// 1.8 sends rotations as a signed byte covering the full 0..360 circle.
+fn angle(value: i8) -> f32 {
+    value as f32 * 360.0 / 256.0
 }
 
 fn bulk_chunk_data_len(primary_bit_mask: u16, sky_light_sent: bool) -> usize {
@@ -509,6 +1532,89 @@ fn bulk_chunk_data_len(primary_bit_mask: u16, sky_light_sent: bool) -> usize {
         len += sections * 2048;
     }
     len + 256
+}
+
+/// Read a 1.8 Slot: Short id (-1 = empty), then Byte count, Short damage and
+/// an optional NBT compound which is skipped.
+fn read_slot(body: &mut PacketReader<'_>) -> Result<Option<SlotItem>> {
+    let id = body.read_i16()?;
+    if id == -1 {
+        return Ok(None);
+    }
+    let count = body.read_u8()?;
+    let damage = body.read_i16()?;
+    let tag_type = body.read_u8()?;
+    if tag_type != 0 {
+        // Named root tag: UShort name length + name bytes, then the payload.
+        let name_len = body.read_u16()? as usize;
+        body.read_bytes(name_len)?;
+        skip_nbt_payload(body, tag_type)?;
+    }
+    Ok(Some(SlotItem { id, count, damage }))
+}
+
+/// Skip the payload of an NBT tag of the given type (1.8 uncompressed NBT).
+fn skip_nbt_payload(body: &mut PacketReader<'_>, tag_type: u8) -> Result<()> {
+    match tag_type {
+        0 => Ok(()),                       // TAG_End
+        1 => body.read_bytes(1).map(drop), // TAG_Byte
+        2 => body.read_bytes(2).map(drop), // TAG_Short
+        3 => body.read_bytes(4).map(drop), // TAG_Int
+        4 => body.read_bytes(8).map(drop), // TAG_Long
+        5 => body.read_bytes(4).map(drop), // TAG_Float
+        6 => body.read_bytes(8).map(drop), // TAG_Double
+        7 => {
+            // TAG_Byte_Array
+            let len = read_nbt_len(body)?;
+            body.read_bytes(len).map(drop)
+        }
+        8 => {
+            // TAG_String
+            let len = body.read_u16()? as usize;
+            body.read_bytes(len).map(drop)
+        }
+        9 => {
+            // TAG_List
+            let element_type = body.read_u8()?;
+            let len = read_nbt_len(body)?;
+            for _ in 0..len {
+                skip_nbt_payload(body, element_type)?;
+            }
+            Ok(())
+        }
+        10 => {
+            // TAG_Compound: named children until TAG_End.
+            loop {
+                let child_type = body.read_u8()?;
+                if child_type == 0 {
+                    return Ok(());
+                }
+                let name_len = body.read_u16()? as usize;
+                body.read_bytes(name_len)?;
+                skip_nbt_payload(body, child_type)?;
+            }
+        }
+        11 => {
+            // TAG_Int_Array
+            let len = read_nbt_len(body)?;
+            body.read_bytes(len * 4).map(drop)
+        }
+        12 => {
+            // TAG_Long_Array
+            let len = read_nbt_len(body)?;
+            body.read_bytes(len * 8).map(drop)
+        }
+        _ => Err(ProtocolError::InvalidData("unknown NBT tag")),
+    }
+}
+
+/// Read an NBT Int length, rejecting negative values.
+fn read_nbt_len(body: &mut PacketReader<'_>) -> Result<usize> {
+    let len = body.read_i32()?;
+    if len < 0 {
+        return Err(ProtocolError::InvalidData("negative NBT length"));
+    }
+    Ok(len as usize)
 }
 
 fn read_block_pos(reader: &mut PacketReader<'_>) -> Result<(i32, i32, i32)> {

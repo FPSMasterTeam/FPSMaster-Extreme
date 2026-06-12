@@ -6,22 +6,41 @@ use std::{
 
 use recraft_protocol::{
     io::ProtocolError,
-    net::BlockingClient,
-    v1_8_9::packets::{ClientboundPlayPacket, EntityAction, ServerboundPacket},
+    net::{BlockingClient, PremiumSession},
+    v1_8_9::{
+        chunk::{decode_chunk_column, ChunkColumnData},
+        packets::{ClientboundPlayPacket, EntityAction, ServerboundPacket},
+    },
 };
 
 use crate::game::MovementSnapshot;
 
 #[derive(Debug)]
 pub enum NetworkEvent {
-    Connected { username: String, uuid: String },
+    Connected {
+        username: String,
+        uuid: String,
+    },
     PlayPacket(ClientboundPlayPacket),
+    /// A chunk decoded on the network thread, ready to load with no main-thread
+    /// decode cost (keeps the render loop unblocked during the join burst).
+    ChunkColumn {
+        x: i32,
+        z: i32,
+        column: ChunkColumnData,
+    },
+    /// The server unloaded a chunk (empty ground-up column).
+    ChunkUnload {
+        x: i32,
+        z: i32,
+    },
     Disconnected(String),
 }
 
 #[derive(Debug)]
 pub enum NetworkCommand {
     Move(MovementSnapshot),
+    Send(ServerboundPacket),
 }
 
 #[derive(Debug, Default)]
@@ -65,6 +84,30 @@ impl WalkingPacketState {
         }
         packets.push(self.next_packet(movement));
         packets
+    }
+
+    /// Build the packet that confirms a server teleport/correction. The 1.8
+    /// server (PlayerConnection) clears `checkMovement` ONLY when it receives a
+    /// packet that carries a position within 0.5 of the teleport target; a
+    /// look-only or flags-only packet leaves the player frozen and the server
+    /// resends the correction every tick. So always emit a full position+look,
+    /// regardless of how small the delta is, and reset our reporting baseline so
+    /// the following movement delta is measured from the confirmed position.
+    fn confirm_packet(&mut self, movement: MovementSnapshot) -> ServerboundPacket {
+        self.last_reported_x = movement.x;
+        self.last_reported_y = movement.y;
+        self.last_reported_z = movement.z;
+        self.last_reported_yaw = movement.yaw;
+        self.last_reported_pitch = movement.pitch;
+        self.position_update_ticks = 0;
+        ServerboundPacket::PlayerPositionLook {
+            x: movement.x,
+            y: movement.y,
+            z: movement.z,
+            yaw: movement.yaw,
+            pitch: movement.pitch,
+            on_ground: movement.on_ground,
+        }
     }
 
     fn next_packet(&mut self, movement: MovementSnapshot) -> ServerboundPacket {
@@ -129,7 +172,21 @@ impl NetworkHandle {
     pub fn connect_offline_1_8_9(host: String, port: u16, username: String) -> Self {
         let (event_tx, event_rx) = mpsc::channel();
         let (command_tx, command_rx) = mpsc::channel();
-        thread::spawn(move || network_thread(host, port, username, event_tx, command_rx));
+        thread::spawn(move || network_thread(host, port, username, None, event_tx, command_rx));
+        Self {
+            events: event_rx,
+            commands: command_tx,
+        }
+    }
+
+    /// Connect using a premium (Microsoft) session for online-mode servers.
+    pub fn connect_premium_1_8_9(host: String, port: u16, session: PremiumSession) -> Self {
+        let (event_tx, event_rx) = mpsc::channel();
+        let (command_tx, command_rx) = mpsc::channel();
+        let username = session.username.clone();
+        thread::spawn(move || {
+            network_thread(host, port, username, Some(session), event_tx, command_rx)
+        });
         Self {
             events: event_rx,
             commands: command_tx,
@@ -139,12 +196,18 @@ impl NetworkHandle {
     pub fn send_movement(&self, movement: MovementSnapshot) {
         let _ = self.commands.send(NetworkCommand::Move(movement));
     }
+
+    /// Queue an arbitrary serverbound packet (interaction, held-item change…).
+    pub fn send_packet(&self, packet: ServerboundPacket) {
+        let _ = self.commands.send(NetworkCommand::Send(packet));
+    }
 }
 
 fn network_thread(
     host: String,
     port: u16,
     username: String,
+    session: Option<PremiumSession>,
     events: Sender<NetworkEvent>,
     commands: Receiver<NetworkCommand>,
 ) {
@@ -157,11 +220,23 @@ fn network_thread(
         }
     };
 
-    let login = match client.login_offline_1_8_9(&host, port, &username) {
-        Ok(login) => login,
-        Err(err) => {
-            let _ = events.send(NetworkEvent::Disconnected(format!("login failed: {err}")));
-            return;
+    let login = if let Some(sess) = session {
+        match client.login_premium_1_8_9(&host, port, &sess) {
+            Ok(login) => login,
+            Err(err) => {
+                let _ = events.send(NetworkEvent::Disconnected(format!(
+                    "premium login failed: {err}"
+                )));
+                return;
+            }
+        }
+    } else {
+        match client.login_offline_1_8_9(&host, port, &username) {
+            Ok(login) => login,
+            Err(err) => {
+                let _ = events.send(NetworkEvent::Disconnected(format!("login failed: {err}")));
+                return;
+            }
         }
     };
     let _ = events.send(NetworkEvent::Connected {
@@ -169,7 +244,15 @@ fn network_thread(
         uuid: login.uuid,
     });
     let _ = client.set_read_timeout(Some(Duration::from_millis(10)));
+
     let mut walking_packets = WalkingPacketState::default();
+    // The brand / client-settings handshake must be sent only once the server
+    // is in the play state — i.e. after it sends JoinGame. Sending earlier (e.g.
+    // through a proxy still in login) yields "Bad packet id".
+    let mut sent_join_handshake = false;
+    // Sky light presence is dimension-derived (overworld only); tracked here so
+    // chunks can be decoded on this thread without the game state.
+    let mut has_sky_light = true;
 
     loop {
         while let Ok(command) = commands.try_recv() {
@@ -183,6 +266,14 @@ fn network_thread(
                                 .send(NetworkEvent::Disconnected(format!("write failed: {err}")));
                             return;
                         }
+                    }
+                }
+                NetworkCommand::Send(packet) => {
+                    log::debug!("sending {}", packet_debug_name(&packet));
+                    if let Err(err) = client.write_packet(packet.into_frame()) {
+                        let _ =
+                            events.send(NetworkEvent::Disconnected(format!("write failed: {err}")));
+                        return;
                     }
                 }
             }
@@ -199,8 +290,176 @@ fn network_thread(
                     return;
                 }
             }
+            Ok(ClientboundPlayPacket::ConfirmTransaction {
+                window_id,
+                action_number,
+                accepted,
+            }) => {
+                // Vanilla echoes an unaccepted server transaction straight back
+                // on the network thread. Anti-cheats (e.g. Grim) inject these as
+                // a timing/ack ping and gate their movement setbacks on the
+                // reply, so a faithful 1.8 client must pong them promptly.
+                if !accepted {
+                    if let Err(err) = client.write_packet(
+                        ServerboundPacket::ConfirmTransaction {
+                            window_id,
+                            action_number,
+                            accepted: true,
+                        }
+                        .into_frame(),
+                    ) {
+                        let _ = events.send(NetworkEvent::Disconnected(format!(
+                            "transaction write failed: {err}"
+                        )));
+                        return;
+                    }
+                }
+            }
             Ok(packet) => {
-                let _ = events.send(NetworkEvent::PlayPacket(packet));
+                // Track dimension-derived sky light and send the vanilla join
+                // handshake (brand + client settings) once we reach the play
+                // state (JoinGame).
+                match &packet {
+                    ClientboundPlayPacket::JoinGame { dimension, .. } => {
+                        has_sky_light = *dimension == 0;
+                        if !sent_join_handshake {
+                            sent_join_handshake = true;
+                            for handshake in initial_play_packets() {
+                                if let Err(err) = client.write_packet(handshake.into_frame()) {
+                                    let _ = events.send(NetworkEvent::Disconnected(format!(
+                                        "handshake write failed: {err}"
+                                    )));
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    ClientboundPlayPacket::Respawn { dimension, .. } => {
+                        has_sky_light = *dimension == 0;
+                    }
+                    ClientboundPlayPacket::PlayerPositionLook {
+                        x,
+                        y,
+                        z,
+                        yaw,
+                        pitch,
+                        flags,
+                    } => {
+                        // Ack the teleport synchronously here, in packet order —
+                        // BEFORE ponging any later transaction. Vanilla does this on
+                        // the netty thread; deferring it to the game tick lets a
+                        // newer transaction pong go out first, so a strict anti-cheat
+                        // (Grim) sees the player "skip past" the setback and
+                        // setback-loops forever. Relative axes resolve against the
+                        // last reported position the network thread already tracks.
+                        let rx = if flags & 0x01 != 0 {
+                            walking_packets.last_reported_x + x
+                        } else {
+                            *x
+                        };
+                        let ry = if flags & 0x02 != 0 {
+                            walking_packets.last_reported_y + y
+                        } else {
+                            *y
+                        };
+                        let rz = if flags & 0x04 != 0 {
+                            walking_packets.last_reported_z + z
+                        } else {
+                            *z
+                        };
+                        let ryaw = if flags & 0x08 != 0 {
+                            walking_packets.last_reported_yaw + yaw
+                        } else {
+                            *yaw
+                        };
+                        let rpitch = if flags & 0x10 != 0 {
+                            walking_packets.last_reported_pitch + pitch
+                        } else {
+                            *pitch
+                        };
+                        let confirm = walking_packets.confirm_packet(MovementSnapshot {
+                            x: rx,
+                            y: ry,
+                            z: rz,
+                            yaw: ryaw,
+                            pitch: rpitch,
+                            // Vanilla teleport-ack reports on_ground=false; with the
+                            // transaction now in order Grim recognises the ack and
+                            // exempts it from the ground check.
+                            on_ground: false,
+                            entity_id: 0,
+                            sneaking: false,
+                            sprinting: false,
+                        });
+                        if let Err(err) = client.write_packet(confirm.into_frame()) {
+                            let _ = events.send(NetworkEvent::Disconnected(format!(
+                                "teleport confirm write failed: {err}"
+                            )));
+                            return;
+                        }
+                    }
+                    _ => {}
+                }
+
+                // Intercept chunk packets and decode them here, off the render
+                // thread, delivering ready-to-load columns; forward everything
+                // else (in receipt order, so block-change ordering is preserved).
+                match packet {
+                    ClientboundPlayPacket::ChunkData {
+                        x,
+                        z,
+                        ground_up,
+                        primary_bit_mask,
+                        data,
+                    } => {
+                        if ground_up && primary_bit_mask == 0 {
+                            let _ = events.send(NetworkEvent::ChunkUnload { x, z });
+                        } else {
+                            match decode_chunk_column(
+                                &data,
+                                primary_bit_mask,
+                                ground_up,
+                                has_sky_light,
+                            ) {
+                                Ok(column) => {
+                                    let _ = events.send(NetworkEvent::ChunkColumn { x, z, column });
+                                }
+                                Err(err) => log::warn!("decode chunk {x},{z} failed: {err}"),
+                            }
+                        }
+                    }
+                    ClientboundPlayPacket::ChunkBulk {
+                        sky_light_sent,
+                        chunks,
+                    } => {
+                        for chunk in chunks {
+                            match decode_chunk_column(
+                                &chunk.data,
+                                chunk.primary_bit_mask,
+                                true,
+                                sky_light_sent,
+                            ) {
+                                Ok(column) => {
+                                    let _ = events.send(NetworkEvent::ChunkColumn {
+                                        x: chunk.x,
+                                        z: chunk.z,
+                                        column,
+                                    });
+                                }
+                                Err(err) => {
+                                    log::warn!(
+                                        "decode bulk chunk {},{} failed: {err}",
+                                        chunk.x,
+                                        chunk.z
+                                    )
+                                }
+                            }
+                        }
+                    }
+                    other => {
+                        let _ = events.send(NetworkEvent::PlayPacket(other));
+                    }
+                }
             }
             Err(ProtocolError::Io(message)) if is_timeout(&message) => {}
             Err(err) => {
@@ -209,6 +468,26 @@ fn network_thread(
             }
         }
     }
+}
+
+/// The packets a vanilla 1.8 client sends right after entering the play state:
+/// the client brand on `MC|Brand`, then client settings.
+fn initial_play_packets() -> Vec<ServerboundPacket> {
+    let mut brand = recraft_protocol::io::PacketWriter::new();
+    brand.write_string("recraft");
+    vec![
+        ServerboundPacket::PluginMessage {
+            channel: "MC|Brand".to_owned(),
+            data: brand.into_inner(),
+        },
+        ServerboundPacket::ClientSettings {
+            locale: "en_US".to_owned(),
+            view_distance: 8,
+            chat_mode: 0,
+            chat_colors: true,
+            skin_parts: 0x7f,
+        },
+    ]
 }
 
 fn is_timeout(message: &str) -> bool {
@@ -232,6 +511,16 @@ fn packet_debug_name(packet: &ServerboundPacket) -> &'static str {
             EntityAction::RidingJump => "C0B EntityAction RIDING_JUMP",
             EntityAction::OpenInventory => "C0B EntityAction OPEN_INVENTORY",
         },
+        ServerboundPacket::UseEntity { .. } => "C02 UseEntity",
+        ServerboundPacket::PlayerDigging { .. } => "C07 PlayerDigging",
+        ServerboundPacket::PlayerBlockPlacement { .. } => "C08 PlayerBlockPlacement",
+        ServerboundPacket::HeldItemChange { .. } => "C09 HeldItemChange",
+        ServerboundPacket::SwingArm => "C0A Animation",
+        ServerboundPacket::ClientStatus { .. } => "C16 ClientStatus",
+        ServerboundPacket::ChatMessage { .. } => "C01 ChatMessage",
+        ServerboundPacket::ConfirmTransaction { .. } => "C0F ConfirmTransaction",
+        ServerboundPacket::ClientSettings { .. } => "C15 ClientSettings",
+        ServerboundPacket::PluginMessage { .. } => "C17 PluginMessage",
         ServerboundPacket::Handshake { .. } => "Handshake",
         ServerboundPacket::LoginStart { .. } => "LoginStart",
         ServerboundPacket::KeepAlive { .. } => "KeepAlive",

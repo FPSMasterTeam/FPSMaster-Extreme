@@ -64,49 +64,73 @@ impl ChunkSection {
     const fn index(x: u8, y: u8, z: u8) -> usize {
         (y as usize * CHUNK_SIZE * CHUNK_SIZE) + (z as usize * CHUNK_SIZE) + x as usize
     }
+
+    /// Fill all 4096 block cells from raw 1.8 block-state values in
+    /// y*256 + z*16 + x order. Each raw value is (block_id << 4) | meta.
+    pub fn fill_blocks_raw(&mut self, raw: &[u16]) {
+        let count = SECTION_VOLUME.min(raw.len());
+        for (cell, &value) in self.blocks[..count].iter_mut().zip(&raw[..count]) {
+            *cell = BlockState::new(value >> 4, (value & 0x0f) as u8);
+        }
+    }
+
+    /// Fill block+sky light from 2048-byte packed-nibble arrays (1.8 wire
+    /// order: nibble index == block index; low nibble = even index, high
+    /// nibble = odd). Missing bytes are treated as 0.
+    pub fn fill_light_nibbles(&mut self, block_light: &[u8], sky_light: &[u8]) {
+        fn nibble(arr: &[u8], i: usize) -> u8 {
+            let byte = arr.get(i / 2).copied().unwrap_or(0);
+            if i % 2 == 0 {
+                byte & 0x0f
+            } else {
+                (byte >> 4) & 0x0f
+            }
+        }
+        for i in 0..SECTION_VOLUME {
+            self.block_light[i] = nibble(block_light, i);
+            self.sky_light[i] = nibble(sky_light, i);
+        }
+    }
 }
+
+/// Number of 16-block-tall sections in a 0..256 column.
+pub const SECTION_COUNT: usize = 16;
 
 #[derive(Debug, Clone)]
 pub struct Chunk {
     pub position: ChunkPos,
-    sections: Vec<ChunkSection>,
+    // Direct-indexed by section_y (0..16). Indexing beats the old linear Vec
+    // scan, which was a hot path: meshing does ~6 neighbour lookups per block.
+    sections: [Option<Box<ChunkSection>>; SECTION_COUNT],
 }
 
 impl Chunk {
     pub fn new(position: ChunkPos) -> Self {
         Self {
             position,
-            sections: Vec::new(),
+            sections: std::array::from_fn(|_| None),
         }
     }
 
-    pub fn sections(&self) -> &[ChunkSection] {
-        &self.sections
+    pub fn sections(&self) -> impl Iterator<Item = &ChunkSection> {
+        self.sections
+            .iter()
+            .filter_map(|section| section.as_deref())
+    }
+
+    fn section_index(section_y: i32) -> Option<usize> {
+        usize::try_from(section_y)
+            .ok()
+            .filter(|&index| index < SECTION_COUNT)
     }
 
     pub fn section_mut_or_insert(&mut self, section_y: i32) -> &mut ChunkSection {
-        if let Some(index) = self
-            .sections
-            .iter()
-            .position(|section| section.y() == section_y)
-        {
-            return &mut self.sections[index];
-        }
-
-        self.sections.push(ChunkSection::new(section_y));
-        self.sections.sort_by_key(ChunkSection::y);
-        let index = self
-            .sections
-            .iter()
-            .position(|section| section.y() == section_y)
-            .expect("inserted section must exist");
-        &mut self.sections[index]
+        let index = Self::section_index(section_y).expect("section_y in 0..16");
+        self.sections[index].get_or_insert_with(|| Box::new(ChunkSection::new(section_y)))
     }
 
     pub fn section(&self, section_y: i32) -> Option<&ChunkSection> {
-        self.sections
-            .iter()
-            .find(|section| section.y() == section_y)
+        Self::section_index(section_y).and_then(|index| self.sections[index].as_deref())
     }
 
     pub fn get_block(&self, x: u8, y: i32, z: u8) -> BlockState {
@@ -175,5 +199,46 @@ mod tests {
         let mut chunk = Chunk::new(ChunkPos::new(0, 0));
         chunk.set_light(1, 64, 2, 7, 12);
         assert_eq!(chunk.light_at(1, 64, 2), (7, 12));
+    }
+
+    #[test]
+    fn fill_blocks_raw_matches_index_layout() {
+        let mut section = ChunkSection::new(0);
+        let mut raw = vec![0u16; SECTION_VOLUME];
+        // STONE (id 1, meta 0) at (x=1, y=2, z=3): index = y*256 + z*16 + x.
+        raw[2 * 256 + 3 * 16 + 1] = 1 << 4;
+        // id 35, meta 5 at (x=15, y=15, z=15).
+        raw[15 * 256 + 15 * 16 + 15] = (35 << 4) | 5;
+        section.fill_blocks_raw(&raw);
+        assert_eq!(section.get(1, 2, 3), BlockState::STONE);
+        assert_eq!(section.get(15, 15, 15), BlockState::new(35, 5));
+        assert_eq!(section.get(0, 0, 0), BlockState::AIR);
+    }
+
+    #[test]
+    fn fill_light_nibbles_round_trips() {
+        let mut section = ChunkSection::new(0);
+        let mut block_light = [0u8; SECTION_VOLUME / 2];
+        // Block index 0 -> low nibble of byte 0, index 1 -> high nibble.
+        block_light[0] = 0x21;
+        let mut sky_light = [0u8; SECTION_VOLUME / 2];
+        sky_light[0] = 0x43;
+        section.fill_light_nibbles(&block_light, &sky_light);
+        assert_eq!(section.block_light(0, 0, 0), 1);
+        assert_eq!(section.block_light(1, 0, 0), 2);
+        assert_eq!(section.sky_light(0, 0, 0), 3);
+        assert_eq!(section.sky_light(1, 0, 0), 4);
+        // Unset bytes are zero.
+        assert_eq!(section.block_light(2, 0, 0), 0);
+    }
+
+    #[test]
+    fn fill_light_nibbles_tolerates_short_arrays() {
+        let mut section = ChunkSection::new(0);
+        section.fill_light_nibbles(&[0x21], &[]);
+        assert_eq!(section.block_light(0, 0, 0), 1);
+        assert_eq!(section.block_light(1, 0, 0), 2);
+        assert_eq!(section.sky_light(0, 0, 0), 0);
+        assert_eq!(section.sky_light(15, 15, 15), 0);
     }
 }

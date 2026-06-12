@@ -1,5 +1,6 @@
 use glam::DVec3;
 
+use crate::mc_math::{mc_cos, mc_sin, DEG_TO_RAD};
 use crate::{EntityState, World};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -198,9 +199,11 @@ impl PlayerPhysics {
         if input.jump && player.on_ground {
             velocity.y = self.config.jump_velocity;
             if input.sprint {
-                let yaw = player.yaw.to_radians();
-                velocity.x -= (yaw.sin() * 0.2) as f64;
-                velocity.z += (yaw.cos() * 0.2) as f64;
+                // Vanilla sprint-jump boost: 0.2 in the facing direction, using
+                // MathHelper trig (not libm) so the direction matches the server.
+                let yaw = player.yaw * DEG_TO_RAD;
+                velocity.x -= (mc_sin(yaw) * 0.2) as f64;
+                velocity.z += (mc_cos(yaw) * 0.2) as f64;
             }
         }
 
@@ -238,21 +241,34 @@ impl PlayerPhysics {
 
         velocity += movement_vector(forward, strafe, player.yaw, acceleration);
 
-        let (position, mut adjusted_velocity, on_ground) = move_with_collisions(
+        // Vanilla 1.8 sneak edge protection: while sneaking on the ground, the
+        // intended horizontal movement is shrunk in 0.05 steps until the player
+        // box (lowered by one block) would still rest on a collider, so the
+        // player never walks off a ledge.
+        if input.sneak && player.on_ground {
+            let (clamped_x, clamped_z) =
+                clamp_sneak_to_edges(world, player.aabb, velocity.x, velocity.z);
+            velocity.x = clamped_x;
+            velocity.z = clamped_z;
+        }
+
+        let result = move_with_collisions(
             world,
             player.aabb,
             velocity,
             self.config.step_height,
             player.on_ground,
         );
+        let mut adjusted_velocity = result.velocity;
         adjusted_velocity.y -= self.config.gravity;
         adjusted_velocity.y *= self.config.air_drag_y;
         adjusted_velocity.x *= horizontal_drag as f64;
         adjusted_velocity.z *= horizontal_drag as f64;
 
-        player.position = position;
+        player.position = result.feet;
         player.velocity = adjusted_velocity;
-        player.on_ground = on_ground;
+        player.on_ground = result.on_ground;
+        player.collided_horizontally = result.collided_horizontally;
         player.sync_aabb_to_position();
     }
 }
@@ -270,9 +286,11 @@ fn movement_vector(forward: f32, strafe: f32, yaw_degrees: f32, friction: f32) -
     let scale = friction / length;
     let strafe = strafe * scale;
     let forward = forward * scale;
-    let yaw = yaw_degrees.to_radians();
-    let sin = yaw.sin();
-    let cos = yaw.cos();
+    // Vanilla Entity.moveFlying uses MathHelper's table-based sin/cos, which the
+    // server replicates exactly; using libm here drifts from the prediction.
+    let yaw = yaw_degrees * DEG_TO_RAD;
+    let sin = mc_sin(yaw);
+    let cos = mc_cos(yaw);
     DVec3::new(
         (strafe * cos - forward * sin) as f64,
         0.0,
@@ -286,7 +304,7 @@ fn move_with_collisions(
     velocity: DVec3,
     step_height: f64,
     was_on_ground: bool,
-) -> (DVec3, DVec3, bool) {
+) -> MoveResult {
     let original_velocity = velocity;
     let mut x = velocity.x;
     let mut y = velocity.y;
@@ -407,33 +425,105 @@ fn move_with_collisions(
     if original_velocity.z != z {
         adjusted_velocity.z = 0.0;
     }
-    let on_ground = original_y != y && original_y < 0.0;
+    // Vanilla sets onGround when a downward move is stopped by collision. A player
+    // resting with zero vertical velocity — e.g. the tick after a teleport/setback
+    // zeroes motion — has no downward move to collide, yet is still standing on a
+    // block. Detect that support directly so on_ground reporting matches the server
+    // (otherwise the client claims it is airborne while grounded, tripping anti-cheat
+    // ground checks and provoking an inescapable setback loop).
+    let landed = original_y != y && original_y < 0.0;
+    let on_ground = landed || (original_y == 0.0 && supported_below(world, moved));
+    // Vanilla isCollidedHorizontally: set whenever an intended horizontal move
+    // was clamped by collision. Drives the sprint wall-cancel.
+    let collided_horizontally = original_x != x || original_z != z;
 
-    (feet, adjusted_velocity, on_ground)
+    MoveResult {
+        feet,
+        velocity: adjusted_velocity,
+        on_ground,
+        collided_horizontally,
+    }
+}
+
+struct MoveResult {
+    feet: DVec3,
+    velocity: DVec3,
+    on_ground: bool,
+    collided_horizontally: bool,
+}
+
+/// Reduce the desired sneak movement so the player stays supported. Mirrors the
+/// 1.8 `Entity.moveEntity` ledge check: each axis (and finally both together) is
+/// stepped down by 0.05 while the box offset by `(dx, -1, dz)` finds no collider.
+fn clamp_sneak_to_edges(world: &World, aabb: Aabb, mut dx: f64, mut dz: f64) -> (f64, f64) {
+    const STEP: f64 = 0.05;
+
+    while dx != 0.0 && !has_collision(world, aabb.offset(DVec3::new(dx, -1.0, 0.0))) {
+        dx = shrink_sneak_step(dx, STEP);
+    }
+    while dz != 0.0 && !has_collision(world, aabb.offset(DVec3::new(0.0, -1.0, dz))) {
+        dz = shrink_sneak_step(dz, STEP);
+    }
+    while dx != 0.0 && dz != 0.0 && !has_collision(world, aabb.offset(DVec3::new(dx, -1.0, dz))) {
+        dx = shrink_sneak_step(dx, STEP);
+        dz = shrink_sneak_step(dz, STEP);
+    }
+
+    (dx, dz)
+}
+
+fn shrink_sneak_step(value: f64, step: f64) -> f64 {
+    if value < step && value >= -step {
+        0.0
+    } else if value > 0.0 {
+        value - step
+    } else {
+        value + step
+    }
+}
+
+/// Public ground check: whether the player box is resting on solid ground. Used
+/// to set on_ground correctly right after a teleport (which zeroes motion, so the
+/// next tick has no downward move for the collision-based ground test to catch).
+pub fn resting_on_ground(world: &World, aabb: Aabb) -> bool {
+    supported_below(world, aabb)
+}
+
+/// True when a block surface sits immediately beneath the AABB's feet (within a
+/// 0.001 epsilon) — i.e. the box is resting on the ground even with no downward
+/// motion this tick. Mirrors how the server treats a grounded player and keeps
+/// on_ground reporting correct across teleports that zero the player's motion.
+fn supported_below(world: &World, aabb: Aabb) -> bool {
+    let slab = Aabb::new(
+        DVec3::new(aabb.min.x, aabb.min.y - 0.001, aabb.min.z),
+        DVec3::new(aabb.max.x, aabb.min.y, aabb.max.z),
+    );
+    has_collision(world, slab)
+}
+
+fn has_collision(world: &World, query: Aabb) -> bool {
+    !colliding_boxes(world, query).is_empty()
 }
 
 fn colliding_boxes(world: &World, query: Aabb) -> Vec<Aabb> {
+    // Match vanilla World.getCollidingBoundingBoxes which scans
+    // floor(min)..floor(max + 1); using ceil(max) would miss the block on the
+    // far side when the box edge lands exactly on an integer boundary. The y
+    // scan starts one block BELOW floor(min) — that is how vanilla picks up
+    // fence/wall boxes that extend 1.5 above their cell (standing on a fence
+    // top, the fence block itself is below the query range).
     let min_x = query.min.x.floor() as i32;
-    let max_x = query.max.x.ceil() as i32;
-    let min_y = query.min.y.floor() as i32;
-    let max_y = query.max.y.ceil() as i32;
+    let max_x = (query.max.x + 1.0).floor() as i32;
+    let min_y = (query.min.y.floor() as i32) - 1;
+    let max_y = (query.max.y + 1.0).floor() as i32;
     let min_z = query.min.z.floor() as i32;
-    let max_z = query.max.z.ceil() as i32;
+    let max_z = (query.max.z + 1.0).floor() as i32;
     let mut colliders = Vec::new();
 
     for x in min_x..max_x {
-        for y in min_y..max_y {
-            for z in min_z..max_z {
-                if !world.block_at(x, y, z).is_solid_collision() {
-                    continue;
-                }
-                let block = Aabb::new(
-                    DVec3::new(x as f64, y as f64, z as f64),
-                    DVec3::new(x as f64 + 1.0, y as f64 + 1.0, z as f64 + 1.0),
-                );
-                if block.intersects(query) {
-                    colliders.push(block);
-                }
+        for z in min_z..max_z {
+            for y in min_y..max_y {
+                crate::collision::add_block_collision_boxes(world, x, y, z, query, &mut colliders);
             }
         }
     }
@@ -555,6 +645,408 @@ mod tests {
 
         assert!(player.position.y >= 1.99);
         assert!(player.position.z > 2.0);
+    }
+
+    #[test]
+    fn sneaking_player_stays_on_ledge_while_walking_off() {
+        let world = single_block_platform();
+        let mut player = EntityState::new_local_player(EntityId(1), DVec3::new(0.5, 1.0, 0.5));
+        player.on_ground = true;
+        let physics = PlayerPhysics::default();
+
+        for _ in 0..60 {
+            physics.tick(
+                &world,
+                &mut player,
+                PlayerInput {
+                    forward: 1.0,
+                    sneak: true,
+                    ..PlayerInput::default()
+                },
+            );
+        }
+
+        assert!(player.on_ground, "sneaking player should not fall off");
+        assert!(
+            player.position.y > 0.99,
+            "sneaking player should stay at block height, was {}",
+            player.position.y
+        );
+    }
+
+    #[test]
+    fn walking_player_falls_off_ledge_without_sneak() {
+        let world = single_block_platform();
+        let mut player = EntityState::new_local_player(EntityId(1), DVec3::new(0.5, 1.0, 0.5));
+        player.on_ground = true;
+        let physics = PlayerPhysics::default();
+
+        for _ in 0..60 {
+            physics.tick(
+                &world,
+                &mut player,
+                PlayerInput {
+                    forward: 1.0,
+                    ..PlayerInput::default()
+                },
+            );
+        }
+
+        assert!(
+            player.position.y < 0.5,
+            "walking player should fall off the ledge, was {}",
+            player.position.y
+        );
+    }
+
+    #[test]
+    fn player_rests_on_top_of_bottom_slab() {
+        let mut world = World::new();
+        world.set_block(0, 0, 0, BlockState::new(44, 0)); // bottom stone slab
+        let mut player = EntityState::new_local_player(EntityId(1), DVec3::new(0.5, 2.0, 0.5));
+        let physics = PlayerPhysics::default();
+        for _ in 0..40 {
+            physics.tick(&world, &mut player, PlayerInput::default());
+        }
+        assert!(player.on_ground);
+        assert!(
+            (player.position.y - 0.5).abs() < 0.01,
+            "should rest on the half slab, was {}",
+            player.position.y
+        );
+    }
+
+    /// Drop a player onto the block at the origin and return the resting feet
+    /// height. Asserts the player actually lands.
+    fn resting_height_on(block: BlockState) -> f64 {
+        let mut world = World::new();
+        world.set_block(0, 0, 0, block);
+        let mut player = EntityState::new_local_player(EntityId(1), DVec3::new(0.5, 3.0, 0.5));
+        let physics = PlayerPhysics::default();
+        for _ in 0..60 {
+            physics.tick(&world, &mut player, PlayerInput::default());
+        }
+        assert!(player.on_ground, "player never landed on {block:?}");
+        player.position.y
+    }
+
+    #[test]
+    fn resting_heights_match_vanilla_partial_blocks() {
+        for (block, height) in [
+            (BlockState::new(60, 0), 1.0),     // farmland is a full cube in 1.8
+            (BlockState::new(54, 2), 0.875),   // chest
+            (BlockState::new(88, 0), 0.875),   // soul sand
+            (BlockState::new(26, 0), 0.5625),  // bed
+            (BlockState::new(96, 0), 0.1875),  // closed bottom trapdoor
+            (BlockState::new(78, 0), 0.0),     // 1 snow layer: zero-height box
+            (BlockState::new(78, 3), 0.375),   // 4 snow layers
+            (BlockState::new(116, 0), 0.75),   // enchantment table
+            (BlockState::new(93, 1), 0.125),   // repeater
+            (BlockState::new(118, 0), 0.3125), // cauldron floor (walls miss the centred box)
+            (BlockState::new(53, 4), 1.0),     // upside-down stairs: flush top
+        ] {
+            let rest = resting_height_on(block);
+            assert!(
+                (rest - height).abs() < 1.0e-6,
+                "{block:?}: rested at {rest}, vanilla {height}"
+            );
+        }
+    }
+
+    #[test]
+    fn player_rests_on_fence_top_at_1_5() {
+        // Also exercises the y-1 collider scan: while standing at 1.5 the
+        // fence block (y=0) is below the query box's floor(min.y).
+        let rest = resting_height_on(BlockState::new(85, 0));
+        assert!((rest - 1.5).abs() < 1.0e-6, "fence rest height was {rest}");
+    }
+
+    #[test]
+    fn player_rests_on_wall_top_at_1_5() {
+        let rest = resting_height_on(BlockState::new(139, 0));
+        assert!((rest - 1.5).abs() < 1.0e-6, "wall rest height was {rest}");
+    }
+
+    #[test]
+    fn stairs_low_and_high_halves_have_vanilla_heights() {
+        // East-facing bottom stairs: low half on x < 0.5 (height 0.5), high
+        // quarter on x >= 0.5 (height 1.0).
+        let mut world = World::new();
+        world.set_block(0, 0, 0, BlockState::new(53, 0));
+        let physics = PlayerPhysics::default();
+
+        let mut low = EntityState::new_local_player(EntityId(1), DVec3::new(0.18, 3.0, 0.5));
+        let mut high = EntityState::new_local_player(EntityId(2), DVec3::new(0.82, 3.0, 0.5));
+        for _ in 0..60 {
+            physics.tick(&world, &mut low, PlayerInput::default());
+            physics.tick(&world, &mut high, PlayerInput::default());
+        }
+        assert!(
+            (low.position.y - 0.5).abs() < 1.0e-6,
+            "low half was {}",
+            low.position.y
+        );
+        assert!(
+            (high.position.y - 1.0).abs() < 1.0e-6,
+            "high half was {}",
+            high.position.y
+        );
+    }
+
+    #[test]
+    fn sneak_edge_guard_sees_fence_below() {
+        // Sneaking on a fence top must not shrink movement to zero only after
+        // falling: the ledge probe (offset -1) has to find the fence box.
+        let mut world = World::new();
+        world.set_block(0, 0, 0, BlockState::new(85, 0));
+        let mut player = EntityState::new_local_player(EntityId(1), DVec3::new(0.5, 1.5, 0.5));
+        player.on_ground = true;
+        let physics = PlayerPhysics::default();
+        for _ in 0..40 {
+            physics.tick(
+                &world,
+                &mut player,
+                PlayerInput {
+                    forward: 1.0,
+                    sneak: true,
+                    ..PlayerInput::default()
+                },
+            );
+        }
+        assert!(player.on_ground, "sneaking player fell off the fence");
+        assert!(
+            (player.position.y - 1.5).abs() < 1.0e-6,
+            "sneaking player should stay on the fence top, was {}",
+            player.position.y
+        );
+    }
+
+    #[test]
+    fn player_falls_through_tall_grass() {
+        let mut world = World::new();
+        world.set_block(0, 0, 0, BlockState::STONE);
+        world.set_block(0, 1, 0, BlockState::new(31, 1)); // tall grass, no collision
+        let mut player = EntityState::new_local_player(EntityId(1), DVec3::new(0.5, 3.0, 0.5));
+        let physics = PlayerPhysics::default();
+        for _ in 0..60 {
+            physics.tick(&world, &mut player, PlayerInput::default());
+        }
+        // Lands on the stone at y=1, having passed through the grass at y=1.
+        assert!(
+            (player.position.y - 1.0).abs() < 0.01,
+            "y was {}",
+            player.position.y
+        );
+    }
+
+    fn single_block_platform() -> World {
+        let mut world = World::new();
+        world.set_block(0, 0, 0, BlockState::STONE);
+        world
+    }
+
+    /// A flat stone floor at y=0 over x,z in -2..=8, with a wall `height` tall
+    /// standing at x=3 across z in -2..=2.
+    fn floor_with_wall(height: i32) -> World {
+        let mut world = World::new();
+        for x in -2..=8 {
+            for z in -4..=4 {
+                world.set_block(x, 0, z, BlockState::STONE);
+            }
+        }
+        for y in 1..=height {
+            for z in -4..=4 {
+                world.set_block(3, y, z, BlockState::STONE);
+            }
+        }
+        world
+    }
+
+    fn player_overlaps_solid(world: &World, player: &EntityState) -> bool {
+        let aabb = player.aabb;
+        let min_x = aabb.min.x.floor() as i32;
+        let max_x = (aabb.max.x - 1.0e-7).floor() as i32;
+        let min_y = aabb.min.y.floor() as i32;
+        let max_y = (aabb.max.y - 1.0e-7).floor() as i32;
+        let min_z = aabb.min.z.floor() as i32;
+        let max_z = (aabb.max.z - 1.0e-7).floor() as i32;
+        for x in min_x..=max_x {
+            for y in min_y..=max_y {
+                for z in min_z..=max_z {
+                    if world.block_at(x, y, z).is_solid_collision() {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    // At yaw 0, `strafe` drives +x (toward the x=3 wall) and `forward` drives +z.
+    // The wall spans z -4..=4, so a large strafe-dominant push tests head-on
+    // collision while keeping the player within the wall's extent.
+    fn walk_into_wall(
+        start: DVec3,
+        forward: f32,
+        strafe: f32,
+        sprint: bool,
+        ticks: usize,
+    ) -> (World, EntityState) {
+        let world = floor_with_wall(3);
+        let mut player = EntityState::new_local_player(EntityId(1), start);
+        player.on_ground = true;
+        let physics = PlayerPhysics::default();
+        for _ in 0..ticks {
+            physics.tick(
+                &world,
+                &mut player,
+                PlayerInput {
+                    forward,
+                    strafe,
+                    sprint,
+                    ..PlayerInput::default()
+                },
+            );
+        }
+        (world, player)
+    }
+
+    #[test]
+    fn player_box_is_full_height_and_width() {
+        let player = EntityState::new_local_player(EntityId(1), DVec3::new(0.0, 0.0, 0.0));
+        assert!((player.aabb.max.y - player.aabb.min.y - 1.8).abs() < 1.0e-9);
+        assert!((player.aabb.max.x - player.aabb.min.x - 0.6).abs() < 1.0e-9);
+        assert!((player.aabb.max.z - player.aabb.min.z - 0.6).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn walking_into_wall_does_not_clip_through() {
+        // strafe=+1 => pure +x into the wall at x=3.
+        let (world, player) = walk_into_wall(DVec3::new(0.5, 1.0, 0.5), 0.0, 1.0, false, 80);
+        assert!(
+            !player_overlaps_solid(&world, &player),
+            "player ended inside wall at {:?}",
+            player.position
+        );
+        assert!(
+            player.position.x < 2.7 + 1.0e-6,
+            "player clipped past wall face: x={}",
+            player.position.x
+        );
+    }
+
+    #[test]
+    fn sprinting_into_wall_does_not_clip_through() {
+        let (world, player) = walk_into_wall(DVec3::new(0.5, 1.0, 0.5), 0.0, 1.0, true, 120);
+        assert!(
+            !player_overlaps_solid(&world, &player),
+            "sprinting player ended inside wall at {:?}",
+            player.position
+        );
+        assert!(
+            player.position.x < 2.7 + 1.0e-6,
+            "sprinting player clipped past wall: x={}",
+            player.position.x
+        );
+    }
+
+    #[test]
+    fn sprinting_cannot_escape_enclosed_room() {
+        // A sealed 1..=2 walled room (floor at y=0, 5-tall walls). Sprinting in
+        // every direction for many ticks must never push the player outside.
+        let mut world = World::new();
+        for x in -1..=5 {
+            for z in -1..=5 {
+                world.set_block(x, 0, z, BlockState::STONE);
+            }
+        }
+        for y in 1..=5 {
+            for x in -1..=5 {
+                world.set_block(x, y, -1, BlockState::STONE);
+                world.set_block(x, y, 5, BlockState::STONE);
+                world.set_block(-1, y, x, BlockState::STONE);
+                world.set_block(5, y, x, BlockState::STONE);
+            }
+        }
+        let physics = PlayerPhysics::default();
+        for &(yaw, fwd, strafe) in &[
+            (0.0_f32, 1.0_f32, 0.0_f32),
+            (0.0, 0.0, 1.0),
+            (0.0, 1.0, 1.0),
+            (45.0, 1.0, 0.0),
+            (135.0, 1.0, 1.0),
+            (250.0, 1.0, -1.0),
+        ] {
+            let mut player = EntityState::new_local_player(EntityId(1), DVec3::new(2.0, 1.0, 2.0));
+            player.on_ground = true;
+            player.yaw = yaw;
+            for _ in 0..200 {
+                physics.tick(
+                    &world,
+                    &mut player,
+                    PlayerInput {
+                        forward: fwd,
+                        strafe,
+                        sprint: true,
+                        ..PlayerInput::default()
+                    },
+                );
+            }
+            assert!(
+                !player_overlaps_solid(&world, &player),
+                "player escaped/clipped (yaw {yaw}) to {:?}",
+                player.position
+            );
+            // Interior free space for the 0.6-wide box is x,z in [0.3, 4.7].
+            assert!(
+                player.position.x > 0.29 && player.position.x < 4.71,
+                "player x escaped: {}",
+                player.position.x
+            );
+            assert!(
+                player.position.z > 0.29 && player.position.z < 4.71,
+                "player z escaped: {}",
+                player.position.z
+            );
+        }
+    }
+
+    #[test]
+    fn head_block_is_solid_against_body() {
+        // A block only at head height (y=2) with floor at y=0; walking forward the
+        // upper body must collide and not pass through.
+        let mut world = World::new();
+        for x in -2..=8 {
+            for z in -2..=2 {
+                world.set_block(x, 0, z, BlockState::STONE);
+            }
+        }
+        for z in -2..=2 {
+            world.set_block(3, 2, z, BlockState::STONE);
+        }
+        let mut player = EntityState::new_local_player(EntityId(1), DVec3::new(0.5, 1.0, 0.5));
+        player.on_ground = true;
+        let physics = PlayerPhysics::default();
+        for _ in 0..80 {
+            physics.tick(
+                &world,
+                &mut player,
+                PlayerInput {
+                    forward: 1.0,
+                    ..PlayerInput::default()
+                },
+            );
+        }
+        assert!(
+            !player_overlaps_solid(&world, &player),
+            "player clipped into head block at {:?}",
+            player.position
+        );
+        assert!(
+            player.position.x < 2.7 + 1.0e-6,
+            "player passed under/through head block: x={}",
+            player.position.x
+        );
     }
 
     fn flat_world_with_one_block_step() -> World {

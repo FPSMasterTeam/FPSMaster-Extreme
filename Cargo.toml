@@ -11,18 +11,33 @@ resolver = "2"
 edition = "2021"
 rust-version = "1.82"
 license = "MIT OR Apache-2.0"
-repository = "https://example.invalid/recraft"
+repository = "https://github.com/gaoyu06/MiniCraft"
 
 [workspace.dependencies]
 anyhow = "1.0"
+arboard = "3.4"
 bytemuck = { version = "1.15", features = ["derive"] }
 env_logger = "0.11"
 flate2 = "1.0"
+font8x8 = "0.3"
 glam = "0.27"
+hickory-resolver = "0.24"
 image = { version = "0.25", default-features = false, features = ["png"] }
 log = "0.4"
 pollster = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 thiserror = "1.0"
 wgpu = "0.19"
 winit = "0.29"
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
+# Auth / HTTP
+ureq = { version = "2.10", features = ["json", "tls"] }
+# Crypto (online-mode)
+rand = "0.8"
+rsa = "0.9"
+sha1 = "0.10"
+num-bigint = "0.4"
+aes = "0.8"
+cfb8 = "0.8"
+base64 = "0.22"

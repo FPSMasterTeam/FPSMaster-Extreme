@@ -64,6 +64,13 @@ impl<'a> PacketReader<'a> {
         Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
     }
 
+    /// Little-endian u16. The 1.8 chunk block-state array is stored low-byte
+    /// first, unlike the otherwise big-endian protocol.
+    pub fn read_u16_le(&mut self) -> Result<u16> {
+        let bytes = self.take(2)?;
+        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+    }
+
     pub fn read_i16(&mut self) -> Result<i16> {
         let bytes = self.take(2)?;
         Ok(i16::from_be_bytes([bytes[0], bytes[1]]))
@@ -172,7 +179,15 @@ impl PacketWriter {
         self.data.extend_from_slice(&value.to_be_bytes());
     }
 
+    pub fn write_i16(&mut self, value: i16) {
+        self.data.extend_from_slice(&value.to_be_bytes());
+    }
+
     pub fn write_i32(&mut self, value: i32) {
+        self.data.extend_from_slice(&value.to_be_bytes());
+    }
+
+    pub fn write_i64(&mut self, value: i64) {
         self.data.extend_from_slice(&value.to_be_bytes());
     }
 

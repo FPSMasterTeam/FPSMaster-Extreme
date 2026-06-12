@@ -1,156 +1,94 @@
 use std::{
+    collections::{HashMap, HashSet},
     env,
     fs::{self, File},
     io::Read,
     path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
 };
 
 use image::{imageops::FilterType, DynamicImage, GenericImage, Rgba, RgbaImage};
+use recraft_core::registry;
 use zip::ZipArchive;
 
 pub const TILE_SIZE: u32 = 16;
 pub const ATLAS_COLUMNS: u32 = 16;
-pub const ATLAS_ROWS: u32 = 9;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BlockTile {
-    Missing = 0,
-    Stone = 1,
-    GrassTop = 2,
-    GrassSide = 3,
-    Dirt = 4,
-    CoarseDirt = 5,
-    PodzolTop = 6,
-    PodzolSide = 7,
-    Cobblestone = 8,
-    Bedrock = 9,
-    Gravel = 10,
-    Sand = 11,
-    RedSand = 12,
-    Granite = 13,
-    PolishedGranite = 14,
-    Diorite = 15,
-    PolishedDiorite = 16,
-    Andesite = 17,
-    PolishedAndesite = 18,
-    CoalOre = 19,
-    IronOre = 20,
-    GoldOre = 21,
-    LapisOre = 22,
-    RedstoneOre = 23,
-    DiamondOre = 24,
-    EmeraldOre = 25,
-    PlanksOak = 26,
-    PlanksSpruce = 27,
-    PlanksBirch = 28,
-    PlanksJungle = 29,
-    PlanksAcacia = 30,
-    PlanksDarkOak = 31,
-    OakLogSide = 32,
-    OakLogTop = 33,
-    SpruceLogSide = 34,
-    SpruceLogTop = 35,
-    BirchLogSide = 36,
-    BirchLogTop = 37,
-    JungleLogSide = 38,
-    JungleLogTop = 39,
-    AcaciaLogSide = 40,
-    AcaciaLogTop = 41,
-    DarkOakLogSide = 42,
-    DarkOakLogTop = 43,
-    OakLeaves = 44,
-    SpruceLeaves = 45,
-    BirchLeaves = 46,
-    JungleLeaves = 47,
-    AcaciaLeaves = 48,
-    DarkOakLeaves = 49,
-    SandstoneSide = 50,
-    SandstoneTop = 51,
-    SandstoneBottom = 52,
-    SandstoneCarved = 53,
-    SandstoneSmooth = 54,
-    RedSandstoneSide = 55,
-    RedSandstoneTop = 56,
-    RedSandstoneBottom = 57,
-    RedSandstoneCarved = 58,
-    RedSandstoneSmooth = 59,
-    WoolWhite = 60,
-    WoolOrange = 61,
-    WoolMagenta = 62,
-    WoolLightBlue = 63,
-    WoolYellow = 64,
-    WoolLime = 65,
-    WoolPink = 66,
-    WoolGray = 67,
-    WoolSilver = 68,
-    WoolCyan = 69,
-    WoolPurple = 70,
-    WoolBlue = 71,
-    WoolBrown = 72,
-    WoolGreen = 73,
-    WoolRed = 74,
-    WoolBlack = 75,
-    GoldBlock = 76,
-    IronBlock = 77,
-    LapisBlock = 78,
-    DiamondBlock = 79,
-    EmeraldBlock = 80,
-    RedstoneBlock = 81,
-    CoalBlock = 82,
-    Brick = 83,
-    MossyCobblestone = 84,
-    Obsidian = 85,
-    Snow = 86,
-    Ice = 87,
-    PackedIce = 88,
-    Clay = 89,
-    HardenedClay = 90,
-    StainedClayWhite = 91,
-    StainedClayOrange = 92,
-    StainedClayMagenta = 93,
-    StainedClayLightBlue = 94,
-    StainedClayYellow = 95,
-    StainedClayLime = 96,
-    StainedClayPink = 97,
-    StainedClayGray = 98,
-    StainedClaySilver = 99,
-    StainedClayCyan = 100,
-    StainedClayPurple = 101,
-    StainedClayBlue = 102,
-    StainedClayBrown = 103,
-    StainedClayGreen = 104,
-    StainedClayRed = 105,
-    StainedClayBlack = 106,
-    PumpkinSide = 107,
-    PumpkinTop = 108,
-    PumpkinFace = 109,
-    MelonSide = 110,
-    MelonTop = 111,
-    Netherrack = 112,
-    SoulSand = 113,
-    Glowstone = 114,
-    StoneBrick = 115,
-    StoneBrickMossy = 116,
-    StoneBrickCracked = 117,
-    StoneBrickCarved = 118,
-    MyceliumTop = 119,
-    MyceliumSide = 120,
-    NetherBrick = 121,
-    EndStone = 122,
-    QuartzSide = 123,
-    QuartzTop = 124,
-    QuartzBottom = 125,
-    QuartzChiseled = 126,
-    QuartzChiseledTop = 127,
-    QuartzPillarSide = 128,
-    QuartzPillarTop = 129,
+// Plains colormap point: temperature 0.8, downfall 0.4 (rainfall is multiplied
+// by temperature before lookup). Used to sample grass.png / foliage.png.
+const PLAINS_TEMPERATURE: f64 = 0.8;
+const PLAINS_DOWNFALL: f64 = 0.4;
+const DEFAULT_GRASS: [u8; 3] = [0x91, 0xBD, 0x59];
+const DEFAULT_FOLIAGE: [u8; 3] = [0x77, 0xAB, 0x2F];
+
+const GRASS_SIDE_OVERLAY: &str = "assets/minecraft/textures/blocks/grass_side_overlay.png";
+const GRASS_COLORMAP: &str = "assets/minecraft/textures/colormap/grass.png";
+const FOLIAGE_COLORMAP: &str = "assets/minecraft/textures/colormap/foliage.png";
+
+/// Maps texture base-names to atlas tile indices and yields UVs. Index 0 is the
+/// magenta "missing" tile, so unknown/missing textures are visually obvious.
+#[derive(Debug, Clone, Default)]
+pub struct AtlasUv {
+    name_to_index: HashMap<String, u32>,
+    rows: u32,
+    /// Tile indices whose texture failed to load (magenta placeholders).
+    missing: HashSet<u32>,
 }
 
-impl BlockTile {
-    pub const fn index(self) -> u32 {
-        self as u32
+impl AtlasUv {
+    pub fn uv(&self, name: Option<&str>) -> [[f32; 2]; 4] {
+        tile_uv(self.tile_index(name), self.rows)
+    }
+
+    /// Atlas tile index for a texture base-name (0 = the magenta "missing"
+    /// tile). Used by the UI to blit a block's tile as an item thumbnail.
+    pub fn tile_index(&self, name: Option<&str>) -> u32 {
+        name.and_then(|name| self.name_to_index.get(name).copied())
+            .unwrap_or(0)
+    }
+
+    /// Whether this name resolves to the magenta missing tile — either no
+    /// name / a name absent from the atlas (index 0), or a mapped tile whose
+    /// texture file failed to load.
+    pub fn is_missing_tile(&self, name: Option<&str>) -> bool {
+        let index = self.tile_index(name);
+        index == 0 || self.missing.contains(&index)
+    }
+
+    /// Normalized `(u0, v0, width, height)` of a tile, for sub-tile UV
+    /// mapping (partial-block faces crop the texture by their box extent).
+    pub fn tile_rect(&self, name: Option<&str>) -> [f32; 4] {
+        let index = self.tile_index(name);
+        let atlas_w = (ATLAS_COLUMNS * TILE_SIZE) as f32;
+        let atlas_h = (self.rows.max(1) * TILE_SIZE) as f32;
+        [
+            (index % ATLAS_COLUMNS * TILE_SIZE) as f32 / atlas_w,
+            (index / ATLAS_COLUMNS * TILE_SIZE) as f32 / atlas_h,
+            TILE_SIZE as f32 / atlas_w,
+            TILE_SIZE as f32 / atlas_h,
+        ]
     }
 }
+
+/// The 16 vanilla dye color suffixes in meta order (stained glass/clay/wool).
+pub const STAINED_COLORS: [&str; 16] = [
+    "white",
+    "orange",
+    "magenta",
+    "light_blue",
+    "yellow",
+    "lime",
+    "pink",
+    "gray",
+    "silver",
+    "cyan",
+    "purple",
+    "blue",
+    "brown",
+    "green",
+    "red",
+    "black",
+];
 
 #[derive(Debug, Clone)]
 pub struct TextureAtlasImage {
@@ -158,6 +96,12 @@ pub struct TextureAtlasImage {
     pub height: u32,
     pub pixels: Vec<u8>,
     pub source: TextureAtlasSource,
+    pub grass_color: [f32; 3],
+    pub foliage_color: [f32; 3],
+    name_to_index: HashMap<String, u32>,
+    rows: u32,
+    /// Tile indices left as magenta placeholders (texture file not found).
+    missing_indices: Vec<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -168,92 +112,205 @@ pub enum TextureAtlasSource {
 }
 
 impl TextureAtlasImage {
+    /// UV lookup table for the mesher (cheap to clone — just the name map).
+    pub fn uv_table(&self) -> AtlasUv {
+        AtlasUv {
+            name_to_index: self.name_to_index.clone(),
+            rows: self.rows,
+            // In pure-fallback mode every tile is a placeholder; per-block
+            // missing-tile reports would only repeat the load warning.
+            missing: if matches!(self.source, TextureAtlasSource::Fallback) {
+                HashSet::new()
+            } else {
+                self.missing_indices.iter().copied().collect()
+            },
+        }
+    }
+
+    /// Build the atlas from the block registry's texture names, loading each
+    /// `blocks/<name>.png` from the first available asset source.
     pub fn load_default() -> Self {
-        let candidates = candidate_asset_paths();
-        for path in &candidates {
-            match Self::from_asset_path(path.clone()) {
+        let mut names = registry().all_texture_names();
+        // The mining crack overlays (destroy_stage_0..9) live alongside the
+        // block textures; give them atlas tiles so the renderer can draw
+        // breaking progress over the targeted block.
+        for stage in 0..10 {
+            names.push(format!("destroy_stage_{stage}"));
+        }
+        // Glass pane edge textures, used by the mesher for pane top/bottom
+        // faces (the data file's face textures cover the panel sides).
+        names.push("glass_pane_top".to_owned());
+        for color in STAINED_COLORS {
+            names.push(format!("glass_pane_top_{color}"));
+        }
+        for path in candidate_asset_paths() {
+            match Self::from_asset_path(path.clone(), &names) {
                 Ok(atlas) => return atlas,
-                Err(err) => log::warn!(
-                    "failed to load Minecraft textures from {}: {err}",
-                    path.display()
-                ),
+                Err(err) => {
+                    log::warn!("failed to load textures from {}: {err}", path.display())
+                }
             }
         }
-        if candidates.is_empty() {
-            log::warn!(
-                "no Minecraft assets found; run scripts/setup_minecraft_1_8_9_assets.py or pass --assets <resource-pack-root-or-zip>"
-            );
-        } else {
-            log::warn!("tried Minecraft asset paths: {candidates:?}");
-        }
-        Self::fallback()
+        log::warn!(
+            "no Minecraft 1.8.9 assets found; using fallback atlas (run the asset setup script or pass --assets)"
+        );
+        Self::fallback(&names)
     }
 
-    pub fn from_minecraft_jar(path: PathBuf) -> Result<Self, String> {
-        Self::from_asset_zip(path)
-    }
-
-    pub fn from_asset_path(path: PathBuf) -> Result<Self, String> {
+    fn from_asset_path(path: PathBuf, names: &[String]) -> Result<Self, String> {
         if path.is_dir() {
-            Self::from_asset_directory(path)
+            Self::from_asset_directory(path, names)
         } else {
-            Self::from_asset_zip(path)
+            Self::from_asset_zip(path, names)
         }
     }
 
-    pub fn from_asset_directory(path: PathBuf) -> Result<Self, String> {
-        let mut atlas = fallback_atlas();
-        let loaded = load_directory_tiles(&path, &mut atlas);
-
-        if loaded == 0 {
-            return Err("directory did not contain 1.8-style block textures".to_owned());
+    fn from_asset_directory(path: PathBuf, names: &[String]) -> Result<Self, String> {
+        let mut read = |asset: &str| read_directory_image(&path, asset);
+        let (built, loaded) = build_atlas(names, &mut read);
+        if loaded == 0 && !names.is_empty() {
+            return Err("directory has no block textures".to_owned());
         }
-        log::info!("loaded {loaded} block atlas tiles from {}", path.display());
-
-        Ok(Self {
-            width: atlas.width(),
-            height: atlas.height(),
-            pixels: atlas.into_raw(),
-            source: TextureAtlasSource::Directory(path),
-        })
+        Ok(Self::from_built(built, TextureAtlasSource::Directory(path)))
     }
 
-    pub fn from_asset_zip(path: PathBuf) -> Result<Self, String> {
+    fn from_asset_zip(path: PathBuf, names: &[String]) -> Result<Self, String> {
         let file = File::open(&path).map_err(|err| err.to_string())?;
         let mut zip = ZipArchive::new(file).map_err(|err| err.to_string())?;
-        let mut atlas = fallback_atlas();
-        let loaded = load_zip_tiles(&mut zip, &mut atlas);
-
-        if loaded == 0 {
-            return Err("zip did not contain 1.8-style block textures".to_owned());
+        let mut read = |asset: &str| read_zip_image(&mut zip, asset);
+        let (built, loaded) = build_atlas(names, &mut read);
+        if loaded == 0 && !names.is_empty() {
+            return Err("archive has no block textures".to_owned());
         }
-        log::info!("loaded {loaded} block atlas tiles from {}", path.display());
-
-        Ok(Self {
-            width: atlas.width(),
-            height: atlas.height(),
-            pixels: atlas.into_raw(),
-            source: TextureAtlasSource::Archive(path),
-        })
+        Ok(Self::from_built(built, TextureAtlasSource::Archive(path)))
     }
 
-    fn fallback() -> Self {
-        let atlas = fallback_atlas();
+    fn fallback(names: &[String]) -> Self {
+        let mut read = |_: &str| None;
+        let (built, _) = build_atlas(names, &mut read);
+        Self::from_built(built, TextureAtlasSource::Fallback)
+    }
+
+    fn from_built(built: BuiltAtlas, source: TextureAtlasSource) -> Self {
         Self {
-            width: atlas.width(),
-            height: atlas.height(),
-            pixels: atlas.into_raw(),
-            source: TextureAtlasSource::Fallback,
+            width: built.image.width(),
+            height: built.image.height(),
+            pixels: built.image.into_raw(),
+            source,
+            grass_color: built.grass_color,
+            foliage_color: built.foliage_color,
+            name_to_index: built.name_to_index,
+            rows: built.rows,
+            missing_indices: built.missing_indices,
         }
     }
 }
 
-pub fn tile_uv(tile: BlockTile) -> [[f32; 2]; 4] {
-    let index = tile.index();
+struct BuiltAtlas {
+    image: RgbaImage,
+    name_to_index: HashMap<String, u32>,
+    rows: u32,
+    grass_color: [f32; 3],
+    foliage_color: [f32; 3],
+    missing_indices: Vec<u32>,
+}
+
+/// Place the missing-tile at index 0 then every named texture at index 1.., one
+/// per 16×16 cell, loading each via `read` (which resolves an `assets/...` path
+/// to an image; None leaves the magenta placeholder).
+fn build_atlas(
+    names: &[String],
+    read: &mut dyn FnMut(&str) -> Option<DynamicImage>,
+) -> (BuiltAtlas, usize) {
+    let tile_count = names.len() as u32 + 1; // +1 for the missing tile at 0
+    let rows = tile_count.div_ceil(ATLAS_COLUMNS).max(1);
+    let mut image = RgbaImage::new(ATLAS_COLUMNS * TILE_SIZE, rows * TILE_SIZE);
+    fill_missing(&mut image);
+
+    let mut name_to_index = HashMap::with_capacity(names.len());
+    let mut loaded = 0;
+    let mut missing = Vec::new();
+    let mut missing_indices = Vec::new();
+    for (offset, name) in names.iter().enumerate() {
+        let index = offset as u32 + 1;
+        name_to_index.insert(name.clone(), index);
+        let asset = format!("assets/minecraft/textures/blocks/{name}.png");
+        if let Some(source) = read(&asset) {
+            copy_tile(&mut image, index, source);
+            loaded += 1;
+        } else {
+            put_missing(&mut image, index);
+            missing.push(name.as_str());
+            missing_indices.push(index);
+        }
+    }
+
+    if loaded > 0 {
+        log::info!("loaded {loaded}/{} block atlas tiles", names.len());
+        if !missing.is_empty() {
+            log::warn!(
+                "missing {} block atlas textures; using purple/black fallback for: {}",
+                missing.len(),
+                missing.join(", ")
+            );
+        }
+    }
+
+    let grass = read(GRASS_COLORMAP)
+        .map(|img| sample_plains_color(&img))
+        .unwrap_or(DEFAULT_GRASS);
+    let foliage = read(FOLIAGE_COLORMAP)
+        .map(|img| sample_plains_color(&img))
+        .unwrap_or(DEFAULT_FOLIAGE);
+    if let (Some(&index), Some(overlay)) =
+        (name_to_index.get("grass_side"), read(GRASS_SIDE_OVERLAY))
+    {
+        composite_grass_side(&mut image, index, &overlay, grass);
+    }
+
+    (
+        BuiltAtlas {
+            image,
+            name_to_index,
+            rows,
+            grass_color: u8_to_unit(grass),
+            foliage_color: u8_to_unit(foliage),
+            missing_indices,
+        },
+        loaded,
+    )
+}
+
+/// Log once per (block, meta, context) when a texture resolves to the magenta
+/// missing tile, so broken texture wiring is easy to spot in the log without
+/// flooding it on every chunk rebuild.
+pub(crate) fn warn_missing_tile(block_id: u16, meta: u8, context: &str, name: Option<&str>) {
+    static SEEN: OnceLock<Mutex<HashSet<(u16, u8, String)>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    if !seen.lock().expect("missing-tile log set poisoned").insert((
+        block_id,
+        meta,
+        context.to_owned(),
+    )) {
+        return;
+    }
+    match name {
+        Some(name) => log::warn!(
+            "block {block_id}:{meta} renders the missing (magenta) tile for {context}: \
+             texture '{name}' is not in the atlas"
+        ),
+        None => log::warn!(
+            "block {block_id}:{meta} renders the missing (magenta) tile for {context}: \
+             no texture mapped in blocks.json"
+        ),
+    }
+}
+
+fn tile_uv(index: u32, rows: u32) -> [[f32; 2]; 4] {
     let x = index % ATLAS_COLUMNS;
     let y = index / ATLAS_COLUMNS;
     let atlas_w = (ATLAS_COLUMNS * TILE_SIZE) as f32;
-    let atlas_h = (ATLAS_ROWS * TILE_SIZE) as f32;
+    let atlas_h = (rows * TILE_SIZE) as f32;
     let min_u = (x * TILE_SIZE) as f32 / atlas_w;
     let max_u = ((x + 1) * TILE_SIZE) as f32 / atlas_w;
     let min_v = (y * TILE_SIZE) as f32 / atlas_h;
@@ -264,6 +321,669 @@ pub fn tile_uv(tile: BlockTile) -> [[f32; 2]; 4] {
         [max_u, min_v],
         [max_u, max_v],
     ]
+}
+
+fn tile_origin(index: u32) -> (u32, u32) {
+    (
+        index % ATLAS_COLUMNS * TILE_SIZE,
+        index / ATLAS_COLUMNS * TILE_SIZE,
+    )
+}
+
+fn copy_tile(atlas: &mut RgbaImage, index: u32, image: DynamicImage) {
+    let tile = first_animation_frame(image)
+        .resize_exact(TILE_SIZE, TILE_SIZE, FilterType::Nearest)
+        .to_rgba8();
+    let (x, y) = tile_origin(index);
+    let _ = atlas.copy_from(&tile, x, y);
+}
+
+/// Animated textures ship as a vertical strip of square frames; use frame 0.
+fn first_animation_frame(image: DynamicImage) -> DynamicImage {
+    let (width, height) = (image.width(), image.height());
+    if width > 0 && height > width && height % width == 0 {
+        image.crop_imm(0, 0, width, width)
+    } else {
+        image
+    }
+}
+
+fn fill_missing(atlas: &mut RgbaImage) {
+    put_missing(atlas, 0);
+}
+
+fn put_missing(atlas: &mut RgbaImage, index: u32) {
+    let (x0, y0) = tile_origin(index);
+    for y in 0..TILE_SIZE {
+        for x in 0..TILE_SIZE {
+            let dark = ((x / 4) + (y / 4)) % 2 == 0;
+            let color = if dark {
+                Rgba([0, 0, 0, 255])
+            } else {
+                Rgba([255, 0, 255, 255])
+            };
+            atlas.put_pixel(x0 + x, y0 + y, color);
+        }
+    }
+}
+
+fn u8_to_unit(rgb: [u8; 3]) -> [f32; 3] {
+    [
+        rgb[0] as f32 / 255.0,
+        rgb[1] as f32 / 255.0,
+        rgb[2] as f32 / 255.0,
+    ]
+}
+
+fn sample_plains_color(colormap: &DynamicImage) -> [u8; 3] {
+    let image = colormap.to_rgba8();
+    let (width, height) = image.dimensions();
+    let rain = PLAINS_DOWNFALL * PLAINS_TEMPERATURE;
+    let x = (((1.0 - PLAINS_TEMPERATURE) * 255.0) as u32).min(width.saturating_sub(1));
+    let y = (((1.0 - rain) * 255.0) as u32).min(height.saturating_sub(1));
+    let pixel = image.get_pixel(x, y);
+    [pixel[0], pixel[1], pixel[2]]
+}
+
+fn composite_grass_side(atlas: &mut RgbaImage, index: u32, overlay: &DynamicImage, grass: [u8; 3]) {
+    let overlay = overlay
+        .resize_exact(TILE_SIZE, TILE_SIZE, FilterType::Nearest)
+        .to_rgba8();
+    let (x0, y0) = tile_origin(index);
+    for ty in 0..TILE_SIZE {
+        for tx in 0..TILE_SIZE {
+            let over = overlay.get_pixel(tx, ty);
+            let alpha = over[3] as f32 / 255.0;
+            if alpha <= 0.0 {
+                continue;
+            }
+            let base = atlas.get_pixel(x0 + tx, y0 + ty).0;
+            let mut out = [0u8; 4];
+            for c in 0..3 {
+                let tinted = grass[c] as f32 * (over[c] as f32 / 255.0);
+                out[c] = (base[c] as f32 * (1.0 - alpha) + tinted * alpha)
+                    .round()
+                    .clamp(0.0, 255.0) as u8;
+            }
+            out[3] = 255;
+            atlas.put_pixel(x0 + tx, y0 + ty, Rgba(out));
+        }
+    }
+}
+
+/// Load a single GUI texture (e.g. "widgets", "icons") from any asset source.
+pub fn load_gui_image(name: &str) -> Option<RgbaImage> {
+    load_asset_image(&format!("assets/minecraft/textures/gui/{name}.png"))
+}
+
+/// 1.8 numeric item id → texture base-name under `textures/items/`. Metadata
+/// variants (dye/fish/record subtypes) collapse to the base item. None means we
+/// don't have a thumbnail for it (the UI then draws a tint swatch).
+pub fn item_texture_name(id: i16) -> Option<&'static str> {
+    let name = match id {
+        256 => "iron_shovel",
+        257 => "iron_pickaxe",
+        258 => "iron_axe",
+        259 => "flint_and_steel",
+        260 => "apple",
+        261 => "bow_standby",
+        262 => "arrow",
+        263 => "coal",
+        264 => "diamond",
+        265 => "iron_ingot",
+        266 => "gold_ingot",
+        267 => "iron_sword",
+        268 => "wood_sword",
+        269 => "wood_shovel",
+        270 => "wood_pickaxe",
+        271 => "wood_axe",
+        272 => "stone_sword",
+        273 => "stone_shovel",
+        274 => "stone_pickaxe",
+        275 => "stone_axe",
+        276 => "diamond_sword",
+        277 => "diamond_shovel",
+        278 => "diamond_pickaxe",
+        279 => "diamond_axe",
+        280 => "stick",
+        281 => "bowl",
+        282 => "mushroom_stew",
+        283 => "gold_sword",
+        284 => "gold_shovel",
+        285 => "gold_pickaxe",
+        286 => "gold_axe",
+        287 => "string",
+        288 => "feather",
+        289 => "gunpowder",
+        290 => "wood_hoe",
+        291 => "stone_hoe",
+        292 => "iron_hoe",
+        293 => "diamond_hoe",
+        294 => "gold_hoe",
+        295 => "seeds_wheat",
+        296 => "wheat",
+        297 => "bread",
+        298 => "leather_helmet",
+        299 => "leather_chestplate",
+        300 => "leather_leggings",
+        301 => "leather_boots",
+        302 => "chainmail_helmet",
+        303 => "chainmail_chestplate",
+        304 => "chainmail_leggings",
+        305 => "chainmail_boots",
+        306 => "iron_helmet",
+        307 => "iron_chestplate",
+        308 => "iron_leggings",
+        309 => "iron_boots",
+        310 => "diamond_helmet",
+        311 => "diamond_chestplate",
+        312 => "diamond_leggings",
+        313 => "diamond_boots",
+        314 => "gold_helmet",
+        315 => "gold_chestplate",
+        316 => "gold_leggings",
+        317 => "gold_boots",
+        318 => "flint",
+        319 => "porkchop_raw",
+        320 => "porkchop_cooked",
+        321 => "painting",
+        322 => "apple_golden",
+        323 => "sign",
+        324 => "door_wood",
+        325 => "bucket_empty",
+        326 => "bucket_water",
+        327 => "bucket_lava",
+        328 => "minecart_normal",
+        329 => "saddle",
+        330 => "door_iron",
+        331 => "redstone_dust",
+        332 => "snowball",
+        333 => "boat",
+        334 => "leather",
+        335 => "bucket_milk",
+        336 => "brick",
+        337 => "clay_ball",
+        338 => "reeds",
+        339 => "paper",
+        340 => "book_normal",
+        341 => "slimeball",
+        342 => "minecart_chest",
+        343 => "minecart_furnace",
+        344 => "egg",
+        345 => "compass",
+        346 => "fishing_rod_uncast",
+        347 => "clock",
+        348 => "glowstone_dust",
+        349 => "fish_cod_raw",
+        350 => "fish_cod_cooked",
+        351 => "dye_powder_black",
+        352 => "bone",
+        353 => "sugar",
+        354 => "cake",
+        355 => "bed",
+        356 => "repeater",
+        357 => "cookie",
+        358 => "map_filled",
+        359 => "shears",
+        360 => "melon",
+        361 => "seeds_pumpkin",
+        362 => "seeds_melon",
+        363 => "beef_raw",
+        364 => "beef_cooked",
+        365 => "chicken_raw",
+        366 => "chicken_cooked",
+        367 => "rotten_flesh",
+        368 => "ender_pearl",
+        369 => "blaze_rod",
+        370 => "ghast_tear",
+        371 => "gold_nugget",
+        372 => "nether_wart",
+        373 => "potion_bottle_drinkable",
+        374 => "potion_bottle_empty",
+        375 => "spider_eye",
+        376 => "spider_eye_fermented",
+        377 => "blaze_powder",
+        378 => "magma_cream",
+        379 => "brewing_stand",
+        380 => "cauldron",
+        381 => "ender_eye",
+        382 => "melon_speckled",
+        383 => "spawn_egg",
+        384 => "experience_bottle",
+        385 => "fireball",
+        386 => "book_writable",
+        387 => "book_written",
+        388 => "emerald",
+        389 => "item_frame",
+        390 => "flower_pot",
+        391 => "carrot",
+        392 => "potato",
+        393 => "potato_baked",
+        394 => "potato_poisonous",
+        395 => "map_empty",
+        396 => "carrot_golden",
+        398 => "carrot_on_a_stick",
+        399 => "nether_star",
+        400 => "pumpkin_pie",
+        401 => "fireworks",
+        402 => "fireworks_charge",
+        403 => "book_enchanted",
+        404 => "comparator",
+        405 => "netherbrick",
+        406 => "quartz",
+        407 => "minecart_tnt",
+        408 => "minecart_hopper",
+        409 => "prismarine_shard",
+        410 => "prismarine_crystals",
+        411 => "rabbit_raw",
+        412 => "rabbit_cooked",
+        413 => "rabbit_stew",
+        414 => "rabbit_foot",
+        415 => "rabbit_hide",
+        416 => "wooden_armorstand",
+        417 => "iron_horse_armor",
+        418 => "gold_horse_armor",
+        419 => "diamond_horse_armor",
+        420 => "lead",
+        421 => "name_tag",
+        422 => "minecart_command_block",
+        423 => "mutton_raw",
+        424 => "mutton_cooked",
+        425 => "banner_base",
+        427 => "door_spruce",
+        428 => "door_birch",
+        429 => "door_jungle",
+        430 => "door_acacia",
+        431 => "door_dark_oak",
+        2257 => "record_cat",
+        2258 => "record_blocks",
+        2259 => "record_chirp",
+        2260 => "record_far",
+        2261 => "record_mall",
+        2262 => "record_mellohi",
+        2263 => "record_stal",
+        2264 => "record_strad",
+        2265 => "record_ward",
+        2267 => "record_wait",
+        _ => return None,
+    };
+    Some(name)
+}
+
+/// An atlas of 16×16 item thumbnails packed into a 16-wide tile grid, built from
+/// the `textures/items/` assets the [`item_texture_name`] table references. Only
+/// items whose texture actually loaded get a tile; the rest fall back to swatches.
+#[derive(Debug, Clone, Default)]
+pub struct ItemAtlasImage {
+    image: Option<RgbaImage>,
+    name_to_index: HashMap<&'static str, u32>,
+}
+
+impl ItemAtlasImage {
+    /// Build the item atlas by loading every referenced item texture. Always
+    /// succeeds (an empty atlas when no item assets are present).
+    pub fn load_default() -> Self {
+        // Collect the unique texture names referenced by the id table.
+        let mut names: Vec<&'static str> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for id in (256..432).chain(2256..2268) {
+            if let Some(name) = item_texture_name(id) {
+                if seen.insert(name) {
+                    names.push(name);
+                }
+            }
+        }
+        // Load each, keeping only the ones that exist.
+        let loaded: Vec<(&'static str, RgbaImage)> = names
+            .into_iter()
+            .filter_map(|name| {
+                load_asset_image(&format!("assets/minecraft/textures/items/{name}.png"))
+                    .map(|image| (name, to_item_tile(image)))
+            })
+            .collect();
+        if loaded.is_empty() {
+            log::warn!("no item textures found; item thumbnails will use color swatches");
+            return Self::default();
+        }
+        let count = loaded.len() as u32;
+        let rows = count.div_ceil(ATLAS_COLUMNS).max(1);
+        let mut image = RgbaImage::new(ATLAS_COLUMNS * TILE_SIZE, rows * TILE_SIZE);
+        let mut name_to_index = HashMap::with_capacity(loaded.len());
+        for (index, (name, tile)) in loaded.into_iter().enumerate() {
+            let index = index as u32;
+            let x = index % ATLAS_COLUMNS * TILE_SIZE;
+            let y = index / ATLAS_COLUMNS * TILE_SIZE;
+            let _ = image.copy_from(&tile, x, y);
+            name_to_index.insert(name, index);
+        }
+        log::info!("loaded {count} item textures");
+        Self {
+            image: Some(image),
+            name_to_index,
+        }
+    }
+
+    pub fn image(&self) -> Option<&RgbaImage> {
+        self.image.as_ref()
+    }
+
+    /// Source pixel rect of an item id's thumbnail in the atlas, or None if there
+    /// is no loaded texture for it.
+    pub fn tile_for_id(&self, id: i16) -> Option<(u32, u32)> {
+        let name = item_texture_name(id)?;
+        let index = *self.name_to_index.get(name)?;
+        Some((
+            index % ATLAS_COLUMNS * TILE_SIZE,
+            index / ATLAS_COLUMNS * TILE_SIZE,
+        ))
+    }
+}
+
+/// Crop an item texture to its first animation frame (compass/clock are vertical
+/// strips) and scale it to a 16×16 tile.
+fn to_item_tile(image: RgbaImage) -> RgbaImage {
+    let (w, h) = image.dimensions();
+    let frame = if w > 0 && h > w && h % w == 0 {
+        image::imageops::crop_imm(&image, 0, 0, w, w).to_image()
+    } else {
+        image
+    };
+    if frame.width() == TILE_SIZE && frame.height() == TILE_SIZE {
+        frame
+    } else {
+        image::imageops::resize(&frame, TILE_SIZE, TILE_SIZE, FilterType::Nearest)
+    }
+}
+
+/// Load a single entity texture (e.g. "steve", "zombie/zombie") from any
+/// asset source.
+pub fn load_entity_image(name: &str) -> Option<RgbaImage> {
+    load_asset_image(&format!("assets/minecraft/textures/entity/{name}.png"))
+}
+
+pub(crate) fn load_asset_image(asset: &str) -> Option<RgbaImage> {
+    for path in candidate_asset_paths() {
+        let image = if path.is_dir() {
+            read_directory_image(&path, asset)
+        } else {
+            File::open(&path)
+                .ok()
+                .and_then(|file| ZipArchive::new(file).ok())
+                .and_then(|mut zip| read_zip_image(&mut zip, asset))
+        };
+        if let Some(image) = image {
+            return Some(image.to_rgba8());
+        }
+    }
+    None
+}
+
+/// Load a raw (non-image) asset file, e.g. `font/glyph_sizes.bin`.
+pub(crate) fn load_asset_bytes(asset: &str) -> Option<Vec<u8>> {
+    for path in candidate_asset_paths() {
+        if path.is_dir() {
+            if let Ok(bytes) = fs::read(directory_texture_path(&path, asset)) {
+                return Some(bytes);
+            }
+        } else if let Some(bytes) = File::open(&path)
+            .ok()
+            .and_then(|file| ZipArchive::new(file).ok())
+            .and_then(|mut zip| {
+                let mut file = zip.by_name(asset).ok()?;
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes).ok()?;
+                Some(bytes)
+            })
+        {
+            return Some(bytes);
+        }
+    }
+    None
+}
+
+/// Side length in pixels of one slot in the entity texture atlas grid.
+pub const ENTITY_SLOT_PX: u32 = 64;
+
+/// Number of slots stacked vertically in the entity atlas (including the
+/// trailing guaranteed-white slot).
+pub const ENTITY_SLOT_COUNT: u32 = 10;
+
+/// Fixed dimensions of the entity texture atlas: a single column of
+/// `ENTITY_SLOT_COUNT` slots of `ENTITY_SLOT_PX` square pixels each, one per
+/// [`EntitySlot`].
+pub const ENTITY_ATLAS_WIDTH: u32 = ENTITY_SLOT_PX;
+pub const ENTITY_ATLAS_HEIGHT: u32 = ENTITY_SLOT_COUNT * ENTITY_SLOT_PX;
+
+/// One 64x64 slot of the entity texture atlas. The discriminant is the slot's
+/// row index from the top; `entity_slot_origin` yields its pixel origin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EntitySlot {
+    /// Player skin (steve.png), normalized to the modern 64x64 layout.
+    Player = 0,
+    Zombie = 1,
+    /// 64x32 source texture; occupies the top half of the slot.
+    Skeleton = 2,
+    Creeper = 3,
+    Pig = 4,
+    Cow = 5,
+    Sheep = 6,
+    Chicken = 7,
+    Villager = 8,
+    /// Guaranteed opaque-white slot sampled by solid-color geometry.
+    White = 9,
+}
+
+/// Pixel origin (top-left corner) of an entity atlas slot.
+pub fn entity_slot_origin(slot: EntitySlot) -> (u32, u32) {
+    (0, slot as u32 * ENTITY_SLOT_PX)
+}
+
+/// UV of a texel inside the guaranteed-opaque-white region of the entity
+/// atlas (the center of the `EntitySlot::White` slot); solid-color model
+/// geometry samples here so its vertex tint passes through unchanged.
+pub const ENTITY_WHITE_UV: [f32; 2] = [
+    0.5,
+    ((EntitySlot::White as u32 * ENTITY_SLOT_PX + ENTITY_SLOT_PX / 2) as f32)
+        / ENTITY_ATLAS_HEIGHT as f32,
+];
+
+/// The 1.8 entity textures loaded into each mob slot, plus the procedural
+/// fallback tint used when the asset is missing. The player slot is handled
+/// separately (normalize_skin / procedural_skin).
+const MOB_SLOT_ASSETS: [(EntitySlot, &str, [u8; 3]); 8] = [
+    (EntitySlot::Zombie, "zombie/zombie", [88, 124, 80]),
+    (EntitySlot::Skeleton, "skeleton/skeleton", [192, 192, 192]),
+    (EntitySlot::Creeper, "creeper/creeper", [86, 170, 70]),
+    (EntitySlot::Pig, "pig/pig", [238, 158, 158]),
+    (EntitySlot::Cow, "cow/cow", [108, 80, 58]),
+    (EntitySlot::Sheep, "sheep/sheep", [228, 228, 228]),
+    (EntitySlot::Chicken, "chicken", [238, 238, 216]),
+    (EntitySlot::Villager, "villager/villager", [136, 104, 70]),
+];
+
+/// RGBA pixels for the entity atlas sampled by the model pass: a vertical
+/// grid of 64x64 slots, one per entity texture (player skin plus the common
+/// 1.8 mobs), with a guaranteed solid-white slot at the bottom for
+/// solid-color geometry. Every slot has a procedural fallback, so building
+/// the atlas always succeeds even with no assets installed.
+#[derive(Debug, Clone)]
+pub struct EntityAtlasImage {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u8>,
+    pub player_skin_loaded: bool,
+    /// How many of the mob slots were filled from real assets (the rest use
+    /// per-type procedural textures).
+    pub mob_textures_loaded: usize,
+}
+
+impl EntityAtlasImage {
+    /// Build the atlas, falling back to procedural textures per slot when an
+    /// asset is missing. Always succeeds.
+    pub fn load_default() -> Self {
+        // Start fully white so the White slot (and any texel a normalized
+        // texture does not cover, e.g. the bottom half of a 64x32 slot) is a
+        // safe opaque-white sample.
+        let mut atlas = RgbaImage::from_pixel(
+            ENTITY_ATLAS_WIDTH,
+            ENTITY_ATLAS_HEIGHT,
+            Rgba([255, 255, 255, 255]),
+        );
+
+        let skin = load_entity_image("steve");
+        let player_skin_loaded = skin.is_some();
+        let skin = skin.map(normalize_skin).unwrap_or_else(procedural_skin);
+        blit_slot(&mut atlas, EntitySlot::Player, &skin);
+
+        let mut mob_textures_loaded = 0;
+        for (slot, name, tint) in MOB_SLOT_ASSETS {
+            let image = match load_entity_image(name) {
+                Some(image) => {
+                    mob_textures_loaded += 1;
+                    normalize_entity_texture(image)
+                }
+                None => procedural_entity_texture(tint),
+            };
+            blit_slot(&mut atlas, slot, &image);
+        }
+        log::info!(
+            "loaded {mob_textures_loaded}/{} mob entity textures",
+            MOB_SLOT_ASSETS.len()
+        );
+
+        Self {
+            width: ENTITY_ATLAS_WIDTH,
+            height: ENTITY_ATLAS_HEIGHT,
+            pixels: atlas.into_raw(),
+            player_skin_loaded,
+            mob_textures_loaded,
+        }
+    }
+}
+
+/// Copy a (normalized, at most 64x64) image into its slot, anchored top-left.
+fn blit_slot(atlas: &mut RgbaImage, slot: EntitySlot, image: &RgbaImage) {
+    let (x, y) = entity_slot_origin(slot);
+    let _ = atlas.copy_from(image, x, y);
+}
+
+/// Fit a mob texture into a 64-wide slot keeping its aspect ratio: 64x64
+/// textures fill the slot, 64x32 textures (and other 2:1 sources) end up in
+/// the slot's top half, which matches their models' UV layout. Anything else
+/// is scaled to 64 wide with the height clamped to the slot.
+fn normalize_entity_texture(image: RgbaImage) -> RgbaImage {
+    let (w, h) = image.dimensions();
+    if w == ENTITY_SLOT_PX && h <= ENTITY_SLOT_PX {
+        return image;
+    }
+    let target_h = (h * ENTITY_SLOT_PX / w.max(1)).clamp(1, ENTITY_SLOT_PX);
+    DynamicImage::ImageRgba8(image)
+        .resize_exact(ENTITY_SLOT_PX, target_h, FilterType::Nearest)
+        .to_rgba8()
+}
+
+/// Procedural stand-in for a missing mob texture: a two-tone checker of the
+/// type's tint, plus dark eyes in the head-front region (x 8..16, y 8..16 for
+/// the 8x8x8 head most of these models use) so mobs stay readable.
+fn procedural_entity_texture(tint: [u8; 3]) -> RgbaImage {
+    let shade = |c: u8, mul: f32| (c as f32 * mul).round().clamp(0.0, 255.0) as u8;
+    let base = Rgba([tint[0], tint[1], tint[2], 255]);
+    let dark = Rgba([
+        shade(tint[0], 0.82),
+        shade(tint[1], 0.82),
+        shade(tint[2], 0.82),
+        255,
+    ]);
+    let eye = Rgba([
+        shade(tint[0], 0.25),
+        shade(tint[1], 0.25),
+        shade(tint[2], 0.25),
+        255,
+    ]);
+    let mut image = RgbaImage::from_fn(ENTITY_SLOT_PX, ENTITY_SLOT_PX, |x, y| {
+        if ((x / 4) + (y / 4)) % 2 == 0 {
+            base
+        } else {
+            dark
+        }
+    });
+    for (x, y) in [(9, 11), (10, 11), (13, 11), (14, 11)] {
+        image.put_pixel(x, y, eye);
+        image.put_pixel(x, y + 1, eye);
+    }
+    image
+}
+
+/// Bring a player skin to the modern 64x64 layout: HD skins are downscaled
+/// and legacy 64x32 skins get their right arm/leg copied into the 1.8-format
+/// left arm/leg slots so the geometry builder can hardcode one layout.
+fn normalize_skin(image: RgbaImage) -> RgbaImage {
+    // Legacy skins are 2:1 (64x32 and HD multiples); everything else is
+    // treated as the square modern layout.
+    let target_height = if image.height() * 2 == image.width() {
+        32
+    } else {
+        64
+    };
+    let image = if image.width() != 64 || image.height() != target_height {
+        DynamicImage::ImageRgba8(image)
+            .resize_exact(64, target_height, FilterType::Nearest)
+            .to_rgba8()
+    } else {
+        image
+    };
+    if image.height() == 64 {
+        return image;
+    }
+    let mut full = RgbaImage::new(64, 64);
+    let _ = full.copy_from(&image, 0, 0);
+    copy_region(&mut full, 0, 16, 16, 48, 16, 16); // right leg -> left leg slot
+    copy_region(&mut full, 40, 16, 32, 48, 16, 16); // right arm -> left arm slot
+    full
+}
+
+fn copy_region(image: &mut RgbaImage, sx: u32, sy: u32, dx: u32, dy: u32, w: u32, h: u32) {
+    for y in 0..h {
+        for x in 0..w {
+            let pixel = *image.get_pixel(sx + x, sy + y);
+            image.put_pixel(dx + x, dy + y, pixel);
+        }
+    }
+}
+
+/// A simple Steve-like 64x64 skin so players stay readable when no asset
+/// skin is available: skin-tone head/arms, hair, eyes, teal shirt, indigo
+/// pants and gray shoes painted into the standard skin regions.
+fn procedural_skin() -> RgbaImage {
+    const SKIN: Rgba<u8> = Rgba([198, 152, 110, 255]);
+    const HAIR: Rgba<u8> = Rgba([66, 48, 30, 255]);
+    const SHIRT: Rgba<u8> = Rgba([0, 134, 143, 255]);
+    const PANTS: Rgba<u8> = Rgba([64, 64, 140, 255]);
+    const SHOES: Rgba<u8> = Rgba([90, 90, 90, 255]);
+    const EYE_WHITE: Rgba<u8> = Rgba([255, 255, 255, 255]);
+    const EYE_IRIS: Rgba<u8> = Rgba([60, 50, 130, 255]);
+
+    let mut skin = RgbaImage::from_pixel(64, 64, SKIN);
+    let mut fill = |x0: u32, y0: u32, x1: u32, y1: u32, color: Rgba<u8>| {
+        for y in y0..y1 {
+            for x in x0..x1 {
+                skin.put_pixel(x, y, color);
+            }
+        }
+    };
+    fill(16, 16, 40, 32, SHIRT); // torso block
+    fill(0, 16, 16, 32, PANTS); // right leg block
+    fill(16, 48, 32, 64, PANTS); // left leg block (1.8 layout)
+    fill(0, 30, 16, 32, SHOES); // bottom rows of the leg side strips
+    fill(16, 62, 32, 64, SHOES);
+    fill(8, 0, 16, 8, HAIR); // head top
+    fill(0, 8, 32, 11, HAIR); // hair band across all four head sides
+                              // Symmetric eyes on the head-front region (x 8..16, y 8..16).
+    skin.put_pixel(9, 12, EYE_WHITE);
+    skin.put_pixel(10, 12, EYE_IRIS);
+    skin.put_pixel(13, 12, EYE_IRIS);
+    skin.put_pixel(14, 12, EYE_WHITE);
+    skin
 }
 
 fn candidate_asset_paths() -> Vec<PathBuf> {
@@ -306,634 +1026,6 @@ fn asset_path_exists(path: &Path) -> bool {
         || path.join("minecraft/textures/blocks").is_dir()
 }
 
-fn empty_atlas() -> RgbaImage {
-    let mut image = RgbaImage::new(ATLAS_COLUMNS * TILE_SIZE, ATLAS_ROWS * TILE_SIZE);
-    for y in 0..image.height() {
-        for x in 0..image.width() {
-            let dark = ((x / 4) + (y / 4)) % 2 == 0;
-            image.put_pixel(
-                x,
-                y,
-                if dark {
-                    Rgba([0, 0, 0, 255])
-                } else {
-                    Rgba([255, 0, 255, 255])
-                },
-            );
-        }
-    }
-    image
-}
-
-fn fallback_atlas() -> RgbaImage {
-    let mut atlas = empty_atlas();
-    fill_tile(&mut atlas, BlockTile::Stone, [116, 116, 116, 255]);
-    fill_tile(&mut atlas, BlockTile::Cobblestone, [98, 98, 98, 255]);
-    fill_tile(&mut atlas, BlockTile::GrassTop, [82, 158, 45, 255]);
-    fill_tile(&mut atlas, BlockTile::GrassSide, [94, 132, 48, 255]);
-    fill_tile(&mut atlas, BlockTile::Dirt, [115, 76, 39, 255]);
-    fill_tile(&mut atlas, BlockTile::Sand, [194, 178, 128, 255]);
-    fill_tile(&mut atlas, BlockTile::OakLogSide, [89, 55, 28, 255]);
-    fill_tile(&mut atlas, BlockTile::OakLogTop, [151, 119, 75, 255]);
-    fill_tile(&mut atlas, BlockTile::PlanksOak, [157, 128, 79, 255]);
-    fill_tile(&mut atlas, BlockTile::OakLeaves, [46, 115, 40, 220]);
-    fill_tile(&mut atlas, BlockTile::Snow, [235, 245, 245, 255]);
-    fill_tile(&mut atlas, BlockTile::Netherrack, [111, 54, 53, 255]);
-    fill_tile(&mut atlas, BlockTile::Glowstone, [171, 135, 84, 255]);
-    atlas
-}
-
-struct TextureSpec {
-    tile: BlockTile,
-    paths: &'static [&'static str],
-}
-
-const TEXTURE_SPECS: &[TextureSpec] = &[
-    TextureSpec {
-        tile: BlockTile::Stone,
-        paths: &["assets/minecraft/textures/blocks/stone.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::GrassTop,
-        paths: &["assets/minecraft/textures/blocks/grass_top.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::GrassSide,
-        paths: &["assets/minecraft/textures/blocks/grass_side.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::Dirt,
-        paths: &["assets/minecraft/textures/blocks/dirt.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::CoarseDirt,
-        paths: &["assets/minecraft/textures/blocks/coarse_dirt.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::PodzolTop,
-        paths: &["assets/minecraft/textures/blocks/dirt_podzol_top.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::PodzolSide,
-        paths: &["assets/minecraft/textures/blocks/dirt_podzol_side.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::Cobblestone,
-        paths: &["assets/minecraft/textures/blocks/cobblestone.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::Bedrock,
-        paths: &["assets/minecraft/textures/blocks/bedrock.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::Gravel,
-        paths: &["assets/minecraft/textures/blocks/gravel.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::Sand,
-        paths: &["assets/minecraft/textures/blocks/sand.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::RedSand,
-        paths: &["assets/minecraft/textures/blocks/red_sand.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::Granite,
-        paths: &["assets/minecraft/textures/blocks/stone_granite.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::PolishedGranite,
-        paths: &["assets/minecraft/textures/blocks/stone_granite_smooth.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::Diorite,
-        paths: &["assets/minecraft/textures/blocks/stone_diorite.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::PolishedDiorite,
-        paths: &["assets/minecraft/textures/blocks/stone_diorite_smooth.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::Andesite,
-        paths: &["assets/minecraft/textures/blocks/stone_andesite.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::PolishedAndesite,
-        paths: &["assets/minecraft/textures/blocks/stone_andesite_smooth.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::CoalOre,
-        paths: &["assets/minecraft/textures/blocks/coal_ore.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::IronOre,
-        paths: &["assets/minecraft/textures/blocks/iron_ore.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::GoldOre,
-        paths: &["assets/minecraft/textures/blocks/gold_ore.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::LapisOre,
-        paths: &["assets/minecraft/textures/blocks/lapis_ore.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::RedstoneOre,
-        paths: &["assets/minecraft/textures/blocks/redstone_ore.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::DiamondOre,
-        paths: &["assets/minecraft/textures/blocks/diamond_ore.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::EmeraldOre,
-        paths: &["assets/minecraft/textures/blocks/emerald_ore.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::PlanksOak,
-        paths: &["assets/minecraft/textures/blocks/planks_oak.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::PlanksSpruce,
-        paths: &["assets/minecraft/textures/blocks/planks_spruce.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::PlanksBirch,
-        paths: &["assets/minecraft/textures/blocks/planks_birch.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::PlanksJungle,
-        paths: &["assets/minecraft/textures/blocks/planks_jungle.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::PlanksAcacia,
-        paths: &["assets/minecraft/textures/blocks/planks_acacia.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::PlanksDarkOak,
-        paths: &["assets/minecraft/textures/blocks/planks_big_oak.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::OakLogSide,
-        paths: &["assets/minecraft/textures/blocks/log_oak.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::OakLogTop,
-        paths: &["assets/minecraft/textures/blocks/log_oak_top.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::SpruceLogSide,
-        paths: &["assets/minecraft/textures/blocks/log_spruce.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::SpruceLogTop,
-        paths: &["assets/minecraft/textures/blocks/log_spruce_top.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::BirchLogSide,
-        paths: &["assets/minecraft/textures/blocks/log_birch.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::BirchLogTop,
-        paths: &["assets/minecraft/textures/blocks/log_birch_top.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::JungleLogSide,
-        paths: &["assets/minecraft/textures/blocks/log_jungle.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::JungleLogTop,
-        paths: &["assets/minecraft/textures/blocks/log_jungle_top.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::AcaciaLogSide,
-        paths: &["assets/minecraft/textures/blocks/log_acacia.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::AcaciaLogTop,
-        paths: &["assets/minecraft/textures/blocks/log_acacia_top.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::DarkOakLogSide,
-        paths: &["assets/minecraft/textures/blocks/log_big_oak.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::DarkOakLogTop,
-        paths: &["assets/minecraft/textures/blocks/log_big_oak_top.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::OakLeaves,
-        paths: &["assets/minecraft/textures/blocks/leaves_oak.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::SpruceLeaves,
-        paths: &["assets/minecraft/textures/blocks/leaves_spruce.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::BirchLeaves,
-        paths: &["assets/minecraft/textures/blocks/leaves_birch.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::JungleLeaves,
-        paths: &["assets/minecraft/textures/blocks/leaves_jungle.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::AcaciaLeaves,
-        paths: &["assets/minecraft/textures/blocks/leaves_acacia.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::DarkOakLeaves,
-        paths: &["assets/minecraft/textures/blocks/leaves_big_oak.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::SandstoneSide,
-        paths: &["assets/minecraft/textures/blocks/sandstone_normal.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::SandstoneTop,
-        paths: &["assets/minecraft/textures/blocks/sandstone_top.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::SandstoneBottom,
-        paths: &["assets/minecraft/textures/blocks/sandstone_bottom.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::SandstoneCarved,
-        paths: &["assets/minecraft/textures/blocks/sandstone_carved.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::SandstoneSmooth,
-        paths: &["assets/minecraft/textures/blocks/sandstone_smooth.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::RedSandstoneSide,
-        paths: &["assets/minecraft/textures/blocks/red_sandstone_normal.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::RedSandstoneTop,
-        paths: &["assets/minecraft/textures/blocks/red_sandstone_top.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::RedSandstoneBottom,
-        paths: &["assets/minecraft/textures/blocks/red_sandstone_bottom.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::RedSandstoneCarved,
-        paths: &["assets/minecraft/textures/blocks/red_sandstone_carved.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::RedSandstoneSmooth,
-        paths: &["assets/minecraft/textures/blocks/red_sandstone_smooth.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::WoolWhite,
-        paths: &["assets/minecraft/textures/blocks/wool_colored_white.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::WoolOrange,
-        paths: &["assets/minecraft/textures/blocks/wool_colored_orange.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::WoolMagenta,
-        paths: &["assets/minecraft/textures/blocks/wool_colored_magenta.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::WoolLightBlue,
-        paths: &["assets/minecraft/textures/blocks/wool_colored_light_blue.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::WoolYellow,
-        paths: &["assets/minecraft/textures/blocks/wool_colored_yellow.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::WoolLime,
-        paths: &["assets/minecraft/textures/blocks/wool_colored_lime.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::WoolPink,
-        paths: &["assets/minecraft/textures/blocks/wool_colored_pink.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::WoolGray,
-        paths: &["assets/minecraft/textures/blocks/wool_colored_gray.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::WoolSilver,
-        paths: &["assets/minecraft/textures/blocks/wool_colored_silver.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::WoolCyan,
-        paths: &["assets/minecraft/textures/blocks/wool_colored_cyan.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::WoolPurple,
-        paths: &["assets/minecraft/textures/blocks/wool_colored_purple.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::WoolBlue,
-        paths: &["assets/minecraft/textures/blocks/wool_colored_blue.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::WoolBrown,
-        paths: &["assets/minecraft/textures/blocks/wool_colored_brown.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::WoolGreen,
-        paths: &["assets/minecraft/textures/blocks/wool_colored_green.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::WoolRed,
-        paths: &["assets/minecraft/textures/blocks/wool_colored_red.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::WoolBlack,
-        paths: &["assets/minecraft/textures/blocks/wool_colored_black.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::GoldBlock,
-        paths: &["assets/minecraft/textures/blocks/gold_block.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::IronBlock,
-        paths: &["assets/minecraft/textures/blocks/iron_block.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::LapisBlock,
-        paths: &["assets/minecraft/textures/blocks/lapis_block.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::DiamondBlock,
-        paths: &["assets/minecraft/textures/blocks/diamond_block.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::EmeraldBlock,
-        paths: &["assets/minecraft/textures/blocks/emerald_block.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::RedstoneBlock,
-        paths: &["assets/minecraft/textures/blocks/redstone_block.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::CoalBlock,
-        paths: &["assets/minecraft/textures/blocks/coal_block.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::Brick,
-        paths: &["assets/minecraft/textures/blocks/brick.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::MossyCobblestone,
-        paths: &["assets/minecraft/textures/blocks/cobblestone_mossy.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::Obsidian,
-        paths: &["assets/minecraft/textures/blocks/obsidian.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::Snow,
-        paths: &["assets/minecraft/textures/blocks/snow.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::Ice,
-        paths: &["assets/minecraft/textures/blocks/ice.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::PackedIce,
-        paths: &["assets/minecraft/textures/blocks/ice_packed.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::Clay,
-        paths: &["assets/minecraft/textures/blocks/clay.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::HardenedClay,
-        paths: &["assets/minecraft/textures/blocks/hardened_clay.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::StainedClayWhite,
-        paths: &["assets/minecraft/textures/blocks/hardened_clay_stained_white.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::StainedClayOrange,
-        paths: &["assets/minecraft/textures/blocks/hardened_clay_stained_orange.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::StainedClayMagenta,
-        paths: &["assets/minecraft/textures/blocks/hardened_clay_stained_magenta.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::StainedClayLightBlue,
-        paths: &["assets/minecraft/textures/blocks/hardened_clay_stained_light_blue.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::StainedClayYellow,
-        paths: &["assets/minecraft/textures/blocks/hardened_clay_stained_yellow.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::StainedClayLime,
-        paths: &["assets/minecraft/textures/blocks/hardened_clay_stained_lime.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::StainedClayPink,
-        paths: &["assets/minecraft/textures/blocks/hardened_clay_stained_pink.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::StainedClayGray,
-        paths: &["assets/minecraft/textures/blocks/hardened_clay_stained_gray.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::StainedClaySilver,
-        paths: &["assets/minecraft/textures/blocks/hardened_clay_stained_silver.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::StainedClayCyan,
-        paths: &["assets/minecraft/textures/blocks/hardened_clay_stained_cyan.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::StainedClayPurple,
-        paths: &["assets/minecraft/textures/blocks/hardened_clay_stained_purple.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::StainedClayBlue,
-        paths: &["assets/minecraft/textures/blocks/hardened_clay_stained_blue.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::StainedClayBrown,
-        paths: &["assets/minecraft/textures/blocks/hardened_clay_stained_brown.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::StainedClayGreen,
-        paths: &["assets/minecraft/textures/blocks/hardened_clay_stained_green.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::StainedClayRed,
-        paths: &["assets/minecraft/textures/blocks/hardened_clay_stained_red.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::StainedClayBlack,
-        paths: &["assets/minecraft/textures/blocks/hardened_clay_stained_black.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::PumpkinSide,
-        paths: &["assets/minecraft/textures/blocks/pumpkin_side.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::PumpkinTop,
-        paths: &["assets/minecraft/textures/blocks/pumpkin_top.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::PumpkinFace,
-        paths: &["assets/minecraft/textures/blocks/pumpkin_face_off.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::MelonSide,
-        paths: &["assets/minecraft/textures/blocks/melon_side.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::MelonTop,
-        paths: &["assets/minecraft/textures/blocks/melon_top.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::Netherrack,
-        paths: &["assets/minecraft/textures/blocks/netherrack.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::SoulSand,
-        paths: &["assets/minecraft/textures/blocks/soul_sand.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::Glowstone,
-        paths: &["assets/minecraft/textures/blocks/glowstone.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::StoneBrick,
-        paths: &["assets/minecraft/textures/blocks/stonebrick.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::StoneBrickMossy,
-        paths: &["assets/minecraft/textures/blocks/stonebrick_mossy.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::StoneBrickCracked,
-        paths: &["assets/minecraft/textures/blocks/stonebrick_cracked.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::StoneBrickCarved,
-        paths: &["assets/minecraft/textures/blocks/stonebrick_carved.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::MyceliumTop,
-        paths: &["assets/minecraft/textures/blocks/mycelium_top.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::MyceliumSide,
-        paths: &["assets/minecraft/textures/blocks/mycelium_side.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::NetherBrick,
-        paths: &["assets/minecraft/textures/blocks/nether_brick.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::EndStone,
-        paths: &["assets/minecraft/textures/blocks/end_stone.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::QuartzSide,
-        paths: &["assets/minecraft/textures/blocks/quartz_block_side.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::QuartzTop,
-        paths: &["assets/minecraft/textures/blocks/quartz_block_top.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::QuartzBottom,
-        paths: &["assets/minecraft/textures/blocks/quartz_block_bottom.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::QuartzChiseled,
-        paths: &["assets/minecraft/textures/blocks/quartz_block_chiseled.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::QuartzChiseledTop,
-        paths: &["assets/minecraft/textures/blocks/quartz_block_chiseled_top.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::QuartzPillarSide,
-        paths: &["assets/minecraft/textures/blocks/quartz_block_lines.png"],
-    },
-    TextureSpec {
-        tile: BlockTile::QuartzPillarTop,
-        paths: &["assets/minecraft/textures/blocks/quartz_block_lines_top.png"],
-    },
-];
-
-fn load_directory_tiles(root: &Path, atlas: &mut RgbaImage) -> usize {
-    TEXTURE_SPECS
-        .iter()
-        .map(|spec| copy_first_directory_tile(root, atlas, spec.tile, spec.paths))
-        .sum()
-}
-
-fn load_zip_tiles<R: Read + std::io::Seek>(
-    zip: &mut ZipArchive<R>,
-    atlas: &mut RgbaImage,
-) -> usize {
-    TEXTURE_SPECS
-        .iter()
-        .map(|spec| copy_first_zip_tile(zip, atlas, spec.tile, spec.paths))
-        .sum()
-}
-
-fn copy_first_zip_tile<R: Read + std::io::Seek>(
-    zip: &mut ZipArchive<R>,
-    atlas: &mut RgbaImage,
-    tile: BlockTile,
-    paths: &[&str],
-) -> usize {
-    for path in paths {
-        let Ok(mut file) = zip.by_name(path) else {
-            continue;
-        };
-        let mut bytes = Vec::new();
-        if let Err(err) = file.read_to_end(&mut bytes) {
-            log::warn!("failed to read texture {path}: {err}");
-            continue;
-        }
-        match image::load_from_memory(&bytes) {
-            Ok(image) => {
-                copy_tile(atlas, tile, image);
-                return 1;
-            }
-            Err(err) => log::warn!("failed to decode texture {path}: {err}"),
-        }
-    }
-    log::warn!("missing texture candidates for {tile:?}: {paths:?}");
-    0
-}
-
-fn copy_first_directory_tile(
-    root: &Path,
-    atlas: &mut RgbaImage,
-    tile: BlockTile,
-    paths: &[&str],
-) -> usize {
-    for path in paths {
-        let full_path = directory_texture_path(root, path);
-        let Ok(bytes) = fs::read(&full_path) else {
-            continue;
-        };
-        match image::load_from_memory(&bytes) {
-            Ok(image) => {
-                copy_tile(atlas, tile, image);
-                return 1;
-            }
-            Err(err) => log::warn!("failed to decode texture {}: {err}", full_path.display()),
-        }
-    }
-    log::warn!("missing texture candidates for {tile:?}: {paths:?}");
-    0
-}
-
 fn directory_texture_path(root: &Path, asset_path: &str) -> PathBuf {
     let full_path = root.join(asset_path);
     if full_path.exists() {
@@ -942,21 +1034,110 @@ fn directory_texture_path(root: &Path, asset_path: &str) -> PathBuf {
     root.join(asset_path.strip_prefix("assets/").unwrap_or(asset_path))
 }
 
-fn copy_tile(atlas: &mut RgbaImage, tile: BlockTile, image: DynamicImage) {
-    let tile_image = image
-        .resize_exact(TILE_SIZE, TILE_SIZE, FilterType::Nearest)
-        .to_rgba8();
-    let x = tile.index() % ATLAS_COLUMNS * TILE_SIZE;
-    let y = tile.index() / ATLAS_COLUMNS * TILE_SIZE;
-    let _ = atlas.copy_from(&tile_image, x, y);
+fn read_directory_image(root: &Path, asset_path: &str) -> Option<DynamicImage> {
+    let full_path = directory_texture_path(root, asset_path);
+    let bytes = fs::read(full_path).ok()?;
+    image::load_from_memory(&bytes).ok()
 }
 
-fn fill_tile(atlas: &mut RgbaImage, tile: BlockTile, rgba: [u8; 4]) {
-    let x0 = tile.index() % ATLAS_COLUMNS * TILE_SIZE;
-    let y0 = tile.index() / ATLAS_COLUMNS * TILE_SIZE;
-    for y in y0..y0 + TILE_SIZE {
-        for x in x0..x0 + TILE_SIZE {
-            atlas.put_pixel(x, y, Rgba(rgba));
+fn read_zip_image<R: Read + std::io::Seek>(
+    zip: &mut ZipArchive<R>,
+    asset_path: &str,
+) -> Option<DynamicImage> {
+    let mut file = zip.by_name(asset_path).ok()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    image::load_from_memory(&bytes).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn entity_atlas_has_expected_dimensions_and_white_slot() {
+        let atlas = EntityAtlasImage::load_default();
+        assert_eq!(atlas.width, ENTITY_ATLAS_WIDTH);
+        assert_eq!(atlas.height, ENTITY_ATLAS_HEIGHT);
+        assert_eq!(
+            atlas.pixels.len(),
+            (ENTITY_ATLAS_WIDTH * ENTITY_ATLAS_HEIGHT * 4) as usize
+        );
+        // The texel under ENTITY_WHITE_UV must be opaque white regardless of
+        // which assets were found.
+        let x = (ENTITY_WHITE_UV[0] * ENTITY_ATLAS_WIDTH as f32) as u32;
+        let y = (ENTITY_WHITE_UV[1] * ENTITY_ATLAS_HEIGHT as f32) as u32;
+        let i = ((y * ENTITY_ATLAS_WIDTH + x) * 4) as usize;
+        assert_eq!(&atlas.pixels[i..i + 4], &[255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn missing_tile_detection_flags_unmapped_names() {
+        let atlas = TextureAtlasImage::load_default().uv_table();
+        // No name / unknown name resolve to the magenta tile.
+        assert!(atlas.is_missing_tile(None));
+        assert!(atlas.is_missing_tile(Some("definitely_not_a_texture")));
+        // A registry texture is mapped (real tile with assets; in fallback
+        // mode the per-tile missing set is intentionally empty).
+        assert!(!atlas.is_missing_tile(Some("stone")));
+    }
+
+    #[test]
+    fn item_names_cover_common_ids() {
+        assert_eq!(item_texture_name(256), Some("iron_shovel"));
+        assert_eq!(item_texture_name(264), Some("diamond"));
+        assert_eq!(item_texture_name(331), Some("redstone_dust"));
+        assert_eq!(item_texture_name(2257), Some("record_cat"));
+        assert_eq!(item_texture_name(0), None); // air
+        assert_eq!(item_texture_name(255), None); // still a block id
+    }
+
+    #[test]
+    fn item_atlas_builds_and_resolves() {
+        let atlas = ItemAtlasImage::load_default();
+        // Air / block ids never resolve to an item tile.
+        assert!(atlas.tile_for_id(0).is_none());
+        assert!(atlas.tile_for_id(1).is_none());
+        // With item assets present, common items get a tile; with none the atlas
+        // is empty — both are valid and must never panic.
+        if atlas.image().is_some() {
+            assert!(
+                atlas.tile_for_id(264).is_some() || atlas.tile_for_id(256).is_some(),
+                "expected a common item to resolve when item assets exist"
+            );
         }
+    }
+
+    #[test]
+    fn slot_origins_are_distinct_and_inside_the_atlas() {
+        let slots = [
+            EntitySlot::Player,
+            EntitySlot::Zombie,
+            EntitySlot::Skeleton,
+            EntitySlot::Creeper,
+            EntitySlot::Pig,
+            EntitySlot::Cow,
+            EntitySlot::Sheep,
+            EntitySlot::Chicken,
+            EntitySlot::Villager,
+            EntitySlot::White,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for slot in slots {
+            let (x, y) = entity_slot_origin(slot);
+            assert!(x + ENTITY_SLOT_PX <= ENTITY_ATLAS_WIDTH);
+            assert!(y + ENTITY_SLOT_PX <= ENTITY_ATLAS_HEIGHT);
+            assert!(seen.insert((x, y)), "duplicate slot origin {x},{y}");
+        }
+        assert_eq!(seen.len() as u32, ENTITY_SLOT_COUNT);
+    }
+
+    #[test]
+    fn normalize_entity_texture_keeps_two_to_one_sources_in_the_top_half() {
+        let legacy = RgbaImage::from_pixel(128, 64, Rgba([1, 2, 3, 255]));
+        let normalized = normalize_entity_texture(legacy);
+        assert_eq!(normalized.dimensions(), (64, 32));
+        let square = RgbaImage::from_pixel(128, 128, Rgba([1, 2, 3, 255]));
+        assert_eq!(normalize_entity_texture(square).dimensions(), (64, 64));
     }
 }

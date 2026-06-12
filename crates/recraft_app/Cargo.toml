@@ -7,11 +7,15 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+arboard.workspace = true
 env_logger.workspace = true
 glam.workspace = true
+hickory-resolver.workspace = true
 log.workspace = true
 pollster.workspace = true
 recraft_core = { path = "../recraft_core" }
 recraft_protocol = { path = "../recraft_protocol" }
 recraft_render = { path = "../recraft_render" }
 winit.workspace = true
+serde_json.workspace = true
+ureq.workspace = true
