@@ -5,7 +5,6 @@ use recraft_core::EntityKind;
 use crate::texture::{
     entity_slot_origin, EntitySlot, ENTITY_ATLAS_HEIGHT, ENTITY_ATLAS_WIDTH, ENTITY_WHITE_UV,
 };
-use crate::Camera;
 
 /// Vertex for the model pass used by entities and the first-person hand: a
 /// position, an RGBA tint multiplied with the sampled texel, and a UV into the
@@ -99,60 +98,21 @@ impl ModelMesh {
         }
     }
 
-    /// Append a first-person right forearm in front of the camera. `swing` is
-    /// 0..1 swing progress; like vanilla, the arm sweeps along
-    /// `sin(sqrt(p)·π)` (raise/jab) with a later `sin(p²·π)` inward pull, and
-    /// rolls a little around its long axis while it does. The box samples the
-    /// player skin's right-arm region; `color` contributes its alpha (the skin
-    /// texture provides the tone).
-    pub fn push_hand(&mut self, camera: &Camera, swing: f32, color: [f32; 4]) {
-        let forward = camera.direction();
-        let right = forward.cross(Vec3::Y).normalize_or_zero();
-        let up = right.cross(forward).normalize_or_zero();
-        let pi = std::f32::consts::PI;
-
-        let swing = swing.clamp(0.0, 1.0);
-        // Vanilla swing curves: the main arc rises fast and settles
-        // (sin(sqrt(p)·π)); the cross-screen pull peaks later (sin(p²·π)).
-        let arc = (swing.sqrt() * pi).sin();
-        let pull = (swing * swing * pi).sin();
-
-        // Hand (box center): rest pose at the lower right, matching vanilla's
-        // renderPlayerArm anchor (~0.64 right, 0.6 down, 0.72 forward in view
-        // space); the swing raises it, pushes it forward and pulls it across
-        // toward the view center.
-        let center = camera.position
-            + forward * (0.58 + 0.18 * arc)
-            + right * (0.52 - 0.34 * pull)
-            + up * (-0.54 + 0.30 * arc);
-
-        // The forearm's long axis runs from the off-screen elbow (lower
-        // right, near the camera) up toward the hand; it rotates with the
-        // swing so the arm sweeps in an arc instead of just translating.
-        let to_hand = (forward + right * (-0.18 - 0.40 * pull) + up * (0.45 + 0.30 * arc))
-            .normalize_or_zero();
-        // Local frame: +y points back up the arm (skin's shoulder end toward
-        // the camera), with some roll around the arm during the swing.
-        let axis_y = -to_hand;
-        let flat_x = up.cross(axis_y).normalize_or_zero();
-        let flat_z = flat_x.cross(axis_y);
-        let roll = (40.0 + 25.0 * arc).to_radians();
-        let (rs, rc) = roll.sin_cos();
-        let axis_x = flat_x * rc + flat_z * rs;
-        let axis_z = flat_z * rc - flat_x * rs;
-
-        // Forearm box in arm-local space (4x12x4 px proportions, ~0.6 m long).
-        let min = Vec3::new(-0.09, -0.30, -0.09);
-        let max = Vec3::new(0.09, 0.30, 0.09);
+    /// Append the player's right-arm box (vanilla `ModelBiped.bipedRightArm`:
+    /// `addBox(-3, -2, -2, 4, 12, 4)` at 1/16 scale) through an arbitrary
+    /// local→world transform — the first-person `renderPlayerArm` matrix chain
+    /// is computed by the caller and folded into `transform`. Samples the
+    /// player skin's right-arm region.
+    pub fn push_arm_box(&mut self, transform: &dyn Fn(Vec3) -> Vec3, alpha: f32) {
         let region = box_region(40.0, 16.0, 4.0, 12.0, 4.0); // player right arm
         let (ox, oy) = entity_slot_origin(EntitySlot::Player);
         self.push_textured_box(
-            min,
-            max,
+            Vec3::new(-3.0, -2.0, -2.0) * 0.0625,
+            Vec3::new(1.0, 10.0, 2.0) * 0.0625,
             &region,
             [ox as f32, oy as f32],
-            color[3],
-            &|local| center + axis_x * local.x + axis_y * local.y + axis_z * local.z,
+            alpha,
+            transform,
         );
     }
 
@@ -614,27 +574,26 @@ mod tests {
     }
 
     #[test]
-    fn hand_sweeps_an_arc_and_samples_the_player_arm() {
-        let camera = Camera::new(Vec3::new(0.0, 70.0, 0.0), 1.6);
-        let build = |swing: f32| {
+    fn arm_box_applies_the_transform_and_samples_the_player_arm() {
+        let build = |offset: Vec3| {
             let mut mesh = ModelMesh::new();
-            mesh.push_hand(&camera, swing, [0.86, 0.71, 0.58, 1.0]);
+            mesh.push_arm_box(&|local| local + offset, 1.0);
             mesh
         };
-        let rest = build(0.0);
-        let mid = build(0.5);
+        let rest = build(Vec3::ZERO);
+        let moved = build(Vec3::new(1.0, 2.0, 3.0));
         assert_eq!(rest.vertices.len(), 24); // one box
-        for mesh in [&rest, &mid] {
+        for mesh in [&rest, &moved] {
             assert_well_formed(mesh);
             let (v0, v1) = slot_v_range(EntitySlot::Player);
             assert!(mesh.vertices.iter().all(|v| (v0..=v1).contains(&v.uv[1])));
         }
-        // The swing must actually move the hand.
+        // The transform must move every vertex.
         let centroid = |mesh: &ModelMesh| {
             let sum: Vec3 = mesh.vertices.iter().map(|v| Vec3::from(v.position)).sum();
             sum / mesh.vertices.len() as f32
         };
-        assert!(centroid(&rest).distance(centroid(&mid)) > 0.05);
+        assert!((centroid(&moved) - centroid(&rest)).distance(Vec3::new(1.0, 2.0, 3.0)) < 1.0e-4);
     }
 
     #[test]

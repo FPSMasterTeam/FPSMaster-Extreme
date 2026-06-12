@@ -745,13 +745,12 @@ fn render_frame(
     let tick_alpha = (tick_accumulator / 0.05).clamp(0.0, 1.0);
     if app.in_world {
         app.game.update_camera(tick_alpha);
-        let swing = app.game.swing_progress(tick_alpha);
-        let held = app.game.held_item();
+        let first_person = app.game.first_person_view(tick_alpha);
         let mut model = app.game.build_entity_model(tick_alpha);
         if hud_visible {
-            ItemRenderer::render_arm(&mut model, &app.game.camera, swing, held);
+            ItemRenderer::render_arm(&mut model, &app.game.camera, &first_person);
             let (vertices, indices) =
-                ItemRenderer::build_held_item(&app.game.camera, swing, held, atlas_uv);
+                ItemRenderer::build_held_item(&app.game.camera, &first_person, atlas_uv);
             renderer.set_first_person_item(&vertices, &indices);
         } else {
             renderer.set_first_person_item(&[], &[]);

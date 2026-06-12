@@ -153,6 +153,20 @@ fn effective_attribute_value(
     d1.max(0.0)
 }
 
+/// Snapshot driving the first-person hand/item rendering for one frame
+/// (vanilla ItemRenderer inputs at a given partialTicks).
+#[derive(Debug, Clone, Copy)]
+pub struct FirstPersonView {
+    /// The item the hand currently shows (lags the selection by the equip dip).
+    pub item: Option<SlotItem>,
+    /// Vanilla `1 - equippedProgress`: 0 = fully raised, 1 = fully lowered.
+    pub equip_progress: f32,
+    pub swing_progress: f32,
+    /// `rotateWithPlayerRotations` lag rotations, in degrees.
+    pub arm_lag_pitch: f32,
+    pub arm_lag_yaw: f32,
+}
+
 /// Standing eye height above the feet, in blocks (vanilla 1.8).
 const STANDING_EYE_HEIGHT: f64 = 1.62;
 /// How far the camera drops below the standing eye height while sneaking.
@@ -345,6 +359,19 @@ pub struct GameState {
     is_swinging: bool,
     swing_progress: f32,
     prev_swing_progress: f32,
+    // Vanilla ItemRenderer equip animation: the rendered item lags the
+    // selection, dipping out of view (progress sinks below 0.1) before the
+    // newly selected item rises back up.
+    equipped_progress: f32,
+    prev_equipped_progress: f32,
+    rendered_item: Option<SlotItem>,
+    equipped_slot: i32,
+    // Vanilla renderArmPitch/renderArmYaw: a 0.5-lerp-per-tick smoothed copy
+    // of the view rotation; the hand lags the camera by 10% of the gap.
+    render_arm_pitch: f32,
+    render_arm_yaw: f32,
+    prev_render_arm_pitch: f32,
+    prev_render_arm_yaw: f32,
     // Selected hotbar slot, 0..9.
     selected_slot: i32,
     /// The block currently being mined (survival), with accumulated progress.
@@ -448,6 +475,14 @@ impl GameState {
             is_swinging: false,
             swing_progress: 0.0,
             prev_swing_progress: 0.0,
+            equipped_progress: 0.0,
+            prev_equipped_progress: 0.0,
+            rendered_item: None,
+            equipped_slot: 0,
+            render_arm_pitch: 0.0,
+            render_arm_yaw: 0.0,
+            prev_render_arm_pitch: 0.0,
+            prev_render_arm_yaw: 0.0,
             selected_slot: 0,
             breaking: None,
             sprinting: false,
@@ -642,6 +677,8 @@ impl GameState {
         }
 
         self.update_arm_swing();
+        self.update_equipped_item();
+        self.update_render_arm();
 
         // Advance remote-entity interpolation: one lerp step per tick toward
         // the latest server target (vanilla newPosRotationIncrements).
@@ -818,6 +855,47 @@ impl GameState {
             delta += 1.0;
         }
         self.prev_swing_progress + delta * partial_ticks.clamp(0.0, 1.0)
+    }
+
+    /// Vanilla `ItemRenderer.updateEquippedItem`: the equip progress chases
+    /// 1 while the rendered item matches the selection and 0 otherwise; the
+    /// rendered item only swaps once the hand has dipped below 0.1.
+    fn update_equipped_item(&mut self) {
+        self.prev_equipped_progress = self.equipped_progress;
+        let current = self.held_item();
+        let raised =
+            self.equipped_slot == self.selected_slot && current == self.rendered_item;
+        let target = if raised { 1.0 } else { 0.0 };
+        let delta = (target - self.equipped_progress).clamp(-0.4, 0.4);
+        self.equipped_progress += delta;
+        if self.equipped_progress < 0.1 {
+            self.rendered_item = current;
+            self.equipped_slot = self.selected_slot;
+        }
+    }
+
+    /// Vanilla `EntityPlayerSP` renderArmPitch/Yaw: half-lerp toward the view
+    /// rotation each tick (the hand sways behind quick turns).
+    fn update_render_arm(&mut self) {
+        self.prev_render_arm_pitch = self.render_arm_pitch;
+        self.prev_render_arm_yaw = self.render_arm_yaw;
+        self.render_arm_pitch += (self.player.pitch - self.render_arm_pitch) * 0.5;
+        self.render_arm_yaw += (self.player.yaw - self.render_arm_yaw) * 0.5;
+    }
+
+    /// Snapshot driving the first-person hand/item rendering for one frame.
+    pub fn first_person_view(&self, partial_ticks: f32) -> FirstPersonView {
+        let partial = partial_ticks.clamp(0.0, 1.0);
+        let equip = lerp(self.prev_equipped_progress, self.equipped_progress, partial);
+        let arm_pitch = lerp(self.prev_render_arm_pitch, self.render_arm_pitch, partial);
+        let arm_yaw = lerp(self.prev_render_arm_yaw, self.render_arm_yaw, partial);
+        FirstPersonView {
+            item: self.rendered_item,
+            equip_progress: 1.0 - equip,
+            swing_progress: self.swing_progress(partial),
+            arm_lag_pitch: (self.player.pitch - arm_pitch) * 0.1,
+            arm_lag_yaw: (self.player.yaw - arm_yaw) * 0.1,
+        }
     }
 
     /// The item in the selected hotbar slot, if any.
