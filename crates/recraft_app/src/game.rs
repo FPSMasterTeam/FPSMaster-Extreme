@@ -7,7 +7,10 @@ use recraft_core::{
 };
 use recraft_protocol::v1_8_9::{
     chunk::{decode_chunk_column, ChunkColumnData},
-    packets::{ClientboundPlayPacket, DiggingStatus, ServerboundPacket, SlotItem, UseEntityKind},
+    packets::{
+        ClientboundPlayPacket, DiggingStatus, ServerboundPacket, SlotItem, TitleAction,
+        UseEntityKind,
+    },
 };
 use recraft_render::{Camera, ModelMesh};
 use winit::{
@@ -120,6 +123,36 @@ impl Default for PlayerCapabilities {
     }
 }
 
+/// Vanilla sprint speed-boost modifier UUID
+/// (662a6b8d-da3e-4c1c-8813-96ea6097278d). The server includes it in the
+/// movement-speed attribute while we sprint; it is excluded from the synced
+/// value because physics applies the 1.3 sprint multiplier itself.
+const SPRINT_SPEED_BOOST_UUID: [u8; 16] = [
+    0x66, 0x2a, 0x6b, 0x8d, 0xda, 0x3e, 0x4c, 0x1c, 0x88, 0x13, 0x96, 0xea, 0x60, 0x97, 0x27, 0x8d,
+];
+
+/// Vanilla `ModifiableAttributeInstance.computeValue`: base plus the additive
+/// modifiers (op 0), then ×(1 + Σ op 1), then ×(1 + amount) per op 2 —
+/// skipping the modifier with the `excluded` UUID.
+fn effective_attribute_value(
+    property: &recraft_protocol::v1_8_9::packets::EntityProperty,
+    excluded: &[u8; 16],
+) -> f64 {
+    let modifiers = || property.modifiers.iter().filter(|m| &m.uuid != excluded);
+    let mut d0 = property.base;
+    for modifier in modifiers().filter(|m| m.operation == 0) {
+        d0 += modifier.amount;
+    }
+    let mut d1 = d0;
+    for modifier in modifiers().filter(|m| m.operation == 1) {
+        d1 += d0 * modifier.amount;
+    }
+    for modifier in modifiers().filter(|m| m.operation == 2) {
+        d1 *= 1.0 + modifier.amount;
+    }
+    d1.max(0.0)
+}
+
 /// Standing eye height above the feet, in blocks (vanilla 1.8).
 const STANDING_EYE_HEIGHT: f64 = 1.62;
 /// How far the camera drops below the standing eye height while sneaking.
@@ -127,6 +160,135 @@ const SNEAK_EYE_DROP: f64 = 0.08;
 /// Field-of-view added on top of the base FOV while sprinting, in degrees.
 const SPRINT_FOV_BOOST: f32 = 10.0;
 const BASE_FOV: f32 = 70.0;
+
+const DEFAULT_TITLE_FADE_IN_TICKS: i32 = 10;
+const DEFAULT_TITLE_STAY_TICKS: i32 = 70;
+const DEFAULT_TITLE_FADE_OUT_TICKS: i32 = 20;
+
+/// Ready-to-render title overlay snapshot.
+#[derive(Debug, Clone, Copy)]
+pub struct TitleOverlay<'a> {
+    pub title: &'a str,
+    pub subtitle: &'a str,
+    pub alpha: f32,
+}
+
+#[derive(Debug, Clone)]
+struct TitleState {
+    title: String,
+    subtitle: String,
+    timer: i32,
+    fade_in: i32,
+    stay: i32,
+    fade_out: i32,
+}
+
+impl Default for TitleState {
+    fn default() -> Self {
+        Self {
+            title: String::new(),
+            subtitle: String::new(),
+            timer: 0,
+            fade_in: DEFAULT_TITLE_FADE_IN_TICKS,
+            stay: DEFAULT_TITLE_STAY_TICKS,
+            fade_out: DEFAULT_TITLE_FADE_OUT_TICKS,
+        }
+    }
+}
+
+impl TitleState {
+    fn overlay(&self, partial_ticks: f32) -> Option<TitleOverlay<'_>> {
+        if self.timer <= 0 {
+            return None;
+        }
+        let alpha = self.alpha(partial_ticks);
+        if alpha <= 8.0 / 255.0 || (self.title.is_empty() && self.subtitle.is_empty()) {
+            return None;
+        }
+        Some(TitleOverlay {
+            title: &self.title,
+            subtitle: &self.subtitle,
+            alpha,
+        })
+    }
+
+    fn alpha(&self, partial_ticks: f32) -> f32 {
+        let partial = partial_ticks.clamp(0.0, 1.0);
+        let remaining = self.timer as f32 - partial;
+        let total = self.total_ticks() as f32;
+        let mut alpha = 1.0;
+        if self.fade_in > 0 && self.timer > self.fade_out + self.stay {
+            let elapsed = total - remaining;
+            alpha = elapsed / self.fade_in as f32;
+        }
+        if self.fade_out > 0 && self.timer <= self.fade_out {
+            alpha = remaining / self.fade_out as f32;
+        }
+        alpha.clamp(0.0, 1.0)
+    }
+
+    fn total_ticks(&self) -> i32 {
+        self.fade_in + self.stay + self.fade_out
+    }
+
+    fn clear(&mut self) {
+        self.title.clear();
+        self.subtitle.clear();
+        self.timer = 0;
+    }
+
+    fn reset_times(&mut self) {
+        self.fade_in = DEFAULT_TITLE_FADE_IN_TICKS;
+        self.stay = DEFAULT_TITLE_STAY_TICKS;
+        self.fade_out = DEFAULT_TITLE_FADE_OUT_TICKS;
+    }
+
+    fn apply(&mut self, action: TitleAction) {
+        match action {
+            TitleAction::Title { json } => {
+                self.title = chat::flatten_chat_json(&json);
+                self.timer = self.total_ticks();
+            }
+            TitleAction::Subtitle { json } => {
+                self.subtitle = chat::flatten_chat_json(&json);
+            }
+            TitleAction::Times {
+                fade_in,
+                stay,
+                fade_out,
+            } => {
+                if fade_in >= 0 {
+                    self.fade_in = fade_in;
+                }
+                if stay >= 0 {
+                    self.stay = stay;
+                }
+                if fade_out >= 0 {
+                    self.fade_out = fade_out;
+                }
+                if self.timer > 0 {
+                    self.timer = self.total_ticks();
+                }
+            }
+            TitleAction::Clear => self.clear(),
+            TitleAction::Reset => {
+                self.clear();
+                self.reset_times();
+            }
+        }
+    }
+
+    fn tick(&mut self) {
+        if self.timer <= 0 {
+            return;
+        }
+        self.timer -= 1;
+        if self.timer <= 0 {
+            self.title.clear();
+            self.subtitle.clear();
+        }
+    }
+}
 
 pub struct GameState {
     pub world: World,
@@ -190,6 +352,9 @@ pub struct GameState {
     sprinting: bool,
     /// Server-driven abilities (S39); `flying` is also toggled locally.
     capabilities: PlayerCapabilities,
+    /// The movementSpeed attribute from S20 (sprint boost excluded); drives
+    /// ground speed so speed potions / walk-speed plugins stay in sync.
+    walk_speed_attribute: f32,
     /// Vanilla flyToggleTimer: a second jump press while this is non-zero
     /// (a 7-tick window) toggles flight.
     fly_toggle_timer: u8,
@@ -201,6 +366,7 @@ pub struct GameState {
     pub chat: ChatState,
     /// Objectives/scores/teams driving the sidebar (S3B/S3C/S3D/S3E).
     pub scoreboard: Scoreboard,
+    title: TitleState,
 }
 
 /// In-progress survival block break: the target cell, the face the dig started
@@ -278,11 +444,13 @@ impl GameState {
             breaking: None,
             sprinting: false,
             capabilities: PlayerCapabilities::default(),
+            walk_speed_attribute: 0.1,
             fly_toggle_timer: 0,
             was_jump_down: false,
             abilities_dirty: false,
             chat: ChatState::default(),
             scoreboard: Scoreboard::default(),
+            title: TitleState::default(),
         }
     }
 
@@ -409,6 +577,10 @@ impl GameState {
         self.xp_level
     }
 
+    pub fn title_overlay(&self, partial_ticks: f32) -> Option<TitleOverlay<'_>> {
+        self.title.overlay(partial_ticks)
+    }
+
     /// Whether the server reported us dead and we have not respawned yet.
     pub fn is_dead(&self) -> bool {
         self.is_dead
@@ -444,6 +616,7 @@ impl GameState {
     /// teleport ack (already sent via [`take_position_confirm`]) and resumes
     /// movement next tick. The caller must not send a movement packet on `None`.
     pub fn tick(&mut self, dt: f32) -> Option<MovementSnapshot> {
+        self.title.tick();
         self.previous_player_position = self.player.position;
         let turn_speed = 110.0 * dt;
         if self.input.turn_left {
@@ -458,6 +631,15 @@ impl GameState {
         }
         if self.input.look_down {
             self.player.pitch = (self.player.pitch + turn_speed).min(89.0);
+        }
+
+        // Advance remote-entity interpolation: one lerp step per tick toward
+        // the latest server target (vanilla newPosRotationIncrements).
+        let player_id = self.player.id;
+        for entity in self.world.entities_mut() {
+            if entity.id != player_id {
+                entity.tick_interpolation();
+            }
         }
 
         // Vanilla EntityPlayerSP fly toggle: a second jump press while the
@@ -517,6 +699,7 @@ impl GameState {
             input.sprint = self.sprinting;
             input.flying = self.capabilities.flying;
             input.fly_speed = self.capabilities.fly_speed;
+            input.walk_speed = self.walk_speed_attribute;
             self.physics.tick(&self.world, &mut self.player, input);
         } else {
             self.player.velocity = DVec3::ZERO;
@@ -579,13 +762,15 @@ impl GameState {
     /// visible behind menu overlays. The first-person hand/held item is
     /// appended by [`crate::item_renderer::ItemRenderer`]; the mining crack
     /// overlay is drawn by the renderer from `breaking_overlay()`.
-    pub fn build_entity_model(&self) -> ModelMesh {
+    /// `tick_alpha` interpolates entity positions between simulation ticks
+    /// (vanilla partialTicks) so movement stays smooth at any frame rate.
+    pub fn build_entity_model(&self, tick_alpha: f32) -> ModelMesh {
         let mut mesh = ModelMesh::new();
         for entity in self.world.entities() {
             if entity.id == self.player.id {
                 continue;
             }
-            let feet = to_render_vec3(entity.position);
+            let feet = to_render_vec3(entity.render_position(tick_alpha as f64));
             let (half_width, height) = entity.size();
             mesh.push_entity(
                 entity.kind,
@@ -1188,8 +1373,8 @@ impl GameState {
                 pitch,
             } => {
                 if let Some(entity) = self.remote_entity_mut(entity_id) {
-                    entity.yaw = yaw;
-                    entity.pitch = pitch;
+                    let target = entity.server_position;
+                    entity.set_server_target(target, yaw, pitch);
                 }
                 false
             }
@@ -1202,10 +1387,7 @@ impl GameState {
                 pitch,
             } => {
                 if let Some(entity) = self.remote_entity_mut(entity_id) {
-                    entity.position = DVec3::new(x, y, z);
-                    entity.yaw = yaw;
-                    entity.pitch = pitch;
-                    entity.sync_aabb_to_position();
+                    entity.set_server_target(DVec3::new(x, y, z), yaw, pitch);
                 }
                 false
             }
@@ -1275,6 +1457,23 @@ impl GameState {
                 };
                 false
             }
+            ClientboundPlayPacket::EntityProperties {
+                entity_id,
+                properties,
+            } => {
+                // Only the local player's movement speed feeds the prediction;
+                // other entities' attributes aren't modeled.
+                if entity_id == self.player.id.0 {
+                    for property in &properties {
+                        if property.key == "generic.movementSpeed" {
+                            self.walk_speed_attribute =
+                                effective_attribute_value(property, &SPRINT_SPEED_BOOST_UUID)
+                                    as f32;
+                        }
+                    }
+                }
+                false
+            }
             ClientboundPlayPacket::ChatMessage { json, position } => {
                 let text = chat::flatten_chat_json(&json);
                 if position == 2 {
@@ -1310,6 +1509,10 @@ impl GameState {
             }
             ClientboundPlayPacket::Teams { name, action } => {
                 self.scoreboard.apply_team(name, action);
+                false
+            }
+            ClientboundPlayPacket::Title { action } => {
+                self.title.apply(action);
                 false
             }
             ClientboundPlayPacket::Disconnect { reason_json } => {
@@ -1365,12 +1568,12 @@ impl GameState {
         look: Option<(f32, f32)>,
     ) {
         if let Some(entity) = self.remote_entity_mut(entity_id) {
-            entity.position += DVec3::new(dx, dy, dz);
-            if let Some((yaw, pitch)) = look {
-                entity.yaw = yaw;
-                entity.pitch = pitch;
-            }
-            entity.sync_aabb_to_position();
+            // Vanilla accumulates relative moves on the server-side position
+            // (serverPosX) and lerps toward it over 3 ticks — never snapping
+            // the rendered position to the packet.
+            let target = entity.server_position + DVec3::new(dx, dy, dz);
+            let (yaw, pitch) = look.unwrap_or((entity.server_yaw, entity.server_pitch));
+            entity.set_server_target(target, yaw, pitch);
         }
     }
 
@@ -2011,6 +2214,195 @@ mod interaction_tests {
         assert!((caps.walk_speed - 0.2).abs() < f32::EPSILON);
         // Server-applied abilities never trigger a client echo by themselves.
         assert!(gs.take_abilities_packet().is_none());
+    }
+
+    #[test]
+    fn title_packet_sets_text_and_fades_out() {
+        let mut gs = GameState::empty_for_server(1.0);
+        gs.apply_play_packet(ClientboundPlayPacket::Title {
+            action: TitleAction::Times {
+                fade_in: 2,
+                stay: 2,
+                fade_out: 2,
+            },
+        });
+        gs.apply_play_packet(ClientboundPlayPacket::Title {
+            action: TitleAction::Subtitle {
+                json: r#"{"text":"Sub"}"#.to_owned(),
+            },
+        });
+        assert!(
+            gs.title_overlay(0.0).is_none(),
+            "subtitle alone does not start the timer"
+        );
+
+        gs.apply_play_packet(ClientboundPlayPacket::Title {
+            action: TitleAction::Title {
+                json: r#"{"text":"Main","color":"gold"}"#.to_owned(),
+            },
+        });
+        assert!(
+            gs.title_overlay(0.0).is_none(),
+            "first fade-in frame starts fully transparent"
+        );
+        let overlay = gs
+            .title_overlay(1.0)
+            .expect("title fades in during the first tick");
+        assert_eq!(overlay.title, "§6Main");
+        assert_eq!(overlay.subtitle, "Sub");
+        assert!((overlay.alpha - 0.5).abs() < 1.0e-6);
+
+        gs.tick(0.05);
+        gs.tick(0.05);
+        assert!((gs.title_overlay(0.0).unwrap().alpha - 1.0).abs() < 1.0e-6);
+        gs.tick(0.05);
+        gs.tick(0.05);
+        assert!((gs.title_overlay(0.0).unwrap().alpha - 1.0).abs() < 1.0e-6);
+        gs.tick(0.05);
+        assert!((gs.title_overlay(0.0).unwrap().alpha - 0.5).abs() < 1.0e-6);
+        gs.tick(0.05);
+        assert!(
+            gs.title_overlay(0.0).is_none(),
+            "title expires and clears itself"
+        );
+    }
+
+    #[test]
+    fn title_clear_and_reset_match_vanilla() {
+        let mut gs = GameState::empty_for_server(1.0);
+        gs.apply_play_packet(ClientboundPlayPacket::Title {
+            action: TitleAction::Times {
+                fade_in: 1,
+                stay: 1,
+                fade_out: 1,
+            },
+        });
+        gs.apply_play_packet(ClientboundPlayPacket::Title {
+            action: TitleAction::Title {
+                json: r#"{"text":"A"}"#.to_owned(),
+            },
+        });
+        assert!(gs.title_overlay(1.0).is_some());
+        gs.apply_play_packet(ClientboundPlayPacket::Title {
+            action: TitleAction::Clear,
+        });
+        assert!(gs.title_overlay(0.0).is_none());
+
+        gs.apply_play_packet(ClientboundPlayPacket::Title {
+            action: TitleAction::Title {
+                json: r#"{"text":"B"}"#.to_owned(),
+            },
+        });
+        assert_eq!(gs.title.timer, 3, "clear keeps custom timings");
+        gs.apply_play_packet(ClientboundPlayPacket::Title {
+            action: TitleAction::Reset,
+        });
+        assert!(gs.title_overlay(0.0).is_none());
+        gs.apply_play_packet(ClientboundPlayPacket::Title {
+            action: TitleAction::Title {
+                json: r#"{"text":"C"}"#.to_owned(),
+            },
+        });
+        assert_eq!(
+            gs.title.timer, 100,
+            "reset restores vanilla 10/70/20 timings"
+        );
+    }
+
+    #[test]
+    fn movement_speed_attribute_applies_potions_but_skips_sprint_boost() {
+        use recraft_protocol::v1_8_9::packets::{AttributeModifier, EntityProperty};
+        let mut gs = GameState::empty_for_server(1.0);
+        gs.player.id = EntityId(7);
+        gs.apply_play_packet(ClientboundPlayPacket::EntityProperties {
+            entity_id: 7,
+            properties: vec![EntityProperty {
+                key: "generic.movementSpeed".to_owned(),
+                base: 0.1,
+                modifiers: vec![
+                    // Speed I potion: op 2, +20%.
+                    AttributeModifier {
+                        uuid: [1; 16],
+                        amount: 0.2,
+                        operation: 2,
+                    },
+                    // The sprint boost must be excluded (physics models it).
+                    AttributeModifier {
+                        uuid: SPRINT_SPEED_BOOST_UUID,
+                        amount: 0.3,
+                        operation: 2,
+                    },
+                ],
+            }],
+        });
+        assert!((gs.walk_speed_attribute - 0.12).abs() < 1.0e-6);
+
+        // Attributes for other entities don't touch the player's speed.
+        gs.apply_play_packet(ClientboundPlayPacket::EntityProperties {
+            entity_id: 99,
+            properties: vec![EntityProperty {
+                key: "generic.movementSpeed".to_owned(),
+                base: 0.5,
+                modifiers: Vec::new(),
+            }],
+        });
+        assert!((gs.walk_speed_attribute - 0.12).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn attribute_operations_follow_vanilla_compute_value() {
+        use recraft_protocol::v1_8_9::packets::{AttributeModifier, EntityProperty};
+        let modifier = |amount: f64, operation: u8| AttributeModifier {
+            uuid: [amount.to_bits() as u8; 16],
+            amount,
+            operation,
+        };
+        let property = EntityProperty {
+            key: "generic.movementSpeed".to_owned(),
+            base: 0.1,
+            modifiers: vec![
+                modifier(0.05, 0), // d0 = 0.15
+                modifier(0.5, 1),  // d1 = 0.15 * 1.5 = 0.225
+                modifier(0.2, 2),  // 0.225 * 1.2 = 0.27
+            ],
+        };
+        let value = effective_attribute_value(&property, &SPRINT_SPEED_BOOST_UUID);
+        assert!((value - 0.27).abs() < 1.0e-9, "got {value}");
+    }
+
+    #[test]
+    fn entity_movement_interpolates_instead_of_snapping() {
+        let mut gs = GameState::demo(1.0);
+        gs.world.upsert_entity(EntityState::new_remote(
+            EntityId(9),
+            EntityKind::Mob(54),
+            DVec3::new(10.0, 1.0, 10.0),
+            0.0,
+            0.0,
+        ));
+        // Two relative moves accumulate on the server-side target.
+        for _ in 0..2 {
+            gs.apply_play_packet(ClientboundPlayPacket::EntityRelativeMove {
+                entity_id: 9,
+                dx: 1.5,
+                dy: 0.0,
+                dz: 0.0,
+            });
+        }
+        let x = |gs: &GameState| {
+            gs.world
+                .entities()
+                .find(|e| e.id == EntityId(9))
+                .unwrap()
+                .position
+                .x
+        };
+        assert!((x(&gs) - 10.0).abs() < 1.0e-9, "packets must not snap");
+        gs.tick(0.05);
+        assert!((x(&gs) - 11.0).abs() < 1.0e-9, "1/3 of the way after a tick");
+        gs.tick(0.05);
+        gs.tick(0.05);
+        assert!((x(&gs) - 13.0).abs() < 1.0e-9, "settled on the target");
     }
 
     #[test]

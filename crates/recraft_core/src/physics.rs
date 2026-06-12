@@ -138,6 +138,10 @@ pub struct PlayerInput {
     pub flying: bool,
     /// Fly speed from the server's abilities packet (vanilla default 0.05).
     pub fly_speed: f32,
+    /// Ground movement speed: the vanilla movementSpeed attribute value
+    /// (base 0.1, scaled by potion/server modifiers via S20), excluding the
+    /// sprint boost which physics applies itself.
+    pub walk_speed: f32,
 }
 
 impl Default for PlayerInput {
@@ -150,6 +154,7 @@ impl Default for PlayerInput {
             sprint: false,
             flying: false,
             fly_speed: 0.05,
+            walk_speed: 0.1,
         }
     }
 }
@@ -162,7 +167,6 @@ pub struct PlayerPhysicsConfig {
     pub step_height: f64,
     pub air_acceleration: f32,
     pub ground_acceleration: f32,
-    pub base_walk_speed: f32,
     pub sprint_multiplier: f32,
     pub default_block_slipperiness: f32,
 }
@@ -176,7 +180,6 @@ impl Default for PlayerPhysicsConfig {
             step_height: 0.6,
             air_acceleration: 0.02,
             ground_acceleration: 0.1,
-            base_walk_speed: 0.1,
             sprint_multiplier: 1.3,
             default_block_slipperiness: 0.6,
         }
@@ -232,7 +235,7 @@ impl PlayerPhysics {
             0.91
         };
 
-        let move_speed = self.config.base_walk_speed
+        let move_speed = input.walk_speed
             * if input.sprint {
                 self.config.sprint_multiplier
             } else {
@@ -848,6 +851,40 @@ mod tests {
             (player.position.y - 1.5).abs() < 1.0e-6,
             "sneaking player should stay on the fence top, was {}",
             player.position.y
+        );
+    }
+
+    #[test]
+    fn ground_speed_scales_with_the_walk_speed_attribute() {
+        let mut world = World::new();
+        for x in -2..=2 {
+            for z in -2..=2 {
+                world.set_block(x, 0, z, BlockState::STONE);
+            }
+        }
+        let physics = PlayerPhysics::default();
+        let first_tick_speed = |walk_speed: f32| {
+            let mut player =
+                EntityState::new_local_player(EntityId(1), DVec3::new(0.5, 1.0, 0.5));
+            player.on_ground = true;
+            physics.tick(
+                &world,
+                &mut player,
+                PlayerInput {
+                    forward: 1.0,
+                    walk_speed,
+                    ..PlayerInput::default()
+                },
+            );
+            player.position.z - 0.5
+        };
+        let normal = first_tick_speed(0.1);
+        let potioned = first_tick_speed(0.12); // Speed I
+        assert!(normal > 0.0);
+        assert!(
+            (potioned / normal - 1.2).abs() < 1.0e-6,
+            "speed ratio was {}",
+            potioned / normal
         );
     }
 

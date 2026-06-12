@@ -741,7 +741,7 @@ fn render_frame(
     if app.in_world {
         app.game.update_camera(tick_accumulator / 0.05);
         app.game.advance_animations(frame_dt);
-        let mut model = app.game.build_entity_model();
+        let mut model = app.game.build_entity_model(tick_accumulator / 0.05);
         if hud_visible {
             ItemRenderer::render_first_person(
                 &mut model,
@@ -780,6 +780,7 @@ fn render_frame(
         inventory: game.inventory_slots(),
         chat: &game.chat,
         scoreboard: &game.scoreboard,
+        title: game.title_overlay(tick_accumulator / 0.05),
     };
     if hud_visible {
         let chat_input: Option<String> = screen

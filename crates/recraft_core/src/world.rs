@@ -123,6 +123,10 @@ impl World {
         self.entities.get_mut(&id)
     }
 
+    pub fn entities_mut(&mut self) -> impl Iterator<Item = &mut EntityState> {
+        self.entities.values_mut()
+    }
+
     pub fn entities(&self) -> impl Iterator<Item = &EntityState> {
         self.entities.values()
     }

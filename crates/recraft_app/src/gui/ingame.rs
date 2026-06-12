@@ -9,6 +9,7 @@ use recraft_protocol::v1_8_9::packets::SlotItem;
 use recraft_render::{text_width, GuiTexture, UiColor, UiFrame, UiRect};
 
 use crate::chat::{self, ChatState};
+use crate::game::TitleOverlay;
 use crate::gui::widgets::trim_to_tail;
 use crate::scoreboard::Scoreboard;
 
@@ -24,6 +25,7 @@ pub struct HudState<'a> {
     pub inventory: &'a [Option<SlotItem>],
     pub chat: &'a ChatState,
     pub scoreboard: &'a Scoreboard,
+    pub title: Option<TitleOverlay<'a>>,
 }
 
 // gui/widgets.png hotbar source metrics (pixels).
@@ -78,6 +80,7 @@ impl GuiIngame {
 
         draw_status_bars(ui, width, height, hud);
         draw_hotbar(ui, width, height, hud);
+        draw_title(ui, width, height, hud);
         draw_action_bar(ui, width, height, hud);
         draw_sidebar(ui, width, height, hud);
         draw_chat(ui, width, height, hud, chat_input);
@@ -305,6 +308,39 @@ fn draw_chat(ui: &mut UiFrame, width: i32, height: i32, hud: &HudState, input: O
         ui.text_shadowed(rect.x + pad, rect.y + scale, scale, faded_white(alpha), row);
         bottom = rect.y;
     }
+}
+
+/// Center-screen title + subtitle with vanilla fade timing.
+fn draw_title(ui: &mut UiFrame, width: i32, height: i32, hud: &HudState) {
+    let Some(title) = hud.title else {
+        return;
+    };
+    let scale = gui_scale(height);
+    let alpha = (255.0 * title.alpha).round().clamp(0.0, 255.0) as u8;
+    if alpha <= 8 {
+        return;
+    }
+    let color = UiColor::rgba(255, 255, 255, alpha);
+    let center_x = width / 2;
+    let center_y = height / 2;
+    let title_scale = 4 * scale;
+    let subtitle_scale = 2 * scale;
+    let title_w = text_width(title.title, title_scale);
+    let subtitle_w = text_width(title.subtitle, subtitle_scale);
+    ui.text_shadowed(
+        center_x - title_w / 2,
+        center_y - 10 * scale,
+        title_scale,
+        color,
+        title.title,
+    );
+    ui.text_shadowed(
+        center_x - subtitle_w / 2,
+        center_y + 5 * scale,
+        subtitle_scale,
+        color,
+        title.subtitle,
+    );
 }
 
 /// The action-bar text (chat position 2) centered above the hotbar.

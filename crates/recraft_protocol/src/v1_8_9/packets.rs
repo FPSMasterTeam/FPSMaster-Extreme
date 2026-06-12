@@ -226,6 +226,41 @@ pub enum TeamAction {
     },
 }
 
+/// One attribute in an S20 EntityProperties packet.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EntityProperty {
+    pub key: String,
+    pub base: f64,
+    pub modifiers: Vec<AttributeModifier>,
+}
+
+/// A vanilla attribute modifier: 16-byte UUID, amount, and operation
+/// (0 = add, 1 = add base-relative, 2 = multiply).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AttributeModifier {
+    pub uuid: [u8; 16],
+    pub amount: f64,
+    pub operation: u8,
+}
+
+/// S45 Title action discriminant. The vanilla enum is sent as a VarInt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TitleAction {
+    Title {
+        json: String,
+    },
+    Subtitle {
+        json: String,
+    },
+    Times {
+        fade_in: i32,
+        stay: i32,
+        fade_out: i32,
+    },
+    Clear,
+    Reset,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ClientboundPlayPacket {
     KeepAlive {
@@ -248,6 +283,12 @@ pub enum ClientboundPlayPacket {
         creative: bool,
         fly_speed: f32,
         walk_speed: f32,
+    },
+    /// S20 EntityProperties — attribute sync. The movement-speed attribute
+    /// (with potion/sprint modifiers) drives the player's ground speed.
+    EntityProperties {
+        entity_id: i32,
+        properties: Vec<EntityProperty>,
     },
     /// S3B ScoreboardObjective — create (0), remove (1) or retitle (2) an
     /// objective. `display_name` is empty for removals; the render-type
@@ -277,6 +318,10 @@ pub enum ClientboundPlayPacket {
     Teams {
         name: String,
         action: TeamAction,
+    },
+    /// S45 Title — center-screen title/subtitle text plus fade timings.
+    Title {
+        action: TitleAction,
     },
     JoinGame {
         entity_id: i32,
@@ -997,8 +1042,46 @@ impl ClientboundPlayPacket {
                 };
                 Ok(Self::Teams { name, action })
             }
+            0x20 => {
+                let entity_id = body.read_var_i32()?;
+                let count = body.read_i32()?;
+                if count < 0 {
+                    return Err(ProtocolError::InvalidData("negative property count"));
+                }
+                let mut properties = Vec::with_capacity(count.min(64) as usize);
+                for _ in 0..count {
+                    let key = body.read_string(64)?;
+                    let base = body.read_f64()?;
+                    let modifier_count = body.read_var_i32()?;
+                    if modifier_count < 0 {
+                        return Err(ProtocolError::InvalidData("negative modifier count"));
+                    }
+                    let mut modifiers = Vec::with_capacity(modifier_count.min(16) as usize);
+                    for _ in 0..modifier_count {
+                        let mut uuid = [0u8; 16];
+                        uuid.copy_from_slice(body.read_bytes(16)?);
+                        modifiers.push(AttributeModifier {
+                            uuid,
+                            amount: body.read_f64()?,
+                            operation: body.read_u8()?,
+                        });
+                    }
+                    properties.push(EntityProperty {
+                        key,
+                        base,
+                        modifiers,
+                    });
+                }
+                Ok(Self::EntityProperties {
+                    entity_id,
+                    properties,
+                })
+            }
             0x40 => Ok(Self::Disconnect {
                 reason_json: body.read_string(32767)?,
+            }),
+            0x45 => Ok(Self::Title {
+                action: read_title_action(&mut body)?,
             }),
             id => Ok(Self::Unknown {
                 id,
@@ -1006,6 +1089,25 @@ impl ClientboundPlayPacket {
             }),
         }
     }
+}
+
+fn read_title_action(body: &mut PacketReader<'_>) -> Result<TitleAction> {
+    Ok(match body.read_var_i32()? {
+        0 => TitleAction::Title {
+            json: body.read_string(32767)?,
+        },
+        1 => TitleAction::Subtitle {
+            json: body.read_string(32767)?,
+        },
+        2 => TitleAction::Times {
+            fade_in: body.read_i32()?,
+            stay: body.read_i32()?,
+            fade_out: body.read_i32()?,
+        },
+        3 => TitleAction::Clear,
+        4 => TitleAction::Reset,
+        _ => return Err(ProtocolError::InvalidData("unknown title action")),
+    })
 }
 
 #[cfg(test)]
@@ -1396,6 +1498,41 @@ mod tests {
     }
 
     #[test]
+    fn clientbound_entity_properties_decodes_attributes_and_modifiers() {
+        let uuid = [
+            0x66, 0x2a, 0x6b, 0x8d, 0xda, 0x3e, 0x4c, 0x1c, 0x88, 0x13, 0x96, 0xea, 0x60, 0x97,
+            0x27, 0x8d,
+        ];
+        let mut body = PacketWriter::new();
+        body.write_var_i32(7); // entity id
+        body.write_i32(1); // property count
+        body.write_string("generic.movementSpeed");
+        body.write_f64(0.1);
+        body.write_var_i32(1); // modifier count
+        body.write_bytes(&uuid);
+        body.write_f64(0.3);
+        body.write_u8(2);
+
+        let packet =
+            ClientboundPlayPacket::from_frame(PacketFrame::new(0x20, body.into_inner())).unwrap();
+        assert_eq!(
+            packet,
+            ClientboundPlayPacket::EntityProperties {
+                entity_id: 7,
+                properties: vec![EntityProperty {
+                    key: "generic.movementSpeed".to_owned(),
+                    base: 0.1,
+                    modifiers: vec![AttributeModifier {
+                        uuid,
+                        amount: 0.3,
+                        operation: 2,
+                    }],
+                }],
+            }
+        );
+    }
+
+    #[test]
     fn clientbound_abilities_decodes_flags_and_speeds() {
         let mut body = PacketWriter::new();
         body.write_u8(0x0d); // invulnerable + allow flying + creative, not flying
@@ -1461,6 +1598,67 @@ mod tests {
                 position: 2,
             }
         );
+    }
+
+    #[test]
+    fn clientbound_title_decodes_text_and_times() {
+        let mut body = PacketWriter::new();
+        body.write_var_i32(0);
+        body.write_string(r#"{"text":"Main","color":"gold"}"#);
+        let packet =
+            ClientboundPlayPacket::from_frame(PacketFrame::new(0x45, body.into_inner())).unwrap();
+        assert_eq!(
+            packet,
+            ClientboundPlayPacket::Title {
+                action: TitleAction::Title {
+                    json: r#"{"text":"Main","color":"gold"}"#.to_owned(),
+                },
+            }
+        );
+
+        let mut body = PacketWriter::new();
+        body.write_var_i32(1);
+        body.write_string(r#"{"text":"Sub"}"#);
+        let packet =
+            ClientboundPlayPacket::from_frame(PacketFrame::new(0x45, body.into_inner())).unwrap();
+        assert_eq!(
+            packet,
+            ClientboundPlayPacket::Title {
+                action: TitleAction::Subtitle {
+                    json: r#"{"text":"Sub"}"#.to_owned(),
+                },
+            }
+        );
+
+        let mut body = PacketWriter::new();
+        body.write_var_i32(2);
+        body.write_i32(10);
+        body.write_i32(70);
+        body.write_i32(20);
+        let packet =
+            ClientboundPlayPacket::from_frame(PacketFrame::new(0x45, body.into_inner())).unwrap();
+        assert_eq!(
+            packet,
+            ClientboundPlayPacket::Title {
+                action: TitleAction::Times {
+                    fade_in: 10,
+                    stay: 70,
+                    fade_out: 20,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn clientbound_title_decodes_clear_and_reset() {
+        for (wire, expected) in [(3, TitleAction::Clear), (4, TitleAction::Reset)] {
+            let mut body = PacketWriter::new();
+            body.write_var_i32(wire);
+            let packet =
+                ClientboundPlayPacket::from_frame(PacketFrame::new(0x45, body.into_inner()))
+                    .unwrap();
+            assert_eq!(packet, ClientboundPlayPacket::Title { action: expected });
+        }
     }
 
     #[test]

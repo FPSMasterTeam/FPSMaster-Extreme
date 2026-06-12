@@ -908,9 +908,15 @@ impl<'window> Renderer<'window> {
     /// (window size / gui pixel scale) and upscaled nearest by the UI pass —
     /// the vanilla chunky look at a fraction of the CPU/upload cost.
     fn prepare_ui(&mut self, ui: &UiFrame) {
+        // Rasterize at HALF the GUI scale (2 buffer px per GUI px): the
+        // unicode font pages draw 16px CJK glyphs into 8 GUI px, so a
+        // 1px-per-GUI-px buffer would drop half their rows/columns. Two
+        // buffer px per GUI px keeps them 1:1 while still rasterizing at a
+        // quarter of the full-resolution cost.
         let scale = crate::ui::gui_pixel_scale(self.config.height).max(1);
-        let width = self.config.width.div_ceil(scale).max(1);
-        let height = self.config.height.div_ceil(scale).max(1);
+        let divisor = (scale / 2).max(1);
+        let width = self.config.width.div_ceil(divisor).max(1);
+        let height = self.config.height.div_ceil(divisor).max(1);
         let needs_new_texture = self
             .ui_cache
             .as_ref()
@@ -961,7 +967,7 @@ impl<'window> Renderer<'window> {
             return;
         }
 
-        let pixels = ui.rasterize(width, height, scale, &self.gui_atlas);
+        let pixels = ui.rasterize(width, height, divisor, &self.gui_atlas);
         self.queue.write_texture(
             wgpu::ImageCopyTexture {
                 texture: &cache.texture,

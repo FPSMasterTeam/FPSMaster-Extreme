@@ -30,6 +30,19 @@ pub fn mc_cos(value: f32) -> f32 {
     SIN_TABLE[((value * 10430.378_f32 + 16384.0_f32) as i32 & 0xffff) as usize]
 }
 
+
+/// Vanilla `MathHelper.wrapAngleTo180_float`: wrap an angle to [-180, 180).
+pub fn wrap_degrees(mut value: f32) -> f32 {
+    value %= 360.0;
+    if value >= 180.0 {
+        value -= 360.0;
+    }
+    if value < -180.0 {
+        value += 360.0;
+    }
+    value
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
