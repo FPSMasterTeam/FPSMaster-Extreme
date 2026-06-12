@@ -61,12 +61,20 @@ impl GuiIngame {
         hud: &HudState,
         chat_input: Option<&str>,
     ) {
-        draw_fps_panel(ui, fps, chunk_count);
+        let scale = gui_scale(height);
+        draw_fps_panel(ui, scale, fps, chunk_count);
 
+        // Crosshair: 10 GUI px arms, 2 GUI px thick.
         let center_x = width / 2;
         let center_y = height / 2;
-        ui.rect(UiRect::new(center_x - 8, center_y - 1, 17, 2), WHITE_DIM);
-        ui.rect(UiRect::new(center_x - 1, center_y - 8, 2, 17), WHITE_DIM);
+        ui.rect(
+            UiRect::new(center_x - 5 * scale, center_y - scale, 10 * scale, 2 * scale),
+            WHITE_DIM,
+        );
+        ui.rect(
+            UiRect::new(center_x - scale, center_y - 5 * scale, 2 * scale, 10 * scale),
+            WHITE_DIM,
+        );
 
         draw_status_bars(ui, width, height, hud);
         draw_hotbar(ui, width, height, hud);
@@ -80,13 +88,13 @@ fn gui_scale(height: i32) -> i32 {
     super::gui_scale(height)
 }
 
-fn draw_fps_panel(ui: &mut UiFrame, fps: f32, chunk_count: usize) {
+fn draw_fps_panel(ui: &mut UiFrame, scale: i32, fps: f32, chunk_count: usize) {
     let fps_text = format!("FPS {:>3.0}", fps);
-    let chunks_text = format!("CHUNKS {}", chunk_count);
-    let width = text_width(&fps_text, 2).max(text_width(&chunks_text, 1)) + 24;
-    ui.rect(UiRect::new(12, 12, width, 58), BLACK_170);
-    ui.text(24, 24, 2, faded_white(1.0), fps_text);
-    ui.text(24, 50, 1, MUTED, chunks_text);
+    let chunks_text = format!("Chunks {chunk_count}");
+    let width = text_width(&fps_text, scale).max(text_width(&chunks_text, scale)) + 8 * scale;
+    ui.rect(UiRect::new(4 * scale, 4 * scale, width, 26 * scale), BLACK_170);
+    ui.text_shadowed(8 * scale, 8 * scale, scale, faded_white(1.0), fps_text);
+    ui.text_shadowed(8 * scale, 19 * scale, scale, MUTED, chunks_text);
 }
 
 /// Geometry of the GUI-scaled hotbar so both the background blit and the item

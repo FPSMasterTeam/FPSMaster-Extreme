@@ -164,10 +164,12 @@ fn main() -> anyhow::Result<()> {
     let username = config.username.clone();
 
     let mut app = App {
-        game: if auto_connect.is_some() {
-            GameState::empty_for_server(renderer.aspect())
-        } else {
+        // The demo world is only built when actually entering it; menus run
+        // over an empty world (hidden behind the dirt background anyway).
+        game: if auto_demo {
             GameState::demo(renderer.aspect())
+        } else {
+            GameState::empty_for_server(renderer.aspect())
         },
         network: auto_connect.as_ref().map(|(host, port)| {
             log::info!("connecting to {host}:{port} as {username}");
@@ -437,10 +439,18 @@ fn main() -> anyhow::Result<()> {
                                 &mut use_pressed,
                                 left_held,
                             );
+                            // Abilities echo (C13) goes out after the click
+                            // actions and before the flying packet, matching
+                            // vanilla's runTick → onLivingUpdate →
+                            // onUpdateWalkingPlayer ordering.
+                            let abilities = app.game.take_abilities_packet();
                             if let Some(network) = &app.network {
                                 if app.game.can_send_movement_packets() {
                                     for packet in actions {
                                         network.send_packet(packet);
+                                    }
+                                    if let Some(abilities) = abilities {
+                                        network.send_packet(abilities);
                                     }
                                     network.send_movement(movement);
                                 }
@@ -527,7 +537,8 @@ fn handle_actions(app: &mut App, renderer: &mut Renderer, actions: Vec<GuiAction
                 app.network = None;
                 app.connecting = false;
                 app.in_world = false;
-                app.game = GameState::demo(renderer.aspect());
+                // Drop the session world; the title screen needs none.
+                app.game = GameState::empty_for_server(renderer.aspect());
                 renderer.upload_world(&app.game.world);
                 app.screen = Some(Box::new(GuiMainMenu::new()));
             }

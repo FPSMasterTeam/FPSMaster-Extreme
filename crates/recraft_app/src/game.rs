@@ -76,6 +76,8 @@ impl InputState {
             jump: self.jump,
             sneak: self.sneak,
             sprint: self.effective_sprinting(),
+            // Flight state is filled in by GameState::tick from capabilities.
+            ..PlayerInput::default()
         }
     }
 
@@ -90,6 +92,31 @@ impl InputState {
     /// after resuming.
     pub fn release_all(&mut self) {
         *self = Self::default();
+    }
+}
+
+/// Vanilla `PlayerCapabilities`: driven by the server's S39 abilities packet
+/// and echoed back in C13 whenever the client toggles flight.
+#[derive(Debug, Clone, Copy)]
+pub struct PlayerCapabilities {
+    pub invulnerable: bool,
+    pub flying: bool,
+    pub allow_flying: bool,
+    pub creative: bool,
+    pub fly_speed: f32,
+    pub walk_speed: f32,
+}
+
+impl Default for PlayerCapabilities {
+    fn default() -> Self {
+        Self {
+            invulnerable: false,
+            flying: false,
+            allow_flying: false,
+            creative: false,
+            fly_speed: 0.05,
+            walk_speed: 0.1,
+        }
     }
 }
 
@@ -161,6 +188,15 @@ pub struct GameState {
     /// than recomputing per tick) is what lets a mid-air sprint-cancel and a sprint
     /// into a block edge stay in sync with the server's movement prediction.
     sprinting: bool,
+    /// Server-driven abilities (S39); `flying` is also toggled locally.
+    capabilities: PlayerCapabilities,
+    /// Vanilla flyToggleTimer: a second jump press while this is non-zero
+    /// (a 7-tick window) toggles flight.
+    fly_toggle_timer: u8,
+    /// Jump key state last tick, for the press-edge detection.
+    was_jump_down: bool,
+    /// Set when capabilities changed locally and a C13 echo must be sent.
+    abilities_dirty: bool,
     /// Received/sent chat lines and the action bar (S02 ChatMessage).
     pub chat: ChatState,
     /// Objectives/scores/teams driving the sidebar (S3B/S3C/S3D/S3E).
@@ -185,7 +221,11 @@ impl GameState {
     pub fn demo(aspect: f32) -> Self {
         let mut world = World::new();
         build_demo_world(&mut world);
-        Self::new(world, EntityId(0), DVec3::new(0.5, 2.0, 0.5), aspect)
+        let mut state = Self::new(world, EntityId(0), DVec3::new(0.5, 2.0, 0.5), aspect);
+        // Demo sandbox: allow flight (double-tap space) so the abilities
+        // mechanics are usable offline.
+        state.capabilities.allow_flying = true;
+        state
     }
 
     pub fn empty_for_server(aspect: f32) -> Self {
@@ -237,9 +277,31 @@ impl GameState {
             selected_slot: 0,
             breaking: None,
             sprinting: false,
+            capabilities: PlayerCapabilities::default(),
+            fly_toggle_timer: 0,
+            was_jump_down: false,
+            abilities_dirty: false,
             chat: ChatState::default(),
             scoreboard: Scoreboard::default(),
         }
+    }
+
+    /// The queued C13 abilities echo, if flight was toggled since the last
+    /// call. Sent before the tick's movement packet, like vanilla
+    /// `sendPlayerAbilities`.
+    pub fn take_abilities_packet(&mut self) -> Option<ServerboundPacket> {
+        if !std::mem::take(&mut self.abilities_dirty) {
+            return None;
+        }
+        let caps = self.capabilities;
+        Some(ServerboundPacket::PlayerAbilities {
+            invulnerable: caps.invulnerable,
+            flying: caps.flying,
+            allow_flying: caps.allow_flying,
+            creative: caps.creative,
+            fly_speed: caps.fly_speed,
+            walk_speed: caps.walk_speed,
+        })
     }
 
     pub fn selected_slot(&self) -> i32 {
@@ -398,6 +460,25 @@ impl GameState {
             self.player.pitch = (self.player.pitch + turn_speed).min(89.0);
         }
 
+        // Vanilla EntityPlayerSP fly toggle: a second jump press while the
+        // 7-tick flyToggleTimer runs flips flight and queues the C13 echo.
+        // The timer decrements after the check (in EntityPlayer.onLivingUpdate),
+        // which is what makes the double-tap window exactly 7 ticks.
+        let jump_pressed = self.input.jump && !self.was_jump_down;
+        self.was_jump_down = self.input.jump;
+        if self.capabilities.allow_flying && jump_pressed {
+            if self.fly_toggle_timer == 0 {
+                self.fly_toggle_timer = 7;
+            } else {
+                self.capabilities.flying = !self.capabilities.flying;
+                self.abilities_dirty = true;
+                self.fly_toggle_timer = 0;
+            }
+        }
+        if self.fly_toggle_timer > 0 {
+            self.fly_toggle_timer -= 1;
+        }
+
         // First tick after a teleport: hold exactly on the target and emit no
         // movement packet — the teleport ack (take_position_confirm) is the only
         // packet this tick, matching vanilla, which resumes movement next tick.
@@ -425,14 +506,26 @@ impl GameState {
         self.sprinting = if self.sprinting {
             wants_sprint && !self.player.collided_horizontally
         } else {
-            wants_sprint && self.player.on_ground && !self.player.collided_horizontally
+            // Vanilla's sprint-key branch has no onGround requirement; keep
+            // the ground gate for normal play but allow starting while flying.
+            wants_sprint
+                && (self.player.on_ground || self.capabilities.flying)
+                && !self.player.collided_horizontally
         };
         if self.world.is_block_column_loaded(bx, bz) {
             let mut input = self.input.player_input();
             input.sprint = self.sprinting;
+            input.flying = self.capabilities.flying;
+            input.fly_speed = self.capabilities.fly_speed;
             self.physics.tick(&self.world, &mut self.player, input);
         } else {
             self.player.velocity = DVec3::ZERO;
+        }
+        // Vanilla: touching the ground while flying turns flight off (checked
+        // after the move) and sends the abilities echo.
+        if self.player.on_ground && self.capabilities.flying {
+            self.capabilities.flying = false;
+            self.abilities_dirty = true;
         }
         self.world.upsert_entity(self.player.clone());
         self.advance_view_state();
@@ -462,7 +555,9 @@ impl GameState {
         let sprint = lerp(self.previous_sprint_amount, self.sprint_amount, alpha);
         let eye_height = STANDING_EYE_HEIGHT - SNEAK_EYE_DROP * sneak as f64;
         self.camera.position = to_render_vec3(position + DVec3::new(0.0, eye_height, 0.0));
-        self.camera.fovy_degrees = BASE_FOV + SPRINT_FOV_BOOST * sprint;
+        // Vanilla getFovModifier widens the FOV by 1.1x while flying.
+        let fly_factor = if self.capabilities.flying { 1.1 } else { 1.0 };
+        self.camera.fovy_degrees = (BASE_FOV + SPRINT_FOV_BOOST * sprint) * fly_factor;
         self.camera.yaw = self.player.yaw;
         self.camera.pitch = self.player.pitch;
     }
@@ -1160,6 +1255,26 @@ impl GameState {
                 }
                 false
             }
+            ClientboundPlayPacket::PlayerAbilities {
+                invulnerable,
+                flying,
+                allow_flying,
+                creative,
+                fly_speed,
+                walk_speed,
+            } => {
+                // Vanilla handlePlayerAbilities applies every field
+                // unconditionally (no echo from the handler itself).
+                self.capabilities = PlayerCapabilities {
+                    invulnerable,
+                    flying,
+                    allow_flying,
+                    creative,
+                    fly_speed,
+                    walk_speed,
+                };
+                false
+            }
             ClientboundPlayPacket::ChatMessage { json, position } => {
                 let text = chat::flatten_chat_json(&json);
                 if position == 2 {
@@ -1829,6 +1944,73 @@ mod interaction_tests {
         assert_eq!(gs.player.velocity, DVec3::ZERO, "velocity must reset");
         assert!(gs.can_send_movement_packets());
         assert!((gs.player.position.y - 64.0).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn double_tap_jump_toggles_flight_and_queues_echo() {
+        let mut gs = GameState::demo(1.0); // demo grants allow_flying
+        // Press, release, press again within the 7-tick window.
+        gs.input.jump = true;
+        gs.tick(0.05);
+        gs.input.jump = false;
+        gs.tick(0.05);
+        gs.input.jump = true;
+        gs.tick(0.05);
+        assert!(gs.capabilities.flying, "double-tap should enable flight");
+        let packet = gs.take_abilities_packet().expect("C13 echo queued");
+        assert!(matches!(
+            packet,
+            ServerboundPacket::PlayerAbilities { flying: true, .. }
+        ));
+        assert!(gs.take_abilities_packet().is_none(), "echo consumed once");
+    }
+
+    #[test]
+    fn slow_taps_do_not_toggle_flight() {
+        let mut gs = GameState::demo(1.0);
+        gs.input.jump = true;
+        gs.tick(0.05);
+        gs.input.jump = false;
+        for _ in 0..8 {
+            gs.tick(0.05); // let the 7-tick window lapse
+        }
+        gs.input.jump = true;
+        gs.tick(0.05);
+        assert!(!gs.capabilities.flying, "slow second tap must not toggle");
+        assert!(gs.take_abilities_packet().is_none());
+    }
+
+    #[test]
+    fn touching_ground_disables_flight() {
+        let mut gs = GameState::demo(1.0);
+        gs.capabilities.flying = true;
+        gs.player.position = DVec3::new(0.5, 1.0, 0.5); // resting on the floor
+        gs.player.sync_aabb_to_position();
+        gs.tick(0.05);
+        assert!(!gs.capabilities.flying, "landing must stop flight");
+        assert!(matches!(
+            gs.take_abilities_packet(),
+            Some(ServerboundPacket::PlayerAbilities { flying: false, .. })
+        ));
+    }
+
+    #[test]
+    fn abilities_packet_updates_capabilities() {
+        let mut gs = GameState::empty_for_server(1.0);
+        gs.apply_play_packet(ClientboundPlayPacket::PlayerAbilities {
+            invulnerable: true,
+            flying: true,
+            allow_flying: true,
+            creative: true,
+            fly_speed: 0.1,
+            walk_speed: 0.2,
+        });
+        let caps = gs.capabilities;
+        assert!(caps.invulnerable && caps.flying && caps.allow_flying && caps.creative);
+        assert!((caps.fly_speed - 0.1).abs() < f32::EPSILON);
+        assert!((caps.walk_speed - 0.2).abs() < f32::EPSILON);
+        // Server-applied abilities never trigger a client echo by themselves.
+        assert!(gs.take_abilities_packet().is_none());
     }
 
     #[test]

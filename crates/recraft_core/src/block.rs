@@ -102,7 +102,7 @@ impl BlockState {
     fn shape_boxes(self, shape: Shape, render: bool) -> CollisionBoxes {
         match shape {
             Shape::Cube => CollisionBoxes::one(FULL_CUBE),
-            Shape::Cross | Shape::Rail | Shape::Ladder => CollisionBoxes::none(),
+            Shape::Cross | Shape::Rail | Shape::Ladder | Shape::None => CollisionBoxes::none(),
             Shape::Slab => CollisionBoxes::one(slab_box(self.meta)),
             // Stairs approximated as a walkable bottom half slab.
             Shape::Stairs => CollisionBoxes::one(box3(0.0, 0.0, 0.0, 1.0, 0.5, 1.0)),
@@ -122,6 +122,65 @@ impl BlockState {
             Shape::Cactus => CollisionBoxes::one(box3(0.0625, 0.0, 0.0625, 0.9375, 1.0, 0.9375)),
             Shape::Farmland => CollisionBoxes::one(box3(0.0, 0.0, 0.0, 1.0, 0.9375, 1.0)),
             Shape::Lily => CollisionBoxes::one(box3(0.0, 0.0, 0.0, 1.0, 0.015_625, 1.0)),
+            // Trapdoor: 3/16 plate at the bottom/top, or against a wall when open.
+            Shape::Trapdoor => CollisionBoxes::one(if self.meta & 4 != 0 {
+                match self.meta & 3 {
+                    0 => box3(0.0, 0.0, 0.8125, 1.0, 1.0, 1.0), // north
+                    1 => box3(0.0, 0.0, 0.0, 1.0, 1.0, 0.1875), // south
+                    2 => box3(0.8125, 0.0, 0.0, 1.0, 1.0, 1.0), // west
+                    _ => box3(0.0, 0.0, 0.0, 0.1875, 1.0, 1.0), // east
+                }
+            } else if self.meta & 8 != 0 {
+                box3(0.0, 0.8125, 0.0, 1.0, 1.0, 1.0)
+            } else {
+                box3(0.0, 0.0, 0.0, 1.0, 0.1875, 1.0)
+            }),
+            Shape::Chest => CollisionBoxes::one(box3(0.0625, 0.0, 0.0625, 0.9375, 0.875, 0.9375)),
+            Shape::Plate => CollisionBoxes::one(box3(0.0625, 0.0, 0.0625, 0.9375, 0.0625, 0.9375)),
+            // Button: a 6x4x2 px pad on its mounting face (meta 1-4 walls,
+            // otherwise floor/ceiling).
+            Shape::Button => CollisionBoxes::one(match self.meta & 7 {
+                1 => box3(0.0, 0.375, 0.3125, 0.125, 0.625, 0.6875),
+                2 => box3(0.875, 0.375, 0.3125, 1.0, 0.625, 0.6875),
+                3 => box3(0.3125, 0.375, 0.0, 0.6875, 0.625, 0.125),
+                4 => box3(0.3125, 0.375, 0.875, 0.6875, 0.625, 1.0),
+                _ => box3(0.3125, 0.0, 0.375, 0.6875, 0.125, 0.625),
+            }),
+            // Cake: the west edge advances 2/16 per bite.
+            Shape::Cake => {
+                let bites = (self.meta & 7) as f64;
+                CollisionBoxes::one(BlockBox {
+                    min: [(1.0 + bites * 2.0) / 16.0, 0.0, 0.0625],
+                    max: [0.9375, 0.5, 0.9375],
+                })
+            }
+            Shape::Pot => CollisionBoxes::one(box3(0.3125, 0.0, 0.3125, 0.6875, 0.375, 0.6875)),
+            // Anvil: full height, 1/8 inset across the facing axis
+            // (meta&3: 0/2 face south/north, 1/3 face west/east).
+            Shape::Anvil => CollisionBoxes::one(if self.meta & 1 != 0 {
+                box3(0.0, 0.0, 0.125, 1.0, 1.0, 0.875)
+            } else {
+                box3(0.125, 0.0, 0.0, 0.875, 1.0, 1.0)
+            }),
+            // Cauldron: 5/16 floor plus four 1/8-thick walls.
+            Shape::Cauldron => CollisionBoxes::from_boxes(&[
+                box3(0.0, 0.0, 0.0, 1.0, 0.3125, 1.0),
+                box3(0.0, 0.0, 0.0, 0.125, 1.0, 1.0),
+                box3(0.875, 0.0, 0.0, 1.0, 1.0, 1.0),
+                box3(0.0, 0.0, 0.0, 1.0, 1.0, 0.125),
+                box3(0.0, 0.0, 0.875, 1.0, 1.0, 1.0),
+            ]),
+            // Hopper: bowl, tapering funnel, output stem.
+            Shape::Hopper => CollisionBoxes::from_boxes(&[
+                box3(0.0, 0.625, 0.0, 1.0, 1.0, 1.0),
+                box3(0.25, 0.25, 0.25, 0.75, 0.625, 0.75),
+                box3(0.375, 0.0, 0.375, 0.625, 0.25, 0.625),
+            ]),
+            // Nether portal panel: 4/16 thick across the meta axis (1=x, 2=z).
+            Shape::Portal => CollisionBoxes::one(match self.meta & 3 {
+                2 => box3(0.375, 0.0, 0.0, 0.625, 1.0, 1.0),
+                _ => box3(0.0, 0.0, 0.375, 1.0, 1.0, 0.625),
+            }),
         }
     }
 }
@@ -152,7 +211,7 @@ const fn box3(x0: f64, y0: f64, z0: f64, x1: f64, y1: f64, z1: f64) -> BlockBox 
 
 pub const FULL_CUBE: BlockBox = box3(0.0, 0.0, 0.0, 1.0, 1.0, 1.0);
 
-const MAX_BLOCK_BOXES: usize = 4;
+const MAX_BLOCK_BOXES: usize = 6;
 
 /// Up to `MAX_BLOCK_BOXES` collision boxes for a single block.
 #[derive(Debug, Clone, Copy)]
@@ -173,6 +232,13 @@ impl CollisionBoxes {
         let mut boxes = [FULL_CUBE; MAX_BLOCK_BOXES];
         boxes[0] = b;
         Self { boxes, len: 1 }
+    }
+
+    fn from_boxes(list: &[BlockBox]) -> Self {
+        let mut boxes = [FULL_CUBE; MAX_BLOCK_BOXES];
+        let len = list.len().min(MAX_BLOCK_BOXES);
+        boxes[..len].copy_from_slice(&list[..len]);
+        Self { boxes, len }
     }
 
     pub fn as_slice(&self) -> &[BlockBox] {

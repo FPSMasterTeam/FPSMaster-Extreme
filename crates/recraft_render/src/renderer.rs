@@ -904,9 +904,13 @@ impl<'window> Renderer<'window> {
     /// Ensure `self.ui_cache` holds a GPU texture matching `ui`. The texture is
     /// re-created only when the surface size changes and re-rasterized/uploaded
     /// only when the `UiFrame` content differs from the last upload, so a static
-    /// HUD costs nothing per frame.
+    /// HUD costs nothing per frame. The buffer is rasterized at GUI resolution
+    /// (window size / gui pixel scale) and upscaled nearest by the UI pass —
+    /// the vanilla chunky look at a fraction of the CPU/upload cost.
     fn prepare_ui(&mut self, ui: &UiFrame) {
-        let (width, height) = (self.config.width, self.config.height);
+        let scale = crate::ui::gui_pixel_scale(self.config.height).max(1);
+        let width = self.config.width.div_ceil(scale).max(1);
+        let height = self.config.height.div_ceil(scale).max(1);
         let needs_new_texture = self
             .ui_cache
             .as_ref()
@@ -957,7 +961,7 @@ impl<'window> Renderer<'window> {
             return;
         }
 
-        let pixels = ui.rasterize(width, height, &self.gui_atlas);
+        let pixels = ui.rasterize(width, height, scale, &self.gui_atlas);
         self.queue.write_texture(
             wgpu::ImageCopyTexture {
                 texture: &cache.texture,

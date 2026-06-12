@@ -34,6 +34,21 @@ pub enum Shape {
     Cactus,
     Farmland,
     Lily,
+    /// Entity-rendered blocks with no block geometry (signs, banners, skulls).
+    None,
+    Trapdoor,
+    Chest,
+    /// Pressure plates.
+    Plate,
+    Button,
+    Cake,
+    /// Flower pot.
+    Pot,
+    Anvil,
+    Cauldron,
+    Hopper,
+    /// Nether portal panel (axis from meta).
+    Portal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -349,6 +364,17 @@ fn parse_shape(value: &str) -> Shape {
         "cactus" => Shape::Cactus,
         "farmland" => Shape::Farmland,
         "lily" => Shape::Lily,
+        "none" => Shape::None,
+        "trapdoor" => Shape::Trapdoor,
+        "chest" => Shape::Chest,
+        "plate" => Shape::Plate,
+        "button" => Shape::Button,
+        "cake" => Shape::Cake,
+        "pot" => Shape::Pot,
+        "anvil" => Shape::Anvil,
+        "cauldron" => Shape::Cauldron,
+        "hopper" => Shape::Hopper,
+        "portal" => Shape::Portal,
         _ => Shape::Cube,
     }
 }

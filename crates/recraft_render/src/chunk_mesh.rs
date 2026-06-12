@@ -919,6 +919,37 @@ mod tests {
     }
 
     #[test]
+    fn previously_missing_block_states_resolve_textures() {
+        // Every block state that used to log a missing-texture warning must
+        // now either map all its faces to atlas tiles or render no geometry
+        // at all (entity-rendered blocks like signs/banners/skulls).
+        let uv = atlas();
+        let states: &[(u16, u8)] = &[
+            (146, 0), (33, 4), (90, 2), (51, 0), (145, 2), (145, 1), (145, 0),
+            (154, 0), (131, 3), (100, 0), (145, 3), (118, 3), (177, 5), (148, 0),
+            (92, 0), (140, 0), (144, 1), (154, 5), (154, 4), (54, 2), (147, 2),
+            (147, 3), (33, 0), (120, 1), (143, 4), (138, 0), (96, 6), (96, 7),
+            (96, 5), (96, 4), (148, 1), (54, 3), (54, 4), (54, 5), (143, 1),
+            (72, 0), (70, 0),
+        ];
+        for &(id, meta) in states {
+            let block = BlockState::new(id, meta);
+            if matches!(block.render_shape(), RenderShape::Boxes)
+                && block.render_boxes().as_slice().is_empty()
+            {
+                continue; // renders nothing — no texture needed
+            }
+            for face in [BlockFace::Top, BlockFace::Bottom, BlockFace::Side] {
+                let name = block.texture_name(face);
+                assert!(
+                    !uv.is_missing_tile(name),
+                    "block {id}:{meta} {face:?} resolves to missing texture ({name:?})"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn stairs_render_base_plus_quarter() {
         let mut world = World::new();
         world.set_block(0, 0, 0, BlockState::new(53, 0)); // east-facing bottom stairs

@@ -145,6 +145,17 @@ pub enum ServerboundPacket {
     ChatMessage {
         message: String,
     },
+    /// C13 PlayerAbilities — sent when the client toggles flight (double-tap
+    /// jump / landing). Vanilla echoes back the full capability set it last
+    /// received via S39, with only the `flying` bit under client control.
+    PlayerAbilities {
+        invulnerable: bool,
+        flying: bool,
+        allow_flying: bool,
+        creative: bool,
+        fly_speed: f32,
+        walk_speed: f32,
+    },
 }
 
 /// Minimal Slot data for a held item in a block-placement packet.
@@ -225,6 +236,18 @@ pub enum ClientboundPlayPacket {
     ChatMessage {
         json: String,
         position: i8,
+    },
+    /// S39 PlayerAbilities — the server-driven capability set (vanilla
+    /// `PlayerCapabilities`): flags byte (1 invulnerable, 2 flying,
+    /// 4 allow-flying, 8 creative) plus fly/walk speeds. Applied
+    /// unconditionally by the vanilla client.
+    PlayerAbilities {
+        invulnerable: bool,
+        flying: bool,
+        allow_flying: bool,
+        creative: bool,
+        fly_speed: f32,
+        walk_speed: f32,
     },
     /// S3B ScoreboardObjective — create (0), remove (1) or retitle (2) an
     /// objective. `display_name` is empty for removals; the render-type
@@ -595,8 +618,30 @@ impl ServerboundPacket {
                 body.write_string(&message);
                 PacketFrame::new(0x01, body.into_inner())
             }
+            Self::PlayerAbilities {
+                invulnerable,
+                flying,
+                allow_flying,
+                creative,
+                fly_speed,
+                walk_speed,
+            } => {
+                let mut body = PacketWriter::new();
+                body.write_u8(abilities_flags(invulnerable, flying, allow_flying, creative));
+                body.write_f32(fly_speed);
+                body.write_f32(walk_speed);
+                PacketFrame::new(0x13, body.into_inner())
+            }
         }
     }
+}
+
+/// Pack the vanilla abilities flag byte (shared by S39 and C13).
+fn abilities_flags(invulnerable: bool, flying: bool, allow_flying: bool, creative: bool) -> u8 {
+    u8::from(invulnerable)
+        | u8::from(flying) << 1
+        | u8::from(allow_flying) << 2
+        | u8::from(creative) << 3
 }
 
 /// Encode a block position into the 1.8 packed long (26/12/26 bits).
@@ -858,6 +903,17 @@ impl ClientboundPlayPacket {
                 json: body.read_string(32767)?,
                 position: body.read_i8()?,
             }),
+            0x39 => {
+                let flags = body.read_u8()?;
+                Ok(Self::PlayerAbilities {
+                    invulnerable: flags & 1 != 0,
+                    flying: flags & 2 != 0,
+                    allow_flying: flags & 4 != 0,
+                    creative: flags & 8 != 0,
+                    fly_speed: body.read_f32()?,
+                    walk_speed: body.read_f32()?,
+                })
+            }
             0x3b => {
                 let name = body.read_string(64)?;
                 let mode = body.read_u8()?;
@@ -1337,6 +1393,46 @@ mod tests {
                 vz: 0.0,
             }
         );
+    }
+
+    #[test]
+    fn clientbound_abilities_decodes_flags_and_speeds() {
+        let mut body = PacketWriter::new();
+        body.write_u8(0x0d); // invulnerable + allow flying + creative, not flying
+        body.write_f32(0.05);
+        body.write_f32(0.1);
+        let packet =
+            ClientboundPlayPacket::from_frame(PacketFrame::new(0x39, body.into_inner())).unwrap();
+        assert_eq!(
+            packet,
+            ClientboundPlayPacket::PlayerAbilities {
+                invulnerable: true,
+                flying: false,
+                allow_flying: true,
+                creative: true,
+                fly_speed: 0.05,
+                walk_speed: 0.1,
+            }
+        );
+    }
+
+    #[test]
+    fn serverbound_abilities_writes_vanilla_layout() {
+        let frame = ServerboundPacket::PlayerAbilities {
+            invulnerable: false,
+            flying: true,
+            allow_flying: true,
+            creative: false,
+            fly_speed: 0.05,
+            walk_speed: 0.1,
+        }
+        .into_frame();
+        assert_eq!(frame.id, 0x13);
+        let mut reader = PacketReader::new(&frame.body);
+        assert_eq!(reader.read_u8().unwrap(), 0x06); // flying | allow flying
+        assert_eq!(reader.read_f32().unwrap(), 0.05);
+        assert_eq!(reader.read_f32().unwrap(), 0.1);
+        assert!(reader.is_empty());
     }
 
     #[test]

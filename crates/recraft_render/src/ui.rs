@@ -246,12 +246,17 @@ impl UiFrame {
         });
     }
 
-    pub fn rasterize(&self, width: u32, height: u32, gui: &GuiAtlas) -> Vec<u8> {
+    /// Rasterize into a buffer downscaled by `pixel_scale` (the GUI pixel
+    /// scale): command coordinates are divided by it, so the CPU rasterizes at
+    /// GUI resolution and the GPU upscales nearest-neighbour — the vanilla
+    /// chunky look at a fraction of the per-frame cost.
+    pub fn rasterize(&self, width: u32, height: u32, pixel_scale: u32, gui: &GuiAtlas) -> Vec<u8> {
+        let s = pixel_scale.max(1) as i32;
         let mut pixels = vec![0; width as usize * height as usize * 4];
         for command in &self.commands {
             match command {
                 UiCommand::Rect { rect, color } => {
-                    fill_rect(&mut pixels, width, height, *rect, *color)
+                    fill_rect(&mut pixels, width, height, scale_rect(*rect, s), *color)
                 }
                 UiCommand::Text {
                     x,
@@ -263,14 +268,16 @@ impl UiFrame {
                 } => {
                     let f = font::font();
                     let rgba = [color.r, color.g, color.b, color.a];
+                    let glyph_scale = (*scale / s).max(1);
+                    let (tx, ty) = (*x / s, *y / s);
                     if *shadow {
                         f.draw(
                             &mut pixels,
                             width,
                             height,
-                            x + scale,
-                            y + scale,
-                            *scale,
+                            tx + glyph_scale,
+                            ty + glyph_scale,
+                            glyph_scale,
                             rgba,
                             true,
                             text,
@@ -280,9 +287,9 @@ impl UiFrame {
                         &mut pixels,
                         width,
                         height,
-                        *x,
-                        *y,
-                        *scale,
+                        tx,
+                        ty,
+                        glyph_scale,
                         rgba,
                         false,
                         text,
@@ -297,7 +304,8 @@ impl UiFrame {
                     sh,
                 } => {
                     if let Some(src) = gui.get(*texture) {
-                        blit_image(&mut pixels, width, height, *dst, src, *sx, *sy, *sw, *sh);
+                        let dst = scale_rect(*dst, s);
+                        blit_image(&mut pixels, width, height, dst, src, *sx, *sy, *sw, *sh);
                     }
                 }
                 UiCommand::TiledImage {
@@ -306,20 +314,16 @@ impl UiFrame {
                     tile_px,
                     tint,
                 } => {
+                    let dst = scale_rect(*dst, s);
                     if let Some(src) = gui.get(*texture) {
-                        tile_image(&mut pixels, width, height, *dst, src, *tile_px, *tint);
+                        tile_image(&mut pixels, width, height, dst, src, (*tile_px / s).max(1), *tint);
                     } else {
                         // Missing texture: a flat dark fill keeps menus readable.
-                        fill_rect(
-                            &mut pixels,
-                            width,
-                            height,
-                            *dst,
-                            UiColor::rgba(28, 22, 18, 255),
-                        );
+                        fill_rect(&mut pixels, width, height, dst, UiColor::rgba(28, 22, 18, 255));
                     }
                 }
                 UiCommand::ItemIcon { dst, item_id } => {
+                    let dst = &scale_rect(*dst, s);
                     if let (Some((sx, sy)), Some(blocks)) = (gui.block_tile(*item_id), &gui.blocks)
                     {
                         // Block item: blit its block-atlas tile.
@@ -364,6 +368,22 @@ impl UiFrame {
         }
         pixels
     }
+}
+
+/// The GUI pixel scale for a window height (vanilla auto gui scale, 2..4).
+/// Shared by the app's layout code and the renderer's UI rasterizer.
+pub fn gui_pixel_scale(height: u32) -> u32 {
+    (height / 240).clamp(2, 4)
+}
+
+/// Divide a rect by the pixel scale, dividing the edges (not the size) so
+/// adjacent rects stay seamless after rounding.
+fn scale_rect(rect: UiRect, s: i32) -> UiRect {
+    let x0 = rect.x / s;
+    let y0 = rect.y / s;
+    let x1 = (rect.x + rect.width) / s;
+    let y1 = (rect.y + rect.height) / s;
+    UiRect::new(x0, y0, x1 - x0, y1 - y0)
 }
 
 /// Width of §-coded text in screen px (vanilla per-character advances).

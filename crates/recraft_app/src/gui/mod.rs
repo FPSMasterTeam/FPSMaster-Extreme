@@ -121,9 +121,10 @@ pub struct AccountEntry {
     pub active: bool,
 }
 
-/// GUI pixel scale shared by every screen and the HUD.
+/// GUI pixel scale shared by every screen and the HUD (same formula the
+/// renderer rasterizes the UI buffer at, so all layout snaps to GUI pixels).
 pub fn gui_scale(height: i32) -> i32 {
-    (height / 240).clamp(2, 4)
+    recraft_render::gui_pixel_scale(height.max(1) as u32) as i32
 }
 
 // ─── Shared drawing helpers ──────────────────────────────────────────────────

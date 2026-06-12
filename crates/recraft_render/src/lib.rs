@@ -15,4 +15,6 @@ pub use font::char_width;
 pub use model::{ModelMesh, ModelVertex};
 pub use renderer::{RenderStats, Renderer, RendererError};
 pub use texture::{AtlasUv, TextureAtlasImage};
-pub use ui::{text_height, text_width, GuiAtlas, GuiTexture, UiColor, UiFrame, UiRect};
+pub use ui::{
+    gui_pixel_scale, text_height, text_width, GuiAtlas, GuiTexture, UiColor, UiFrame, UiRect,
+};

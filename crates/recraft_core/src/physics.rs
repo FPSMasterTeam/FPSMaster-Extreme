@@ -134,6 +134,10 @@ pub struct PlayerInput {
     pub jump: bool,
     pub sneak: bool,
     pub sprint: bool,
+    /// Creative-style flight is active (vanilla `capabilities.isFlying`).
+    pub flying: bool,
+    /// Fly speed from the server's abilities packet (vanilla default 0.05).
+    pub fly_speed: f32,
 }
 
 impl Default for PlayerInput {
@@ -144,6 +148,8 @@ impl Default for PlayerInput {
             jump: false,
             sneak: false,
             sprint: false,
+            flying: false,
+            fly_speed: 0.05,
         }
     }
 }
@@ -196,7 +202,20 @@ impl PlayerPhysics {
             velocity.z = 0.0;
         }
 
+        // Vanilla EntityPlayerSP flight thrust, applied to motionY before the
+        // move: sneak descends, jump ascends, both ±flySpeed*3 (and both can
+        // cancel out in the same tick).
+        if input.flying {
+            if input.sneak {
+                velocity.y -= (input.fly_speed * 3.0) as f64;
+            }
+            if input.jump {
+                velocity.y += (input.fly_speed * 3.0) as f64;
+            }
+        }
         if input.jump && player.on_ground {
+            // Vanilla jump() assigns (not adds) motionY, so it also overrides
+            // any flight thrust applied above.
             velocity.y = self.config.jump_velocity;
             if input.sprint {
                 // Vanilla sprint-jump boost: 0.2 in the facing direction, using
@@ -221,6 +240,10 @@ impl PlayerPhysics {
             };
         let acceleration = if player.on_ground {
             move_speed * (0.16277136 / (horizontal_drag * horizontal_drag * horizontal_drag))
+        } else if input.flying {
+            // Vanilla EntityPlayer.moveEntityWithHeading overrides the airborne
+            // jumpMovementFactor with flySpeed (doubled while sprinting).
+            input.fly_speed * if input.sprint { 2.0 } else { 1.0 }
         } else {
             self.config.air_acceleration
                 * if input.sprint {
@@ -252,6 +275,9 @@ impl PlayerPhysics {
             velocity.z = clamped_z;
         }
 
+        // Pre-move vertical motion: while flying, vanilla restores this (×0.6)
+        // after the move, discarding gravity/drag and any vertical collision.
+        let pre_move_y = velocity.y;
         let result = move_with_collisions(
             world,
             player.aabb,
@@ -260,8 +286,12 @@ impl PlayerPhysics {
             player.on_ground,
         );
         let mut adjusted_velocity = result.velocity;
-        adjusted_velocity.y -= self.config.gravity;
-        adjusted_velocity.y *= self.config.air_drag_y;
+        if input.flying {
+            adjusted_velocity.y = pre_move_y * 0.6;
+        } else {
+            adjusted_velocity.y -= self.config.gravity;
+            adjusted_velocity.y *= self.config.air_drag_y;
+        }
         adjusted_velocity.x *= horizontal_drag as f64;
         adjusted_velocity.z *= horizontal_drag as f64;
 
@@ -818,6 +848,89 @@ mod tests {
             (player.position.y - 1.5).abs() < 1.0e-6,
             "sneaking player should stay on the fence top, was {}",
             player.position.y
+        );
+    }
+
+    #[test]
+    fn flying_player_hovers_without_gravity() {
+        let world = World::new();
+        let mut player = EntityState::new_local_player(EntityId(1), DVec3::new(0.5, 40.0, 0.5));
+        let physics = PlayerPhysics::default();
+        for _ in 0..40 {
+            physics.tick(
+                &world,
+                &mut player,
+                PlayerInput {
+                    flying: true,
+                    ..PlayerInput::default()
+                },
+            );
+        }
+        assert!(
+            (player.position.y - 40.0).abs() < 1.0e-9,
+            "hovering player drifted to {}",
+            player.position.y
+        );
+        assert_eq!(player.velocity.y, 0.0);
+    }
+
+    #[test]
+    fn flying_jump_ascends_and_decays_by_point_six() {
+        let world = World::new();
+        let mut player = EntityState::new_local_player(EntityId(1), DVec3::new(0.5, 40.0, 0.5));
+        let physics = PlayerPhysics::default();
+        physics.tick(
+            &world,
+            &mut player,
+            PlayerInput {
+                flying: true,
+                jump: true,
+                ..PlayerInput::default()
+            },
+        );
+        // Thrust 0.05*3 = 0.15 moves the player up; velocity keeps 0.15*0.6.
+        assert!((player.position.y - 40.15).abs() < 1.0e-6);
+        assert!((player.velocity.y - 0.09).abs() < 1.0e-6);
+
+        let mut sneaker = EntityState::new_local_player(EntityId(2), DVec3::new(0.5, 40.0, 0.5));
+        physics.tick(
+            &world,
+            &mut sneaker,
+            PlayerInput {
+                flying: true,
+                sneak: true,
+                ..PlayerInput::default()
+            },
+        );
+        assert!((sneaker.position.y - 39.85).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn sprint_flying_accelerates_twice_as_fast() {
+        let world = World::new();
+        let physics = PlayerPhysics::default();
+        let fly = |sprint: bool| {
+            let mut player =
+                EntityState::new_local_player(EntityId(1), DVec3::new(0.5, 40.0, 0.5));
+            physics.tick(
+                &world,
+                &mut player,
+                PlayerInput {
+                    flying: true,
+                    forward: 1.0,
+                    sprint,
+                    ..PlayerInput::default()
+                },
+            );
+            player.position.z - 0.5
+        };
+        let normal = fly(false);
+        let sprinting = fly(true);
+        assert!(normal > 0.0);
+        assert!(
+            (sprinting / normal - 2.0).abs() < 1.0e-6,
+            "sprint-fly ratio was {}",
+            sprinting / normal
         );
     }
 
