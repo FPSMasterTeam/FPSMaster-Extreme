@@ -1,6 +1,13 @@
 use std::collections::HashSet;
 
 use glam::{DVec3, Vec3};
+
+#[derive(Debug, Clone, Copy)]
+pub enum DemoKind {
+    Landscape,
+    ChunkStress,
+    EntityStress,
+}
 use recraft_core::{
     collision::{is_fence, is_pane, is_stairs},
     mc_math::wrap_degrees,
@@ -515,13 +522,18 @@ fn is_block_item(id: i16) -> bool {
 }
 
 impl GameState {
-    pub fn demo(aspect: f32) -> Self {
+    pub fn demo(kind: DemoKind, aspect: f32) -> Self {
         let mut world = World::new();
-        build_demo_world(&mut world);
-        let mut state = Self::new(world, EntityId(0), DVec3::new(0.5, 2.0, 0.5), aspect);
-        // Demo sandbox: allow flight (double-tap space) so the abilities
-        // mechanics are usable offline.
+        let spawn = match kind {
+            DemoKind::Landscape => build_demo_landscape(&mut world),
+            DemoKind::ChunkStress => build_demo_chunk_stress(&mut world),
+            DemoKind::EntityStress => build_demo_entity_stress(&mut world),
+        };
+        let mut state = Self::new(world, EntityId(0), spawn, aspect);
         state.capabilities.allow_flying = true;
+        if matches!(kind, DemoKind::ChunkStress) {
+            state.camera.pitch = 45.0;
+        }
         state
     }
 
@@ -3136,41 +3148,253 @@ fn ray_aabb(origin: DVec3, dir: DVec3, min: DVec3, max: DVec3) -> Option<f64> {
     Some(t_near.max(0.0))
 }
 
-fn build_demo_world(world: &mut World) {
-    for x in -16..32 {
-        for z in -16..32 {
-            world.set_block(x, 0, z, BlockState::GRASS);
-            for y in 1..4 {
-                if (x + z + y) % 17 == 0 {
-                    world.set_block(x, y, z, BlockState::STONE);
+/// Simple deterministic hash for procedural generation (no std rand dependency).
+fn hash2d(x: i32, z: i32, seed: u32) -> u32 {
+    let mut h = seed;
+    h ^= x as u32;
+    h = h.wrapping_mul(0x45d9f3b).wrapping_add(0x16f11fe5);
+    h ^= z as u32;
+    h = h.wrapping_mul(0x45d9f3b).wrapping_add(0x16f11fe5);
+    h ^ (h >> 16)
+}
+
+/// Terrain height at (x, z) using overlapping sine waves.
+fn terrain_height(x: i32, z: i32) -> i32 {
+    let fx = x as f64;
+    let fz = z as f64;
+    let h = 62.0
+        + 8.0 * (fx * 0.02).sin() * (fz * 0.03).cos()
+        + 4.0 * (fx * 0.07 + 1.0).sin() * (fz * 0.05 + 2.0).cos()
+        + 2.0 * (fx * 0.15 + 3.0).cos() * (fz * 0.12 + 1.0).sin();
+    h as i32
+}
+
+/// Place a simple oak tree at (x, y, z).
+fn place_tree(world: &mut World, x: i32, y: i32, z: i32) {
+    let trunk = BlockState::new(17, 0);
+    let leaves = BlockState::new(18, 0);
+    let h = 4 + (hash2d(x, z, 777) % 3) as i32;
+    for dy in 0..h {
+        world.set_block(x, y + dy, z, trunk);
+    }
+    let top = y + h;
+    for dx in -2..=2 {
+        for dz in -2..=2 {
+            for dy in -2..=1 {
+                let dist = dx * dx + dy * dy + dz * dz;
+                if dist <= 6 && !(dx == 0 && dz == 0 && dy < 0) {
+                    let bx = x + dx;
+                    let by = top + dy;
+                    let bz = z + dz;
+                    if world.block_at(bx, by, bz).is_air() {
+                        world.set_block(bx, by, bz, leaves);
+                    }
                 }
             }
         }
     }
-    for x in 4..10 {
-        for y in 1..5 {
-            for z in 4..10 {
-                if x == 4 || x == 9 || z == 4 || z == 9 || y == 4 {
-                    world.set_block(x, y, z, BlockState::STONE);
+}
+
+/// Landscape demo: hilly terrain, trees, a lake, scattered ores, animals.
+/// Returns the spawn position.
+fn build_demo_landscape(world: &mut World) -> DVec3 {
+    let water_level = 60;
+    let range = 8; // chunks -8..8 (17×17)
+
+    for cx in -range..=range {
+        for cz in -range..=range {
+            for lx in 0..16 {
+                for lz in 0..16 {
+                    let x = cx * 16 + lx;
+                    let z = cz * 16 + lz;
+                    let h = terrain_height(x, z);
+                    let surface = h.max(water_level);
+
+                    // Bedrock
+                    world.set_block(x, 0, z, BlockState::new(7, 0));
+
+                    // Stone fill
+                    for y in 1..h.saturating_sub(3) {
+                        // Scatter ores
+                        let r = hash2d(x, y * 37 + z, 42);
+                        let block = if r % 80 == 0 {
+                            BlockState::new(16, 0) // coal
+                        } else if r % 120 == 0 {
+                            BlockState::new(15, 0) // iron
+                        } else {
+                            BlockState::STONE
+                        };
+                        world.set_block(x, y, z, block);
+                    }
+
+                    // Dirt / sand layers
+                    let near_water = h <= water_level + 2;
+                    let fill = if near_water {
+                        BlockState::new(12, 0) // sand
+                    } else {
+                        BlockState::DIRT
+                    };
+                    for y in h.saturating_sub(3).max(1)..h {
+                        world.set_block(x, y, z, fill);
+                    }
+
+                    // Surface
+                    if h > water_level {
+                        let top = if near_water { fill } else { BlockState::GRASS };
+                        world.set_block(x, h, z, top);
+                    } else {
+                        // Underwater: dirt/sand on bottom, water above
+                        world.set_block(x, h, z, fill);
+                        for y in (h + 1)..=water_level {
+                            world.set_block(x, y, z, BlockState::new(9, 0)); // still water
+                        }
+                    }
+
+                    // Sky light: full above surface
+                    for y in (surface + 1)..=(surface + 16) {
+                        world.set_light(x, y, z, 0, 15);
+                    }
+                    world.set_light(x, surface, z, 0, 15);
                 }
             }
         }
     }
-    for y in 1..7 {
-        world.set_block(-4, y, -4, BlockState::new(17, 0));
-    }
-    for x in -7..0 {
-        for y in 5..9 {
-            for z in -7..0 {
-                let dx = x + 4;
-                let dy = y - 7;
-                let dz = z + 4;
-                if dx * dx + dy * dy + dz * dz < 12 {
-                    world.set_block(x, y, z, BlockState::new(18, 0));
+
+    // Trees on grass blocks
+    let tree_range = range * 16;
+    for cx in -range..=range {
+        for cz in -range..=range {
+            // ~2 trees per chunk
+            for seed in [111u32, 222] {
+                let r = hash2d(cx, cz, seed);
+                let lx = (r % 14 + 1) as i32;
+                let lz = ((r >> 8) % 14 + 1) as i32;
+                let x = cx * 16 + lx;
+                let z = cz * 16 + lz;
+                if x.abs() > tree_range || z.abs() > tree_range {
+                    continue;
+                }
+                let h = terrain_height(x, z);
+                if h > water_level + 2 {
+                    place_tree(world, x, h + 1, z);
                 }
             }
         }
     }
+
+    // Animals
+    let mob_types = [90u8, 91, 92, 93]; // pig, sheep, cow, chicken
+    let mut eid = 100;
+    for i in 0..24 {
+        let r = hash2d(i, i * 7 + 3, 555);
+        let x = ((r % 80) as i32 - 40) as f64 + 0.5;
+        let z = (((r >> 8) % 80) as i32 - 40) as f64 + 0.5;
+        let h = terrain_height(x as i32, z as i32);
+        if h > water_level {
+            let kind = EntityKind::Mob(mob_types[i as usize % mob_types.len()]);
+            world.upsert_entity(EntityState::new_remote(
+                EntityId(eid),
+                kind,
+                DVec3::new(x, h as f64 + 1.0, z),
+                (r % 360) as f32,
+                0.0,
+            ));
+            eid += 1;
+        }
+    }
+
+    let spawn_h = terrain_height(0, 0).max(water_level) + 1;
+    DVec3::new(0.5, spawn_h as f64 + 1.0, 0.5)
+}
+
+/// Chunk stress test: large area filled with geometry-heavy patterns to
+/// maximize visible faces, draw calls, and triangle count.
+fn build_demo_chunk_stress(world: &mut World) -> DVec3 {
+    let range = 10; // 21×21 chunks
+
+    for cx in -range..=range {
+        for cz in -range..=range {
+            for lx in 0..16 {
+                for lz in 0..16 {
+                    let x = cx * 16 + lx;
+                    let z = cz * 16 + lz;
+
+                    // Ground
+                    world.set_block(x, 0, z, BlockState::new(7, 0)); // bedrock
+
+                    // Layers 1-48: dense 3D checkerboard (every block has 6 exposed faces)
+                    for y in 1..=48 {
+                        if (x + y + z) % 2 == 0 {
+                            // Vary block types across layers to stress all render paths
+                            let block = match y % 6 {
+                                0 => BlockState::STONE,
+                                1 => BlockState::new(4, 0),  // cobblestone
+                                2 => BlockState::new(98, 0), // stone bricks
+                                3 => BlockState::new(18, 0), // leaves (cutout)
+                                4 => BlockState::new(20, 0), // glass (cutout)
+                                _ => BlockState::new(95, (x.unsigned_abs() % 16) as u8), // stained glass (transparent)
+                            };
+                            world.set_block(x, y, z, block);
+                        }
+                    }
+
+                    // Light
+                    for y in 49..65 {
+                        world.set_light(x, y, z, 0, 15);
+                    }
+                }
+            }
+        }
+    }
+
+    DVec3::new(0.5, 52.0, 0.5)
+}
+
+/// Entity stress test: flat ground with hundreds of mob entities.
+fn build_demo_entity_stress(world: &mut World) -> DVec3 {
+    let range = 4; // 9×9 chunks
+
+    // Flat grass ground
+    for cx in -range..=range {
+        for cz in -range..=range {
+            for lx in 0..16 {
+                for lz in 0..16 {
+                    let x = cx * 16 + lx;
+                    let z = cz * 16 + lz;
+                    world.set_block(x, 0, z, BlockState::GRASS);
+                    for y in 1..4 {
+                        world.set_light(x, y, z, 0, 15);
+                    }
+                }
+            }
+        }
+    }
+
+    // Spawn 500 mobs in a grid
+    let mob_types = [50u8, 51, 52, 54, 90, 91, 92, 93, 95, 120];
+    let mut eid = 100;
+    let grid = 23; // ~23×23 = 529 entities
+    let spacing = 3.0;
+    let offset = -(grid as f64) * spacing / 2.0;
+
+    for ix in 0..grid {
+        for iz in 0..grid {
+            let x = offset + ix as f64 * spacing + 0.5;
+            let z = offset + iz as f64 * spacing + 0.5;
+            let kind_idx = (ix * grid + iz) % mob_types.len();
+            let yaw = hash2d(ix as i32, iz as i32, 999) % 360;
+            world.upsert_entity(EntityState::new_remote(
+                EntityId(eid),
+                EntityKind::Mob(mob_types[kind_idx]),
+                DVec3::new(x, 1.0, z),
+                yaw as f32,
+                0.0,
+            ));
+            eid += 1;
+        }
+    }
+
+    DVec3::new(0.5, 2.0, 0.5)
 }
 
 #[cfg(test)]
@@ -3856,7 +4080,7 @@ mod interaction_tests {
 
     #[test]
     fn double_tap_jump_toggles_flight_and_queues_echo() {
-        let mut gs = GameState::demo(1.0); // demo grants allow_flying
+        let mut gs = GameState::demo(DemoKind::Landscape, 1.0); // demo grants allow_flying
         // Press, release, press again within the 7-tick window.
         gs.input.jump = true;
         gs.tick(0.05);
@@ -3875,7 +4099,7 @@ mod interaction_tests {
 
     #[test]
     fn slow_taps_do_not_toggle_flight() {
-        let mut gs = GameState::demo(1.0);
+        let mut gs = GameState::demo(DemoKind::Landscape, 1.0);
         gs.input.jump = true;
         gs.tick(0.05);
         gs.input.jump = false;
@@ -3890,7 +4114,7 @@ mod interaction_tests {
 
     #[test]
     fn touching_ground_disables_flight() {
-        let mut gs = GameState::demo(1.0);
+        let mut gs = GameState::demo(DemoKind::Landscape, 1.0);
         gs.capabilities.flying = true;
         gs.player.position = DVec3::new(0.5, 1.0, 0.5); // resting on the floor
         gs.player.sync_aabb_to_position();
@@ -4077,7 +4301,7 @@ mod interaction_tests {
 
     #[test]
     fn entity_movement_interpolates_instead_of_snapping() {
-        let mut gs = GameState::demo(1.0);
+        let mut gs = GameState::demo(DemoKind::Landscape, 1.0);
         gs.world.upsert_entity(EntityState::new_remote(
             EntityId(9),
             EntityKind::Mob(54),
@@ -4112,7 +4336,7 @@ mod interaction_tests {
 
     #[test]
     fn continuous_swinging_cycles_instead_of_pinning_at_the_start() {
-        let mut gs = GameState::demo(1.0);
+        let mut gs = GameState::demo(DemoKind::Landscape, 1.0);
         // Swinging every tick (hold-to-mine) must advance through the vanilla
         // half-cycle (restart allowed past the midpoint), not reset to zero
         // every tick.

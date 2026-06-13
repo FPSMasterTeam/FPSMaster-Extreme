@@ -41,6 +41,114 @@ impl Vertex {
     }
 }
 
+/// Compact 16-byte chunk vertex. World-space position is stored as fixed-point
+/// i16 at 1/64 block resolution (±512 block range per axis). Light curves are
+/// packed into the 4th position component. Color is RGBA8 unorm and atlas UVs
+/// are 16-bit unorm.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct ChunkVertex {
+    /// xyz: world position × 64, as fixed-point i16 (1/64 block precision).
+    /// w: packed `(sky_u8 << 8) | block_u8` reinterpreted as i16.
+    pub pos_light: [i16; 4],
+    /// Material tint × directional face shade × AO + alpha, as RGBA8 unorm.
+    pub color: [u8; 4],
+    /// Normalized atlas UV as Unorm16×2.
+    pub uv: [u16; 2],
+}
+
+impl ChunkVertex {
+    pub const ATTRIBUTES: [wgpu::VertexAttribute; 3] =
+        wgpu::vertex_attr_array![0 => Sint16x4, 1 => Unorm8x4, 2 => Unorm16x2];
+
+    pub fn layout<'a>() -> wgpu::VertexBufferLayout<'a> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Self>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &Self::ATTRIBUTES,
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct ChunkMeshBuffers {
+    pub vertices: Vec<ChunkVertex>,
+    pub indices: Vec<u16>,
+}
+
+impl ChunkMeshBuffers {
+    pub fn is_empty(&self) -> bool {
+        self.indices.is_empty()
+    }
+
+    fn push_quad(
+        &mut self,
+        corners: [[f32; 3]; 4],
+        uvs: [[f32; 2]; 4],
+        color: [f32; 4],
+        light: [f32; 2],
+    ) {
+        self.push_quad_smooth(corners, uvs, [color; 4], [light; 4]);
+    }
+
+    fn push_quad_double_sided(
+        &mut self,
+        corners: [[f32; 3]; 4],
+        uvs: [[f32; 2]; 4],
+        color: [f32; 4],
+        light: [f32; 2],
+    ) {
+        self.push_quad(corners, uvs, color, light);
+        let back = [corners[3], corners[2], corners[1], corners[0]];
+        let back_uvs = [uvs[3], uvs[2], uvs[1], uvs[0]];
+        self.push_quad(back, back_uvs, color, light);
+    }
+
+    fn push_quad_smooth(
+        &mut self,
+        corners: [[f32; 3]; 4],
+        uvs: [[f32; 2]; 4],
+        colors: [[f32; 4]; 4],
+        lights: [[f32; 2]; 4],
+    ) {
+        let start = self.vertices.len() as u16;
+        for (((position, uv), color), light) in
+            corners.into_iter().zip(uvs).zip(colors).zip(lights)
+        {
+            self.vertices.push(encode_chunk_vertex(position, color, uv, light));
+        }
+        self.indices
+            .extend_from_slice(&[start, start + 1, start + 2, start, start + 2, start + 3]);
+    }
+}
+
+fn encode_chunk_vertex(
+    position: [f32; 3],
+    color: [f32; 4],
+    uv: [f32; 2],
+    light: [f32; 2],
+) -> ChunkVertex {
+    let px = (position[0] * 64.0).round() as i16;
+    let py = (position[1] * 64.0).round() as i16;
+    let pz = (position[2] * 64.0).round() as i16;
+    let sky_u8 = (light[0] * 255.0 + 0.5) as u8;
+    let block_u8 = (light[1] * 255.0 + 0.5) as u8;
+    let w = ((sky_u8 as u16) << 8 | block_u8 as u16) as i16;
+    ChunkVertex {
+        pos_light: [px, py, pz, w],
+        color: [
+            (color[0] * 255.0 + 0.5) as u8,
+            (color[1] * 255.0 + 0.5) as u8,
+            (color[2] * 255.0 + 0.5) as u8,
+            (color[3] * 255.0 + 0.5) as u8,
+        ],
+        uv: [
+            (uv[0] * 65535.0 + 0.5) as u16,
+            (uv[1] * 65535.0 + 0.5) as u16,
+        ],
+    }
+}
+
 /// Per-biome tint colors (0..1) applied to grass and foliage, which ship as
 /// grayscale textures in vanilla and must be colored at runtime.
 #[derive(Debug, Clone, Copy)]
@@ -156,71 +264,14 @@ pub struct MeshBuffers {
     pub indices: Vec<u32>,
 }
 
-impl MeshBuffers {
-    pub fn is_empty(&self) -> bool {
-        self.indices.is_empty()
-    }
-
-    fn push_quad(
-        &mut self,
-        corners: [[f32; 3]; 4],
-        uvs: [[f32; 2]; 4],
-        color: [f32; 4],
-        light: [f32; 2],
-    ) {
-        self.push_quad_smooth(corners, uvs, [color; 4], [light; 4]);
-    }
-
-    /// Emit `corners`/`uvs` as a double-sided quad: the front face plus a
-    /// reverse-wound back face, so the shape stays visible from both sides under
-    /// back-face culling. Used by the genuinely 2D shapes (cross plants, rails,
-    /// ladders), mirroring how vanilla's `cross` model carries a face per side.
-    fn push_quad_double_sided(
-        &mut self,
-        corners: [[f32; 3]; 4],
-        uvs: [[f32; 2]; 4],
-        color: [f32; 4],
-        light: [f32; 2],
-    ) {
-        self.push_quad(corners, uvs, color, light);
-        let back = [corners[3], corners[2], corners[1], corners[0]];
-        let back_uvs = [uvs[3], uvs[2], uvs[1], uvs[0]];
-        self.push_quad(back, back_uvs, color, light);
-    }
-
-    /// Like [`push_quad`](Self::push_quad) but with an independent color and
-    /// light pair per corner, for smooth (per-vertex) lighting.
-    fn push_quad_smooth(
-        &mut self,
-        corners: [[f32; 3]; 4],
-        uvs: [[f32; 2]; 4],
-        colors: [[f32; 4]; 4],
-        lights: [[f32; 2]; 4],
-    ) {
-        let start = self.vertices.len() as u32;
-        for (((position, uv), color), light) in
-            corners.into_iter().zip(uvs).zip(colors).zip(lights)
-        {
-            self.vertices.push(Vertex {
-                position,
-                color,
-                uv,
-                light,
-            });
-        }
-        self.indices
-            .extend_from_slice(&[start, start + 1, start + 2, start, start + 2, start + 3]);
-    }
-}
-
 /// A chunk's geometry split by render pass: opaque, alpha-tested cutout
 /// (leaves/plants/glass — keeps the texture's transparent gaps), and
 /// alpha-blended translucent (water/ice/stained glass).
 #[derive(Debug, Default, Clone)]
 pub struct ChunkMesh {
-    pub solid: MeshBuffers,
-    pub cutout: MeshBuffers,
-    pub transparent: MeshBuffers,
+    pub solid: ChunkMeshBuffers,
+    pub cutout: ChunkMeshBuffers,
+    pub transparent: ChunkMeshBuffers,
 }
 
 impl ChunkMesh {
@@ -450,7 +501,7 @@ const FACING_NORMAL: [[i32; 3]; 6] = [
     [1, 0, 0],
 ];
 
-fn buffer_for(mesh: &mut ChunkMesh, block: BlockState) -> &mut MeshBuffers {
+fn buffer_for(mesh: &mut ChunkMesh, block: BlockState) -> &mut ChunkMeshBuffers {
     match block.render_layer() {
         RenderLayer::Solid => &mut mesh.solid,
         RenderLayer::Cutout => &mut mesh.cutout,
@@ -623,7 +674,7 @@ fn pane_edge_texture(block: BlockState) -> Option<String> {
 /// semantics, so e.g. a slab side shows the lower half of the texture).
 #[allow(clippy::too_many_arguments)]
 fn emit_face<S: BlockSource>(
-    buffer: &mut MeshBuffers,
+    buffer: &mut ChunkMeshBuffers,
     ctx: &BlockCtx<S>,
     face: &Face,
     x: i32,
@@ -1198,9 +1249,15 @@ mod tests {
     use super::*;
 
     fn atlas() -> AtlasUv {
-        // The mesher only needs name→index resolution; the default atlas covers
-        // every registry texture.
         crate::TextureAtlasImage::load_default().uv_table()
+    }
+
+    fn vpos(v: &ChunkVertex) -> [f32; 3] {
+        [
+            v.pos_light[0] as f32 / 64.0,
+            v.pos_light[1] as f32 / 64.0,
+            v.pos_light[2] as f32 / 64.0,
+        ]
     }
 
     #[test]
@@ -1275,8 +1332,6 @@ mod tests {
 
     #[test]
     fn smooth_lighting_is_flat_on_an_unoccluded_block() {
-        // With no neighbours, every face's four corners get the same light, so
-        // smooth lighting must not introduce any per-vertex variation.
         let mut world = World::new();
         world.set_block(0, 0, 0, BlockState::STONE);
         let mesh = build_world_mesh(&world, &atlas(), BiomeColors::default());
@@ -1293,14 +1348,12 @@ mod tests {
     fn ambient_occlusion_darkens_occluded_top_corners() {
         let mut world = World::new();
         world.set_block(0, 0, 0, BlockState::STONE);
-        // A block on the +x edge of the top face occludes two of its corners.
         world.set_block(1, 1, 0, BlockState::STONE);
         let mesh = build_world_mesh(&world, &atlas(), BiomeColors::default());
-        // The origin block's top face is the quad whose four corners span the
-        // full [0,1]×[0,1] footprint at y = 1.
-        let span = |q: &[Vertex], axis: usize| {
-            let lo = q.iter().map(|v| v.position[axis]).fold(f32::MAX, f32::min);
-            let hi = q.iter().map(|v| v.position[axis]).fold(f32::MIN, f32::max);
+        let pos = |v: &ChunkVertex, axis: usize| v.pos_light[axis] as f32 / 64.0;
+        let span = |q: &[ChunkVertex], axis: usize| {
+            let lo = q.iter().map(|v| pos(v, axis)).fold(f32::MAX, f32::min);
+            let hi = q.iter().map(|v| pos(v, axis)).fold(f32::MIN, f32::max);
             (lo, hi)
         };
         let top = mesh
@@ -1308,12 +1361,12 @@ mod tests {
             .vertices
             .chunks(4)
             .find(|q| {
-                q.iter().all(|v| (v.position[1] - 1.0).abs() < 1.0e-6)
+                q.iter().all(|v| (pos(v, 1) - 1.0).abs() < 0.02)
                     && span(q, 0) == (0.0, 1.0)
                     && span(q, 2) == (0.0, 1.0)
             })
             .expect("origin top face quad");
-        let lum = |v: &Vertex| v.color[0];
+        let lum = |v: &ChunkVertex| v.color[0] as f32 / 255.0;
         let min = top.iter().map(lum).fold(f32::MAX, f32::min);
         let max = top.iter().map(lum).fold(f32::MIN, f32::max);
         assert!(
@@ -1344,7 +1397,7 @@ mod tests {
             .cutout
             .vertices
             .iter()
-            .all(|v| (v.color[3] - 1.0).abs() < 1.0e-6));
+            .all(|v| v.color[3] == 255));
     }
 
     #[test]
@@ -1379,9 +1432,9 @@ mod tests {
             .solid
             .vertices
             .iter()
-            .map(|v| v.position[1])
+            .map(|v| vpos(v)[1])
             .fold(f32::MIN, f32::max);
-        assert!((max_y - 0.5).abs() < 1.0e-6, "slab top was {max_y}");
+        assert!((max_y - 0.5).abs() < 0.02, "slab top was {max_y}");
     }
 
     #[test]
@@ -1428,24 +1481,22 @@ mod tests {
     #[test]
     fn stairs_render_base_plus_quarter() {
         let mut world = World::new();
-        world.set_block(0, 0, 0, BlockState::new(53, 0)); // east-facing bottom stairs
+        world.set_block(0, 0, 0, BlockState::new(53, 0));
         let mesh = build_world_mesh(&world, &atlas(), BiomeColors::default());
-        // Two boxes (slab + quarter) x 6 faces x 4 vertices.
         assert_eq!(mesh.solid.vertices.len(), 48);
         let max_y = mesh
             .solid
             .vertices
             .iter()
-            .map(|v| v.position[1])
+            .map(|v| vpos(v)[1])
             .fold(f32::MIN, f32::max);
-        assert!((max_y - 1.0).abs() < 1.0e-6, "stair top was {max_y}");
-        // The full-height quarter only spans x >= 0.5.
+        assert!((max_y - 1.0).abs() < 0.02, "stair top was {max_y}");
         assert!(mesh
             .solid
             .vertices
             .iter()
-            .filter(|v| v.position[1] > 0.75)
-            .all(|v| v.position[0] >= 0.5 - 1.0e-6));
+            .filter(|v| vpos(v)[1] > 0.75)
+            .all(|v| vpos(v)[0] >= 0.5 - 0.02));
     }
 
     #[test]
@@ -1481,19 +1532,18 @@ mod tests {
     #[test]
     fn rails_rotate_and_slope() {
         let mut world = World::new();
-        world.set_block(0, 0, 0, BlockState::new(66, 0)); // flat north-south
-        world.set_block(1, 0, 0, BlockState::new(66, 2)); // ascending east
+        world.set_block(0, 0, 0, BlockState::new(66, 0));
+        world.set_block(1, 0, 0, BlockState::new(66, 2));
         let mesh = build_world_mesh(&world, &atlas(), BiomeColors::default());
-        // One double-sided quad per rail (front + back) → 8 vertices each.
         assert_eq!(mesh.cutout.vertices.len(), 16, "one double-sided quad per rail");
         let max_y = mesh
             .cutout
             .vertices
             .iter()
-            .map(|v| v.position[1])
+            .map(|v| vpos(v)[1])
             .fold(f32::MIN, f32::max);
         assert!(
-            (max_y - 1.0625).abs() < 1.0e-6,
+            (max_y - 1.0625).abs() < 0.02,
             "ascending rail top was {max_y}"
         );
     }
@@ -1501,39 +1551,37 @@ mod tests {
     #[test]
     fn cross_plants_are_inset_from_the_corners() {
         let mut world = World::new();
-        world.set_block(0, 0, 0, BlockState::new(38, 0)); // poppy
+        world.set_block(0, 0, 0, BlockState::new(38, 0));
         let mesh = build_world_mesh(&world, &atlas(), BiomeColors::default());
         for v in &mesh.cutout.vertices {
-            assert!(v.position[0] >= 0.05 - 1.0e-6 && v.position[0] <= 0.95 + 1.0e-6);
-            assert!(v.position[2] >= 0.05 - 1.0e-6 && v.position[2] <= 0.95 + 1.0e-6);
+            let p = vpos(v);
+            assert!(p[0] >= 0.05 - 0.02 && p[0] <= 0.95 + 0.02);
+            assert!(p[2] >= 0.05 - 0.02 && p[2] <= 0.95 + 0.02);
         }
     }
 
     #[test]
     fn slab_side_faces_crop_the_texture_vertically() {
         let mut world = World::new();
-        world.set_block(0, 0, 0, BlockState::new(44, 0)); // bottom slab
+        world.set_block(0, 0, 0, BlockState::new(44, 0));
         let mesh = build_world_mesh(&world, &atlas(), BiomeColors::default());
         let uv = atlas();
         let rect = uv.tile_rect(BlockState::new(44, 0).texture_name(BlockFace::Side));
-        // Side faces span y 0..0.5 → they must sample only v 0.5..1.0 of the
-        // tile (the lower half). Identify side quads as 4-vertex groups whose
-        // x or z coordinate is constant (vertical planes).
         let mut checked = 0;
         for quad in mesh.solid.vertices.chunks(4) {
             let constant = |axis: usize| {
-                quad.iter()
-                    .all(|v| v.position[axis] == quad[0].position[axis])
+                let p0 = vpos(&quad[0])[axis];
+                quad.iter().all(|v| (vpos(v)[axis] - p0).abs() < 0.02)
             };
             if constant(1) {
-                continue; // top/bottom face
+                continue;
             }
             assert!(constant(0) || constant(2), "unexpected slanted quad");
             for v in quad {
+                let v_coord = v.uv[1] as f32 / 65535.0;
                 assert!(
-                    v.uv[1] >= rect[1] + 0.5 * rect[3] - 1.0e-6,
-                    "slab side sampled the upper texture half (v {})",
-                    v.uv[1]
+                    v_coord >= rect[1] + 0.5 * rect[3] - 0.001,
+                    "slab side sampled the upper texture half (v {v_coord})",
                 );
             }
             checked += 1;
@@ -1544,25 +1592,20 @@ mod tests {
     #[test]
     fn closed_door_is_a_thin_panel_on_the_facing_edge() {
         let mut world = World::new();
-        // Wood door lower half, facing index 1 (south) → closed panel on the
-        // north edge: z in [0, 3/16], full x and y.
         world.set_block(0, 0, 0, BlockState::new(64, 1));
         let mesh = build_world_mesh(&world, &atlas(), BiomeColors::default());
-        // One thin box → 6 faces × 4 vertices, in the cutout layer.
         assert_eq!(mesh.cutout.vertices.len(), 24);
         let max_z = mesh
             .cutout
             .vertices
             .iter()
-            .map(|v| v.position[2])
+            .map(|v| vpos(v)[2])
             .fold(f32::MIN, f32::max);
-        assert!((max_z - 0.1875).abs() < 1.0e-6, "panel z extent was {max_z}");
+        assert!((max_z - 0.1875).abs() < 0.02, "panel z extent was {max_z}");
     }
 
     #[test]
     fn opening_a_door_swings_the_panel_to_an_adjacent_edge() {
-        // Same facing as above but open (bit 2) with a left hinge → the panel
-        // moves from the north edge to the east edge (x in [13/16, 1]).
         let mut world = World::new();
         world.set_block(0, 0, 0, BlockState::new(64, 1 | 4));
         let mesh = build_world_mesh(&world, &atlas(), BiomeColors::default());
@@ -1570,40 +1613,37 @@ mod tests {
             .cutout
             .vertices
             .iter()
-            .map(|v| v.position[0])
+            .map(|v| vpos(v)[0])
             .fold(f32::MAX, f32::min);
-        assert!((min_x - 0.8125).abs() < 1.0e-6, "open panel min x was {min_x}");
+        assert!((min_x - 0.8125).abs() < 0.02, "open panel min x was {min_x}");
     }
 
     #[test]
     fn piston_is_a_full_cube_and_head_is_plate_plus_arm() {
         let mut world = World::new();
-        world.set_block(0, 0, 0, BlockState::new(33, 1)); // piston facing up
+        world.set_block(0, 0, 0, BlockState::new(33, 1));
         let mesh = build_world_mesh(&world, &atlas(), BiomeColors::default());
         assert_eq!(mesh.solid.vertices.len(), 24, "piston body is a full cube");
 
         let mut world = World::new();
-        world.set_block(0, 0, 0, BlockState::new(34, 1)); // extended head facing up
+        world.set_block(0, 0, 0, BlockState::new(34, 1));
         let mesh = build_world_mesh(&world, &atlas(), BiomeColors::default());
-        // Plate + arm = 2 boxes × 6 faces × 4 vertices.
         assert_eq!(mesh.solid.vertices.len(), 48);
-        // The head plate reaches the top of the block (facing up).
         let max_y = mesh
             .solid
             .vertices
             .iter()
-            .map(|v| v.position[1])
+            .map(|v| vpos(v)[1])
             .fold(f32::MIN, f32::max);
-        assert!((max_y - 1.0).abs() < 1.0e-6);
-        // The arm is the 4-wide inner rod (x within [6/16, 10/16]).
+        assert!((max_y - 1.0).abs() < 0.02);
         let arm_min_x = mesh
             .solid
             .vertices
             .iter()
-            .filter(|v| v.position[1] < 0.75) // below the plate
-            .map(|v| v.position[0])
+            .filter(|v| vpos(v)[1] < 0.75)
+            .map(|v| vpos(v)[0])
             .fold(f32::MAX, f32::min);
-        assert!((arm_min_x - 0.375).abs() < 1.0e-6, "arm min x was {arm_min_x}");
+        assert!((arm_min_x - 0.375).abs() < 0.02, "arm min x was {arm_min_x}");
     }
 
     #[test]

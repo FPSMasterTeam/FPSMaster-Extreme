@@ -14,8 +14,8 @@ use crate::{
     chunk_mesh::ChunkNeighborhood,
     mesh_worker::MeshWorker,
     texture::{EntityAtlasImage, SkyAtlasImage, TextureAtlasImage, TextureAtlasSource},
-    AtlasUv, BiomeColors, Camera, ChunkMesh, Frustum, GuiAtlas, MeshBuffers, ModelMesh,
-    ModelVertex, UiFrame, Vertex,
+    AtlasUv, BiomeColors, Camera, ChunkMesh, ChunkMeshBuffers, ChunkVertex, Frustum, GuiAtlas,
+    ModelMesh, ModelVertex, UiFrame, Vertex,
 };
 
 #[derive(Debug, Error)]
@@ -179,6 +179,7 @@ pub struct Renderer<'window> {
     gui_cube_pipeline: wgpu::RenderPipeline,
     item_pipeline: wgpu::RenderPipeline,
     transparent_pipeline: wgpu::RenderPipeline,
+    overlay_pipeline: wgpu::RenderPipeline,
     model_pipeline: wgpu::RenderPipeline,
     model_mesh: Option<DynamicMesh>,
     /// First-person held-item geometry (block-atlas textured), per frame.
@@ -374,6 +375,10 @@ impl<'window> Renderer<'window> {
             label: Some("chunk-shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader/chunk.wgsl").into()),
         });
+        let overlay_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("overlay-shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shader/overlay.wgsl").into()),
+        });
         let sky_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("sky-shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader/sky.wgsl").into()),
@@ -453,7 +458,7 @@ impl<'window> Renderer<'window> {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: "vs_main",
-                buffers: &[Vertex::layout()],
+                buffers: &[ChunkVertex::layout()],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
@@ -494,7 +499,7 @@ impl<'window> Renderer<'window> {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: "vs_main",
-                buffers: &[Vertex::layout()],
+                buffers: &[ChunkVertex::layout()],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
@@ -532,12 +537,12 @@ impl<'window> Renderer<'window> {
             label: Some("gui-cube-pipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
-                module: &shader,
+                module: &overlay_shader,
                 entry_point: "vs_main",
                 buffers: &[Vertex::layout()],
             },
             fragment: Some(wgpu::FragmentState {
-                module: &shader,
+                module: &overlay_shader,
                 entry_point: "fs_cutout",
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
@@ -571,12 +576,12 @@ impl<'window> Renderer<'window> {
             label: Some("item-cutout-pipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
-                module: &shader,
+                module: &overlay_shader,
                 entry_point: "vs_main",
                 buffers: &[Vertex::layout()],
             },
             fragment: Some(wgpu::FragmentState {
-                module: &shader,
+                module: &overlay_shader,
                 entry_point: "fs_cutout",
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
@@ -615,10 +620,46 @@ impl<'window> Renderer<'window> {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: "vs_main",
-                buffers: &[Vertex::layout()],
+                buffers: &[ChunkVertex::layout()],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: Some(wgpu::Face::Back),
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+        });
+        let overlay_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("overlay-pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &overlay_shader,
+                entry_point: "vs_main",
+                buffers: &[Vertex::layout()],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &overlay_shader,
                 entry_point: "fs_main",
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
@@ -929,6 +970,7 @@ impl<'window> Renderer<'window> {
             gui_cube_pipeline,
             item_pipeline,
             transparent_pipeline,
+            overlay_pipeline,
             model_pipeline,
             model_mesh: None,
             first_person_item: None,
@@ -1642,21 +1684,18 @@ impl<'window> Renderer<'window> {
 
             if !self.chunk_meshes.is_empty() {
                 let frustum = camera.frustum();
-                // Draw each render layer by iterating the chunk map in place — no
-                // per-frame Vec allocation for the visible set. The frustum test
-                // is a handful of dot products, cheaper than the heap traffic it
-                // replaces, and is re-run per layer (3x) which is negligible.
-                //
-                // Opaque pass, then alpha-tested cutout (leaves/plants), then the
-                // alpha-blended translucent pass (water/glass) last.
+                let visible: Vec<&GpuChunkMesh> = self
+                    .chunk_meshes
+                    .iter()
+                    .filter(|(pos, _)| section_in_frustum(&frustum, **pos))
+                    .map(|(_, mesh)| mesh)
+                    .collect();
+                visible_chunks = visible.len() as u32;
+
                 pass.set_pipeline(&self.pipeline);
                 pass.set_bind_group(0, &self.camera_bind_group, &[]);
                 pass.set_bind_group(1, &self.texture_bind_group, &[]);
-                for (pos, mesh) in &self.chunk_meshes {
-                    if !section_in_frustum(&frustum, *pos) {
-                        continue;
-                    }
-                    visible_chunks += 1;
+                for mesh in &visible {
                     if let Some(indices) = draw_buffers(&mut pass, mesh.solid.as_ref()) {
                         draw_calls += 1;
                         chunk_indices += indices;
@@ -1664,10 +1703,7 @@ impl<'window> Renderer<'window> {
                 }
 
                 pass.set_pipeline(&self.cutout_pipeline);
-                for (pos, mesh) in &self.chunk_meshes {
-                    if !section_in_frustum(&frustum, *pos) {
-                        continue;
-                    }
+                for mesh in &visible {
                     if let Some(indices) = draw_buffers(&mut pass, mesh.cutout.as_ref()) {
                         draw_calls += 1;
                         chunk_indices += indices;
@@ -1675,10 +1711,7 @@ impl<'window> Renderer<'window> {
                 }
 
                 pass.set_pipeline(&self.transparent_pipeline);
-                for (pos, mesh) in &self.chunk_meshes {
-                    if !section_in_frustum(&frustum, *pos) {
-                        continue;
-                    }
+                for mesh in &visible {
                     if let Some(indices) = draw_buffers(&mut pass, mesh.transparent.as_ref()) {
                         draw_calls += 1;
                         chunk_indices += indices;
@@ -1690,7 +1723,7 @@ impl<'window> Renderer<'window> {
             // blended, depth-tested, no depth write) so the crack texels darken
             // the mined block in place.
             if let Some(overlay) = self.break_overlay.as_ref().filter(|m| m.index_count > 0) {
-                pass.set_pipeline(&self.transparent_pipeline);
+                pass.set_pipeline(&self.overlay_pipeline);
                 pass.set_bind_group(0, &self.camera_bind_group, &[]);
                 pass.set_bind_group(1, &self.texture_bind_group, &[]);
                 pass.set_vertex_buffer(0, overlay.vertex_buffer.slice(..));
@@ -1973,8 +2006,8 @@ fn prepare_ui_layer(
     cache.last_commands = commands.to_vec();
 }
 
-/// Bind and draw a chunk-layer mesh, returning the index count drawn (for
-/// profiling) or `None` when there was nothing to draw.
+/// Bind and draw a chunk-layer mesh with u16 indices, returning the index
+/// count drawn (for profiling) or `None` when there was nothing to draw.
 fn draw_buffers<'a>(
     pass: &mut wgpu::RenderPass<'a>,
     mesh: Option<&'a DynamicMesh>,
@@ -1984,7 +2017,7 @@ fn draw_buffers<'a>(
         return None;
     }
     pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-    pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+    pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
     pass.draw_indexed(0..mesh.index_count, 0, 0..1);
     Some(mesh.index_count)
 }
@@ -1995,7 +2028,7 @@ fn fill_chunk_layer(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     slot: &mut Option<DynamicMesh>,
-    buffers: &MeshBuffers,
+    buffers: &ChunkMeshBuffers,
     label: &str,
 ) {
     fill_dynamic_mesh(

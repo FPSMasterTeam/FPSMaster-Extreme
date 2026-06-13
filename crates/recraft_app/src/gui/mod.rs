@@ -8,6 +8,7 @@
 
 pub mod accounts;
 pub mod chat_screen;
+pub mod demo_select;
 pub mod edit_server;
 pub mod game_over;
 pub mod ingame;
@@ -113,7 +114,7 @@ pub enum GuiAction {
     SetScreen(Box<dyn GuiScreen>),
     /// Close the screen and return to gameplay (re-captures the cursor).
     CloseScreen,
-    StartDemo,
+    StartDemo(crate::game::DemoKind),
     Connect { host: String, port: u16 },
     QuitToTitle,
     Quit,

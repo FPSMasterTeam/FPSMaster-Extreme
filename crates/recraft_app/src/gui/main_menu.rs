@@ -4,6 +4,7 @@
 use recraft_render::{GuiTexture, UiColor, UiFrame, UiRect};
 
 use super::accounts::GuiAccounts;
+use super::demo_select::GuiDemoSelect;
 use super::multiplayer::GuiMultiplayer;
 use super::options::GuiOptions;
 use super::widgets::GuiButton;
@@ -112,7 +113,7 @@ impl GuiScreen for GuiMainMenu {
             return Vec::new();
         }
         if self.buttons[0].clicked(x, y) {
-            return vec![GuiAction::StartDemo];
+            return vec![GuiAction::SetScreen(Box::new(GuiDemoSelect::new()))];
         }
         if self.buttons[1].clicked(x, y) {
             return vec![GuiAction::SetScreen(Box::new(GuiMultiplayer::new()))];

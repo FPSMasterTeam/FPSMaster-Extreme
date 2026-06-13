@@ -34,7 +34,7 @@ use gui::{AccountEntry, DrawCtx, GuiAction, GuiScreen, ScreenCtx};
 use item_renderer::ItemRenderer;
 use network::{NetworkEvent, NetworkHandle};
 use recraft_protocol::{net::PremiumSession, v1_8_9::packets::ServerboundPacket};
-use recraft_render::Renderer;
+use recraft_render::{RenderStats, Renderer};
 use settings::{FpsCounter, Settings};
 
 /// Dirty sections snapshotted and handed to the background mesher each frame.
@@ -59,6 +59,7 @@ struct LaunchConfig {
     scripted_smoke_seconds: Option<f32>,
     headless_smoke_seconds: Option<f32>,
     headless_interact_seconds: Option<f32>,
+    demo_kind: game::DemoKind,
 }
 
 /// All mutable application state the screens and actions operate on (the
@@ -173,7 +174,11 @@ fn main() -> anyhow::Result<()> {
     release_cursor(window);
 
     let mut renderer = pollster::block_on(Renderer::new(window)).context("create renderer")?;
-    let settings = Settings::default();
+    let mut settings = Settings::default();
+    if config.scripted_smoke_seconds.is_some() {
+        settings.vsync = false;
+        settings.fps_cap = u32::MAX;
+    }
     renderer.set_vsync(settings.vsync);
     // Atlas UV table snapshot for first-person item geometry (cheap clone of
     // the name→tile map, taken once).
@@ -187,7 +192,7 @@ fn main() -> anyhow::Result<()> {
         // The demo world is only built when actually entering it; menus run
         // over an empty world (hidden behind the dirt background anyway).
         game: if auto_demo {
-            GameState::demo(renderer.aspect())
+            GameState::demo(config.demo_kind, renderer.aspect())
         } else {
             GameState::empty_for_server(renderer.aspect())
         },
@@ -256,7 +261,12 @@ fn main() -> anyhow::Result<()> {
     let mut fps_counter = FpsCounter::new(app_start);
     let mut tick_accumulator = 0.0f32;
     let scripted_smoke_seconds = config.scripted_smoke_seconds;
+    let scripted_smoke_static = matches!(config.demo_kind, game::DemoKind::ChunkStress);
     let mut scripted_smoke_done = false;
+    // During a scripted-smoke run, aggregate RenderStats over ~1s windows and log
+    // the breakdown so headed benchmark runs print readable profiler numbers to
+    // the terminal (instead of only the on-screen F3 overlay).
+    let mut smoke_profile = scripted_smoke_seconds.map(|_| SmokeProfile::new(app_start));
     // The window starts hidden; revealed after the first frame is presented so
     // the user never sees an empty white window during renderer/asset load.
     let mut window_shown = false;
@@ -544,8 +554,10 @@ fn main() -> anyhow::Result<()> {
                 let sim_dt = (now - last_sim).as_secs_f32().min(0.25);
                 last_sim = now;
                 if let Some(seconds) = scripted_smoke_seconds {
-                    app.game
-                        .apply_scripted_smoke_input((now - app_start).as_secs_f32(), seconds);
+                    if !scripted_smoke_static {
+                        app.game
+                            .apply_scripted_smoke_input((now - app_start).as_secs_f32(), seconds);
+                    }
                 }
                 // The world keeps ticking (and reporting movement) while any
                 // overlay screen is open, exactly like vanilla multiplayer.
@@ -595,6 +607,9 @@ fn main() -> anyhow::Result<()> {
                         .is_some_and(|seconds| (now - app_start).as_secs_f32() >= seconds)
                 {
                     scripted_smoke_done = true;
+                    if let Some(profile) = smoke_profile.as_mut() {
+                        profile.flush(now);
+                    }
                     log::info!("scripted smoke complete");
                     target.exit();
                 }
@@ -624,9 +639,13 @@ fn main() -> anyhow::Result<()> {
                     mouse_down_left,
                     f3_debug,
                 );
+                if let Some(profile) = smoke_profile.as_mut() {
+                    profile.record(renderer.last_stats(), Instant::now());
+                }
                 // Reveal the window once the first frame has actually been drawn.
                 if !window_shown {
                     window.set_visible(true);
+                    window.focus_window();
                     window_shown = true;
                 }
 
@@ -679,10 +698,10 @@ fn handle_actions(app: &mut App, renderer: &mut Renderer, actions: Vec<GuiAction
                     app.screen = Some(Box::new(GuiMainMenu::new()));
                 }
             }
-            GuiAction::StartDemo => {
+            GuiAction::StartDemo(kind) => {
                 app.network = None;
                 app.connecting = false;
-                app.game = GameState::demo(renderer.aspect());
+                app.game = GameState::demo(kind, renderer.aspect());
                 renderer.upload_world(&app.game.world);
                 app.in_world = true;
                 app.screen = None;
@@ -875,6 +894,88 @@ fn sync_cursor(window: &winit::window::Window, captured: &mut bool, app: &App) {
             release_cursor(window);
         }
         *captured = want;
+    }
+}
+
+/// Accumulates `RenderStats` over a ~1s window during scripted-smoke runs and
+/// logs the averaged frame breakdown, so a headed benchmark prints readable
+/// profiler numbers to the terminal. `gpu_us` (timestamp query) is the
+/// occlusion-proof GPU figure; a large `acquire`/`present` with tiny gpu/cpu
+/// means the frame is present/swapchain-bound rather than compute-bound.
+struct SmokeProfile {
+    window_start: Instant,
+    frames: u32,
+    gpu_us: u64,
+    acquire_us: u64,
+    prepare_us: u64,
+    encode_us: u64,
+    submit_us: u64,
+    present_us: u64,
+    draws: u64,
+    visible: u64,
+    indices: u64,
+}
+
+impl SmokeProfile {
+    fn new(now: Instant) -> Self {
+        Self {
+            window_start: now,
+            frames: 0,
+            gpu_us: 0,
+            acquire_us: 0,
+            prepare_us: 0,
+            encode_us: 0,
+            submit_us: 0,
+            present_us: 0,
+            draws: 0,
+            visible: 0,
+            indices: 0,
+        }
+    }
+
+    fn record(&mut self, s: RenderStats, now: Instant) {
+        self.frames += 1;
+        self.gpu_us += s.gpu_us as u64;
+        self.acquire_us += s.acquire_us as u64;
+        self.prepare_us += s.prepare_us as u64;
+        self.encode_us += s.encode_us as u64;
+        self.submit_us += s.submit_us as u64;
+        self.present_us += s.present_us as u64;
+        self.draws += s.draw_calls as u64;
+        self.visible += s.visible_chunks as u64;
+        self.indices += s.chunk_indices as u64;
+        if (now - self.window_start).as_secs_f32() >= 1.0 {
+            self.flush(now);
+        }
+    }
+
+    fn flush(&mut self, now: Instant) {
+        let elapsed = (now - self.window_start).as_secs_f32();
+        if self.frames == 0 || elapsed <= 0.0 {
+            return;
+        }
+        let n = self.frames as f64;
+        let fps = self.frames as f32 / elapsed;
+        let frame_ms = 1000.0 / fps as f64;
+        let accounted_ms = (self.acquire_us + self.prepare_us + self.encode_us
+            + self.submit_us + self.present_us) as f64
+            / n
+            / 1000.0;
+        let other_ms = frame_ms - accounted_ms;
+        log::info!(
+            "profile: {fps:.0} fps ({frame_ms:.2} ms) | gpu {:.2}ms acquire {:.2}ms present {:.2}ms \
+             prepare {:.0}us encode {:.0}us submit {:.0}us | other {other_ms:.2}ms | draws {:.0} visible {:.0} tris {}",
+            self.gpu_us as f64 / n / 1000.0,
+            self.acquire_us as f64 / n / 1000.0,
+            self.present_us as f64 / n / 1000.0,
+            self.prepare_us as f64 / n,
+            self.encode_us as f64 / n,
+            self.submit_us as f64 / n,
+            self.draws as f64 / n,
+            self.visible as f64 / n,
+            (self.indices as f64 / n / 3.0) as u64,
+        );
+        *self = Self::new(now);
     }
 }
 
@@ -1092,6 +1193,7 @@ impl LaunchConfig {
         let mut scripted_smoke_seconds = None;
         let mut headless_smoke_seconds = None;
         let mut headless_interact_seconds = None;
+        let mut demo_kind = game::DemoKind::Landscape;
         let mut args = env::args().skip(1);
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -1122,6 +1224,15 @@ impl LaunchConfig {
                     headless_interact_seconds =
                         args.next().and_then(|value| value.parse::<f32>().ok());
                 }
+                "--demo" => {
+                    if let Some(value) = args.next() {
+                        demo_kind = match value.as_str() {
+                            "chunk" => game::DemoKind::ChunkStress,
+                            "entity" => game::DemoKind::EntityStress,
+                            _ => game::DemoKind::Landscape,
+                        };
+                    }
+                }
                 _ => {}
             }
         }
@@ -1132,6 +1243,7 @@ impl LaunchConfig {
             scripted_smoke_seconds,
             headless_smoke_seconds,
             headless_interact_seconds,
+            demo_kind,
         }
     }
 }

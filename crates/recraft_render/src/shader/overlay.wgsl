@@ -1,8 +1,5 @@
 struct Camera {
     view_proj: mat4x4<f32>,
-    // Day/night sky-light scale (vanilla getSunBrightness): 1.0 by day, ~0.2 at
-    // night. Applied to each vertex's sky-light term so open ground darkens at
-    // night while block-lit (torch/lava) surfaces keep their brightness.
     sky_brightness: f32,
 };
 
@@ -16,13 +13,10 @@ var block_atlas: texture_2d<f32>;
 var block_sampler: sampler;
 
 struct VertexInput {
-    // xyz: world position × 64 as fixed-point i16.
-    // w: packed (sky_u8 << 8 | block_u8) reinterpreted as i16.
-    @location(0) pos_light: vec4<i32>,
-    // RGBA8 unorm: tint × face shade × AO + alpha.
+    @location(0) position: vec3<f32>,
     @location(1) color: vec4<f32>,
-    // Normalized atlas UV as Unorm16×2.
     @location(2) uv: vec2<f32>,
+    @location(3) light: vec2<f32>,
 };
 
 struct VertexOutput {
@@ -35,12 +29,10 @@ struct VertexOutput {
 @vertex
 fn vs_main(input: VertexInput) -> VertexOutput {
     var out: VertexOutput;
-    let world_pos = vec3<f32>(f32(input.pos_light.x), f32(input.pos_light.y), f32(input.pos_light.z)) / 64.0;
-    out.clip_position = camera.view_proj * vec4<f32>(world_pos, 1.0);
+    out.clip_position = camera.view_proj * vec4<f32>(input.position, 1.0);
     out.color = input.color;
     out.uv = input.uv;
-    let w_bits = u32(input.pos_light.w) & 0xFFFFu;
-    out.light = vec2<f32>(f32((w_bits >> 8u) & 0xFFu) / 255.0, f32(w_bits & 0xFFu) / 255.0);
+    out.light = input.light;
     return out;
 }
 

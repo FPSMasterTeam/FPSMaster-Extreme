@@ -12,7 +12,8 @@ pub mod ui;
 
 pub use camera::{Camera, Frustum};
 pub use chunk_mesh::{
-    build_section_mesh, build_world_mesh, BiomeColors, ChunkMesh, MeshBuffers, Vertex, FULLBRIGHT,
+    build_section_mesh, build_world_mesh, BiomeColors, ChunkMesh, ChunkMeshBuffers, ChunkVertex,
+    Vertex, FULLBRIGHT,
 };
 pub use font::char_width;
 pub use item_names::item_display_name;
