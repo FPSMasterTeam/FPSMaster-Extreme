@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -120,11 +120,193 @@ pub struct RenderStats {
     pub chunk_indices: u32,
 }
 
-#[derive(Default)]
-struct GpuChunkMesh {
-    solid: Option<DynamicMesh>,
-    cutout: Option<DynamicMesh>,
-    transparent: Option<DynamicMesh>,
+/// A single `draw_indexed_indirect` command (matches the GPU layout).
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct IndirectCmd {
+    index_count: u32,
+    instance_count: u32,
+    first_index: u32,
+    base_vertex: i32,
+    first_instance: u32,
+}
+
+/// Where one section's data lives inside a `ChunkLayer` page.
+#[derive(Clone, Copy)]
+struct LayerSlot {
+    page: u16,
+    vertex_offset: u32,
+    vertex_alloc: u32,
+    index_offset: u32,
+    index_alloc: u32,
+    index_count: u32,
+}
+
+const CHUNK_VERTEX_SIZE: u64 = std::mem::size_of::<ChunkVertex>() as u64;
+const PAGE_VERTEX_CAP: u32 = 1 << 22; // 4M vertices = 64 MB
+const PAGE_INDEX_CAP: u32 = 1 << 23; // 8M indices = 16 MB
+
+struct ChunkPage {
+    vertex_buf: wgpu::Buffer,
+    index_buf: wgpu::Buffer,
+    vertex_cursor: u32,
+    index_cursor: u32,
+}
+
+/// One render layer's paged mega-buffer. Sections are distributed across
+/// fixed-size pages (64 MB vertex, 16 MB index each) to stay within GPU
+/// buffer-size limits while still batching draws.
+struct ChunkLayer {
+    pages: Vec<ChunkPage>,
+    slots: HashMap<SectionPos, LayerSlot>,
+    label: &'static str,
+}
+
+impl ChunkLayer {
+    fn new(label: &'static str) -> Self {
+        Self {
+            pages: Vec::new(),
+            slots: HashMap::new(),
+            label,
+        }
+    }
+
+    fn create_page(device: &wgpu::Device, label: &str) -> ChunkPage {
+        ChunkPage {
+            vertex_buf: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: PAGE_VERTEX_CAP as u64 * CHUNK_VERTEX_SIZE,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            index_buf: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: PAGE_INDEX_CAP as u64 * 2,
+                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            vertex_cursor: 0,
+            index_cursor: 0,
+        }
+    }
+
+    fn insert(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        pos: SectionPos,
+        buf: &ChunkMeshBuffers,
+    ) {
+        if buf.is_empty() {
+            self.slots.remove(&pos);
+            return;
+        }
+        let vc = buf.vertices.len() as u32;
+        let ic = buf.indices.len() as u32;
+
+        // Try in-place reuse of existing slot.
+        if let Some(slot) = self.slots.get_mut(&pos) {
+            if vc <= slot.vertex_alloc && ic <= slot.index_alloc {
+                let page = &self.pages[slot.page as usize];
+                queue.write_buffer(
+                    &page.vertex_buf,
+                    slot.vertex_offset as u64 * CHUNK_VERTEX_SIZE,
+                    bytemuck::cast_slice(&buf.vertices),
+                );
+                queue.write_buffer(
+                    &page.index_buf,
+                    slot.index_offset as u64 * 2,
+                    bytemuck::cast_slice(&buf.indices),
+                );
+                slot.index_count = ic;
+                return;
+            }
+            self.slots.remove(&pos);
+        }
+
+        // Find a page with enough space, or create one.
+        let pi = self
+            .pages
+            .iter()
+            .position(|p| {
+                p.vertex_cursor + vc <= PAGE_VERTEX_CAP
+                    && p.index_cursor + ic <= PAGE_INDEX_CAP
+            })
+            .unwrap_or_else(|| {
+                self.pages.push(Self::create_page(device, self.label));
+                self.pages.len() - 1
+            });
+
+        let page = &mut self.pages[pi];
+        let vo = page.vertex_cursor;
+        let io = page.index_cursor;
+        queue.write_buffer(
+            &page.vertex_buf,
+            vo as u64 * CHUNK_VERTEX_SIZE,
+            bytemuck::cast_slice(&buf.vertices),
+        );
+        queue.write_buffer(
+            &page.index_buf,
+            io as u64 * 2,
+            bytemuck::cast_slice(&buf.indices),
+        );
+        self.slots.insert(
+            pos,
+            LayerSlot {
+                page: pi as u16,
+                vertex_offset: vo,
+                vertex_alloc: vc,
+                index_offset: io,
+                index_alloc: ic,
+                index_count: ic,
+            },
+        );
+        page.vertex_cursor += vc;
+        page.index_cursor += ic;
+    }
+
+    fn remove(&mut self, pos: SectionPos) {
+        self.slots.remove(&pos);
+    }
+
+    fn clear(&mut self) {
+        self.slots.clear();
+        for page in &mut self.pages {
+            page.vertex_cursor = 0;
+            page.index_cursor = 0;
+        }
+    }
+}
+
+struct PageBatch {
+    page: usize,
+    cmds: Vec<IndirectCmd>,
+}
+
+fn collect_layer_batches(
+    layer: &ChunkLayer,
+    visible: &[SectionPos],
+    chunk_indices: &mut u32,
+) -> Vec<PageBatch> {
+    let mut by_page: HashMap<usize, Vec<IndirectCmd>> = HashMap::new();
+    for pos in visible {
+        if let Some(s) = layer.slots.get(pos) {
+            *chunk_indices += s.index_count;
+            by_page.entry(s.page as usize).or_default().push(IndirectCmd {
+                index_count: s.index_count,
+                instance_count: 1,
+                first_index: s.index_offset,
+                base_vertex: s.vertex_offset as i32,
+                first_instance: 0,
+            });
+        }
+    }
+    let mut batches: Vec<PageBatch> = by_page
+        .into_iter()
+        .map(|(page, cmds)| PageBatch { page, cmds })
+        .collect();
+    batches.sort_unstable_by_key(|b| b.page);
+    batches
 }
 
 /// Measures the GPU execution time of the main render pass via a pair of
@@ -242,7 +424,12 @@ pub struct Renderer<'window> {
     texture_bind_group: wgpu::BindGroup,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
-    chunk_meshes: HashMap<SectionPos, GpuChunkMesh>,
+    chunk_solid: ChunkLayer,
+    chunk_cutout: ChunkLayer,
+    chunk_transparent: ChunkLayer,
+    chunk_sections: HashSet<SectionPos>,
+    indirect_buf: wgpu::Buffer,
+    multi_draw: bool,
     chunk_mesh_generations: HashMap<SectionPos, u64>,
     next_chunk_mesh_generation: u64,
     biome_colors: BiomeColors,
@@ -271,20 +458,23 @@ impl<'window> Renderer<'window> {
 
         // Request timestamp queries when the adapter supports them, for the
         // occlusion-independent GPU-time profiler. Falls back cleanly otherwise.
-        let timestamp_feature = adapter.features() & wgpu::Features::TIMESTAMP_QUERY;
+        let optional_features = adapter.features()
+            & (wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::MULTI_DRAW_INDIRECT);
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("recraft-device"),
-                    required_features: timestamp_feature,
+                    required_features: optional_features,
                     required_limits: wgpu::Limits::default(),
                 },
                 None,
             )
             .await
             .map_err(|err| RendererError::RequestDevice(err.to_string()))?;
-        let timestamps_enabled = timestamp_feature.contains(wgpu::Features::TIMESTAMP_QUERY);
+        let timestamps_enabled = optional_features.contains(wgpu::Features::TIMESTAMP_QUERY);
+        let multi_draw = optional_features.contains(wgpu::Features::MULTI_DRAW_INDIRECT);
         log::info!("GPU timestamp queries: {timestamps_enabled}");
+        log::info!("multi-draw-indirect: {multi_draw}");
 
         let caps = surface.get_capabilities(&adapter);
         let format = caps
@@ -958,6 +1148,16 @@ impl<'window> Renderer<'window> {
             }
         });
 
+        let chunk_solid = ChunkLayer::new("mega-solid");
+        let chunk_cutout = ChunkLayer::new("mega-cutout");
+        let chunk_transparent = ChunkLayer::new("mega-transparent");
+        let indirect_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("indirect-cmds"),
+            size: 4096 * std::mem::size_of::<IndirectCmd>() as u64 * 3,
+            usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         Ok(Self {
             surface,
             device,
@@ -1010,7 +1210,12 @@ impl<'window> Renderer<'window> {
             texture_bind_group,
             camera_buffer,
             camera_bind_group,
-            chunk_meshes: HashMap::new(),
+            chunk_solid,
+            chunk_cutout,
+            chunk_transparent,
+            chunk_sections: HashSet::new(),
+            indirect_buf,
+            multi_draw,
             chunk_mesh_generations: HashMap::new(),
             next_chunk_mesh_generation: 1,
             biome_colors,
@@ -1069,7 +1274,10 @@ impl<'window> Renderer<'window> {
     }
 
     pub fn upload_world(&mut self, world: &World) {
-        self.chunk_meshes.clear();
+        self.chunk_solid.clear();
+        self.chunk_cutout.clear();
+        self.chunk_transparent.clear();
+        self.chunk_sections.clear();
         self.chunk_mesh_generations.clear();
         let sections: Vec<SectionPos> = world
             .chunks()
@@ -1123,7 +1331,7 @@ impl<'window> Renderer<'window> {
                     for section_y in section_ys {
                         let pos = SectionPos::new(column.x, section_y, column.z);
                         self.invalidate_chunk_mesh_jobs(pos);
-                        self.chunk_meshes.remove(&pos);
+                        self.remove_section(pos);
                     }
                 }
             }
@@ -1144,7 +1352,7 @@ impl<'window> Renderer<'window> {
                 continue;
             }
             if world.chunk(pos.chunk()).is_none() {
-                self.chunk_meshes.remove(&pos);
+                self.remove_section(pos);
             } else {
                 self.upload_chunk_mesh(pos, &mesh);
                 uploaded += 1;
@@ -1162,24 +1370,23 @@ impl<'window> Renderer<'window> {
 
     fn upload_chunk_mesh(&mut self, pos: SectionPos, mesh: &ChunkMesh) {
         if mesh.is_empty() {
-            self.chunk_meshes.remove(&pos);
+            self.remove_section(pos);
             return;
         }
-        // Refill the section's buffers in place (reusing the existing GPU
-        // allocation when the geometry still fits), so a re-meshed section
-        // doesn't churn fresh vertex/index buffers on every rebuild.
         let device = &self.device;
         let queue = &self.queue;
-        let entry = self.chunk_meshes.entry(pos).or_default();
-        fill_chunk_layer(device, queue, &mut entry.solid, &mesh.solid, "chunk-solid");
-        fill_chunk_layer(device, queue, &mut entry.cutout, &mesh.cutout, "chunk-cutout");
-        fill_chunk_layer(
-            device,
-            queue,
-            &mut entry.transparent,
-            &mesh.transparent,
-            "chunk-transparent",
-        );
+        self.chunk_solid.insert(device, queue, pos, &mesh.solid);
+        self.chunk_cutout.insert(device, queue, pos, &mesh.cutout);
+        self.chunk_transparent
+            .insert(device, queue, pos, &mesh.transparent);
+        self.chunk_sections.insert(pos);
+    }
+
+    fn remove_section(&mut self, pos: SectionPos) {
+        self.chunk_solid.remove(pos);
+        self.chunk_cutout.remove(pos);
+        self.chunk_transparent.remove(pos);
+        self.chunk_sections.remove(&pos);
     }
 
     /// Replace the per-frame entity/hand geometry drawn in the model pass. The
@@ -1682,39 +1889,109 @@ impl<'window> Renderer<'window> {
                 draw_calls += 1;
             }
 
-            if !self.chunk_meshes.is_empty() {
+            if !self.chunk_sections.is_empty() {
                 let frustum = camera.frustum();
-                let visible: Vec<&GpuChunkMesh> = self
-                    .chunk_meshes
+                let visible: Vec<SectionPos> = self
+                    .chunk_sections
                     .iter()
-                    .filter(|(pos, _)| section_in_frustum(&frustum, **pos))
-                    .map(|(_, mesh)| mesh)
+                    .copied()
+                    .filter(|pos| section_in_frustum(&frustum, *pos))
                     .collect();
                 visible_chunks = visible.len() as u32;
 
-                pass.set_pipeline(&self.pipeline);
+                // Collect per-page indirect commands for each layer.
+                let solid_batches =
+                    collect_layer_batches(&self.chunk_solid, &visible, &mut chunk_indices);
+                let cutout_batches =
+                    collect_layer_batches(&self.chunk_cutout, &visible, &mut chunk_indices);
+                let trans_batches =
+                    collect_layer_batches(&self.chunk_transparent, &visible, &mut chunk_indices);
+
+                // Pack all commands into the indirect buffer.
+                let total_cmds: usize = solid_batches.iter().chain(&cutout_batches).chain(&trans_batches)
+                    .map(|b| b.cmds.len()).sum();
+                if total_cmds > 0 {
+                    let cmd_size = std::mem::size_of::<IndirectCmd>() as u64;
+                    let needed = total_cmds as u64 * cmd_size;
+                    if needed > self.indirect_buf.size() {
+                        self.indirect_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                            label: Some("indirect-cmds"),
+                            size: (needed * 2).max(4096),
+                            usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
+                            mapped_at_creation: false,
+                        });
+                    }
+                    let mut all_cmds = Vec::with_capacity(total_cmds);
+                    for b in solid_batches.iter().chain(&cutout_batches).chain(&trans_batches) {
+                        all_cmds.extend_from_slice(&b.cmds);
+                    }
+                    self.queue.write_buffer(
+                        &self.indirect_buf,
+                        0,
+                        bytemuck::cast_slice(&all_cmds),
+                    );
+                }
+
                 pass.set_bind_group(0, &self.camera_bind_group, &[]);
                 pass.set_bind_group(1, &self.texture_bind_group, &[]);
-                for mesh in &visible {
-                    if let Some(indices) = draw_buffers(&mut pass, mesh.solid.as_ref()) {
-                        draw_calls += 1;
-                        chunk_indices += indices;
+
+                let mut cmd_offset = 0u64;
+                let cmd_stride = std::mem::size_of::<IndirectCmd>() as u64;
+
+                if !solid_batches.is_empty() {
+                    pass.set_pipeline(&self.pipeline);
+                    for batch in &solid_batches {
+                        let page = &self.chunk_solid.pages[batch.page];
+                        pass.set_vertex_buffer(0, page.vertex_buf.slice(..));
+                        pass.set_index_buffer(page.index_buf.slice(..), wgpu::IndexFormat::Uint16);
+                        let count = batch.cmds.len() as u32;
+                        draw_calls += count;
+                        if self.multi_draw {
+                            pass.multi_draw_indexed_indirect(&self.indirect_buf, cmd_offset, count);
+                        } else {
+                            for c in &batch.cmds {
+                                pass.draw_indexed(c.first_index..c.first_index + c.index_count, c.base_vertex, 0..1);
+                            }
+                        }
+                        cmd_offset += count as u64 * cmd_stride;
                     }
                 }
 
-                pass.set_pipeline(&self.cutout_pipeline);
-                for mesh in &visible {
-                    if let Some(indices) = draw_buffers(&mut pass, mesh.cutout.as_ref()) {
-                        draw_calls += 1;
-                        chunk_indices += indices;
+                if !cutout_batches.is_empty() {
+                    pass.set_pipeline(&self.cutout_pipeline);
+                    for batch in &cutout_batches {
+                        let page = &self.chunk_cutout.pages[batch.page];
+                        pass.set_vertex_buffer(0, page.vertex_buf.slice(..));
+                        pass.set_index_buffer(page.index_buf.slice(..), wgpu::IndexFormat::Uint16);
+                        let count = batch.cmds.len() as u32;
+                        draw_calls += count;
+                        if self.multi_draw {
+                            pass.multi_draw_indexed_indirect(&self.indirect_buf, cmd_offset, count);
+                        } else {
+                            for c in &batch.cmds {
+                                pass.draw_indexed(c.first_index..c.first_index + c.index_count, c.base_vertex, 0..1);
+                            }
+                        }
+                        cmd_offset += count as u64 * cmd_stride;
                     }
                 }
 
-                pass.set_pipeline(&self.transparent_pipeline);
-                for mesh in &visible {
-                    if let Some(indices) = draw_buffers(&mut pass, mesh.transparent.as_ref()) {
-                        draw_calls += 1;
-                        chunk_indices += indices;
+                if !trans_batches.is_empty() {
+                    pass.set_pipeline(&self.transparent_pipeline);
+                    for batch in &trans_batches {
+                        let page = &self.chunk_transparent.pages[batch.page];
+                        pass.set_vertex_buffer(0, page.vertex_buf.slice(..));
+                        pass.set_index_buffer(page.index_buf.slice(..), wgpu::IndexFormat::Uint16);
+                        let count = batch.cmds.len() as u32;
+                        draw_calls += count;
+                        if self.multi_draw {
+                            pass.multi_draw_indexed_indirect(&self.indirect_buf, cmd_offset, count);
+                        } else {
+                            for c in &batch.cmds {
+                                pass.draw_indexed(c.first_index..c.first_index + c.index_count, c.base_vertex, 0..1);
+                            }
+                        }
+                        cmd_offset += count as u64 * cmd_stride;
                     }
                 }
             }
@@ -2004,42 +2281,6 @@ fn prepare_ui_layer(
         },
     );
     cache.last_commands = commands.to_vec();
-}
-
-/// Bind and draw a chunk-layer mesh with u16 indices, returning the index
-/// count drawn (for profiling) or `None` when there was nothing to draw.
-fn draw_buffers<'a>(
-    pass: &mut wgpu::RenderPass<'a>,
-    mesh: Option<&'a DynamicMesh>,
-) -> Option<u32> {
-    let mesh = mesh?;
-    if mesh.index_count == 0 {
-        return None;
-    }
-    pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-    pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
-    pass.draw_indexed(0..mesh.index_count, 0, 0..1);
-    Some(mesh.index_count)
-}
-
-/// Refill one chunk render-layer's persistent buffers from CPU mesh data,
-/// reusing the existing GPU allocation when the new geometry still fits.
-fn fill_chunk_layer(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    slot: &mut Option<DynamicMesh>,
-    buffers: &ChunkMeshBuffers,
-    label: &str,
-) {
-    fill_dynamic_mesh(
-        device,
-        queue,
-        slot,
-        bytemuck::cast_slice(&buffers.vertices),
-        bytemuck::cast_slice(&buffers.indices),
-        buffers.indices.len() as u32,
-        label,
-    );
 }
 
 /// Refill a persistent vertex+index buffer pair in place, reallocating (with
