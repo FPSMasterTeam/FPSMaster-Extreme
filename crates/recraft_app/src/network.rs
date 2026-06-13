@@ -494,6 +494,8 @@ fn is_timeout(message: &str) -> bool {
     message.contains("timed out")
         || message.contains("would block")
         || message.contains("Resource temporarily unavailable")
+        || message.contains("os error 10060")
+        || message.contains("os error 10035")
 }
 
 fn packet_debug_name(packet: &ServerboundPacket) -> &'static str {
