@@ -7,6 +7,10 @@ pub enum DemoKind {
     Landscape,
     ChunkStress,
     EntityStress,
+    /// Large rolling terrain viewed from a vista — the realistic-world GPU
+    /// benchmark (large coplanar surfaces that greedy meshing and occlusion
+    /// culling actually act on, unlike the synthetic checkerboard).
+    Terrain,
 }
 use recraft_core::{
     collision::{is_fence, is_pane, is_stairs},
@@ -528,11 +532,20 @@ impl GameState {
             DemoKind::Landscape => build_demo_landscape(&mut world),
             DemoKind::ChunkStress => build_demo_chunk_stress(&mut world),
             DemoKind::EntityStress => build_demo_entity_stress(&mut world),
+            DemoKind::Terrain => build_demo_terrain(&mut world),
         };
         let mut state = Self::new(world, EntityId(0), spawn, aspect);
         state.capabilities.allow_flying = true;
         if matches!(kind, DemoKind::ChunkStress) {
             state.camera.pitch = 45.0;
+        }
+        if matches!(kind, DemoKind::Terrain) {
+            // A fixed vista over the whole landscape so the GPU load is stable
+            // and comparable across mesher changes. Hover (flying) so gravity
+            // never drifts the camera during the static benchmark.
+            state.camera.pitch = 18.0;
+            state.camera.yaw = 30.0;
+            state.capabilities.flying = true;
         }
         state
     }
@@ -1244,10 +1257,15 @@ impl GameState {
     /// (vanilla partialTicks) so movement stays smooth at any frame rate.
     pub fn build_entity_model(
         &self,
+        mesh: &mut ModelMesh,
         tick_alpha: f32,
         skin_rows: &std::collections::HashMap<[u8; 16], u32>,
-    ) -> ModelMesh {
-        let mut mesh = ModelMesh::new();
+    ) {
+        mesh.clear();
+        // Cull entities outside the view frustum up front: most mobs in a loaded
+        // world are off-screen at any moment, and building each one's articulated
+        // mesh is the dominant per-frame cost in entity-dense scenes.
+        let frustum = self.camera.frustum();
         for entity in self.world.entities() {
             if entity.id == self.player.id {
                 continue;
@@ -1280,6 +1298,16 @@ impl GameState {
                 None => to_render_vec3(entity.render_position(tick_alpha as f64)),
             };
             let (half_width, height) = entity.size();
+            // Skip entities whose model box is fully outside the frustum. The box
+            // is padded so model parts that overhang the hitbox (heads, arms,
+            // spider legs) are never clipped at the screen edge.
+            let pad = 0.5;
+            let w = half_width as f32 + pad;
+            let aabb_min = Vec3::new(feet.x - w, feet.y - pad, feet.z - w);
+            let aabb_max = Vec3::new(feet.x + w, feet.y + height as f32 + pad, feet.z + w);
+            if !frustum.intersects_aabb(aabb_min, aabb_max) {
+                continue;
+            }
             let body_yaw = entity.render_yaw(tick_alpha);
             let (limb_swing, limb_swing_amount) = entity.render_limb_swing(tick_alpha);
             // Net head yaw is clamped so a stale head target never spins the
@@ -1304,7 +1332,6 @@ impl GameState {
                 skin_row,
             );
         }
-        mesh
     }
 
     /// The dropped items to render this frame (object type 2 with a known
@@ -3348,6 +3375,110 @@ fn build_demo_chunk_stress(world: &mut World) -> DVec3 {
     }
 
     DVec3::new(0.5, 52.0, 0.5)
+}
+
+/// Dramatic-relief terrain height (range ~28..100): a realistic rolling
+/// landscape with the large flat-ish coplanar surfaces that greedy meshing and
+/// occlusion culling target — the opposite of the checkerboard stress scene.
+fn terrain_height_tall(x: i32, z: i32) -> i32 {
+    let fx = x as f64;
+    let fz = z as f64;
+    let h = 64.0
+        + 22.0 * (fx * 0.012).sin() * (fz * 0.013).cos()
+        + 10.0 * (fx * 0.04 + 1.0).sin() * (fz * 0.035 + 2.0).cos()
+        + 4.0 * (fx * 0.10 + 3.0).cos() * (fz * 0.09 + 1.0).sin();
+    h as i32
+}
+
+/// Realistic-terrain GPU benchmark: a large rolling landscape (25×25 chunks)
+/// with hills, ores, water and trees, viewed from a fixed elevated vista. This
+/// is the representative real-world render load — its broad coplanar grass /
+/// stone / dirt surfaces are exactly what greedy meshing collapses, so before /
+/// after triangle counts here reflect real gameplay rather than the synthetic
+/// checkerboard.
+fn build_demo_terrain(world: &mut World) -> DVec3 {
+    let water_level = 56;
+    let range = 12; // 25×25 chunks
+
+    for cx in -range..=range {
+        for cz in -range..=range {
+            for lx in 0..16 {
+                for lz in 0..16 {
+                    let x = cx * 16 + lx;
+                    let z = cz * 16 + lz;
+                    let h = terrain_height_tall(x, z);
+                    let surface = h.max(water_level);
+
+                    world.set_block(x, 0, z, BlockState::new(7, 0)); // bedrock
+
+                    // Stone fill with scattered ores up to a few blocks below the
+                    // surface.
+                    for y in 1..h.saturating_sub(3) {
+                        let r = hash2d(x, y * 37 + z, 42);
+                        let block = if r % 80 == 0 {
+                            BlockState::new(16, 0) // coal
+                        } else if r % 120 == 0 {
+                            BlockState::new(15, 0) // iron
+                        } else {
+                            BlockState::STONE
+                        };
+                        world.set_block(x, y, z, block);
+                    }
+
+                    // Dirt / sand subsurface.
+                    let near_water = h <= water_level + 2;
+                    let fill = if near_water {
+                        BlockState::new(12, 0) // sand
+                    } else {
+                        BlockState::DIRT
+                    };
+                    for y in h.saturating_sub(3).max(1)..h {
+                        world.set_block(x, y, z, fill);
+                    }
+
+                    // Surface block, or water column over the seabed.
+                    if h > water_level {
+                        let top = if near_water { fill } else { BlockState::GRASS };
+                        world.set_block(x, h, z, top);
+                    } else {
+                        world.set_block(x, h, z, fill);
+                        for y in (h + 1)..=water_level {
+                            world.set_block(x, y, z, BlockState::new(9, 0)); // still water
+                        }
+                    }
+
+                    // Full sky light above the surface.
+                    for y in surface..=(surface + 16) {
+                        world.set_light(x, y, z, 0, 15);
+                    }
+                }
+            }
+        }
+    }
+
+    // Trees on dry grass, ~2 per chunk.
+    let tree_range = range * 16;
+    for cx in -range..=range {
+        for cz in -range..=range {
+            for seed in [111u32, 222] {
+                let r = hash2d(cx, cz, seed);
+                let lx = (r % 14 + 1) as i32;
+                let lz = ((r >> 8) % 14 + 1) as i32;
+                let x = cx * 16 + lx;
+                let z = cz * 16 + lz;
+                if x.abs() > tree_range || z.abs() > tree_range {
+                    continue;
+                }
+                let h = terrain_height_tall(x, z);
+                if h > water_level + 2 {
+                    place_tree(world, x, h + 1, z);
+                }
+            }
+        }
+    }
+
+    // Elevated vista above the peaks so the whole landscape fills the frustum.
+    DVec3::new(0.5, 104.0, 0.5)
 }
 
 /// Entity stress test: flat ground with hundreds of mob entities.

@@ -146,6 +146,13 @@ impl ModelMesh {
         Self::default()
     }
 
+    /// Reset the geometry while keeping the backing allocations, so a per-frame
+    /// rebuild reuses the previous frame's buffers instead of reallocating.
+    pub fn clear(&mut self) {
+        self.vertices.clear();
+        self.indices.clear();
+    }
+
     pub fn is_empty(&self) -> bool {
         self.indices.is_empty()
     }

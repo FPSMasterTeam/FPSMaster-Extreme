@@ -1,5 +1,7 @@
 /target/
 /.DS_Store
+*.exe
+/MiniCraft.zip
 /references/*
 !/references/README.md
 *.log

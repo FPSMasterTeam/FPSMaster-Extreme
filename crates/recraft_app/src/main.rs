@@ -85,6 +85,9 @@ struct App {
     skin_manager: skin::SkinManager,
     /// Vanilla `panoramaTimer` — incremented every frame on the title screen.
     panorama_timer: f32,
+    /// Reused across frames so the per-frame entity rebuild keeps its vertex/index
+    /// allocations instead of reallocating from empty each frame.
+    entity_model: recraft_render::ModelMesh,
     quit: bool,
 }
 
@@ -219,6 +222,7 @@ fn main() -> anyhow::Result<()> {
         tab_open: false,
         skin_manager: skin::SkinManager::new(),
         panorama_timer: 0.0,
+        entity_model: recraft_render::ModelMesh::new(),
         quit: false,
     };
     renderer.upload_world(&app.game.world);
@@ -261,7 +265,10 @@ fn main() -> anyhow::Result<()> {
     let mut fps_counter = FpsCounter::new(app_start);
     let mut tick_accumulator = 0.0f32;
     let scripted_smoke_seconds = config.scripted_smoke_seconds;
-    let scripted_smoke_static = matches!(config.demo_kind, game::DemoKind::ChunkStress);
+    let scripted_smoke_static = matches!(
+        config.demo_kind,
+        game::DemoKind::ChunkStress | game::DemoKind::Terrain
+    );
     let mut scripted_smoke_done = false;
     // During a scripted-smoke run, aggregate RenderStats over ~1s windows and log
     // the breakdown so headed benchmark runs print readable profiler numbers to
@@ -638,6 +645,7 @@ fn main() -> anyhow::Result<()> {
                     cursor_position,
                     mouse_down_left,
                     f3_debug,
+                    smoke_profile.is_some(),
                 );
                 if let Some(profile) = smoke_profile.as_mut() {
                     profile.record(renderer.last_stats(), Instant::now());
@@ -994,11 +1002,16 @@ fn render_frame(
     cursor_position: (f64, f64),
     mouse_down: bool,
     f3_debug: bool,
+    smoke_active: bool,
 ) {
     let now = Instant::now();
     let frame_dt = (now - *last_frame).as_secs_f32().min(0.1);
     fps_counter.tick(now);
     *last_frame = now;
+
+    // The GPU-time readback costs ~0.04 ms/frame, so only measure it when its
+    // number is actually shown: the F3 overlay, or a scripted benchmark run.
+    renderer.set_gpu_timing(f3_debug || smoke_active);
 
     // Local block prediction gets submitted to the background mesher first, but
     // never rebuilt on the render thread; placing/breaking must not stall a
@@ -1037,11 +1050,10 @@ fn render_frame(
         app.skin_manager.poll(renderer);
 
         let first_person = app.game.first_person_view(tick_alpha);
-        let mut model = app
-            .game
-            .build_entity_model(tick_alpha, app.skin_manager.rows());
+        app.game
+            .build_entity_model(&mut app.entity_model, tick_alpha, app.skin_manager.rows());
         if hud_visible {
-            ItemRenderer::render_arm(&mut model, &app.game.camera, &first_person);
+            ItemRenderer::render_arm(&mut app.entity_model, &app.game.camera, &first_person);
             let (vertices, indices) =
                 ItemRenderer::build_held_item(&app.game.camera, &first_person, atlas_uv);
             renderer.set_first_person_item(&vertices, &indices);
@@ -1052,7 +1064,7 @@ fn render_frame(
             renderer.set_first_person_item(&[], &[]);
             renderer.set_nametags(&app.game.camera, &[]);
         }
-        renderer.upload_model(&model);
+        renderer.upload_model(&app.entity_model);
         let dropped = app.game.dropped_items(tick_alpha);
         let (item_vertices, item_indices) =
             ItemRenderer::build_world_items(&app.game.camera, &dropped, atlas_uv);
@@ -1229,6 +1241,7 @@ impl LaunchConfig {
                         demo_kind = match value.as_str() {
                             "chunk" => game::DemoKind::ChunkStress,
                             "entity" => game::DemoKind::EntityStress,
+                            "terrain" => game::DemoKind::Terrain,
                             _ => game::DemoKind::Landscape,
                         };
                     }

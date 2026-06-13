@@ -437,6 +437,9 @@ pub struct Renderer<'window> {
     mesh_worker: MeshWorker,
     /// Optional GPU-time profiler; `None` when the adapter lacks timestamp queries.
     gpu_timer: Option<GpuTimer>,
+    /// Whether to measure per-frame GPU time. Off by default (the readback costs
+    /// ~0.04 ms/frame); enabled only while the F3 overlay or a benchmark needs it.
+    gpu_timing_enabled: bool,
     last_stats: RenderStats,
 }
 
@@ -1238,6 +1241,7 @@ impl<'window> Renderer<'window> {
             atlas_uv,
             mesh_worker,
             gpu_timer,
+            gpu_timing_enabled: false,
             last_stats: RenderStats::default(),
         })
     }
@@ -1247,6 +1251,13 @@ impl<'window> Renderer<'window> {
     /// GPU-bound.
     pub fn last_stats(&self) -> RenderStats {
         self.last_stats
+    }
+
+    /// Enable per-frame GPU-time measurement. Off by default because the
+    /// timestamp readback costs ~0.04 ms/frame; the app turns it on only while
+    /// the F3 overlay is shown or a benchmark is running.
+    pub fn set_gpu_timing(&mut self, enabled: bool) {
+        self.gpu_timing_enabled = enabled;
     }
 
     pub fn has_panorama(&self) -> bool {
@@ -1783,7 +1794,11 @@ impl<'window> Renderer<'window> {
         // to issue a fresh timestamp pair this frame (only when no readback is in
         // flight, so the readback buffer is free to write).
         let gpu_us = self.read_gpu_timestamp();
-        let measure_gpu = self.gpu_timer.as_ref().is_some_and(|t| !t.pending);
+        // The timestamp resolve + buffer copy + map_async readback costs ~0.04 ms
+        // of CPU per frame, so it only runs when something actually displays the
+        // number (the F3 overlay or a benchmark run). Normal gameplay skips it.
+        let measure_gpu =
+            self.gpu_timing_enabled && self.gpu_timer.as_ref().is_some_and(|t| !t.pending);
 
         // Prepare the UI layers up front (re-rasterize/upload on change, icon
         // mesh refill) so their draws can join the single frame pass below.
