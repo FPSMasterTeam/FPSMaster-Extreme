@@ -9,7 +9,7 @@ pub mod world;
 
 pub use block::{door_box, BlockBox, BlockState, CollisionBoxes, RenderShape};
 pub use blocks::{registry, BlockFace, RenderLayer, Tint};
-pub use chunk::{Chunk, ChunkPos, ChunkSection};
+pub use chunk::{Chunk, ChunkPos, ChunkSection, SectionPos};
 pub use entity::{EntityId, EntityKind, EntityState};
 pub use physics::{resting_on_ground, PlayerInput, PlayerPhysics, PlayerPhysicsConfig};
 pub use world::World;

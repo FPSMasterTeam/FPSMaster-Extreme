@@ -37,11 +37,13 @@ use recraft_protocol::{net::PremiumSession, v1_8_9::packets::ServerboundPacket};
 use recraft_render::Renderer;
 use settings::{FpsCounter, Settings};
 
-/// Dirty chunks snapshotted and handed to the background mesher each frame. The
-/// snapshot clone is the only main-thread cost; the mesh build runs off-thread.
-const MESH_SUBMITS_PER_FRAME: usize = 8;
-/// Finished background meshes uploaded to the GPU each frame.
-const MESH_UPLOADS_PER_FRAME: usize = 12;
+/// Dirty sections snapshotted and handed to the background mesher each frame.
+/// Sections of the same column share one snapshot clone (the only main-thread
+/// cost); the mesh build runs off-thread. Higher than the old per-column budget
+/// because a column now contributes several sections.
+const MESH_SUBMITS_PER_FRAME: usize = 40;
+/// Finished background section meshes uploaded to the GPU each frame.
+const MESH_UPLOADS_PER_FRAME: usize = 48;
 use winit::{
     dpi::{LogicalSize, PhysicalPosition, PhysicalSize},
     event::{DeviceEvent, ElementState, Event, MouseButton, WindowEvent},

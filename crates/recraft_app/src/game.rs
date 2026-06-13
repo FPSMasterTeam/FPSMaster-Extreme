@@ -5,7 +5,7 @@ use recraft_core::{
     collision::{is_fence, is_pane, is_stairs},
     mc_math::wrap_degrees,
     resting_on_ground, BlockState, ChunkPos, EntityId, EntityKind, EntityState, PlayerInput,
-    PlayerPhysics, RenderShape, World,
+    PlayerPhysics, RenderShape, SectionPos, World,
 };
 use recraft_protocol::v1_8_9::{
     chunk::{decode_chunk_column, ChunkColumnData},
@@ -393,11 +393,11 @@ pub struct GameState {
     /// Passenger → vehicle mount relationships (S1B AttachEntity). Drives the
     /// rider render offset and the local player following its mount.
     vehicles: std::collections::HashMap<EntityId, EntityId>,
-    dirty_chunks: HashSet<ChunkPos>,
-    /// Chunks changed by local place/break prediction. They are submitted to the
-    /// background mesher before ordinary dirty chunks, but never rebuilt on the
-    /// render thread.
-    urgent_remesh: HashSet<ChunkPos>,
+    dirty_chunks: HashSet<SectionPos>,
+    /// Sections changed by local place/break prediction. They are submitted to
+    /// the background mesher before ordinary dirty sections, but never rebuilt on
+    /// the render thread.
+    urgent_remesh: HashSet<SectionPos>,
     /// Block changes received for chunks that weren't loaded yet, replayed once
     /// the chunk arrives (otherwise spawn-platform blocks can be lost).
     pending_block_changes: std::collections::HashMap<ChunkPos, Vec<(i32, i32, i32, BlockState)>>,
@@ -1759,7 +1759,7 @@ impl GameState {
             .world
             .set_block_if_chunk_loaded(x, y, z, BlockState::AIR)
         {
-            self.mark_block_dirty_urgent(x, z);
+            self.mark_block_dirty_urgent(x, y, z);
         }
     }
 
@@ -1821,7 +1821,7 @@ impl GameState {
             }
         }
         if self.world.set_block_if_chunk_loaded(px, py, pz, state) {
-            self.mark_block_dirty_urgent(px, pz);
+            self.mark_block_dirty_urgent(px, py, pz);
         }
     }
 
@@ -2601,10 +2601,10 @@ impl GameState {
         }
     }
 
-    /// Drain up to `max` dirty chunks, nearest to the player first, leaving the
+    /// Drain up to `max` dirty sections, nearest to the player first, leaving the
     /// rest queued for following frames. Bounds the per-frame mesh-rebuild cost
     /// so a join-time burst of chunks doesn't stall rendering.
-    pub fn take_dirty_chunks_budget(&mut self, max: usize) -> Vec<ChunkPos> {
+    pub fn take_dirty_chunks_budget(&mut self, max: usize) -> Vec<SectionPos> {
         if max == 0 || self.dirty_chunks.is_empty() {
             return Vec::new();
         }
@@ -2612,12 +2612,14 @@ impl GameState {
             return self.dirty_chunks.drain().collect();
         }
         let pcx = (self.player.position.x.floor() as i32).div_euclid(16);
+        let pcy = (self.player.position.y.floor() as i32).div_euclid(16);
         let pcz = (self.player.position.z.floor() as i32).div_euclid(16);
-        let mut all: Vec<ChunkPos> = self.dirty_chunks.iter().copied().collect();
+        let mut all: Vec<SectionPos> = self.dirty_chunks.iter().copied().collect();
         all.sort_by_key(|p| {
             let dx = (p.x - pcx) as i64;
+            let dy = (p.y - pcy) as i64;
             let dz = (p.z - pcz) as i64;
-            dx * dx + dz * dz
+            dx * dx + dy * dy + dz * dz
         });
         all.truncate(max);
         for p in &all {
@@ -2626,10 +2628,10 @@ impl GameState {
         all
     }
 
-    /// Drain locally predicted chunks so the renderer can queue them before
-    /// ordinary dirty chunks. They are removed from the regular queue to avoid
+    /// Drain locally predicted sections so the renderer can queue them before
+    /// ordinary dirty sections. They are removed from the regular queue to avoid
     /// submitting duplicate mesh jobs in the same frame.
-    pub fn take_urgent_remesh(&mut self) -> Vec<ChunkPos> {
+    pub fn take_urgent_remesh(&mut self) -> Vec<SectionPos> {
         let chunks: Vec<_> = self.urgent_remesh.drain().collect();
         for pos in &chunks {
             self.dirty_chunks.remove(pos);
@@ -2648,7 +2650,7 @@ impl GameState {
                 .push((x, y, z, block));
             return false;
         }
-        self.mark_block_dirty(x, z);
+        self.mark_block_dirty(x, y, z);
         true
     }
 
@@ -2714,51 +2716,69 @@ impl GameState {
         self.mark_chunk_dirty(pos);
     }
 
+    /// Mark a whole column (and its four horizontal neighbours) dirty at section
+    /// granularity, used when a column is loaded or unloaded. A loaded column
+    /// marks only its non-empty sections; an unloaded one marks all 16 so their
+    /// GPU meshes get dropped.
     fn mark_chunk_dirty(&mut self, pos: ChunkPos) {
-        for dirty in [
+        for col in [
             pos,
             ChunkPos::new(pos.x - 1, pos.z),
             ChunkPos::new(pos.x + 1, pos.z),
             ChunkPos::new(pos.x, pos.z - 1),
             ChunkPos::new(pos.x, pos.z + 1),
         ] {
-            self.dirty_chunks.insert(dirty);
+            let section_ys: Vec<i32> = match self.world.chunk(col) {
+                Some(chunk) => chunk.sections().map(|section| section.y()).collect(),
+                None => (0..16).collect(),
+            };
+            for y in section_ys {
+                self.dirty_chunks.insert(SectionPos::new(col.x, y, col.z));
+            }
         }
     }
 
-    fn mark_block_dirty(&mut self, x: i32, z: i32) {
-        let pos = ChunkPos::new(x.div_euclid(16), z.div_euclid(16));
-        self.dirty_chunks.insert(pos);
-        let lx = x.rem_euclid(16);
-        let lz = z.rem_euclid(16);
-        if lx == 0 {
-            self.dirty_chunks.insert(ChunkPos::new(pos.x - 1, pos.z));
-        } else if lx == 15 {
-            self.dirty_chunks.insert(ChunkPos::new(pos.x + 1, pos.z));
-        }
-        if lz == 0 {
-            self.dirty_chunks.insert(ChunkPos::new(pos.x, pos.z - 1));
-        } else if lz == 15 {
-            self.dirty_chunks.insert(ChunkPos::new(pos.x, pos.z + 1));
-        }
+    fn mark_block_dirty(&mut self, x: i32, y: i32, z: i32) {
+        self.dirty_chunks.extend(Self::block_dirty_sections(x, y, z));
     }
 
-    fn mark_block_dirty_urgent(&mut self, x: i32, z: i32) {
-        self.mark_block_dirty(x, z);
-        let pos = ChunkPos::new(x.div_euclid(16), z.div_euclid(16));
-        self.urgent_remesh.insert(pos);
+    fn mark_block_dirty_urgent(&mut self, x: i32, y: i32, z: i32) {
+        let sections = Self::block_dirty_sections(x, y, z);
+        self.dirty_chunks.extend(sections.iter().copied());
+        self.urgent_remesh.extend(sections);
+    }
+
+    /// The sections a single block edit dirties: the block's own section plus the
+    /// neighbour section across any chunk/section face it touches (so border-face
+    /// culling and cross-border smooth lighting stay correct). Out-of-range Y
+    /// edits touch nothing.
+    fn block_dirty_sections(x: i32, y: i32, z: i32) -> Vec<SectionPos> {
+        let sy = y.div_euclid(16);
+        if !(0..16).contains(&sy) {
+            return Vec::new();
+        }
+        let cx = x.div_euclid(16);
+        let cz = z.div_euclid(16);
         let lx = x.rem_euclid(16);
+        let ly = y.rem_euclid(16);
         let lz = z.rem_euclid(16);
+        let mut sections = vec![SectionPos::new(cx, sy, cz)];
         if lx == 0 {
-            self.urgent_remesh.insert(ChunkPos::new(pos.x - 1, pos.z));
+            sections.push(SectionPos::new(cx - 1, sy, cz));
         } else if lx == 15 {
-            self.urgent_remesh.insert(ChunkPos::new(pos.x + 1, pos.z));
+            sections.push(SectionPos::new(cx + 1, sy, cz));
         }
         if lz == 0 {
-            self.urgent_remesh.insert(ChunkPos::new(pos.x, pos.z - 1));
+            sections.push(SectionPos::new(cx, sy, cz - 1));
         } else if lz == 15 {
-            self.urgent_remesh.insert(ChunkPos::new(pos.x, pos.z + 1));
+            sections.push(SectionPos::new(cx, sy, cz + 1));
         }
+        if ly == 0 && sy > 0 {
+            sections.push(SectionPos::new(cx, sy - 1, cz));
+        } else if ly == 15 && sy < 15 {
+            sections.push(SectionPos::new(cx, sy + 1, cz));
+        }
+        sections
     }
 
     fn movement_snapshot(&self) -> MovementSnapshot {

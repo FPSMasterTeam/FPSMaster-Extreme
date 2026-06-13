@@ -1,15 +1,16 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
-use recraft_core::{ChunkPos, World};
+use recraft_core::{ChunkPos, SectionPos, World};
 use thiserror::Error;
 use wgpu::util::DeviceExt;
 use winit::{dpi::PhysicalSize, window::Window};
 
 use crate::{
-    build_chunk_mesh,
+    build_section_mesh,
     chunk_mesh::ChunkNeighborhood,
     mesh_worker::MeshWorker,
     texture::{EntityAtlasImage, SkyAtlasImage, TextureAtlasImage, TextureAtlasSource},
@@ -71,16 +72,12 @@ struct CelestialUniform {
     view_proj: [[f32; 4]; 4],
 }
 
-struct GpuBuffers {
-    vertex_buffer: wgpu::Buffer,
-    index_buffer: wgpu::Buffer,
-    index_count: u32,
-}
-
 /// A vertex+index buffer pair that persists across frames and is refilled in
 /// place with `queue.write_buffer`, only reallocating when the geometry outgrows
 /// the current capacity. Used for the per-frame entity/hand geometry so a moving
-/// player doesn't allocate two fresh GPU buffers every single frame.
+/// player doesn't allocate two fresh GPU buffers every single frame, and for the
+/// per-section chunk meshes so a re-meshed section (e.g. a placed/broken block)
+/// reuses its buffers instead of allocating a fresh pair each rebuild.
 struct DynamicMesh {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
@@ -114,7 +111,8 @@ pub struct RenderStats {
     pub submit_us: u32,
     /// Microseconds in `frame.present`.
     pub present_us: u32,
-    /// Chunk meshes that passed frustum culling this frame.
+    /// Section meshes that passed frustum culling this frame (counted on the
+    /// opaque layer pass).
     pub visible_chunks: u32,
     /// `draw_indexed` calls issued this frame (chunks across all layers + entities).
     pub draw_calls: u32,
@@ -124,9 +122,9 @@ pub struct RenderStats {
 
 #[derive(Default)]
 struct GpuChunkMesh {
-    solid: Option<GpuBuffers>,
-    cutout: Option<GpuBuffers>,
-    transparent: Option<GpuBuffers>,
+    solid: Option<DynamicMesh>,
+    cutout: Option<DynamicMesh>,
+    transparent: Option<DynamicMesh>,
 }
 
 /// Measures the GPU execution time of the main render pass via a pair of
@@ -235,8 +233,8 @@ pub struct Renderer<'window> {
     texture_bind_group: wgpu::BindGroup,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
-    chunk_meshes: HashMap<ChunkPos, GpuChunkMesh>,
-    chunk_mesh_generations: HashMap<ChunkPos, u64>,
+    chunk_meshes: HashMap<SectionPos, GpuChunkMesh>,
+    chunk_mesh_generations: HashMap<SectionPos, u64>,
     next_chunk_mesh_generation: u64,
     biome_colors: BiomeColors,
     atlas_uv: AtlasUv,
@@ -317,7 +315,10 @@ impl<'window> Renderer<'window> {
             label: Some("camera-layout"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
+                // The chunk fragment shader reads `camera.sky_brightness` for the
+                // day/night lightmap, so the camera uniform must be visible in the
+                // fragment stage as well as the vertex stage.
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
@@ -1013,45 +1014,67 @@ impl<'window> Renderer<'window> {
     pub fn upload_world(&mut self, world: &World) {
         self.chunk_meshes.clear();
         self.chunk_mesh_generations.clear();
-        let positions: Vec<_> = world.chunks().map(|chunk| chunk.position).collect();
-        self.upload_dirty_chunks(world, positions);
+        let sections: Vec<SectionPos> = world
+            .chunks()
+            .flat_map(|chunk| {
+                let pos = chunk.position;
+                chunk
+                    .sections()
+                    .map(move |section| SectionPos::new(pos.x, section.y(), pos.z))
+            })
+            .collect();
+        self.upload_dirty_sections(world, sections);
     }
 
-    pub fn upload_dirty_chunks<I>(&mut self, world: &World, positions: I)
+    pub fn upload_dirty_sections<I>(&mut self, world: &World, sections: I)
     where
-        I: IntoIterator<Item = ChunkPos>,
+        I: IntoIterator<Item = SectionPos>,
     {
-        for pos in positions {
+        for pos in sections {
             self.invalidate_chunk_mesh_jobs(pos);
-            let mesh = build_chunk_mesh(world, pos, &self.atlas_uv, self.biome_colors);
+            let mesh = build_section_mesh(world, pos, &self.atlas_uv, self.biome_colors);
             self.upload_chunk_mesh(pos, &mesh);
         }
     }
 
-    /// Snapshot the given chunks and queue them for background meshing on the
-    /// worker pool. Chunks that are no longer loaded drop their GPU mesh now.
-    /// The snapshot clone is the only main-thread cost; the mesh build itself
-    /// runs off-thread, so chunk updates never stall the frame.
-    pub fn queue_chunk_meshes<I>(&mut self, world: &World, positions: I)
+    /// Snapshot the given sections and queue them for background meshing on the
+    /// worker pool. Sections are grouped by column so each column is snapshotted
+    /// (cloned) at most once even when several of its sections are dirty;
+    /// sections whose column is no longer loaded drop their GPU mesh now. The
+    /// snapshot clone is the only main-thread cost; the mesh build itself runs
+    /// off-thread, so chunk updates never stall the frame.
+    pub fn queue_chunk_meshes<I>(&mut self, world: &World, sections: I)
     where
-        I: IntoIterator<Item = ChunkPos>,
+        I: IntoIterator<Item = SectionPos>,
     {
-        for pos in positions {
-            match ChunkNeighborhood::snapshot(world, pos) {
+        let mut by_column: HashMap<ChunkPos, Vec<i32>> = HashMap::new();
+        for pos in sections {
+            by_column.entry(pos.chunk()).or_default().push(pos.y);
+        }
+        for (column, section_ys) in by_column {
+            match ChunkNeighborhood::snapshot(world, column) {
                 Some(neighborhood) => {
-                    let generation = self.invalidate_chunk_mesh_jobs(pos);
-                    self.mesh_worker.submit(neighborhood, generation);
+                    let neighborhood = Arc::new(neighborhood);
+                    for section_y in section_ys {
+                        let pos = SectionPos::new(column.x, section_y, column.z);
+                        let generation = self.invalidate_chunk_mesh_jobs(pos);
+                        self.mesh_worker
+                            .submit(Arc::clone(&neighborhood), section_y, generation);
+                    }
                 }
                 None => {
-                    self.invalidate_chunk_mesh_jobs(pos);
-                    self.chunk_meshes.remove(&pos);
+                    for section_y in section_ys {
+                        let pos = SectionPos::new(column.x, section_y, column.z);
+                        self.invalidate_chunk_mesh_jobs(pos);
+                        self.chunk_meshes.remove(&pos);
+                    }
                 }
             }
         }
     }
 
     /// Upload up to `max` finished background meshes to the GPU. Results for
-    /// chunks unloaded since they were queued are discarded.
+    /// sections unloaded since they were queued are discarded.
     pub fn process_ready_meshes(&mut self, world: &World, max: usize) -> usize {
         let mut processed = 0;
         let mut uploaded = 0;
@@ -1063,7 +1086,7 @@ impl<'window> Renderer<'window> {
             if self.chunk_mesh_generations.get(&pos).copied() != Some(generation) {
                 continue;
             }
-            if world.chunk(pos).is_none() {
+            if world.chunk(pos.chunk()).is_none() {
                 self.chunk_meshes.remove(&pos);
             } else {
                 self.upload_chunk_mesh(pos, &mesh);
@@ -1073,26 +1096,32 @@ impl<'window> Renderer<'window> {
         uploaded
     }
 
-    fn invalidate_chunk_mesh_jobs(&mut self, pos: ChunkPos) -> u64 {
+    fn invalidate_chunk_mesh_jobs(&mut self, pos: SectionPos) -> u64 {
         let generation = self.next_chunk_mesh_generation;
         self.next_chunk_mesh_generation = self.next_chunk_mesh_generation.wrapping_add(1).max(1);
         self.chunk_mesh_generations.insert(pos, generation);
         generation
     }
 
-    fn upload_chunk_mesh(&mut self, pos: ChunkPos, mesh: &ChunkMesh) {
+    fn upload_chunk_mesh(&mut self, pos: SectionPos, mesh: &ChunkMesh) {
         if mesh.is_empty() {
             self.chunk_meshes.remove(&pos);
             return;
         }
-
-        self.chunk_meshes.insert(
-            pos,
-            GpuChunkMesh {
-                solid: self.upload_buffers(&mesh.solid, "chunk-solid"),
-                cutout: self.upload_buffers(&mesh.cutout, "chunk-cutout"),
-                transparent: self.upload_buffers(&mesh.transparent, "chunk-transparent"),
-            },
+        // Refill the section's buffers in place (reusing the existing GPU
+        // allocation when the geometry still fits), so a re-meshed section
+        // doesn't churn fresh vertex/index buffers on every rebuild.
+        let device = &self.device;
+        let queue = &self.queue;
+        let entry = self.chunk_meshes.entry(pos).or_default();
+        fill_chunk_layer(device, queue, &mut entry.solid, &mesh.solid, "chunk-solid");
+        fill_chunk_layer(device, queue, &mut entry.cutout, &mesh.cutout, "chunk-cutout");
+        fill_chunk_layer(
+            device,
+            queue,
+            &mut entry.transparent,
+            &mesh.transparent,
+            "chunk-transparent",
         );
     }
 
@@ -1393,30 +1422,6 @@ impl<'window> Renderer<'window> {
         );
     }
 
-    fn upload_buffers(&self, buffers: &MeshBuffers, label: &str) -> Option<GpuBuffers> {
-        if buffers.is_empty() {
-            return None;
-        }
-        let vertex_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some(label),
-                contents: bytemuck::cast_slice(&buffers.vertices),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
-        let index_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some(label),
-                contents: bytemuck::cast_slice(&buffers.indices),
-                usage: wgpu::BufferUsages::INDEX,
-            });
-        Some(GpuBuffers {
-            vertex_buffer,
-            index_buffer,
-            index_count: buffers.indices.len() as u32,
-        })
-    }
 
     pub fn render(&mut self, camera: &Camera) -> Result<(), RendererError> {
         self.render_with_optional_ui(camera, None)
@@ -1602,7 +1607,7 @@ impl<'window> Renderer<'window> {
                 pass.set_bind_group(0, &self.camera_bind_group, &[]);
                 pass.set_bind_group(1, &self.texture_bind_group, &[]);
                 for (pos, mesh) in &self.chunk_meshes {
-                    if !chunk_in_frustum(&frustum, *pos) {
+                    if !section_in_frustum(&frustum, *pos) {
                         continue;
                     }
                     visible_chunks += 1;
@@ -1614,7 +1619,7 @@ impl<'window> Renderer<'window> {
 
                 pass.set_pipeline(&self.cutout_pipeline);
                 for (pos, mesh) in &self.chunk_meshes {
-                    if !chunk_in_frustum(&frustum, *pos) {
+                    if !section_in_frustum(&frustum, *pos) {
                         continue;
                     }
                     if let Some(indices) = draw_buffers(&mut pass, mesh.cutout.as_ref()) {
@@ -1625,7 +1630,7 @@ impl<'window> Renderer<'window> {
 
                 pass.set_pipeline(&self.transparent_pipeline);
                 for (pos, mesh) in &self.chunk_meshes {
-                    if !chunk_in_frustum(&frustum, *pos) {
+                    if !section_in_frustum(&frustum, *pos) {
                         continue;
                     }
                     if let Some(indices) = draw_buffers(&mut pass, mesh.transparent.as_ref()) {
@@ -1921,17 +1926,40 @@ fn prepare_ui_layer(
     cache.last_commands = commands.to_vec();
 }
 
-/// Bind and draw a chunk-layer buffer pair, returning the index count drawn (for
+/// Bind and draw a chunk-layer mesh, returning the index count drawn (for
 /// profiling) or `None` when there was nothing to draw.
 fn draw_buffers<'a>(
     pass: &mut wgpu::RenderPass<'a>,
-    buffers: Option<&'a GpuBuffers>,
+    mesh: Option<&'a DynamicMesh>,
 ) -> Option<u32> {
-    let buffers = buffers?;
-    pass.set_vertex_buffer(0, buffers.vertex_buffer.slice(..));
-    pass.set_index_buffer(buffers.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-    pass.draw_indexed(0..buffers.index_count, 0, 0..1);
-    Some(buffers.index_count)
+    let mesh = mesh?;
+    if mesh.index_count == 0 {
+        return None;
+    }
+    pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+    pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+    pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+    Some(mesh.index_count)
+}
+
+/// Refill one chunk render-layer's persistent buffers from CPU mesh data,
+/// reusing the existing GPU allocation when the new geometry still fits.
+fn fill_chunk_layer(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    slot: &mut Option<DynamicMesh>,
+    buffers: &MeshBuffers,
+    label: &str,
+) {
+    fill_dynamic_mesh(
+        device,
+        queue,
+        slot,
+        bytemuck::cast_slice(&buffers.vertices),
+        bytemuck::cast_slice(&buffers.indices),
+        buffers.indices.len() as u32,
+        label,
+    );
 }
 
 /// Refill a persistent vertex+index buffer pair in place, reallocating (with
@@ -2088,10 +2116,12 @@ fn grow_capacity(needed: u64) -> u64 {
     aligned.max(4)
 }
 
-/// Whether any part of a chunk's 16×256×16 column is inside the view frustum.
-fn chunk_in_frustum(frustum: &Frustum, pos: ChunkPos) -> bool {
-    let min = Vec3::new((pos.x * 16) as f32, 0.0, (pos.z * 16) as f32);
-    let max = min + Vec3::new(16.0, 256.0, 16.0);
+/// Whether any part of a 16×16×16 section is inside the view frustum. Unlike the
+/// old column test this also culls vertically, so sections under the floor or
+/// high above are skipped.
+fn section_in_frustum(frustum: &Frustum, pos: SectionPos) -> bool {
+    let min = Vec3::new((pos.x * 16) as f32, (pos.y * 16) as f32, (pos.z * 16) as f32);
+    let max = min + Vec3::splat(16.0);
     frustum.intersects_aabb(min, max)
 }
 

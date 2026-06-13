@@ -1,7 +1,7 @@
 use bytemuck::{Pod, Zeroable};
 use recraft_core::{
-    collision, door_box, BlockFace, BlockState, Chunk, ChunkPos, RenderLayer, RenderShape, Tint,
-    World,
+    collision, door_box, BlockFace, BlockState, Chunk, ChunkPos, RenderLayer, RenderShape,
+    SectionPos, Tint, World,
 };
 
 use crate::texture::STAINED_COLORS;
@@ -321,29 +321,43 @@ pub fn build_world_mesh(world: &World, atlas: &AtlasUv, biome: BiomeColors) -> C
     mesh
 }
 
-pub fn build_chunk_mesh(
+/// Build the mesh of a single 16³ section against the live `World` (synchronous
+/// path, used by the full-world upload). Neighbour lookups for face culling and
+/// smooth lighting read the world directly, so cross-section/cross-chunk borders
+/// resolve correctly.
+pub fn build_section_mesh(
     world: &World,
-    pos: ChunkPos,
+    pos: SectionPos,
     atlas: &AtlasUv,
     biome: BiomeColors,
 ) -> ChunkMesh {
     let mut mesh = ChunkMesh::default();
-    if let Some(chunk) = world.chunk(pos) {
-        append_chunk_mesh(world, chunk, &mut mesh, atlas, biome);
+    if let Some(chunk) = world.chunk(pos.chunk()) {
+        append_section_mesh(world, chunk, pos.y, &mut mesh, atlas, biome);
     }
     mesh
 }
 
-/// Build a chunk mesh from a self-contained neighbourhood snapshot. This is the
-/// off-main-thread path: no live `World` is referenced, so it can run on a
-/// worker thread.
-pub fn build_chunk_mesh_neighborhood(
+/// Build a single section's mesh from a self-contained neighbourhood snapshot.
+/// This is the off-main-thread path: no live `World` is referenced, so it runs
+/// on a worker thread. The snapshot is the whole column plus its eight
+/// horizontal neighbours, so the up/down sections needed for vertical face
+/// culling and smooth lighting are present in `center`.
+pub fn build_section_mesh_neighborhood(
     neighborhood: &ChunkNeighborhood,
+    section_y: i32,
     atlas: &AtlasUv,
     biome: BiomeColors,
 ) -> ChunkMesh {
     let mut mesh = ChunkMesh::default();
-    append_chunk_mesh(neighborhood, &neighborhood.center, &mut mesh, atlas, biome);
+    append_section_mesh(
+        neighborhood,
+        &neighborhood.center,
+        section_y,
+        &mut mesh,
+        atlas,
+        biome,
+    );
     mesh
 }
 
@@ -354,27 +368,42 @@ fn append_chunk_mesh<S: BlockSource>(
     atlas: &AtlasUv,
     biome: BiomeColors,
 ) {
+    for section in chunk.sections() {
+        append_section_mesh(source, chunk, section.y(), mesh, atlas, biome);
+    }
+}
+
+/// Emit the geometry of section `section_y` (0..16) of `chunk` into `mesh`.
+fn append_section_mesh<S: BlockSource>(
+    source: &S,
+    chunk: &Chunk,
+    section_y: i32,
+    mesh: &mut ChunkMesh,
+    atlas: &AtlasUv,
+    biome: BiomeColors,
+) {
+    let Some(section) = chunk.section(section_y) else {
+        return;
+    };
     let base_x = chunk.position.x * 16;
     let base_z = chunk.position.z * 16;
-    for section in chunk.sections() {
-        let base_y = section.y() * 16;
-        for y in 0..16i32 {
-            for z in 0..16i32 {
-                for x in 0..16i32 {
-                    let block = section.get(x as u8, y as u8, z as u8);
-                    if block.is_air() {
-                        continue;
-                    }
-                    let ctx = BlockCtx {
-                        source,
-                        chunk,
-                        base_x,
-                        base_z,
-                        atlas,
-                        biome,
-                    };
-                    append_block(mesh, &ctx, base_x + x, base_y + y, base_z + z, block);
+    let base_y = section_y * 16;
+    for y in 0..16i32 {
+        for z in 0..16i32 {
+            for x in 0..16i32 {
+                let block = section.get(x as u8, y as u8, z as u8);
+                if block.is_air() {
+                    continue;
                 }
+                let ctx = BlockCtx {
+                    source,
+                    chunk,
+                    base_x,
+                    base_z,
+                    atlas,
+                    biome,
+                };
+                append_block(mesh, &ctx, base_x + x, base_y + y, base_z + z, block);
             }
         }
     }
@@ -1164,7 +1193,7 @@ fn vertex_light<S: BlockSource>(
 
 #[cfg(test)]
 mod tests {
-    use recraft_core::{BlockState, World};
+    use recraft_core::{BlockState, ChunkPos, SectionPos, World};
 
     use super::*;
 
@@ -1172,6 +1201,67 @@ mod tests {
         // The mesher only needs name→index resolution; the default atlas covers
         // every registry texture.
         crate::TextureAtlasImage::load_default().uv_table()
+    }
+
+    #[test]
+    fn section_mesh_only_covers_its_own_section() {
+        let mut world = World::new();
+        world.set_block(0, 0, 0, BlockState::STONE);
+        // The block lives in section 0; section 0 has its six faces, every other
+        // section is empty.
+        let s0 = build_section_mesh(&world, SectionPos::new(0, 0, 0), &atlas(), BiomeColors::default());
+        assert_eq!(s0.solid.indices.len(), 36);
+        let s1 = build_section_mesh(&world, SectionPos::new(0, 1, 0), &atlas(), BiomeColors::default());
+        assert!(s1.is_empty());
+    }
+
+    #[test]
+    fn sections_sum_to_the_whole_column() {
+        // A block in each of two different sections: the per-section meshes must
+        // together equal the whole-column mesh.
+        let mut world = World::new();
+        world.set_block(1, 2, 3, BlockState::STONE); // section 0
+        world.set_block(4, 40, 5, BlockState::STONE); // section 2
+        let column = build_world_mesh(&world, &atlas(), BiomeColors::default());
+        let mut total = 0;
+        for sy in 0..16 {
+            total += build_section_mesh(&world, SectionPos::new(0, sy, 0), &atlas(), BiomeColors::default())
+                .solid
+                .indices
+                .len();
+        }
+        assert_eq!(total, column.solid.indices.len());
+        assert_eq!(total, 2 * 36);
+    }
+
+    #[test]
+    fn vertical_border_culls_faces_across_sections() {
+        // Two stacked blocks straddling the section-0/section-1 boundary (y=15 and
+        // y=16). The shared faces must be culled even though the neighbour lives
+        // in a different section, so each block keeps only five faces.
+        let mut world = World::new();
+        world.set_block(0, 15, 0, BlockState::STONE);
+        world.set_block(0, 16, 0, BlockState::STONE);
+        let s0 = build_section_mesh(&world, SectionPos::new(0, 0, 0), &atlas(), BiomeColors::default());
+        let s1 = build_section_mesh(&world, SectionPos::new(0, 1, 0), &atlas(), BiomeColors::default());
+        assert_eq!(s0.solid.indices.len(), 5 * 6, "y=15 block's top face culled");
+        assert_eq!(s1.solid.indices.len(), 5 * 6, "y=16 block's bottom face culled");
+    }
+
+    #[test]
+    fn neighborhood_section_path_matches_sync() {
+        // The off-thread (snapshot) path and the synchronous (live World) path
+        // must produce identical geometry for a section, including the vertical
+        // border against the section below.
+        let mut world = World::new();
+        world.set_block(0, 15, 0, BlockState::STONE);
+        world.set_block(0, 16, 0, BlockState::STONE);
+        let sync = build_section_mesh(&world, SectionPos::new(0, 1, 0), &atlas(), BiomeColors::default());
+        let neighborhood = ChunkNeighborhood::snapshot(&world, ChunkPos::new(0, 0)).unwrap();
+        let async_mesh = build_section_mesh_neighborhood(&neighborhood, 1, &atlas(), BiomeColors::default());
+        assert_eq!(sync.solid.vertices.len(), async_mesh.solid.vertices.len());
+        assert_eq!(sync.solid.indices.len(), async_mesh.solid.indices.len());
+        assert_eq!(async_mesh.solid.indices.len(), 5 * 6);
     }
 
     #[test]
