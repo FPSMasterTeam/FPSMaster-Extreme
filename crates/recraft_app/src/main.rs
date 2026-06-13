@@ -79,6 +79,8 @@ struct App {
     tab_open: bool,
     /// Per-player skin downloads and atlas-row allocation.
     skin_manager: skin::SkinManager,
+    /// Vanilla `panoramaTimer` — incremented every frame on the title screen.
+    panorama_timer: f32,
     quit: bool,
 }
 
@@ -204,6 +206,7 @@ fn main() -> anyhow::Result<()> {
         username,
         tab_open: false,
         skin_manager: skin::SkinManager::new(),
+        panorama_timer: 0.0,
         quit: false,
     };
     renderer.upload_world(&app.game.world);
@@ -840,6 +843,7 @@ fn render_frame(
     mouse_down: bool,
 ) {
     let now = Instant::now();
+    let frame_dt = (now - *last_frame).as_secs_f32().min(0.1);
     fps_counter.tick(now);
     *last_frame = now;
 
@@ -948,15 +952,21 @@ fn render_frame(
             chat_input,
         );
     }
+    let wants_panorama = screen
+        .as_ref()
+        .is_some_and(|s| s.wants_panorama());
+    let has_panorama = wants_panorama && renderer.has_panorama();
+
     if let Some(screen) = screen.as_mut() {
         let ctx = DrawCtx {
             width,
             height,
-            scale: gui::gui_scale(height),
+            scale: gui::gui_scale(width, height),
             mouse: cursor_position,
             mouse_down,
             chunk_count: game.loaded_chunk_count(),
             in_world: app.in_world,
+            has_panorama,
             settings,
             session_username: ms_session.as_ref().map(|s| s.username.as_str()),
             accounts: &account_entries,
@@ -965,8 +975,16 @@ fn render_frame(
         screen.draw(&mut ui, &ctx);
     }
 
-    if let Err(err) = renderer.render_with_ui(&app.game.camera, &ui) {
-        log::error!("render error: {err}");
+    if has_panorama {
+        // Vanilla increments panoramaTimer once per tick (20 Hz).
+        app.panorama_timer += frame_dt * 20.0;
+        if let Err(err) = renderer.render_panorama(&ui, app.panorama_timer) {
+            log::error!("render error: {err}");
+        }
+    } else {
+        if let Err(err) = renderer.render_with_ui(&app.game.camera, &ui) {
+            log::error!("render error: {err}");
+        }
     }
 }
 
@@ -983,7 +1001,7 @@ fn draw_nametags(
     tick_alpha: f32,
 ) {
     let view_proj = game.camera.view_projection();
-    let scale = gui::gui_scale(height);
+    let scale = gui::gui_scale(width, height);
     for (name, world) in game.player_nametags(tick_alpha) {
         let clip = view_proj * glam::Vec4::new(world.x, world.y, world.z, 1.0);
         if clip.w <= 0.05 {

@@ -84,6 +84,13 @@ struct GpuChunkMesh {
     transparent: Option<GpuBuffers>,
 }
 
+/// GPU resources for the title-screen panorama cubemap skybox.
+struct PanoramaResources {
+    pipeline: wgpu::RenderPipeline,
+    bind_group: wgpu::BindGroup,
+    uniform_buffer: wgpu::Buffer,
+}
+
 /// Persistent GPU resources for the UI overlay. The overlay texture is the size
 /// of the surface and only re-rasterized/re-uploaded when the `UiFrame` actually
 /// changes, instead of allocating and uploading a full-screen texture every
@@ -121,6 +128,7 @@ pub struct Renderer<'window> {
     /// written into their rows at runtime (the bind group references it by view).
     entity_texture: wgpu::Texture,
     sky_pipeline: wgpu::RenderPipeline,
+    panorama: Option<PanoramaResources>,
     ui_pipeline: wgpu::RenderPipeline,
     ui_bind_group_layout: wgpu::BindGroupLayout,
     ui_sampler: wgpu::Sampler,
@@ -502,6 +510,8 @@ impl<'window> Renderer<'window> {
             multiview: None,
         });
 
+        let panorama = create_panorama_resources(&device, &queue, format);
+
         let ui_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("ui-pipeline-layout"),
             bind_group_layouts: &[&ui_bind_group_layout],
@@ -558,6 +568,7 @@ impl<'window> Renderer<'window> {
             entity_bind_group,
             entity_texture,
             sky_pipeline,
+            panorama,
             ui_pipeline,
             ui_bind_group_layout,
             ui_sampler,
@@ -582,6 +593,10 @@ impl<'window> Renderer<'window> {
     /// GPU-bound.
     pub fn last_stats(&self) -> RenderStats {
         self.last_stats
+    }
+
+    pub fn has_panorama(&self) -> bool {
+        self.panorama.is_some()
     }
 
     pub fn resize(&mut self, size: PhysicalSize<u32>) {
@@ -843,17 +858,25 @@ impl<'window> Renderer<'window> {
     }
 
     pub fn render(&mut self, camera: &Camera) -> Result<(), RendererError> {
-        self.render_with_optional_ui(camera, None)
+        self.render_inner(camera, None, None)
     }
 
     pub fn render_with_ui(&mut self, camera: &Camera, ui: &UiFrame) -> Result<(), RendererError> {
-        self.render_with_optional_ui(camera, Some(ui))
+        self.render_inner(camera, Some(ui), None)
     }
 
-    fn render_with_optional_ui(
+    /// Render the title-screen panorama background behind the UI overlay.
+    /// `panorama_timer` is the vanilla `panoramaTimer + partialTicks`.
+    pub fn render_panorama(&mut self, ui: &UiFrame, panorama_timer: f32) -> Result<(), RendererError> {
+        let dummy_camera = Camera::new(Vec3::ZERO, 1.0);
+        self.render_inner(&dummy_camera, Some(ui), Some(panorama_timer))
+    }
+
+    fn render_inner(
         &mut self,
         camera: &Camera,
         ui: Option<&UiFrame>,
+        panorama_timer: Option<f32>,
     ) -> Result<(), RendererError> {
         self.queue.write_buffer(
             &self.camera_buffer,
@@ -891,6 +914,37 @@ impl<'window> Renderer<'window> {
         let mut draw_calls = 0u32;
         let mut chunk_indices = 0u32;
 
+        if let (Some(timer), Some(pan)) = (panorama_timer, &self.panorama) {
+            // Panorama mode: full-screen cubemap skybox, no depth buffer needed.
+            // Vanilla: pitch = sin(timer/400)*25+20 degrees, yaw = -timer*0.1 degrees.
+            let pitch_deg = (timer / 400.0).sin() * 25.0 + 20.0;
+            let yaw_deg = -timer * 0.1;
+            let pitch = pitch_deg.to_radians();
+            let yaw = yaw_deg.to_radians();
+            self.queue.write_buffer(
+                &pan.uniform_buffer,
+                0,
+                bytemuck::bytes_of(&[yaw, pitch, 0.0_f32, 0.0_f32]),
+            );
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("panorama-render-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&pan.pipeline);
+            pass.set_bind_group(0, &pan.bind_group, &[]);
+            pass.draw(0..3, 0..1);
+            draw_calls += 1;
+        } else {
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main-render-pass"),
@@ -918,6 +972,7 @@ impl<'window> Renderer<'window> {
                 occlusion_query_set: None,
                 timestamp_writes: None,
             });
+            // Normal sky gradient.
             pass.set_pipeline(&self.sky_pipeline);
             pass.set_bind_group(0, &self.camera_bind_group, &[]);
             pass.set_bind_group(1, &self.texture_bind_group, &[]);
@@ -1015,6 +1070,7 @@ impl<'window> Renderer<'window> {
                 draw_calls += 1;
             }
         }
+        } // else (non-panorama world render)
 
         if let Some(ui) = ui.filter(|ui| !ui.is_empty()) {
             self.prepare_ui(ui);
@@ -1073,7 +1129,7 @@ impl<'window> Renderer<'window> {
         // 1px-per-GUI-px buffer would drop half their rows/columns. Two
         // buffer px per GUI px keeps them 1:1 while still rasterizing at a
         // quarter of the full-resolution cost.
-        let scale = crate::ui::gui_pixel_scale(self.config.height).max(1);
+        let scale = crate::ui::gui_pixel_scale(self.config.width, self.config.height).max(1);
         let divisor = (scale / 2).max(1);
         let width = self.config.width.div_ceil(divisor).max(1);
         let height = self.config.height.div_ceil(divisor).max(1);
@@ -1602,4 +1658,164 @@ fn create_texture_bind_group(
     // build instead of loading the atlas a second time).
     let block_image = image::RgbaImage::from_raw(atlas.width, atlas.height, atlas.pixels);
     (layout, bind_group, biome_colors, atlas_uv, block_image)
+}
+
+fn create_panorama_resources(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    surface_format: wgpu::TextureFormat,
+) -> Option<PanoramaResources> {
+    let faces = crate::texture::load_panorama_faces()?;
+    let face_w = faces[0].width();
+    let face_h = faces[0].height();
+
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("panorama-array"),
+        size: wgpu::Extent3d {
+            width: face_w,
+            height: face_h,
+            depth_or_array_layers: 6,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+
+    for (i, face) in faces.iter().enumerate() {
+        queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x: 0, y: 0, z: i as u32 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            face,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * face_w),
+                rows_per_image: Some(face_h),
+            },
+            wgpu::Extent3d {
+                width: face_w,
+                height: face_h,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    let view = texture.create_view(&wgpu::TextureViewDescriptor {
+        dimension: Some(wgpu::TextureViewDimension::D2Array),
+        ..Default::default()
+    });
+
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("panorama-sampler"),
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        ..Default::default()
+    });
+
+    let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("panorama-uniform"),
+        contents: bytemuck::bytes_of(&[0.0_f32; 4]),
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+    });
+
+    let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("panorama-bind-group-layout"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    multisampled: false,
+                    view_dimension: wgpu::TextureViewDimension::D2Array,
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    });
+
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("panorama-bind-group"),
+        layout: &bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(&sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: uniform_buffer.as_entire_binding(),
+            },
+        ],
+    });
+
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("panorama-pipeline-layout"),
+        bind_group_layouts: &[&bind_group_layout],
+        push_constant_ranges: &[],
+    });
+
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("panorama-shader"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("shader/panorama.wgsl").into()),
+    });
+
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("panorama-pipeline"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: "vs_main",
+            buffers: &[],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: "fs_main",
+            targets: &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend: Some(wgpu::BlendState::REPLACE),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            ..Default::default()
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None,
+    });
+
+    log::info!("panorama loaded ({face_w}x{face_h}, 6 faces)");
+    Some(PanoramaResources {
+        pipeline,
+        bind_group,
+        uniform_buffer,
+    })
 }

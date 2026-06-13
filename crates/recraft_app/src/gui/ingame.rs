@@ -71,7 +71,7 @@ impl GuiIngame {
         hud: &HudState,
         chat_input: Option<&mut TextInput>,
     ) {
-        let scale = gui_scale(height);
+        let scale = gui_scale(width, height);
         draw_fps_panel(ui, scale, fps, chunk_count);
 
         // Crosshair: 10 GUI px arms, 2 GUI px thick.
@@ -96,8 +96,8 @@ impl GuiIngame {
     }
 }
 
-fn gui_scale(height: i32) -> i32 {
-    super::gui_scale(height)
+fn gui_scale(width: i32, height: i32) -> i32 {
+    super::gui_scale(width, height)
 }
 
 fn draw_fps_panel(ui: &mut UiFrame, scale: i32, fps: f32, chunk_count: usize) {
@@ -120,7 +120,7 @@ pub(crate) struct HotbarLayout {
 }
 
 pub(crate) fn hotbar_layout(width: i32, height: i32) -> HotbarLayout {
-    let scale = gui_scale(height);
+    let scale = gui_scale(width, height);
     let hotbar_w = HOTBAR_WIDTH * scale;
     let hotbar_h = HOTBAR_HEIGHT * scale;
     HotbarLayout {
@@ -268,7 +268,7 @@ pub(crate) fn draw_item_icon(ui: &mut UiFrame, rect: UiRect, item: SlotItem, tex
 /// The chat panel: recent lines above the hotbar (fading when closed, full
 /// backlog when open) plus the input bar when the chat overlay is open.
 fn draw_chat(ui: &mut UiFrame, width: i32, height: i32, hud: &HudState, input: Option<&mut TextInput>) {
-    let scale = gui_scale(height);
+    let scale = gui_scale(width, height);
     let open = input.is_some();
     let now = Instant::now();
 
@@ -335,7 +335,7 @@ fn draw_title(ui: &mut UiFrame, width: i32, height: i32, hud: &HudState) {
     let Some(title) = hud.title else {
         return;
     };
-    let scale = gui_scale(height);
+    let scale = gui_scale(width, height);
     let alpha = (255.0 * title.alpha).round().clamp(0.0, 255.0) as u8;
     if alpha <= 8 {
         return;
@@ -368,7 +368,7 @@ fn draw_action_bar(ui: &mut UiFrame, width: i32, height: i32, hud: &HudState) {
     let Some((text, alpha)) = hud.chat.action_bar(Instant::now()) else {
         return;
     };
-    let scale = gui_scale(height);
+    let scale = gui_scale(width, height);
     let text_w = text_width(text, scale);
     let layout = hotbar_layout(width, height);
     ui.text_shadowed(
@@ -389,7 +389,7 @@ fn draw_sidebar(ui: &mut UiFrame, width: i32, height: i32, hud: &HudState) {
     if view.rows.is_empty() {
         return;
     }
-    let scale = gui_scale(height);
+    let scale = gui_scale(width, height);
     let line_height = 10 * scale;
     let pad = 2 * scale;
 
@@ -465,7 +465,7 @@ fn draw_tab_list(ui: &mut UiFrame, width: i32, height: i32, hud: &HudState) {
     if players.is_empty() {
         return;
     }
-    let scale = gui_scale(height);
+    let scale = gui_scale(width, height);
 
     // Display text per player: explicit display name, else team-decorated name.
     let names: Vec<String> = players

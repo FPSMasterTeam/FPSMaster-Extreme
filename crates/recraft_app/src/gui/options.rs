@@ -7,6 +7,7 @@ use winit::event::{ElementState, KeyEvent};
 use winit::keyboard::{KeyCode, PhysicalKey};
 
 use super::ingame_menu::GuiIngameMenu;
+use super::main_menu::GuiMainMenu;
 use super::widgets::{GuiButton, BUTTON_HEIGHT};
 use super::{draw_centered_text, draw_default_background, DrawCtx, GuiAction, GuiScreen, ScreenCtx};
 
@@ -23,11 +24,31 @@ pub struct GuiOptions {
     vsync: Option<GuiButton>,
     done: Option<GuiButton>,
     dragging: Option<Slider>,
+    /// Whether this was opened from the title screen (Done returns there) vs.
+    /// the in-game pause menu.
+    from_main_menu: bool,
 }
 
 impl GuiOptions {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Opened from the title screen — Done/ESC return to the main menu.
+    pub fn from_main_menu() -> Self {
+        Self {
+            from_main_menu: true,
+            ..Self::default()
+        }
+    }
+
+    /// The screen to return to when leaving options.
+    fn back_screen(&self) -> Box<dyn GuiScreen> {
+        if self.from_main_menu {
+            Box::new(GuiMainMenu::new())
+        } else {
+            Box::new(GuiIngameMenu::new())
+        }
     }
 
     fn layout(&mut self, ctx: &DrawCtx) {
@@ -112,7 +133,7 @@ impl GuiScreen for GuiOptions {
         self.layout(ctx);
         draw_default_background(ui, ctx);
         let s = ctx.scale;
-        draw_centered_text(ui, ctx.width, ctx.height / 4 - 20 * s, s, super::TEXT_WHITE, "Options");
+        draw_centered_text(ui, ctx.width, 15 * s, s, super::TEXT_WHITE, "Options");
 
         draw_slider(
             ui,
@@ -153,7 +174,7 @@ impl GuiScreen for GuiOptions {
             return vec![GuiAction::SetVsync(ctx.settings.vsync)];
         }
         if self.done.as_ref().is_some_and(|b| b.clicked(x, y)) {
-            return vec![GuiAction::SetScreen(Box::new(GuiIngameMenu::new()))];
+            return vec![GuiAction::SetScreen(self.back_screen())];
         }
         Vec::new()
     }
@@ -177,12 +198,15 @@ impl GuiScreen for GuiOptions {
         if event.state == ElementState::Pressed
             && matches!(event.physical_key, PhysicalKey::Code(KeyCode::Escape))
         {
-            return vec![GuiAction::SetScreen(Box::new(GuiIngameMenu::new()))];
+            return vec![GuiAction::SetScreen(self.back_screen())];
         }
         Vec::new()
     }
 
     fn draws_over_hud(&self) -> bool {
-        true
+        // Scrim over the world only when opened in-game. On the title screen the
+        // options draw their own dirt background (vanilla shows dirt, not the
+        // panorama, on sub-screens).
+        !self.from_main_menu
     }
 }

@@ -1,6 +1,6 @@
 //! Account management (Microsoft login, refresh-token entry, account rows).
 
-use recraft_render::{UiColor, UiFrame, UiRect};
+use recraft_render::{text_width, UiFrame, UiRect};
 use winit::event::{ElementState, KeyEvent};
 use winit::keyboard::{KeyCode, PhysicalKey};
 
@@ -9,15 +9,24 @@ use crate::text_input::TextInput;
 use super::main_menu::GuiMainMenu;
 use super::widgets::{GuiButton, GuiTextField};
 use super::{
-    draw_centered_text, draw_default_background, fit_text, DrawCtx, GuiAction, GuiScreen,
+    draw_centered_text, draw_default_background, fit_text, DrawCtx, GuiAction, GuiScreen, ListView,
     ScreenCtx, TEXT_GRAY, TEXT_GREEN, TEXT_WHITE,
 };
+
+/// Account row height in GUI px, mirroring the server list's two-line rows.
+const ROW_HEIGHT_GUI: i32 = 36;
+const LIST_WIDTH_GUI: i32 = 300;
 
 #[derive(Default)]
 pub struct GuiAccounts {
     buttons: Vec<GuiButton>,
-    /// (uuid, use-button, remove-button) per account row, refreshed each draw.
-    rows: Vec<(String, GuiButton, GuiButton)>,
+    selected: Option<usize>,
+    scroll: i32,
+    /// (account-index, row-rect) per visible row, refreshed each draw.
+    row_rects: Vec<(usize, UiRect)>,
+    /// The selected account's uuid, captured at draw time so input handling
+    /// (which only has `ScreenCtx`) can resolve it without the account list.
+    selected_uuid: Option<String>,
 }
 
 impl GuiAccounts {
@@ -25,27 +34,31 @@ impl GuiAccounts {
         Self::default()
     }
 
+    fn list_view(&self, ctx: &DrawCtx) -> ListView {
+        ListView::new(ctx, LIST_WIDTH_GUI, ROW_HEIGHT_GUI, 52)
+    }
+
     fn layout(&mut self, ctx: &DrawCtx) {
         let s = ctx.scale;
-        let x = (ctx.width - 200 * s) / 2;
-        let bottom = ctx.height - 50 * s;
+        // Bottom action row, styled like the server list's button strip.
+        let half = 98 * s;
+        let row = ctx.height - 28 * s;
+        let x = (ctx.width - 3 * half - 2 * 4 * s) / 2;
+        let step = half + 4 * s;
+        let has_selection = self
+            .selected
+            .is_some_and(|index| index < ctx.accounts.len());
         self.buttons = vec![
-            GuiButton::at_px(x, bottom, 200 * s, s, "Add with Microsoft"),
-            GuiButton::at_px(x, bottom + 24 * s, 64 * s, s, "Add Token"),
-            GuiButton::at_px(x + 68 * s, bottom + 24 * s, 64 * s, s, "Copy Token"),
-            GuiButton::at_px(x + 136 * s, bottom + 24 * s, 64 * s, s, "Back"),
+            GuiButton::at_px(x, row, half, s, "Use Account").disabled(!has_selection),
+            GuiButton::at_px(x + step, row, half, s, "Add with Microsoft"),
+            GuiButton::at_px(x + 2 * step, row, half, s, "Add Token"),
+            // Second row: delete / copy token / back.
+            GuiButton::at_px(x, row - 24 * s, half, s, "Delete").disabled(!has_selection),
+            GuiButton::at_px(x + step, row - 24 * s, half, s, "Copy Token"),
+            GuiButton::at_px(x + 2 * step, row - 24 * s, half, s, "Back"),
         ];
-        self.rows.clear();
-        for (index, account) in ctx.accounts.iter().enumerate() {
-            let y = 40 * s + index as i32 * 24 * s;
-            let row_x = (ctx.width - 260 * s) / 2;
-            self.rows.push((
-                account.uuid.clone(),
-                GuiButton::at_px(row_x + 170 * s, y, 40 * s, s, "Use"),
-                GuiButton::at_px(row_x + 214 * s, y, 40 * s, s, "Del"),
-            ));
-        }
     }
+
 }
 
 impl GuiScreen for GuiAccounts {
@@ -53,40 +66,66 @@ impl GuiScreen for GuiAccounts {
         self.layout(ctx);
         draw_default_background(ui, ctx);
         let s = ctx.scale;
-        draw_centered_text(ui, ctx.width, 10 * s, s, TEXT_WHITE, "Accounts");
+        draw_centered_text(ui, ctx.width, 16 * s, s, TEXT_WHITE, "Accounts");
+
+        let list = self.list_view(ctx);
+        list.draw_background(ui);
+
+        self.row_rects.clear();
+        let total = ctx.accounts.len() as i32;
+        let visible = list.visible_rows();
+        let max_scroll = (total - visible).max(0);
+        self.scroll = self.scroll.clamp(0, max_scroll);
 
         if ctx.accounts.is_empty() {
             draw_centered_text(
                 ui,
                 ctx.width,
-                ctx.height / 2 - 30 * s,
+                (list.top + list.bottom) / 2 - 4 * s,
                 s,
                 TEXT_GRAY,
                 "No accounts yet — add one below.",
             );
         }
-        for (index, account) in ctx.accounts.iter().enumerate() {
-            let y = 40 * s + index as i32 * 24 * s;
-            let row_x = (ctx.width - 260 * s) / 2;
-            let name_rect = UiRect::new(row_x, y, 166 * s, 20 * s);
-            ui.rect(name_rect, UiColor::rgba(0, 0, 0, 120));
-            let label = fit_text(&account.username, name_rect.width - 8 * s, s);
+
+        for (visible_index, index) in (self.scroll..total).take(visible as usize).enumerate() {
+            let index = index as usize;
+            let account = &ctx.accounts[index];
+            let rect = list.row_rect(visible_index as i32);
+            self.row_rects.push((index, rect));
+
+            if self.selected == Some(index) {
+                list.draw_selection(ui, rect);
+            }
+
+            let pad = 3 * s;
+            // Username (green if this is the signed-in account).
+            let name = fit_text(&account.username, rect.width - 90 * s, s);
             ui.text_shadowed(
-                name_rect.x + 4 * s,
-                y + 6 * s,
+                rect.x + pad,
+                rect.y + pad,
                 s,
                 if account.active { TEXT_GREEN } else { TEXT_WHITE },
-                if account.active {
-                    format!("{label} §7(active)")
-                } else {
-                    label
-                },
+                name,
             );
-            if let Some((_, use_btn, del_btn)) = self.rows.get(index) {
-                use_btn.draw(ui, s, ctx.mouse, ctx.mouse_down);
-                del_btn.draw(ui, s, ctx.mouse, ctx.mouse_down);
+            // Active tag, right-aligned on the first line.
+            if account.active {
+                let tag = "§a(in use)";
+                let tw = text_width(tag, s);
+                ui.text_shadowed(rect.x + rect.width - tw - pad, rect.y + pad, s, TEXT_GREEN, tag);
             }
+            // Second line: the UUID, dimmed.
+            let uuid = fit_text(&format!("§8{}", account.uuid), rect.width - 2 * pad, s);
+            ui.text_shadowed(rect.x + pad, rect.y + pad + 12 * s, s, TEXT_GRAY, uuid);
         }
+
+        list.draw_scrollbar(ui, self.scroll, max_scroll, total);
+
+        // Capture the selected account's uuid for input handling.
+        self.selected_uuid = self
+            .selected
+            .and_then(|i| ctx.accounts.get(i))
+            .map(|a| a.uuid.clone());
 
         for button in &self.buttons {
             button.draw(ui, s, ctx.mouse, ctx.mouse_down);
@@ -94,21 +133,25 @@ impl GuiScreen for GuiAccounts {
     }
 
     fn mouse_clicked(&mut self, x: f64, y: f64, ctx: &mut ScreenCtx) -> Vec<GuiAction> {
-        for (uuid, use_btn, del_btn) in &self.rows {
-            if use_btn.clicked(x, y) {
-                return vec![GuiAction::UseAccount(uuid.clone())];
-            }
-            if del_btn.clicked(x, y) {
-                return vec![GuiAction::RemoveAccount(uuid.clone())];
+        for (index, rect) in &self.row_rects {
+            if rect.contains(x, y) {
+                self.selected = Some(*index);
+                return Vec::new();
             }
         }
-        if self.buttons.len() < 4 {
+        if self.buttons.len() < 6 {
             return Vec::new();
         }
         if self.buttons[0].clicked(x, y) {
-            return vec![GuiAction::StartMicrosoftLogin];
+            if let Some(uuid) = self.selected_uuid.clone() {
+                return vec![GuiAction::UseAccount(uuid)];
+            }
+            return Vec::new();
         }
         if self.buttons[1].clicked(x, y) {
+            return vec![GuiAction::StartMicrosoftLogin];
+        }
+        if self.buttons[2].clicked(x, y) {
             // Pre-fill the token field from the clipboard, like before.
             let prefill = ctx
                 .clipboard
@@ -118,13 +161,25 @@ impl GuiScreen for GuiAccounts {
                 .unwrap_or_default();
             return vec![GuiAction::SetScreen(Box::new(GuiAddToken::new(prefill)))];
         }
-        if self.buttons[2].clicked(x, y) {
+        if self.buttons[3].clicked(x, y) {
+            if let Some(uuid) = self.selected_uuid.take() {
+                self.selected = None;
+                return vec![GuiAction::RemoveAccount(uuid)];
+            }
+            return Vec::new();
+        }
+        if self.buttons[4].clicked(x, y) {
             return vec![GuiAction::CopyActiveToken];
         }
-        if self.buttons[3].clicked(x, y) {
+        if self.buttons[5].clicked(x, y) {
             return vec![GuiAction::SetScreen(Box::new(GuiMainMenu::new()))];
         }
         Vec::new()
+    }
+
+    fn mouse_scrolled(&mut self, delta: f32) {
+        self.scroll -= delta.signum() as i32;
+        self.scroll = self.scroll.max(0);
     }
 
     fn key_pressed(&mut self, event: &KeyEvent, _ctx: &mut ScreenCtx) -> Vec<GuiAction> {

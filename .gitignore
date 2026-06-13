@@ -5,3 +5,5 @@
 *.log
 /local_server/
 /local_assets/
+/main/
+CLAUDE.md

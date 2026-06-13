@@ -461,6 +461,19 @@ pub fn load_gui_image(name: &str) -> Option<RgbaImage> {
     load_asset_image(&format!("assets/minecraft/textures/gui/{name}.png"))
 }
 
+/// Load the 6 panorama faces (panorama_0..5) for the title screen cubemap.
+/// Returns `None` if any face is missing.
+pub fn load_panorama_faces() -> Option<[RgbaImage; 6]> {
+    let faces: Vec<RgbaImage> = (0..6)
+        .map(|i| {
+            load_asset_image(&format!(
+                "assets/minecraft/textures/gui/title/background/panorama_{i}.png"
+            ))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(std::array::from_fn(|i| faces[i].clone()))
+}
+
 /// 1.8 numeric item id → texture base-name under `textures/items/`. Metadata
 /// variants (dye/fish/record subtypes) collapse to the base item. None means we
 /// don't have a thumbnail for it (the UI then draws a tint swatch).

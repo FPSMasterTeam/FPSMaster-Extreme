@@ -13,6 +13,8 @@ pub enum GuiTexture {
     Inventory,
     /// gui/options_background.png — the tiled dirt menu background.
     OptionsBackground,
+    /// gui/title/minecraft.png — the Minecraft title logo (256×256, two halves).
+    Title,
 }
 
 /// Loaded vanilla GUI textures (hotbar widget, status icons, inventory window)
@@ -24,6 +26,7 @@ pub struct GuiAtlas {
     pub icons: Option<RgbaImage>,
     pub inventory: Option<RgbaImage>,
     pub options_background: Option<RgbaImage>,
+    pub title: Option<RgbaImage>,
     /// The 16×16-tile block atlas, used as item-icon source for block items.
     blocks: Option<RgbaImage>,
     block_uv: AtlasUv,
@@ -40,6 +43,10 @@ impl GuiAtlas {
             icons: crate::texture::load_gui_image("icons"),
             inventory: crate::texture::load_gui_image("container/inventory"),
             options_background: crate::texture::load_gui_image("options_background"),
+            // Custom single-image MINECRAFT logo bundled with the binary.
+            title: image::load_from_memory(include_bytes!("embedded/title_logo.png"))
+                .ok()
+                .map(|img| img.to_rgba8()),
             blocks,
             block_uv,
             items: ItemAtlasImage::load_default(),
@@ -52,6 +59,7 @@ impl GuiAtlas {
             GuiTexture::Icons => self.icons.as_ref(),
             GuiTexture::Inventory => self.inventory.as_ref(),
             GuiTexture::OptionsBackground => self.options_background.as_ref(),
+            GuiTexture::Title => self.title.as_ref(),
         }
     }
 
@@ -155,6 +163,12 @@ pub enum UiCommand {
         tile_px: i32,
         tint: UiColor,
     },
+    /// Vertical gradient from `top_color` to `bottom_color`.
+    GradientRect {
+        rect: UiRect,
+        top_color: UiColor,
+        bottom_color: UiColor,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -234,6 +248,20 @@ impl UiFrame {
     /// Draw an item thumbnail (block-atlas tile, or tint swatch) scaled to `dst`.
     pub fn item_icon(&mut self, dst: UiRect, item_id: i16) {
         self.commands.push(UiCommand::ItemIcon { dst, item_id });
+    }
+
+    /// Vertical gradient from `top_color` to `bottom_color` across `rect`.
+    pub fn gradient_rect(
+        &mut self,
+        rect: UiRect,
+        top_color: UiColor,
+        bottom_color: UiColor,
+    ) {
+        self.commands.push(UiCommand::GradientRect {
+            rect,
+            top_color,
+            bottom_color,
+        });
     }
 
     /// Tile `texture` across `dst` (`tile_px` screen px per repeat) with `tint`.
@@ -322,6 +350,14 @@ impl UiFrame {
                         fill_rect(&mut pixels, width, height, dst, UiColor::rgba(28, 22, 18, 255));
                     }
                 }
+                UiCommand::GradientRect {
+                    rect,
+                    top_color,
+                    bottom_color,
+                } => {
+                    let r = scale_rect(*rect, s);
+                    gradient_rect(&mut pixels, width, height, r, *top_color, *bottom_color);
+                }
                 UiCommand::ItemIcon { dst, item_id } => {
                     let dst = &scale_rect(*dst, s);
                     if let (Some((sx, sy)), Some(blocks)) = (gui.block_tile(*item_id), &gui.blocks)
@@ -370,10 +406,17 @@ impl UiFrame {
     }
 }
 
-/// The GUI pixel scale for a window height (vanilla auto gui scale, 2..4).
-/// Shared by the app's layout code and the renderer's UI rasterizer.
-pub fn gui_pixel_scale(height: u32) -> u32 {
-    (height / 240).clamp(2, 4)
+/// The GUI pixel scale for a window of `width`×`height` (vanilla
+/// `ScaledResolution` auto gui-scale with `guiScale=0`).
+pub fn gui_pixel_scale(width: u32, height: u32) -> u32 {
+    let mut scale = 1u32;
+    while scale < 1000
+        && width / (scale + 1) >= 320
+        && height / (scale + 1) >= 240
+    {
+        scale += 1;
+    }
+    scale.max(1)
 }
 
 /// Divide a rect by the pixel scale, dividing the edges (not the size) so
@@ -404,6 +447,65 @@ fn item_swatch_color(id: i16) -> UiColor {
         80 + (id.wrapping_mul(199) % 160) as u8,
         255,
     )
+}
+
+fn gradient_rect(
+    pixels: &mut [u8],
+    width: u32,
+    height: u32,
+    rect: UiRect,
+    top: UiColor,
+    bottom: UiColor,
+) {
+    let x0 = rect.x.max(0) as u32;
+    let y0 = rect.y.max(0) as u32;
+    let x1 = (rect.x + rect.width).clamp(0, width as i32) as u32;
+    let y1 = (rect.y + rect.height).clamp(0, height as i32) as u32;
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+    let h = rect.height.max(1) as u32;
+    let ry0 = rect.y.max(0) as u32;
+    for y in y0..y1 {
+        let row_offset = y - ry0;
+        let a = lerp_u8_fast(top.a, bottom.a, row_offset, h);
+        if a == 0 {
+            continue;
+        }
+        let r = lerp_u8_fast(top.r, bottom.r, row_offset, h);
+        let g = lerp_u8_fast(top.g, bottom.g, row_offset, h);
+        let b = lerp_u8_fast(top.b, bottom.b, row_offset, h);
+        let base = (y * width) as usize * 4;
+        if a == 255 {
+            for x in x0..x1 {
+                let i = base + x as usize * 4;
+                pixels[i] = r;
+                pixels[i + 1] = g;
+                pixels[i + 2] = b;
+                pixels[i + 3] = 255;
+            }
+        } else {
+            let a16 = a as u16;
+            let inv = 255 - a16;
+            let sr = r as u16 * a16;
+            let sg = g as u16 * a16;
+            let sb = b as u16 * a16;
+            for x in x0..x1 {
+                let i = base + x as usize * 4;
+                pixels[i] = ((sr + pixels[i] as u16 * inv) / 255) as u8;
+                pixels[i + 1] = ((sg + pixels[i + 1] as u16 * inv) / 255) as u8;
+                pixels[i + 2] = ((sb + pixels[i + 2] as u16 * inv) / 255) as u8;
+                pixels[i + 3] =
+                    (a16 + pixels[i + 3] as u16 * inv / 255).min(255) as u8;
+            }
+        }
+    }
+}
+
+fn lerp_u8_fast(a: u8, b: u8, num: u32, den: u32) -> u8 {
+    let a = a as i32;
+    let b = b as i32;
+    (a + (b - a) * num as i32 / den.max(1) as i32).clamp(0, 255) as u8
 }
 
 fn fill_rect(pixels: &mut [u8], width: u32, height: u32, rect: UiRect, color: UiColor) {
@@ -507,3 +609,4 @@ fn blend_pixel(pixels: &mut [u8], width: u32, x: u32, y: u32, source: UiColor) {
     pixels[index + 2] = source.b;
     pixels[index + 3] = source.a;
 }
+

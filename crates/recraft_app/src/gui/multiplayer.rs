@@ -15,12 +15,14 @@ use super::edit_server::{GuiDirectConnect, GuiEditServer};
 use super::main_menu::GuiMainMenu;
 use super::widgets::GuiButton;
 use super::{
-    draw_centered_text, draw_default_background, fit_text, DrawCtx, GuiAction, GuiScreen,
+    draw_centered_text, draw_default_background, fit_text, DrawCtx, GuiAction, GuiScreen, ListView,
     ScreenCtx, TEXT_GRAY, TEXT_WHITE,
 };
 
 /// Server row height in GUI px (vanilla rows are 36).
-const ROW_HEIGHT_GUI: i32 = 30;
+const ROW_HEIGHT_GUI: i32 = 36;
+/// Server list width in GUI px (vanilla server list is wider than 220).
+const LIST_WIDTH_GUI: i32 = 300;
 const DOUBLE_CLICK: Duration = Duration::from_millis(350);
 
 pub struct GuiMultiplayer {
@@ -71,31 +73,42 @@ impl GuiMultiplayer {
         }
     }
 
-    fn visible_rows(&self, ctx: &DrawCtx) -> i32 {
-        let s = ctx.scale;
-        let list_top = 32 * s;
-        let list_bottom = ctx.height - 56 * s;
-        ((list_bottom - list_top) / (ROW_HEIGHT_GUI * s)).max(1)
+    fn list_view(&self, ctx: &DrawCtx) -> ListView {
+        // Bottom margin leaves room for the two button rows.
+        ListView::new(ctx, LIST_WIDTH_GUI, ROW_HEIGHT_GUI, 64)
     }
 
     fn layout(&mut self, ctx: &DrawCtx) {
         let s = ctx.scale;
-        let half = 98 * s;
-        let row1 = ctx.height - 50 * s;
-        let row2 = ctx.height - 26 * s;
-        let x = (ctx.width - 3 * half - 2 * 4 * s) / 2;
-        let step = half + 4 * s;
+        let cx = ctx.width / 2;
+        // Vanilla createButtons() positions (left-anchored at width/2 - 154):
+        //   row1 (height-52): Select(100) @ -154, Direct(100) @ -50, Add(100) @ +54
+        //   row2 (height-28): Edit(70) @ -154, Delete(70) @ -74, Refresh(70) @ +4, Cancel(75) @ +80
+        let row1 = ctx.height - 52 * s;
+        let row2 = ctx.height - 28 * s;
         let has_selection = self
             .selected
             .is_some_and(|index| index < self.servers.entries.len());
         self.buttons = vec![
-            GuiButton::at_px(x, row1, half, s, "Join Server").disabled(!has_selection),
-            GuiButton::at_px(x + step, row1, half, s, "Direct Connect"),
-            GuiButton::at_px(x + 2 * step, row1, half, s, "Add Server"),
-            GuiButton::at_px(x, row2, half, s, "Edit").disabled(!has_selection),
-            GuiButton::at_px(x + step, row2, half, s, "Delete").disabled(!has_selection),
-            GuiButton::at_px(x + 2 * step, row2, half, s, "Refresh"),
+            // 0: Join (Select)
+            GuiButton::at_px(cx - 154 * s, row1, 100 * s, s, "Join Server").disabled(!has_selection),
+            // 1: Direct Connect
+            GuiButton::at_px(cx - 50 * s, row1, 100 * s, s, "Direct Connect"),
+            // 2: Add Server
+            GuiButton::at_px(cx + 54 * s, row1, 100 * s, s, "Add Server"),
+            // 3: Edit
+            GuiButton::at_px(cx - 154 * s, row2, 70 * s, s, "Edit").disabled(!has_selection),
+            // 4: Delete
+            GuiButton::at_px(cx - 74 * s, row2, 70 * s, s, "Delete").disabled(!has_selection),
+            // 5: Refresh
+            GuiButton::at_px(cx + 4 * s, row2, 70 * s, s, "Refresh"),
+            // 6: Cancel (back to title)
+            GuiButton::at_px(cx + 80 * s, row2, 75 * s, s, "Cancel"),
         ];
+    }
+
+    fn back(&self) -> Vec<GuiAction> {
+        vec![GuiAction::SetScreen(Box::new(GuiMainMenu::new()))]
     }
 
     fn delete_selected(&mut self) {
@@ -110,27 +123,55 @@ impl GuiMultiplayer {
     }
 }
 
+/// Vanilla ping-bar icon cell: `(k, l)` index into icons.png. `k` selects the
+/// animation column (1 while pinging), `l` the bar level 0-5.
+fn ping_bar_cell(ping: Option<&PingOutcome>, slot_index: i32) -> (i32, i32) {
+    match ping {
+        Some(PingOutcome::Ok(info)) => {
+            let l = match info.latency_ms {
+                0..=149 => 0,
+                150..=299 => 1,
+                300..=599 => 2,
+                600..=999 => 3,
+                _ => 4,
+            };
+            (0, l)
+        }
+        Some(PingOutcome::Failed(_)) => (0, 5), // no connection
+        None => {
+            // Animated pinging bars (vanilla cycles l over time per slot).
+            let mut l = (slot_index * 2) & 7;
+            if l > 4 {
+                l = 8 - l;
+            }
+            (1, l)
+        }
+    }
+}
+
 impl GuiScreen for GuiMultiplayer {
     fn draw(&mut self, ui: &mut UiFrame, ctx: &DrawCtx) {
         self.layout(ctx);
         draw_default_background(ui, ctx);
         let s = ctx.scale;
-        draw_centered_text(ui, ctx.width, 10 * s, s, TEXT_WHITE, "Play Multiplayer");
+        // Vanilla title at y=20 GUI px (drawn from baseline-ish, so use 20-8/2).
+        draw_centered_text(ui, ctx.width, 16 * s, s, TEXT_WHITE, "Play Multiplayer");
+
+        let list = self.list_view(ctx);
+        list.draw_background(ui);
 
         // Server rows.
         self.row_rects.clear();
-        let list_x = (ctx.width - 300 * s) / 2;
-        let list_w = 300 * s;
-        let row_h = ROW_HEIGHT_GUI * s;
-        let visible = self.visible_rows(ctx);
-        let max_scroll = (self.servers.entries.len() as i32 - visible).max(0);
+        let total = self.servers.entries.len() as i32;
+        let visible = list.visible_rows();
+        let max_scroll = (total - visible).max(0);
         self.scroll = self.scroll.clamp(0, max_scroll);
 
         if self.servers.entries.is_empty() {
             draw_centered_text(
                 ui,
                 ctx.width,
-                ctx.height / 2 - 12 * s,
+                (list.top + list.bottom) / 2 - 4 * s,
                 s,
                 TEXT_GRAY,
                 "No servers yet — Add Server or Direct Connect below.",
@@ -138,71 +179,87 @@ impl GuiScreen for GuiMultiplayer {
         }
 
         for (visible_index, index) in
-            (self.scroll..self.servers.entries.len() as i32).take(visible as usize).enumerate()
+            (self.scroll..total).take(visible as usize).enumerate()
         {
             let index = index as usize;
             let entry = &self.servers.entries[index];
-            let rect = UiRect::new(list_x, 32 * s + visible_index as i32 * row_h, list_w, row_h - 2 * s);
+            let rect = list.row_rect(visible_index as i32);
             self.row_rects.push((index, rect));
 
-            ui.rect(rect, UiColor::rgba(0, 0, 0, 110));
             if self.selected == Some(index) {
-                // Vanilla selection: a light outer border.
-                let b = UiColor::rgba(160, 160, 160, 255);
-                ui.rect(UiRect::new(rect.x, rect.y, rect.width, s), b);
-                ui.rect(UiRect::new(rect.x, rect.y + rect.height - s, rect.width, s), b);
-                ui.rect(UiRect::new(rect.x, rect.y, s, rect.height), b);
-                ui.rect(UiRect::new(rect.x + rect.width - s, rect.y, s, rect.height), b);
+                list.draw_selection(ui, rect);
             }
 
-            let pad = 3 * s;
-            let name = fit_text(&entry.name, rect.width - 90 * s, s);
-            ui.text_shadowed(rect.x + pad, rect.y + pad, s, TEXT_WHITE, name);
+            let ping = self.pings.get(index).and_then(|p| p.as_ref());
 
-            // Right side: players + latency (or status).
-            let status = match self.pings.get(index).and_then(|p| p.as_ref()) {
-                Some(PingOutcome::Ok(info)) => {
-                    format!("§8{} §7{}  §a{}ms", info.version, info.players, info.latency_ms)
-                }
-                Some(PingOutcome::Failed(_)) => "§cCan't connect".to_owned(),
-                None => "§7Pinging...".to_owned(),
-            };
-            let status_w = text_width(&status, s);
-            ui.text_shadowed(
-                rect.x + rect.width - status_w - pad,
-                rect.y + pad,
-                s,
-                TEXT_GRAY,
-                status,
+            // Server icon: 32×32 at the row's top-left (vanilla unknown_server
+            // placeholder — we draw a dark plate since we don't fetch favicons).
+            let icon = UiRect::new(rect.x, rect.y, 32 * s, 32 * s);
+            ui.rect(icon, UiColor::rgba(0, 0, 0, 160));
+            ui.rect(
+                UiRect::new(icon.x, icon.y, icon.width, s),
+                UiColor::rgba(80, 80, 80, 255),
             );
 
-            // Second line: MOTD (or the failure), then the address dimmed.
-            let detail = match self.pings.get(index).and_then(|p| p.as_ref()) {
-                Some(PingOutcome::Ok(info)) => format!("§7{}", info.motd),
-                Some(PingOutcome::Failed(err)) => format!("§4{}", fit_text(err, rect.width, s)),
-                None => format!("§8{}", entry.address),
+            // Text column starts at x + 32 + 3 (vanilla).
+            let text_x = rect.x + 35 * s;
+            let text_w = rect.width - 35 * s;
+
+            // Line 1: server name (white).
+            let name = fit_text(&entry.name, text_w - 60 * s, s);
+            ui.text_shadowed(text_x, rect.y + s, s, TEXT_WHITE, name);
+
+            // Population/version, right-aligned on line 1 (left of the ping bars).
+            let pop = match ping {
+                Some(PingOutcome::Ok(info)) => format!("§8{} §7{}", info.version, info.players),
+                Some(PingOutcome::Failed(_)) => String::new(),
+                None => String::new(),
             };
-            let detail = fit_text(&detail, rect.width - 2 * pad, s);
-            ui.text_shadowed(rect.x + pad, rect.y + pad + 11 * s, s, TEXT_GRAY, detail);
+            if !pop.is_empty() {
+                let pw = text_width(&pop, s);
+                ui.text_shadowed(
+                    rect.x + rect.width - pw - 15 * s - 2 * s,
+                    rect.y + s,
+                    s,
+                    TEXT_GRAY,
+                    pop,
+                );
+            }
+
+            // Lines 2-3: MOTD wrapped to 2 lines (vanilla), or status text.
+            let motd = match ping {
+                Some(PingOutcome::Ok(info)) => format!("§7{}", info.motd),
+                Some(PingOutcome::Failed(err)) => format!("§4{err}"),
+                None => "§7Pinging...".to_owned(),
+            };
+            let lines = crate::chat::wrap_legacy(&motd, text_w - 2 * s, s);
+            for (i, line) in lines.iter().take(2).enumerate() {
+                ui.text_shadowed(
+                    text_x,
+                    rect.y + 12 * s + i as i32 * 9 * s,
+                    s,
+                    TEXT_GRAY,
+                    line,
+                );
+            }
+
+            // Ping bars: icons.png src (k*10, 176 + l*8), 10×8, at (x+listWidth-15, y).
+            let (k, l) = ping_bar_cell(ping, visible_index as i32);
+            ui.image(
+                UiRect::new(rect.x + rect.width - 15 * s, rect.y, 10 * s, 8 * s),
+                recraft_render::GuiTexture::Icons,
+                (k * 10) as u32,
+                (176 + l * 8) as u32,
+                10,
+                8,
+            );
         }
 
-        if max_scroll > 0 {
-            let label = format!("{} / {}", self.scroll + 1, self.servers.entries.len());
-            draw_centered_text(ui, ctx.width, ctx.height - 64 * s, s, TEXT_GRAY, &label);
-        }
+        list.draw_scrollbar(ui, self.scroll, max_scroll, total);
 
         for button in &self.buttons {
             button.draw(ui, s, ctx.mouse, ctx.mouse_down);
         }
-
-        // Back link bottom-right corner.
-        ui.text_shadowed(
-            ctx.width - text_width("ESC: Back", s) - 4 * s,
-            ctx.height - 10 * s,
-            s,
-            TEXT_GRAY,
-            "ESC: Back",
-        );
     }
 
     fn update(&mut self, _ctx: &mut ScreenCtx) -> Vec<GuiAction> {
@@ -232,7 +289,7 @@ impl GuiScreen for GuiMultiplayer {
                 return Vec::new();
             }
         }
-        if self.buttons.len() < 6 {
+        if self.buttons.len() < 7 {
             return Vec::new();
         }
         if self.buttons[0].clicked(x, y) {
@@ -261,6 +318,9 @@ impl GuiScreen for GuiMultiplayer {
         if self.buttons[5].clicked(x, y) {
             self.refresh();
             return Vec::new();
+        }
+        if self.buttons[6].clicked(x, y) {
+            return self.back();
         }
         Vec::new()
     }

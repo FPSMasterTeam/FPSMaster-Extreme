@@ -95,6 +95,11 @@ pub trait GuiScreen {
     fn draws_over_hud(&self) -> bool {
         false
     }
+
+    /// Whether this screen wants the panorama skybox background.
+    fn wants_panorama(&self) -> bool {
+        false
+    }
 }
 
 /// What a screen asks the application to do.
@@ -131,6 +136,8 @@ pub struct DrawCtx<'a> {
     /// Whether a world is rendered behind the screen (scrim background)
     /// rather than the dirt menu background.
     pub in_world: bool,
+    /// Whether the GPU panorama skybox is being rendered behind this screen.
+    pub has_panorama: bool,
     pub settings: &'a Settings,
     pub session_username: Option<&'a str>,
     pub accounts: &'a [AccountEntry],
@@ -162,8 +169,8 @@ pub struct AccountEntry {
 
 /// GUI pixel scale shared by every screen and the HUD (same formula the
 /// renderer rasterizes the UI buffer at, so all layout snaps to GUI pixels).
-pub fn gui_scale(height: i32) -> i32 {
-    recraft_render::gui_pixel_scale(height.max(1) as u32) as i32
+pub fn gui_scale(width: i32, height: i32) -> i32 {
+    recraft_render::gui_pixel_scale(width.max(1) as u32, height.max(1) as u32) as i32
 }
 
 // ─── Shared drawing helpers ──────────────────────────────────────────────────
@@ -200,6 +207,117 @@ pub(crate) fn draw_centered_text(
 ) {
     let w = recraft_render::text_width(text, scale);
     ui.text_shadowed((width - w) / 2, y, scale, color, text);
+}
+
+/// Vanilla `GuiSlot`: a centered, scrollable list rendered over the dirt
+/// background with the top/bottom gradient shadow lines and a right-side
+/// scrollbar. Screens compute the geometry, draw their own row content through
+/// the per-row rect this hands back, and read the hit-tested rects for input.
+pub(crate) struct ListView {
+    /// Inner-content left edge (screen px), and the list pixel width.
+    pub left: i32,
+    pub width: i32,
+    /// Vertical bounds of the scrollable viewport (screen px).
+    pub top: i32,
+    pub bottom: i32,
+    /// One row's full height in screen px (vanilla 36 GUI px including padding).
+    pub row_height: i32,
+    pub scale: i32,
+}
+
+impl ListView {
+    /// Standard vanilla list geometry: full window width minus margins, from
+    /// y=32 GUI px down to `bottom_margin` GUI px above the window bottom.
+    pub fn new(ctx: &DrawCtx, list_width_gui: i32, row_height_gui: i32, bottom_margin_gui: i32) -> Self {
+        let s = ctx.scale;
+        Self {
+            left: (ctx.width - list_width_gui * s) / 2,
+            width: list_width_gui * s,
+            top: 32 * s,
+            bottom: ctx.height - bottom_margin_gui * s,
+            row_height: row_height_gui * s,
+            scale: s,
+        }
+    }
+
+    /// How many whole rows fit in the viewport.
+    pub fn visible_rows(&self) -> i32 {
+        ((self.bottom - self.top) / self.row_height).max(1)
+    }
+
+    /// The screen-px rect of the `visible_index`-th visible row (0-based from
+    /// the top of the viewport), inset by the inter-row gap.
+    pub fn row_rect(&self, visible_index: i32) -> UiRect {
+        let s = self.scale;
+        UiRect::new(
+            self.left,
+            self.top + visible_index * self.row_height,
+            self.width,
+            self.row_height - 4 * s,
+        )
+    }
+
+    /// Draw the vanilla list background: dark dirt tile clipped to the viewport,
+    /// then the top and bottom 4-px gradient shadow lines.
+    pub fn draw_background(&self, ui: &mut UiFrame) {
+        let s = self.scale;
+        let viewport = UiRect::new(self.left, self.top, self.width, self.bottom - self.top);
+        // Vanilla GuiSlot tints the dirt darker (32,32,32) inside the list.
+        ui.tiled_image(viewport, GuiTexture::OptionsBackground, 32 * s, UiColor::rgba(32, 32, 32, 255));
+        // Top shadow: opaque black fading down over 4 GUI px.
+        ui.gradient_rect(
+            UiRect::new(self.left, self.top, self.width, 4 * s),
+            UiColor::rgba(0, 0, 0, 255),
+            UiColor::rgba(0, 0, 0, 0),
+        );
+        // Bottom shadow: transparent fading to opaque black over 4 GUI px.
+        ui.gradient_rect(
+            UiRect::new(self.left, self.bottom - 4 * s, self.width, 4 * s),
+            UiColor::rgba(0, 0, 0, 0),
+            UiColor::rgba(0, 0, 0, 255),
+        );
+    }
+
+    /// Draw the vanilla selection box (outer gray + inner black border) around
+    /// a row rect.
+    pub fn draw_selection(&self, ui: &mut UiFrame, rect: UiRect) {
+        let s = self.scale;
+        let outer = UiColor::rgba(128, 128, 128, 255);
+        let inner = UiColor::rgba(0, 0, 0, 255);
+        // Outer gray frame (1 GUI px).
+        let o = UiRect::new(rect.x - 2 * s, rect.y - 2 * s, rect.width + 4 * s, rect.height + 4 * s);
+        ui.rect(UiRect::new(o.x, o.y, o.width, s), outer);
+        ui.rect(UiRect::new(o.x, o.y + o.height - s, o.width, s), outer);
+        ui.rect(UiRect::new(o.x, o.y, s, o.height), outer);
+        ui.rect(UiRect::new(o.x + o.width - s, o.y, s, o.height), outer);
+        // Inner black frame (1 GUI px), just inside the gray.
+        let i = UiRect::new(o.x + s, o.y + s, o.width - 2 * s, o.height - 2 * s);
+        ui.rect(UiRect::new(i.x, i.y, i.width, s), inner);
+        ui.rect(UiRect::new(i.x, i.y + i.height - s, i.width, s), inner);
+        ui.rect(UiRect::new(i.x, i.y, s, i.height), inner);
+        ui.rect(UiRect::new(i.x + i.width - s, i.y, s, i.height), inner);
+    }
+
+    /// Draw the vanilla scrollbar on the right of the list when content
+    /// overflows. `scroll`/`max_scroll` are in whole-row units.
+    pub fn draw_scrollbar(&self, ui: &mut UiFrame, scroll: i32, max_scroll: i32, total_rows: i32) {
+        if max_scroll <= 0 {
+            return;
+        }
+        let s = self.scale;
+        let bar_x = self.left + self.width + 2 * s;
+        let bar_w = 6 * s;
+        let track_h = self.bottom - self.top;
+        // Track (black).
+        ui.rect(UiRect::new(bar_x, self.top, bar_w, track_h), UiColor::rgba(0, 0, 0, 255));
+        // Thumb height proportional to the visible fraction.
+        let visible = self.visible_rows();
+        let thumb_h = ((track_h * visible / total_rows.max(1)).max(8 * s)).min(track_h);
+        let thumb_y = self.top + (track_h - thumb_h) * scroll / max_scroll;
+        ui.rect(UiRect::new(bar_x, thumb_y, bar_w, thumb_h), UiColor::rgba(128, 128, 128, 255));
+        // Light edge on the top/left of the thumb.
+        ui.rect(UiRect::new(bar_x, thumb_y, bar_w - s, thumb_h - s), UiColor::rgba(192, 192, 192, 255));
+    }
 }
 
 /// Truncate with an ellipsis to fit `max_width` screen px.
