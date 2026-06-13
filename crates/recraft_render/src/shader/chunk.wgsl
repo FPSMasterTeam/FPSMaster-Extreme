@@ -55,6 +55,24 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     return vec4<f32>(texel.rgb * input.color.rgb * b, texel.a * input.color.a);
 }
 
+// Flat-colour variant for the texture-cost benchmark: skips the atlas fetch and
+// shades from the vertex colour (tint × face shade × AO) only. Isolates how much
+// of the solid layer's per-pixel cost is texture-read bandwidth vs framebuffer.
+@fragment
+fn fs_flat(input: VertexOutput) -> @location(0) vec4<f32> {
+    let b = day_night(input.light);
+    return vec4<f32>(input.color.rgb * b, 1.0);
+}
+
+// Depth pre-pass: colour writes are masked off in the pipeline, so this skips
+// the texture fetch entirely and just lets the rasterizer record depth. It still
+// declares the full VertexOutput input so the inter-stage interface matches
+// vs_main (wgpu requires every vertex output to be consumed by the fragment).
+@fragment
+fn fs_depth(_input: VertexOutput) -> @location(0) vec4<f32> {
+    return vec4<f32>(0.0);
+}
+
 @fragment
 fn fs_cutout(input: VertexOutput) -> @location(0) vec4<f32> {
     let texel = textureSample(block_atlas, block_sampler, input.uv);

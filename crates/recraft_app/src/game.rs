@@ -11,6 +11,10 @@ pub enum DemoKind {
     /// benchmark (large coplanar surfaces that greedy meshing and occlusion
     /// culling actually act on, unlike the synthetic checkerboard).
     Terrain,
+    /// A single block in an otherwise empty world: the minimal scene for
+    /// measuring the fixed per-frame floor (clear + submit + present) — the FPS
+    /// ceiling no fill-rate optimization can beat.
+    SingleCube,
 }
 use recraft_core::{
     collision::{is_fence, is_pane, is_stairs},
@@ -533,11 +537,17 @@ impl GameState {
             DemoKind::ChunkStress => build_demo_chunk_stress(&mut world),
             DemoKind::EntityStress => build_demo_entity_stress(&mut world),
             DemoKind::Terrain => build_demo_terrain(&mut world),
+            DemoKind::SingleCube => build_demo_single_cube(&mut world),
         };
         let mut state = Self::new(world, EntityId(0), spawn, aspect);
         state.capabilities.allow_flying = true;
         if matches!(kind, DemoKind::ChunkStress) {
             state.camera.pitch = 45.0;
+        }
+        if matches!(kind, DemoKind::SingleCube) {
+            // Look straight ahead (+Z) at the lone block; hover so nothing drifts.
+            state.camera.pitch = 8.0;
+            state.capabilities.flying = true;
         }
         if matches!(kind, DemoKind::Terrain) {
             // A fixed vista over the whole landscape so the GPU load is stable
@@ -3396,6 +3406,19 @@ fn terrain_height_tall(x: i32, z: i32) -> i32 {
 /// stone / dirt surfaces are exactly what greedy meshing collapses, so before /
 /// after triangle counts here reflect real gameplay rather than the synthetic
 /// checkerboard.
+/// Minimal scene: one block at the origin in an empty world. Used by the pass
+/// benchmark's `no-all` config to read the fixed per-frame floor (clear + submit
+/// + present), i.e. the maximum FPS the engine can reach with no fill work.
+fn build_demo_single_cube(world: &mut World) -> DVec3 {
+    world.set_block(0, 64, 0, BlockState::STONE);
+    for y in 64..=80 {
+        world.set_light(0, y, 0, 0, 15);
+        world.set_light(0, y, 5, 0, 15);
+    }
+    // Stand a few blocks back on -Z; yaw 0 looks toward +Z, at the block.
+    DVec3::new(0.5, 64.0, -5.5)
+}
+
 fn build_demo_terrain(world: &mut World) -> DVec3 {
     let water_level = 56;
     let range = 12; // 25×25 chunks

@@ -14,6 +14,13 @@ use zip::ZipArchive;
 pub const TILE_SIZE: u32 = 16;
 pub const ATLAS_COLUMNS: u32 = 16;
 
+/// Mip levels for the block atlas. 16px tiles halve cleanly down to 1px
+/// (16→8→4→2→1), so 5 levels. Because the tile size, column count and atlas
+/// dimensions are all powers of two, an aligned 2×2 box filter over the whole
+/// atlas never straddles a tile boundary — it is exactly a per-tile downsample,
+/// so packed neighbours never bleed into each other at distance.
+pub const ATLAS_MIP_LEVELS: u32 = TILE_SIZE.trailing_zeros() + 1;
+
 // Plains colormap point: temperature 0.8, downfall 0.4 (rainfall is multiplied
 // by temperature before lookup). Used to sample grass.png / foliage.png.
 const PLAINS_TEMPERATURE: f64 = 0.8;
@@ -327,6 +334,56 @@ fn build_atlas(
         },
         loaded,
     )
+}
+
+/// Build the block-atlas mip chain as `(pixels, width, height)` per level.
+/// Level 0 is `base`; each later level is a 2×2 box filter of the previous one.
+/// Colour is alpha-weighted so the transparent (usually black) texels around
+/// cutout edges don't darken the result; alpha is the plain average, so distant
+/// leaves/plants thin out the same way vanilla's mipmaps do.
+pub fn build_atlas_mip_chain(base: &[u8], width: u32, height: u32) -> Vec<(Vec<u8>, u32, u32)> {
+    let mut levels: Vec<(Vec<u8>, u32, u32)> = Vec::with_capacity(ATLAS_MIP_LEVELS as usize);
+    levels.push((base.to_vec(), width, height));
+    for _ in 1..ATLAS_MIP_LEVELS {
+        let (prev, pw, ph) = levels.last().expect("level 0 was pushed");
+        let next = downsample_half(prev, *pw, *ph);
+        levels.push((next, pw / 2, ph / 2));
+    }
+    levels
+}
+
+/// Average each 2×2 block of an RGBA8 image into one texel. RGB is weighted by
+/// source alpha (so fully-transparent texels contribute no colour), alpha is the
+/// straight mean.
+fn downsample_half(src: &[u8], w: u32, h: u32) -> Vec<u8> {
+    let (nw, nh) = (w / 2, h / 2);
+    let mut out = vec![0u8; (nw * nh * 4) as usize];
+    for y in 0..nh {
+        for x in 0..nw {
+            let mut rgb = [0f32; 3];
+            let mut weight = 0f32;
+            let mut alpha = 0f32;
+            for dy in 0..2 {
+                for dx in 0..2 {
+                    let i = (((y * 2 + dy) * w + (x * 2 + dx)) * 4) as usize;
+                    let a = src[i + 3] as f32 / 255.0;
+                    rgb[0] += src[i] as f32 * a;
+                    rgb[1] += src[i + 1] as f32 * a;
+                    rgb[2] += src[i + 2] as f32 * a;
+                    weight += a;
+                    alpha += a;
+                }
+            }
+            let o = ((y * nw + x) * 4) as usize;
+            if weight > 0.0 {
+                out[o] = (rgb[0] / weight).round() as u8;
+                out[o + 1] = (rgb[1] / weight).round() as u8;
+                out[o + 2] = (rgb[2] / weight).round() as u8;
+            }
+            out[o + 3] = (alpha / 4.0 * 255.0).round() as u8;
+        }
+    }
+    out
 }
 
 /// Log once per (block, meta, context) when a texture resolves to the magenta
@@ -1372,6 +1429,44 @@ mod tests {
             assert!(seen.insert((x, y)), "duplicate slot origin {x},{y}");
         }
         assert_eq!(seen.len() as u32, ENTITY_SLOT_COUNT);
+    }
+
+    #[test]
+    fn mip_chain_halves_each_level_and_alpha_weights_colour() {
+        // 2×2 atlas: one opaque red texel, three fully-transparent black ones.
+        let base = vec![
+            255, 0, 0, 255, // (0,0) opaque red
+            0, 0, 0, 0, // (1,0) transparent
+            0, 0, 0, 0, // (0,1) transparent
+            0, 0, 0, 0, // (1,1) transparent
+        ];
+        let chain = build_atlas_mip_chain(&base, 2, 2);
+        // 2px tiles → levels for 2,1 == 2 (log2(2)+1) is not how the const is
+        // derived (it tracks TILE_SIZE), so just check the first downsample.
+        assert!(chain.len() >= 2);
+        assert_eq!((chain[0].1, chain[0].2), (2, 2));
+        assert_eq!((chain[1].1, chain[1].2), (1, 1));
+        let lvl1 = &chain[1].0;
+        // Alpha-weighting must keep the colour red (not 1/4 red darkened toward
+        // black by the transparent texels)…
+        assert_eq!(&lvl1[0..3], &[255, 0, 0]);
+        // …while alpha is the straight mean: one of four texels opaque → ~64.
+        assert_eq!(lvl1[3], 64);
+    }
+
+    #[test]
+    fn mip_chain_preserves_opaque_colour_average() {
+        // All four texels opaque, two reds and two blues → average is (128,0,128).
+        let base = vec![
+            255, 0, 0, 255, 0, 0, 255, 255, // red, blue
+            0, 0, 255, 255, 255, 0, 0, 255, // blue, red
+        ];
+        let chain = build_atlas_mip_chain(&base, 2, 2);
+        let lvl1 = &chain[1].0;
+        assert_eq!(lvl1[3], 255, "all-opaque stays opaque");
+        assert_eq!(lvl1[0], 128);
+        assert_eq!(lvl1[1], 0);
+        assert_eq!(lvl1[2], 128);
     }
 
     #[test]

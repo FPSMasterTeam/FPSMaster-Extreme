@@ -348,6 +348,20 @@ struct UiCache {
     last_commands: Vec<crate::ui::UiCommand>,
 }
 
+/// Per-pass draw toggles used to attribute GPU cost on hardware where timestamp
+/// queries return nothing (the Intel iGPU): skipping a pass and re-measuring
+/// reveals its share. Driven by the `--bench-passes` benchmark via
+/// [`Renderer::set_pass_skip`]; all-false in normal runs.
+#[derive(Clone, Copy, Default)]
+struct DebugSkip {
+    sky: bool,
+    water: bool,
+    ui: bool,
+    /// Render the solid layer with a flat colour (no atlas fetch) to isolate
+    /// texture-read bandwidth from framebuffer cost.
+    flat: bool,
+}
+
 pub struct Renderer<'window> {
     surface: wgpu::Surface<'window>,
     device: wgpu::Device,
@@ -356,6 +370,11 @@ pub struct Renderer<'window> {
     present_modes: Vec<wgpu::PresentMode>,
     size: PhysicalSize<u32>,
     pipeline: wgpu::RenderPipeline,
+    /// Depth-only pass for the solid layer: fills the depth buffer first so the
+    /// colour pass's early-z skips shading every occluded solid fragment.
+    depth_prepass_pipeline: wgpu::RenderPipeline,
+    /// Flat-colour solid pipeline (no atlas fetch) for the texture-cost benchmark.
+    flat_pipeline: wgpu::RenderPipeline,
     cutout_pipeline: wgpu::RenderPipeline,
     /// No-cull cutout variant for the isometric GUI block-icon cubes.
     gui_cube_pipeline: wgpu::RenderPipeline,
@@ -441,6 +460,8 @@ pub struct Renderer<'window> {
     /// ~0.04 ms/frame); enabled only while the F3 overlay or a benchmark needs it.
     gpu_timing_enabled: bool,
     last_stats: RenderStats,
+    /// Temporary per-pass skip toggles for profiling (RECRAFT_SKIP env var).
+    debug_skip: DebugSkip,
 }
 
 impl<'window> Renderer<'window> {
@@ -450,14 +471,38 @@ impl<'window> Renderer<'window> {
         let surface = instance
             .create_surface(window)
             .map_err(|err| RendererError::Surface(err.to_string()))?;
-        let adapter = instance
+        // Prefer a real hardware GPU. When none is available (e.g. inside a VM
+        // without 3D acceleration), fall back to a software adapter (WARP on
+        // DX12) so the app still launches, just slowly.
+        let adapter = match instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 compatible_surface: Some(&surface),
                 force_fallback_adapter: false,
             })
             .await
-            .ok_or(RendererError::NoAdapter)?;
+        {
+            Some(adapter) => adapter,
+            None => {
+                log::warn!("no hardware GPU adapter found, falling back to software rendering");
+                instance
+                    .request_adapter(&wgpu::RequestAdapterOptions {
+                        power_preference: wgpu::PowerPreference::LowPower,
+                        compatible_surface: Some(&surface),
+                        force_fallback_adapter: true,
+                    })
+                    .await
+                    .ok_or(RendererError::NoAdapter)?
+            }
+        };
+
+        let info = adapter.get_info();
+        log::info!(
+            "GPU adapter: {} ({:?}, {:?})",
+            info.name,
+            info.device_type,
+            info.backend
+        );
 
         // Request timestamp queries when the adapter supports them, for the
         // occlusion-independent GPU-time profiler. Falls back cleanly otherwise.
@@ -645,6 +690,9 @@ impl<'window> Renderer<'window> {
         });
         let depth_view = create_depth_view(&device, &config);
 
+        // Solid colour pass. Depth is already filled by the pre-pass below, so it
+        // only tests (LessEqual, matching the pre-pass's recorded depth) without
+        // writing — early-z then rejects every occluded fragment before shading.
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("chunk-pipeline"),
             layout: Some(&pipeline_layout),
@@ -660,6 +708,84 @@ impl<'window> Renderer<'window> {
                     format,
                     blend: Some(wgpu::BlendState::REPLACE),
                     write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: Some(wgpu::Face::Back),
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+        });
+        // Flat-colour clone of the solid pipeline (no atlas fetch), used only by
+        // the `--bench-passes` flat config to measure texture-read cost.
+        let flat_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("chunk-flat-pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_main",
+                buffers: &[ChunkVertex::layout()],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_flat",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: Some(wgpu::Face::Back),
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+        });
+        // Depth-only pre-pass for the solid layer: same geometry, colour writes
+        // masked off so each visible solid pixel is shaded exactly once by the
+        // colour pass above, regardless of chunk draw order. Cheap geometry
+        // versus the textured overdraw it removes on fill/bandwidth-bound GPUs.
+        let depth_prepass_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("chunk-depth-prepass-pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_main",
+                buffers: &[ChunkVertex::layout()],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_depth",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::empty(),
                 })],
             }),
             primitive: wgpu::PrimitiveState {
@@ -962,7 +1088,10 @@ impl<'window> Renderer<'window> {
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: DEPTH_FORMAT,
                 depth_write_enabled: false,
-                depth_compare: wgpu::CompareFunction::Always,
+                // Drawn after opaque terrain: the sky sits at the far plane
+                // (clip z = 1.0), so LessEqual passes only where no block wrote a
+                // nearer depth — i.e. the open sky.
+                depth_compare: wgpu::CompareFunction::LessEqual,
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
@@ -1026,7 +1155,10 @@ impl<'window> Renderer<'window> {
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: DEPTH_FORMAT,
                 depth_write_enabled: false,
-                depth_compare: wgpu::CompareFunction::Always,
+                // Pinned to the far plane in the shader and drawn after terrain,
+                // so LessEqual lets the world occlude the sun/moon/stars while
+                // they still fill the open sky.
+                depth_compare: wgpu::CompareFunction::LessEqual,
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
@@ -1185,6 +1317,8 @@ impl<'window> Renderer<'window> {
             present_modes,
             size,
             pipeline,
+            depth_prepass_pipeline,
+            flat_pipeline,
             cutout_pipeline,
             gui_cube_pipeline,
             item_pipeline,
@@ -1243,6 +1377,7 @@ impl<'window> Renderer<'window> {
             gpu_timer,
             gpu_timing_enabled: false,
             last_stats: RenderStats::default(),
+            debug_skip: DebugSkip::default(),
         })
     }
 
@@ -1251,6 +1386,18 @@ impl<'window> Renderer<'window> {
     /// GPU-bound.
     pub fn last_stats(&self) -> RenderStats {
         self.last_stats
+    }
+
+    /// Override the per-pass skip flags at runtime. Used by the in-process pass
+    /// benchmark (`--bench-passes`) to A/B individual passes within a single,
+    /// thermally-consistent run rather than across separate processes.
+    pub fn set_pass_skip(&mut self, sky: bool, water: bool, ui: bool, flat: bool) {
+        self.debug_skip = DebugSkip {
+            sky,
+            water,
+            ui,
+            flat,
+        };
     }
 
     /// Enable per-frame GPU-time measurement. Off by default because the
@@ -1904,23 +2051,13 @@ impl<'window> Renderer<'window> {
                 pass.draw(0..3, 0..1);
                 draw_calls += 1;
             } else {
-            // Sky gradient (fullscreen view-ray), then the sun/moon/stars at
-            // infinity. Both run before terrain with no depth write, so terrain
-            // occludes them where it stands in front.
-            pass.set_pipeline(&self.sky_pipeline);
-            pass.set_bind_group(0, &self.sky_bind_group, &[]);
-            pass.draw(0..3, 0..1);
-            if let Some(mesh) = self.celestial_mesh.as_ref().filter(|m| m.index_count > 0) {
-                pass.set_pipeline(&self.celestial_pipeline);
-                pass.set_bind_group(0, &self.celestial_uniform_bind_group, &[]);
-                pass.set_bind_group(1, &self.sky_atlas_bind_group, &[]);
-                pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-                pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..mesh.index_count, 0, 0..1);
-                draw_calls += 1;
-            }
-
-            if !self.chunk_sections.is_empty() {
+            // Opaque + cutout terrain first, so the fullscreen sky shader below
+            // can depth-test against them and skip every pixel a block covers
+            // (a large fill-rate saving on weak GPUs). The transparent layer is
+            // drawn after the sky so water/glass still blends over it.
+            let mut cmd_offset = 0u64;
+            let cmd_stride = std::mem::size_of::<IndirectCmd>() as u64;
+            let trans_batches = if !self.chunk_sections.is_empty() {
                 let frustum = camera.frustum();
                 let visible: Vec<SectionPos> = self
                     .chunk_sections
@@ -1966,11 +2103,36 @@ impl<'window> Renderer<'window> {
                 pass.set_bind_group(0, &self.camera_bind_group, &[]);
                 pass.set_bind_group(1, &self.texture_bind_group, &[]);
 
-                let mut cmd_offset = 0u64;
-                let cmd_stride = std::mem::size_of::<IndirectCmd>() as u64;
+                // Depth pre-pass: fill the solid layer's depth first (colour
+                // masked off) so the solid colour pass below shades each visible
+                // pixel exactly once. A local offset walks the same solid
+                // commands; the colour passes keep the running cmd_offset.
+                if !solid_batches.is_empty() {
+                    pass.set_pipeline(&self.depth_prepass_pipeline);
+                    let mut pre_offset = 0u64;
+                    for batch in &solid_batches {
+                        let page = &self.chunk_solid.pages[batch.page];
+                        pass.set_vertex_buffer(0, page.vertex_buf.slice(..));
+                        pass.set_index_buffer(page.index_buf.slice(..), wgpu::IndexFormat::Uint16);
+                        let count = batch.cmds.len() as u32;
+                        if self.multi_draw {
+                            pass.multi_draw_indexed_indirect(&self.indirect_buf, pre_offset, count);
+                        } else {
+                            for c in &batch.cmds {
+                                pass.draw_indexed(c.first_index..c.first_index + c.index_count, c.base_vertex, 0..1);
+                            }
+                        }
+                        pre_offset += count as u64 * cmd_stride;
+                    }
+                }
 
                 if !solid_batches.is_empty() {
-                    pass.set_pipeline(&self.pipeline);
+                    let solid_pipeline = if self.debug_skip.flat {
+                        &self.flat_pipeline
+                    } else {
+                        &self.pipeline
+                    };
+                    pass.set_pipeline(solid_pipeline);
                     for batch in &solid_batches {
                         let page = &self.chunk_solid.pages[batch.page];
                         pass.set_vertex_buffer(0, page.vertex_buf.slice(..));
@@ -2007,23 +2169,49 @@ impl<'window> Renderer<'window> {
                     }
                 }
 
-                if !trans_batches.is_empty() {
-                    pass.set_pipeline(&self.transparent_pipeline);
-                    for batch in &trans_batches {
-                        let page = &self.chunk_transparent.pages[batch.page];
-                        pass.set_vertex_buffer(0, page.vertex_buf.slice(..));
-                        pass.set_index_buffer(page.index_buf.slice(..), wgpu::IndexFormat::Uint16);
-                        let count = batch.cmds.len() as u32;
-                        draw_calls += count;
-                        if self.multi_draw {
-                            pass.multi_draw_indexed_indirect(&self.indirect_buf, cmd_offset, count);
-                        } else {
-                            for c in &batch.cmds {
-                                pass.draw_indexed(c.first_index..c.first_index + c.index_count, c.base_vertex, 0..1);
-                            }
+                trans_batches
+            } else {
+                Vec::new()
+            };
+
+            // Sky gradient (fullscreen view-ray) then the sun/moon/stars, drawn
+            // AFTER the opaque world and depth-tested (LessEqual at the far plane)
+            // so the shader runs only on pixels no block covers.
+            if !self.debug_skip.sky {
+            pass.set_pipeline(&self.sky_pipeline);
+            pass.set_bind_group(0, &self.sky_bind_group, &[]);
+            pass.draw(0..3, 0..1);
+            if let Some(mesh) = self.celestial_mesh.as_ref().filter(|m| m.index_count > 0) {
+                pass.set_pipeline(&self.celestial_pipeline);
+                pass.set_bind_group(0, &self.celestial_uniform_bind_group, &[]);
+                pass.set_bind_group(1, &self.sky_atlas_bind_group, &[]);
+                pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+                draw_calls += 1;
+            }
+            }
+
+            // Transparent terrain (water/glass) over the sky and opaque world.
+            // The sky/celestial draws rebound groups 0/1, so restore them first.
+            if !trans_batches.is_empty() && !self.debug_skip.water {
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                pass.set_bind_group(1, &self.texture_bind_group, &[]);
+                pass.set_pipeline(&self.transparent_pipeline);
+                for batch in &trans_batches {
+                    let page = &self.chunk_transparent.pages[batch.page];
+                    pass.set_vertex_buffer(0, page.vertex_buf.slice(..));
+                    pass.set_index_buffer(page.index_buf.slice(..), wgpu::IndexFormat::Uint16);
+                    let count = batch.cmds.len() as u32;
+                    draw_calls += count;
+                    if self.multi_draw {
+                        pass.multi_draw_indexed_indirect(&self.indirect_buf, cmd_offset, count);
+                    } else {
+                        for c in &batch.cmds {
+                            pass.draw_indexed(c.first_index..c.first_index + c.index_count, c.base_vertex, 0..1);
                         }
-                        cmd_offset += count as u64 * cmd_stride;
                     }
+                    cmd_offset += count as u64 * cmd_stride;
                 }
             }
 
@@ -2085,7 +2273,7 @@ impl<'window> Renderer<'window> {
             }
             } // else (non-panorama sky + world content)
 
-            if draw_ui {
+            if draw_ui && !self.debug_skip.ui {
                 // UI background layer (under the 3D block icons).
                 if let Some(cache) = &self.ui_cache {
                     pass.set_pipeline(&self.ui_pipeline);
@@ -2962,6 +3150,11 @@ fn create_texture_bind_group(
         }
     }
 
+    // Mipmaps: distant terrain otherwise samples the full-resolution atlas with
+    // poor cache locality, which is murderous on bandwidth-starved iGPUs. The
+    // chain is built per-tile (see build_atlas_mip_chain) so neighbours don't
+    // bleed. Built before `atlas.pixels` is moved into `block_image` below.
+    let mips = crate::texture::build_atlas_mip_chain(&atlas.pixels, atlas.width, atlas.height);
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("block-atlas-texture"),
         size: wgpu::Extent3d {
@@ -2969,41 +3162,47 @@ fn create_texture_bind_group(
             height: atlas.height,
             depth_or_array_layers: 1,
         },
-        mip_level_count: 1,
+        mip_level_count: mips.len() as u32,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::Rgba8UnormSrgb,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
-    queue.write_texture(
-        wgpu::ImageCopyTexture {
-            texture: &texture,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        &atlas.pixels,
-        wgpu::ImageDataLayout {
-            offset: 0,
-            bytes_per_row: Some(4 * atlas.width),
-            rows_per_image: Some(atlas.height),
-        },
-        wgpu::Extent3d {
-            width: atlas.width,
-            height: atlas.height,
-            depth_or_array_layers: 1,
-        },
-    );
+    for (level, (data, mw, mh)) in mips.iter().enumerate() {
+        queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &texture,
+                mip_level: level as u32,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            data,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * mw),
+                rows_per_image: Some(*mh),
+            },
+            wgpu::Extent3d {
+                width: *mw,
+                height: *mh,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
     let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
         label: Some("block-atlas-sampler"),
         address_mode_u: wgpu::AddressMode::ClampToEdge,
         address_mode_v: wgpu::AddressMode::ClampToEdge,
         address_mode_w: wgpu::AddressMode::ClampToEdge,
+        // Nearest within a level keeps the blocky look up close AND avoids
+        // bilinear bleed across packed tiles; Linear between levels (trilinear)
+        // smooths the distance transition. The win is sampling small mips far
+        // away, which is cache-friendly regardless of the in-level filter.
         mag_filter: wgpu::FilterMode::Nearest,
         min_filter: wgpu::FilterMode::Nearest,
-        mipmap_filter: wgpu::FilterMode::Nearest,
+        mipmap_filter: wgpu::FilterMode::Linear,
         ..Default::default()
     });
     let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {

@@ -59,6 +59,10 @@ struct LaunchConfig {
     scripted_smoke_seconds: Option<f32>,
     headless_smoke_seconds: Option<f32>,
     headless_interact_seconds: Option<f32>,
+    /// In-process per-pass benchmark: cycle render-pass skip configs frame by
+    /// frame (fps cap off) and print an A/B table on exit. Defeats the
+    /// cross-process thermal/clock drift that makes separate runs incomparable.
+    bench_passes_seconds: Option<f32>,
     demo_kind: game::DemoKind,
 }
 
@@ -178,7 +182,13 @@ fn main() -> anyhow::Result<()> {
 
     let mut renderer = pollster::block_on(Renderer::new(window)).context("create renderer")?;
     let mut settings = Settings::default();
-    if config.scripted_smoke_seconds.is_some() {
+    // Both scripted-smoke and the pass benchmark auto-load the demo world and run
+    // unthrottled.
+    let auto_play = config
+        .scripted_smoke_seconds
+        .or(config.bench_passes_seconds)
+        .is_some();
+    if auto_play {
         settings.vsync = false;
         settings.fps_cap = u32::MAX;
     }
@@ -188,7 +198,7 @@ fn main() -> anyhow::Result<()> {
     let atlas_uv = renderer.atlas_uv().clone();
 
     let auto_connect = config.server.clone();
-    let auto_demo = config.scripted_smoke_seconds.is_some() && auto_connect.is_none();
+    let auto_demo = auto_play && auto_connect.is_none();
     let username = config.username.clone();
 
     let mut app = App {
@@ -264,16 +274,22 @@ fn main() -> anyhow::Result<()> {
     let app_start = Instant::now();
     let mut fps_counter = FpsCounter::new(app_start);
     let mut tick_accumulator = 0.0f32;
-    let scripted_smoke_seconds = config.scripted_smoke_seconds;
+    // Both scripted-smoke and the pass benchmark drive the scripted camera and
+    // auto-exit, so combine them for those two purposes.
+    let scripted_smoke_seconds = config.scripted_smoke_seconds.or(config.bench_passes_seconds);
     let scripted_smoke_static = matches!(
         config.demo_kind,
-        game::DemoKind::ChunkStress | game::DemoKind::Terrain
+        game::DemoKind::ChunkStress | game::DemoKind::Terrain | game::DemoKind::SingleCube
     );
     let mut scripted_smoke_done = false;
     // During a scripted-smoke run, aggregate RenderStats over ~1s windows and log
     // the breakdown so headed benchmark runs print readable profiler numbers to
     // the terminal (instead of only the on-screen F3 overlay).
-    let mut smoke_profile = scripted_smoke_seconds.map(|_| SmokeProfile::new(app_start));
+    let mut smoke_profile = config.scripted_smoke_seconds.map(|_| SmokeProfile::new(app_start));
+    // In-process per-pass A/B benchmark (interleaves skip configs frame by frame).
+    let mut pass_bench = config
+        .bench_passes_seconds
+        .map(|secs| PassBench::new(app_start, secs));
     // The window starts hidden; revealed after the first frame is presented so
     // the user never sees an empty white window during renderer/asset load.
     let mut window_shown = false;
@@ -561,7 +577,10 @@ fn main() -> anyhow::Result<()> {
                 let sim_dt = (now - last_sim).as_secs_f32().min(0.25);
                 last_sim = now;
                 if let Some(seconds) = scripted_smoke_seconds {
-                    if !scripted_smoke_static {
+                    // The pass benchmark keeps the camera still so every config
+                    // renders an identical frame — otherwise scene-to-scene
+                    // variance from a moving camera swamps the per-pass deltas.
+                    if !scripted_smoke_static && pass_bench.is_none() {
                         app.game
                             .apply_scripted_smoke_input((now - app_start).as_secs_f32(), seconds);
                     }
@@ -617,6 +636,9 @@ fn main() -> anyhow::Result<()> {
                     if let Some(profile) = smoke_profile.as_mut() {
                         profile.flush(now);
                     }
+                    if let Some(bench) = pass_bench.as_ref() {
+                        bench.report();
+                    }
                     log::info!("scripted smoke complete");
                     target.exit();
                 }
@@ -627,12 +649,20 @@ fn main() -> anyhow::Result<()> {
                 sync_cursor(window, &mut cursor_captured, &app);
 
                 // --- Render + pacing. ---
-                if let Some(cap) = app.settings.fps_limit() {
-                    let deadline = last_frame + Duration::from_secs_f64(1.0 / cap as f64);
-                    let now = Instant::now();
-                    if now < deadline {
-                        std::thread::sleep(deadline - now);
+                // The pass benchmark runs uncapped so the frame time reflects GPU
+                // cost (a cap would just turn saved GPU time into sleep).
+                if pass_bench.is_none() {
+                    if let Some(cap) = app.settings.fps_limit() {
+                        let deadline = last_frame + Duration::from_secs_f64(1.0 / cap as f64);
+                        let now = Instant::now();
+                        if now < deadline {
+                            std::thread::sleep(deadline - now);
+                        }
                     }
+                }
+                if let Some(bench) = pass_bench.as_mut() {
+                    let (sky, water, ui, flat) = bench.config_for_frame();
+                    renderer.set_pass_skip(sky, water, ui, flat);
                 }
                 render_frame(
                     &mut renderer,
@@ -645,10 +675,13 @@ fn main() -> anyhow::Result<()> {
                     cursor_position,
                     mouse_down_left,
                     f3_debug,
-                    smoke_profile.is_some(),
+                    smoke_profile.is_some() || pass_bench.is_some(),
                 );
                 if let Some(profile) = smoke_profile.as_mut() {
                     profile.record(renderer.last_stats(), Instant::now());
+                }
+                if let Some(bench) = pass_bench.as_mut() {
+                    bench.record(renderer.last_stats(), Instant::now());
                 }
                 // Reveal the window once the first frame has actually been drawn.
                 if !window_shown {
@@ -987,6 +1020,89 @@ impl SmokeProfile {
     }
 }
 
+/// Render-pass skip configurations cycled by the in-process pass benchmark, as
+/// `(skip_sky, skip_water, skip_ui)`. Interleaving them frame by frame within one
+/// run keeps the thermal/clock state identical across configs, so the per-config
+/// averages are directly comparable (unlike separate processes, which drift).
+const BENCH_PASS_CONFIGS: [(&str, (bool, bool, bool, bool)); 6] = [
+    // (skip_sky, skip_water, skip_ui, flat_solid)
+    ("base", (false, false, false, false)),
+    ("no-sky", (true, false, false, false)),
+    ("no-water", (false, true, false, false)),
+    ("no-ui", (false, false, true, false)),
+    ("flat", (false, false, false, true)),
+    ("no-all", (true, true, true, false)),
+];
+
+/// Accumulates per-config frame time and `acquire` across a single run, cycling
+/// the active config every frame. `acquire` is the GPU-time proxy on hardware
+/// whose timestamp queries return nothing (the Intel iGPU); frame time (cap off)
+/// is the end-to-end measure.
+struct PassBench {
+    start: Instant,
+    last: Instant,
+    warmup: f32,
+    frame: u64,
+    current: usize,
+    frame_us: [u64; 6],
+    acquire_us: [u64; 6],
+    count: [u64; 6],
+}
+
+impl PassBench {
+    fn new(now: Instant, _duration: f32) -> Self {
+        Self {
+            start: now,
+            last: now,
+            warmup: 1.5,
+            frame: 0,
+            current: 0,
+            frame_us: [0; 6],
+            acquire_us: [0; 6],
+            count: [0; 6],
+        }
+    }
+
+    /// Pick the config for the frame about to be rendered (round-robin).
+    fn config_for_frame(&mut self) -> (bool, bool, bool, bool) {
+        self.current = (self.frame % BENCH_PASS_CONFIGS.len() as u64) as usize;
+        BENCH_PASS_CONFIGS[self.current].1
+    }
+
+    fn record(&mut self, stats: RenderStats, now: Instant) {
+        let frame_us = (now - self.last).as_micros() as u64;
+        self.last = now;
+        self.frame += 1;
+        // Skip warmup frames (chunk meshing/upload spikes) so they don't bias
+        // whichever config happened to land on them.
+        if (now - self.start).as_secs_f32() < self.warmup {
+            return;
+        }
+        let i = self.current;
+        self.frame_us[i] += frame_us;
+        self.acquire_us[i] += stats.acquire_us as u64;
+        self.count[i] += 1;
+    }
+
+    fn report(&self) {
+        let avg = |sum: u64, n: u64| if n > 0 { sum as f64 / n as f64 } else { 0.0 };
+        let base_frame = avg(self.frame_us[0], self.count[0]);
+        log::info!("=== pass benchmark (fps cap OFF, configs interleaved per frame) ===");
+        for (i, (name, _)) in BENCH_PASS_CONFIGS.iter().enumerate() {
+            let n = self.count[i];
+            let frame_us = avg(self.frame_us[i], n);
+            let frame_ms = frame_us / 1000.0;
+            let fps = if frame_ms > 0.0 { 1000.0 / frame_ms } else { 0.0 };
+            let acquire_ms = avg(self.acquire_us[i], n) / 1000.0;
+            let delta_ms = (frame_us - base_frame) / 1000.0;
+            log::info!(
+                "{name:<8} frames {n:>5} | frame {frame_ms:>6.2}ms ({fps:>3.0} fps) | \
+                 acquire {acquire_ms:>5.2}ms | Δframe {delta_ms:>+6.2}ms vs base",
+            );
+        }
+    }
+}
+
 /// Render one frame: world, entities + first-person hand, HUD and the open
 /// screen. Driven from `AboutToWait` so the frame rate is paced by our own
 /// vsync/FPS-cap logic instead of macOS Core Animation throttling.
@@ -1205,6 +1321,7 @@ impl LaunchConfig {
         let mut scripted_smoke_seconds = None;
         let mut headless_smoke_seconds = None;
         let mut headless_interact_seconds = None;
+        let mut bench_passes_seconds = None;
         let mut demo_kind = game::DemoKind::Landscape;
         let mut args = env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -1236,12 +1353,17 @@ impl LaunchConfig {
                     headless_interact_seconds =
                         args.next().and_then(|value| value.parse::<f32>().ok());
                 }
+                "--bench-passes" => {
+                    bench_passes_seconds =
+                        args.next().and_then(|value| value.parse::<f32>().ok());
+                }
                 "--demo" => {
                     if let Some(value) = args.next() {
                         demo_kind = match value.as_str() {
                             "chunk" => game::DemoKind::ChunkStress,
                             "entity" => game::DemoKind::EntityStress,
                             "terrain" => game::DemoKind::Terrain,
+                            "cube" => game::DemoKind::SingleCube,
                             _ => game::DemoKind::Landscape,
                         };
                     }
@@ -1256,6 +1378,7 @@ impl LaunchConfig {
             scripted_smoke_seconds,
             headless_smoke_seconds,
             headless_interact_seconds,
+            bench_passes_seconds,
             demo_kind,
         }
     }

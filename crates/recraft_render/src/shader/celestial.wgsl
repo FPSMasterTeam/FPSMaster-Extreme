@@ -33,6 +33,11 @@ struct VertexOutput {
 fn vs_main(input: VertexInput) -> VertexOutput {
     var out: VertexOutput;
     out.clip_position = celestial.view_proj * vec4<f32>(input.position, 1.0);
+    // Pin to the far plane (NDC z = 1.0) so the depth test (LessEqual vs the
+    // cleared far depth) lets opaque terrain occlude the sun/moon/stars while
+    // they still fill the open sky. Drawn after terrain to skip the fill behind
+    // blocks. x/y/w are untouched, so the on-screen position is unchanged.
+    out.clip_position.z = out.clip_position.w;
     out.color = input.color;
     out.uv = input.uv;
     return out;
