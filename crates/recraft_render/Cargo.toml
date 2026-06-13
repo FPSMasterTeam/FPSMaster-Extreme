@@ -16,3 +16,6 @@ thiserror.workspace = true
 wgpu.workspace = true
 winit.workspace = true
 zip.workspace = true
+
+[dev-dependencies]
+pollster = "0.3"

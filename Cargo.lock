@@ -2128,6 +2128,7 @@ dependencies = [
  "glam",
  "image",
  "log",
+ "pollster",
  "recraft_core",
  "thiserror 1.0.69",
  "wgpu",
