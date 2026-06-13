@@ -164,6 +164,9 @@ fn main() -> anyhow::Result<()> {
     let window = WindowBuilder::new()
         .with_title("ReCraft - Rust Minecraft Client")
         .with_inner_size(LogicalSize::new(1280.0, 720.0))
+        // Start hidden so the OS never shows an empty white window while the
+        // renderer loads textures; revealed after the first frame is drawn.
+        .with_visible(false)
         .build(&event_loop)
         .context("create window")?;
     let window: &'static winit::window::Window = Box::leak(Box::new(window));
@@ -254,6 +257,9 @@ fn main() -> anyhow::Result<()> {
     let mut tick_accumulator = 0.0f32;
     let scripted_smoke_seconds = config.scripted_smoke_seconds;
     let mut scripted_smoke_done = false;
+    // The window starts hidden; revealed after the first frame is presented so
+    // the user never sees an empty white window during renderer/asset load.
+    let mut window_shown = false;
 
     event_loop.run(move |event, target| {
         target.set_control_flow(ControlFlow::Poll);
@@ -618,6 +624,11 @@ fn main() -> anyhow::Result<()> {
                     mouse_down_left,
                     f3_debug,
                 );
+                // Reveal the window once the first frame has actually been drawn.
+                if !window_shown {
+                    window.set_visible(true);
+                    window_shown = true;
+                }
 
                 // Keep the OS IME in sync with whichever field is focused: enable
                 // it only while editing text (so gameplay keys stay raw and no

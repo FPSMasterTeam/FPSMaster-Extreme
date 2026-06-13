@@ -124,6 +124,9 @@ pub struct PingInfo {
     pub players: String,
     pub version: String,
     pub latency_ms: u32,
+    /// Decoded RGBA favicon (vanilla `data:image/png;base64,...`), if any,
+    /// shared via `Arc` so the UI can blit it cheaply each frame.
+    pub favicon: Option<std::sync::Arc<image::RgbaImage>>,
 }
 
 /// The outcome of pinging one server-list row.
@@ -150,7 +153,7 @@ fn spawn_ping(index: usize, address: String, tx: Sender<(usize, PingOutcome)>) {
                 match recraft_protocol::net::ping_status_1_8_9(
                     &host,
                     port,
-                    Duration::from_secs(4),
+                    Duration::from_secs(5),
                 ) {
                     Ok(status) => PingOutcome::Ok(parse_status(&status.json, status.latency_ms)),
                     Err(err) => PingOutcome::Failed(err.to_string()),
@@ -177,12 +180,24 @@ fn parse_status(json: &str, latency_ms: u32) -> PingInfo {
         value["players"]["max"].as_i64().unwrap_or(0),
     );
     let version = value["version"]["name"].as_str().unwrap_or("?").to_owned();
+    let favicon = value["favicon"].as_str().and_then(decode_favicon);
     PingInfo {
         motd,
         players,
         version,
         latency_ms,
+        favicon,
     }
+}
+
+/// Decode a `data:image/png;base64,<...>` favicon into a shared RGBA image.
+fn decode_favicon(data_uri: &str) -> Option<std::sync::Arc<image::RgbaImage>> {
+    use base64::Engine;
+    let b64 = data_uri.strip_prefix("data:image/png;base64,")?;
+    // Some servers include whitespace/newlines in the base64 payload.
+    let cleaned: String = b64.chars().filter(|c| !c.is_whitespace()).collect();
+    let bytes = base64::engine::general_purpose::STANDARD.decode(cleaned).ok()?;
+    recraft_render::texture::decode_png(&bytes).map(std::sync::Arc::new)
 }
 
 #[cfg(test)]

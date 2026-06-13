@@ -464,6 +464,11 @@ pub fn load_gui_image(name: &str) -> Option<RgbaImage> {
     load_asset_image(&format!("assets/minecraft/textures/gui/{name}.png"))
 }
 
+/// Decode PNG bytes (e.g. a server favicon) into an RGBA image.
+pub fn decode_png(bytes: &[u8]) -> Option<RgbaImage> {
+    image::load_from_memory(bytes).ok().map(|img| img.to_rgba8())
+}
+
 /// Load the 6 panorama faces (panorama_0..5) for the title screen cubemap.
 /// Returns `None` if any face is missing.
 pub fn load_panorama_faces() -> Option<[RgbaImage; 6]> {

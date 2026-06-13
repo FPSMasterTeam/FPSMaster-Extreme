@@ -192,14 +192,22 @@ impl GuiScreen for GuiMultiplayer {
 
             let ping = self.pings.get(index).and_then(|p| p.as_ref());
 
-            // Server icon: 32×32 at the row's top-left (vanilla unknown_server
-            // placeholder — we draw a dark plate since we don't fetch favicons).
+            // Server icon: 32×32 at the row's top-left. Use the server's
+            // favicon when the ping returned one, else a dark placeholder plate.
             let icon = UiRect::new(rect.x, rect.y, 32 * s, 32 * s);
-            ui.rect(icon, UiColor::rgba(0, 0, 0, 160));
-            ui.rect(
-                UiRect::new(icon.x, icon.y, icon.width, s),
-                UiColor::rgba(80, 80, 80, 255),
-            );
+            match ping.and_then(|p| match p {
+                PingOutcome::Ok(info) => info.favicon.clone(),
+                _ => None,
+            }) {
+                Some(favicon) => ui.raw_image(icon, favicon),
+                None => {
+                    ui.rect(icon, UiColor::rgba(0, 0, 0, 160));
+                    ui.rect(
+                        UiRect::new(icon.x, icon.y, icon.width, s),
+                        UiColor::rgba(80, 80, 80, 255),
+                    );
+                }
+            }
 
             // Text column starts at x + 32 + 3 (vanilla).
             let text_x = rect.x + 35 * s;
@@ -209,11 +217,11 @@ impl GuiScreen for GuiMultiplayer {
             let name = fit_text(&entry.name, text_w - 60 * s, s);
             ui.text_shadowed(text_x, rect.y + s, s, TEXT_WHITE, name);
 
-            // Population/version, right-aligned on line 1 (left of the ping bars).
+            // Player count, right-aligned on line 1 (left of the ping bars).
+            // Vanilla shows only the population here, not the server brand.
             let pop = match ping {
-                Some(PingOutcome::Ok(info)) => format!("§8{} §7{}", info.version, info.players),
-                Some(PingOutcome::Failed(_)) => String::new(),
-                None => String::new(),
+                Some(PingOutcome::Ok(info)) => format!("§7{}", info.players),
+                _ => String::new(),
             };
             if !pop.is_empty() {
                 let pw = text_width(&pop, s);

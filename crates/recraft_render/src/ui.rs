@@ -200,6 +200,13 @@ pub enum UiCommand {
         tile_px: i32,
         tint: UiColor,
     },
+    /// Blit a free-standing RGBA image (e.g. a downloaded server favicon),
+    /// nearest-scaled and alpha-composited into `dst`. The image is shared via
+    /// `Arc` so frame-diffing stays a cheap pointer compare.
+    RawImage {
+        dst: UiRect,
+        image: std::sync::Arc<RgbaImage>,
+    },
     /// A vertical gradient (vanilla `drawGradientRect`): `top` at the top edge
     /// lerped to `bottom` at the bottom edge, alpha-composited over the buffer.
     /// Drives the item tooltip's dark fill and purple border, the menu list
@@ -376,6 +383,11 @@ impl UiFrame {
         });
     }
 
+    /// Blit a free-standing RGBA image (server favicon) into `dst`.
+    pub fn raw_image(&mut self, dst: UiRect, image: std::sync::Arc<RgbaImage>) {
+        self.commands.push(UiCommand::RawImage { dst, image });
+    }
+
     /// Rasterize into a buffer downscaled by `pixel_scale` (the GUI pixel
     /// scale): command coordinates are divided by it, so the CPU rasterizes at
     /// GUI resolution and the GPU upscales nearest-neighbour — the vanilla
@@ -457,6 +469,11 @@ impl UiFrame {
                         // Missing texture: a flat dark fill keeps menus readable.
                         fill_rect(&mut pixels, width, height, dst, UiColor::rgba(28, 22, 18, 255));
                     }
+                }
+                UiCommand::RawImage { dst, image } => {
+                    let dst = scale_rect(*dst, s);
+                    let (iw, ih) = image.dimensions();
+                    blit_image(&mut pixels, width, height, dst, image, 0, 0, iw, ih);
                 }
                 UiCommand::ItemIcon { dst, item_id } => {
                     let dst = &scale_rect(*dst, s);

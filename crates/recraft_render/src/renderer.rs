@@ -2890,7 +2890,16 @@ fn create_panorama_resources(
             topology: wgpu::PrimitiveTopology::TriangleList,
             ..Default::default()
         },
-        depth_stencil: None,
+        // The panorama draws inside the main pass (which has a depth attachment),
+        // so the pipeline must declare a matching depth-stencil state. It's a
+        // fullscreen backdrop: always pass, never write depth.
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: false,
+            depth_compare: wgpu::CompareFunction::Always,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
         multisample: wgpu::MultisampleState::default(),
         multiview: None,
     });

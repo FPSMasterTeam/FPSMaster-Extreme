@@ -2081,6 +2081,7 @@ dependencies = [
  "env_logger",
  "glam",
  "hickory-resolver",
+ "image",
  "log",
  "pollster",
  "recraft_core",
