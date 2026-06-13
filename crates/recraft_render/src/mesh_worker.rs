@@ -4,13 +4,19 @@ use std::sync::{
 };
 use std::thread;
 
-use recraft_core::ChunkPos;
+use recraft_core::SectionPos;
 
-use crate::chunk_mesh::{build_chunk_mesh_neighborhood, BiomeColors, ChunkMesh, ChunkNeighborhood};
+use crate::chunk_mesh::{
+    build_section_mesh_neighborhood, BiomeColors, ChunkMesh, ChunkNeighborhood,
+};
 use crate::AtlasUv;
 
 struct Job {
-    neighborhood: ChunkNeighborhood,
+    /// The whole column plus its horizontal neighbours, shared (via `Arc`) by
+    /// every dirty section of the same column so submitting N sections of one
+    /// column clones the snapshot only once.
+    neighborhood: Arc<ChunkNeighborhood>,
+    section_y: i32,
     generation: u64,
 }
 
@@ -20,13 +26,13 @@ struct Job {
 /// up by the render loop, so chunk (re)meshing never stalls a frame.
 pub struct MeshWorker {
     job_tx: Sender<Job>,
-    result_rx: Receiver<(ChunkPos, u64, ChunkMesh)>,
+    result_rx: Receiver<(SectionPos, u64, ChunkMesh)>,
 }
 
 impl MeshWorker {
     pub fn new(atlas: AtlasUv, biome: BiomeColors) -> Self {
         let (job_tx, job_rx) = channel::<Job>();
-        let (result_tx, result_rx) = channel::<(ChunkPos, u64, ChunkMesh)>();
+        let (result_tx, result_rx) = channel::<(SectionPos, u64, ChunkMesh)>();
         // The atlas is read-only and shared by every worker.
         let atlas = Arc::new(atlas);
         let job_rx = Arc::new(Mutex::new(job_rx));
@@ -49,8 +55,14 @@ impl MeshWorker {
                             Ok(job) => job,
                             Err(_) => break, // sender dropped — shut down.
                         };
-                        let pos = job.neighborhood.position();
-                        let mesh = build_chunk_mesh_neighborhood(&job.neighborhood, &atlas, biome);
+                        let col = job.neighborhood.position();
+                        let pos = SectionPos::new(col.x, job.section_y, col.z);
+                        let mesh = build_section_mesh_neighborhood(
+                            &job.neighborhood,
+                            job.section_y,
+                            &atlas,
+                            biome,
+                        );
                         if result_tx.send((pos, job.generation, mesh)).is_err() {
                             break;
                         }
@@ -61,16 +73,17 @@ impl MeshWorker {
         Self { job_tx, result_rx }
     }
 
-    /// Queue a chunk snapshot for meshing.
-    pub fn submit(&self, neighborhood: ChunkNeighborhood, generation: u64) {
+    /// Queue one section of a column snapshot for meshing.
+    pub fn submit(&self, neighborhood: Arc<ChunkNeighborhood>, section_y: i32, generation: u64) {
         let _ = self.job_tx.send(Job {
             neighborhood,
+            section_y,
             generation,
         });
     }
 
     /// Take one finished mesh, if any is ready.
-    pub fn try_recv(&self) -> Option<(ChunkPos, u64, ChunkMesh)> {
+    pub fn try_recv(&self) -> Option<(SectionPos, u64, ChunkMesh)> {
         self.result_rx.try_recv().ok()
     }
 }

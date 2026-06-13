@@ -46,6 +46,9 @@ impl BlockState {
             Shape::Ladder => RenderShape::Ladder,
             Shape::Cube => RenderShape::Cube,
             Shape::None => RenderShape::None,
+            Shape::Door => RenderShape::Door,
+            Shape::Piston => RenderShape::Piston,
+            Shape::PistonHead => RenderShape::PistonHead,
             _ => RenderShape::Boxes,
         }
     }
@@ -99,6 +102,13 @@ impl BlockState {
     /// `BlockWeb` — applies the cobweb stuck-speed when an entity is inside it.
     pub fn is_cobweb(self) -> bool {
         self.id == 30
+    }
+
+    /// `BlockLeaves` (1.8 ids 18 and 161). With vanilla Fancy graphics leaves
+    /// render every face, including those shared with an adjacent leaf block —
+    /// unlike glass/ice, which merge same-block faces — giving the layered look.
+    pub fn is_leaves(self) -> bool {
+        matches!(self.id, 18 | 161)
     }
 
     /// `BlockSoulSand` — multiplies an entity's horizontal motion by 0.4 while
@@ -235,8 +245,57 @@ impl BlockState {
                 2 => box3(0.375, 0.0, 0.0, 0.625, 1.0, 1.0),
                 _ => box3(0.0, 0.0, 0.375, 1.0, 1.0, 0.625),
             }),
+            // Door: the lower half's 3/16 panel blocks passage (hinge unknown
+            // without the upper neighbour → assume left); the upper half adds no
+            // collision (the lower panel already governs walking through).
+            Shape::Door => {
+                if self.meta & 8 != 0 {
+                    CollisionBoxes::none()
+                } else {
+                    CollisionBoxes::one(door_box(self.meta & 3, self.meta & 4 != 0, false))
+                }
+            }
+            // Pistons collide as full cubes (the head's gaps are non-walkable).
+            Shape::Piston | Shape::PistonHead => CollisionBoxes::one(FULL_CUBE),
         }
     }
+}
+
+/// The 3/16 door panel box for a `(facing, open, hinge)` state — vanilla
+/// `BlockDoor.setBlockBoundsBasedOnState`. `facing_index` is the lower-half meta
+/// bits 0-1 (0→east, 1→south, 2→west, 3→north). Shared by collision (best-effort
+/// per half) and the mesher (which resolves the real cross-half hinge).
+pub fn door_box(facing_index: u8, open: bool, hinge_right: bool) -> BlockBox {
+    let f = 0.1875;
+    // Each (facing, open, hinge) selects one of four edge panels.
+    let edge = match (facing_index & 3, open, hinge_right) {
+        (0, false, _) => DoorEdge::WestX,
+        (1, false, _) => DoorEdge::NorthZ,
+        (2, false, _) => DoorEdge::EastX,
+        (3, false, _) => DoorEdge::SouthZ,
+        (0, true, false) => DoorEdge::NorthZ,
+        (0, true, true) => DoorEdge::SouthZ,
+        (1, true, false) => DoorEdge::EastX,
+        (1, true, true) => DoorEdge::WestX,
+        (2, true, false) => DoorEdge::SouthZ,
+        (2, true, true) => DoorEdge::NorthZ,
+        (3, true, false) => DoorEdge::WestX,
+        _ => DoorEdge::EastX,
+    };
+    match edge {
+        DoorEdge::WestX => box3(0.0, 0.0, 0.0, f, 1.0, 1.0),
+        DoorEdge::EastX => box3(1.0 - f, 0.0, 0.0, 1.0, 1.0, 1.0),
+        DoorEdge::NorthZ => box3(0.0, 0.0, 0.0, 1.0, 1.0, f),
+        DoorEdge::SouthZ => box3(0.0, 0.0, 1.0 - f, 1.0, 1.0, 1.0),
+    }
+}
+
+/// Which block edge a door panel sits against.
+enum DoorEdge {
+    WestX,
+    EastX,
+    NorthZ,
+    SouthZ,
 }
 
 /// A block's render geometry kind.
@@ -248,6 +307,10 @@ pub enum RenderShape {
     Rail,
     Ladder,
     Boxes,
+    /// Oriented blocks the mesher builds with directional per-face textures.
+    Door,
+    Piston,
+    PistonHead,
 }
 
 /// An axis-aligned box in unit (0..1) block space.

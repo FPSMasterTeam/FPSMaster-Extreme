@@ -349,6 +349,13 @@ pub enum ClientboundPlayPacket {
     KeepAlive {
         id: i32,
     },
+    /// S03 TimeUpdate — the world age and time of day (both in ticks). A
+    /// negative `time_of_day` signals a fixed time (gamerule doDaylightCycle
+    /// off); its magnitude is the actual time.
+    TimeUpdate {
+        world_age: i64,
+        time_of_day: i64,
+    },
     /// S02 ChatMessage — a JSON chat component plus its display position
     /// (0 = chat, 1 = system message, 2 = action bar above the hotbar).
     ChatMessage {
@@ -546,10 +553,31 @@ pub enum ClientboundPlayPacket {
         slot: i16,
         item: Option<SlotItem>,
     },
+    /// S2D OpenWindow — the server asks the client to open a container window.
+    /// `slots` excludes the player inventory; `entity_id` is only present for the
+    /// horse window (inventory_type == "EntityHorse").
+    OpenWindow {
+        window_id: u8,
+        inventory_type: String,
+        title: String,
+        slots: u8,
+        entity_id: Option<i32>,
+    },
+    /// S2E CloseWindow — the server force-closes the given window.
+    CloseWindowS {
+        window_id: u8,
+    },
     /// S30 WindowItems — the server replaces the whole window contents.
     WindowItems {
         window_id: u8,
         items: Vec<Option<SlotItem>>,
+    },
+    /// S31 WindowProperty — a window field (furnace progress, brewing time,
+    /// enchant levels, beacon power…).
+    WindowProperty {
+        window_id: u8,
+        property: i16,
+        value: i16,
     },
     /// S09 HeldItemChange — the server changes our selected hotbar slot.
     HeldItemChange {
@@ -904,6 +932,10 @@ impl ClientboundPlayPacket {
             0x00 => Ok(Self::KeepAlive {
                 id: body.read_var_i32()?,
             }),
+            0x03 => Ok(Self::TimeUpdate {
+                world_age: body.read_i64()?,
+                time_of_day: body.read_i64()?,
+            }),
             0x01 => Ok(Self::JoinGame {
                 entity_id: body.read_i32()?,
                 game_mode: body.read_u8()?,
@@ -1116,10 +1148,36 @@ impl ClientboundPlayPacket {
                 vy: body.read_i16()? as f64 / 8000.0,
                 vz: body.read_i16()? as f64 / 8000.0,
             }),
+            0x2d => {
+                let window_id = body.read_u8()?;
+                let inventory_type = body.read_string(32)?;
+                let title = body.read_string(256)?;
+                let slots = body.read_u8()?;
+                let entity_id = if inventory_type == "EntityHorse" {
+                    Some(body.read_i32()?)
+                } else {
+                    None
+                };
+                Ok(Self::OpenWindow {
+                    window_id,
+                    inventory_type,
+                    title,
+                    slots,
+                    entity_id,
+                })
+            }
+            0x2e => Ok(Self::CloseWindowS {
+                window_id: body.read_u8()?,
+            }),
             0x2f => Ok(Self::SetSlot {
                 window_id: body.read_i8()?,
                 slot: body.read_i16()?,
                 item: read_slot(&mut body)?,
+            }),
+            0x31 => Ok(Self::WindowProperty {
+                window_id: body.read_u8()?,
+                property: body.read_i16()?,
+                value: body.read_i16()?,
             }),
             0x30 => {
                 let window_id = body.read_u8()?;

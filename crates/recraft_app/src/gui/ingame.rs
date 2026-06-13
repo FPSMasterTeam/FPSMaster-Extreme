@@ -6,7 +6,7 @@
 use std::time::Instant;
 
 use recraft_protocol::v1_8_9::packets::SlotItem;
-use recraft_render::{text_width, GuiTexture, UiColor, UiFrame, UiRect};
+use recraft_render::{text_height, text_width, GuiTexture, RenderStats, UiColor, UiFrame, UiRect};
 
 use crate::chat::{self, ChatState};
 use crate::game::TitleOverlay;
@@ -24,6 +24,9 @@ pub struct HudState<'a> {
     pub selected_slot: i32,
     pub hotbar: &'a [Option<SlotItem>],
     pub inventory: &'a [Option<SlotItem>],
+    /// The open window (player inventory or a server container), whose slot
+    /// layout the container screen renders. `None` when no window is open.
+    pub container: Option<&'a crate::container::Container>,
     /// The stack carried on the cursor in an open inventory (vanilla slot -1).
     pub cursor_item: Option<SlotItem>,
     pub chat: &'a ChatState,
@@ -33,6 +36,18 @@ pub struct HudState<'a> {
     /// Whether the Tab key is held (show the player-list overlay).
     pub tab_open: bool,
     pub title: Option<TitleOverlay<'a>>,
+}
+
+/// Data for the F3 debug overlay: the player feet position (world coords),
+/// look angles and the previous frame's render-pass timings/draw scale.
+#[derive(Debug, Clone, Copy)]
+pub struct DebugInfo {
+    /// Player feet position in world coordinates (vanilla posX/posY/posZ).
+    pub pos: [f64; 3],
+    pub on_ground: bool,
+    pub yaw: f32,
+    pub pitch: f32,
+    pub stats: RenderStats,
 }
 
 // gui/widgets.png hotbar source metrics (pixels).
@@ -62,6 +77,7 @@ impl GuiIngame {
     /// Render the full HUD. `chat_input` is the live chat-box buffer when the
     /// chat overlay screen is open (its caret and IME composition are drawn,
     /// and its caret area recorded for IME candidate-window placement).
+    #[allow(clippy::too_many_arguments)]
     pub fn render(
         ui: &mut UiFrame,
         width: i32,
@@ -70,9 +86,14 @@ impl GuiIngame {
         chunk_count: usize,
         hud: &HudState,
         chat_input: Option<&mut TextInput>,
+        debug: Option<&DebugInfo>,
     ) {
         let scale = gui_scale(width, height);
-        draw_fps_panel(ui, scale, fps, chunk_count);
+        // F3 replaces the small FPS readout with the full debug overlay.
+        match debug {
+            Some(info) => draw_debug_overlay(ui, width, scale, fps, chunk_count, info),
+            None => draw_fps_panel(ui, scale, fps, chunk_count),
+        }
 
         // Crosshair: 10 GUI px arms, 2 GUI px thick.
         let center_x = width / 2;
@@ -107,6 +128,85 @@ fn draw_fps_panel(ui: &mut UiFrame, scale: i32, fps: f32, chunk_count: usize) {
     ui.rect(UiRect::new(4 * scale, 4 * scale, width, 26 * scale), BLACK_170);
     ui.text_shadowed(8 * scale, 8 * scale, scale, faded_white(1.0), fps_text);
     ui.text_shadowed(8 * scale, 19 * scale, scale, MUTED, chunks_text);
+}
+
+/// Per-line background behind the F3 text (vanilla draws a translucent plate).
+const DEBUG_BG: UiColor = UiColor::rgba(16, 16, 16, 160);
+
+/// The vanilla F3 debug overlay: world/position info down the left edge and
+/// the renderer's per-pass profiler down the right edge, each line on a
+/// translucent plate. The render stats are the previous frame's (collected
+/// after the draw), one frame stale — fine for a live readout.
+fn draw_debug_overlay(
+    ui: &mut UiFrame,
+    width: i32,
+    scale: i32,
+    fps: f32,
+    chunk_count: usize,
+    info: &DebugInfo,
+) {
+    let line = text_height(scale) + 2 * scale;
+    let margin = 2 * scale;
+
+    let [fx, fy, fz] = info.pos;
+    let (bx, by, bz) = (fx.floor() as i64, fy.floor() as i64, fz.floor() as i64);
+    let (cx, cz) = (bx.div_euclid(16), bz.div_euclid(16));
+    let (rx, ry, rz) = (bx.rem_euclid(16), by.rem_euclid(16), bz.rem_euclid(16));
+
+    // Vanilla EnumFacing.fromAngle: yaw 0 = south(+Z), CW through west/north/east.
+    let yaw_n = info.yaw.rem_euclid(360.0);
+    let (facing, axis) = match (((yaw_n / 90.0) + 0.5) as i32) & 3 {
+        0 => ("south", "Towards positive Z"),
+        1 => ("west", "Towards negative X"),
+        2 => ("north", "Towards negative Z"),
+        _ => ("east", "Towards positive X"),
+    };
+
+    let grounded = if info.on_ground { "yes" } else { "no" };
+    let left = [
+        format!("ReCraft  {fps:.0} fps"),
+        format!("XYZ: {fx:.3} / {fy:.3} / {fz:.3}"),
+        format!("Block: {bx} {by} {bz}  (grounded: {grounded})"),
+        format!("Chunk: {rx} {ry} {rz} in {cx} {cz}"),
+        format!("Facing: {facing} ({axis}) ({yaw_n:.1} / {:.1})", info.pitch),
+        format!("Chunks: {chunk_count}"),
+    ];
+
+    let s = &info.stats;
+    let frame_ms = if fps > 0.0 { 1000.0 / fps } else { 0.0 };
+    let gpu = if s.gpu_us > 0 {
+        format!("gpu: {:.2} ms", s.gpu_us as f32 / 1000.0)
+    } else {
+        "gpu: n/a".to_owned()
+    };
+    let right = [
+        format!("frame: {frame_ms:.2} ms ({fps:.0} fps)"),
+        gpu,
+        format!("cpu prepare {}us  encode {}us", s.prepare_us, s.encode_us),
+        format!("submit {}us  acquire {}us", s.submit_us, s.acquire_us),
+        format!("draws {}  visible {}", s.draw_calls, s.visible_chunks),
+        format!("tris {}", s.chunk_indices / 3),
+    ];
+
+    for (i, text) in left.iter().enumerate() {
+        let y = margin + i as i32 * line;
+        let w = text_width(text, scale);
+        ui.rect(
+            UiRect::new(margin - scale, y - scale, w + 2 * scale, line),
+            DEBUG_BG,
+        );
+        ui.text_shadowed(margin, y, scale, faded_white(1.0), text.clone());
+    }
+    for (i, text) in right.iter().enumerate() {
+        let y = margin + i as i32 * line;
+        let w = text_width(text, scale);
+        let x = width - margin - w;
+        ui.rect(
+            UiRect::new(x - scale, y - scale, w + 2 * scale, line),
+            DEBUG_BG,
+        );
+        ui.text_shadowed(x, y, scale, MUTED, text.clone());
+    }
 }
 
 /// Geometry of the GUI-scaled hotbar so both the background blit and the item
@@ -157,7 +257,7 @@ fn draw_hotbar(ui: &mut UiFrame, width: i32, height: i32, hud: &HudState) {
                 16 * scale,
                 16 * scale,
             );
-            draw_item_icon(ui, cell, *item, scale.max(2));
+            draw_item_icon(ui, cell, *item, scale.max(2), false);
         }
     }
 
@@ -250,12 +350,29 @@ fn draw_status_bars(ui: &mut UiFrame, width: i32, height: i32, hud: &HudState) {
 
 /// Draw an item's thumbnail (real block texture for block items) plus its
 /// stack count in the bottom-right. Shared with the inventory screen.
-pub(crate) fn draw_item_icon(ui: &mut UiFrame, rect: UiRect, item: SlotItem, text_scale: i32) {
-    ui.item_icon(rect, item.id);
+/// Draw a slot's item. Block items with real geometry become 3D cubes (queued
+/// for the GPU cube pass); everything else is a flat icon. The stack count
+/// always goes to the overlay layer so it stays on top of the cube. `overlay`
+/// routes flat icons to the foreground too (for the cursor-carried stack, which
+/// must draw over the slots).
+pub(crate) fn draw_item_icon(
+    ui: &mut UiFrame,
+    rect: UiRect,
+    item: SlotItem,
+    text_scale: i32,
+    overlay: bool,
+) {
+    if let Some((block_id, meta)) = recraft_render::gui_item::is_block_icon(item.id, item.damage) {
+        ui.block_item(rect, block_id, meta);
+    } else if overlay {
+        ui.overlay_item_icon(rect, item.id);
+    } else {
+        ui.item_icon(rect, item.id);
+    }
     if item.count > 1 {
         let label = format!("{}", item.count);
         let w = text_width(&label, text_scale);
-        ui.text_shadowed(
+        ui.overlay_text_shadowed(
             rect.x + rect.width - w - text_scale,
             rect.y + rect.height - 8 * text_scale,
             text_scale,

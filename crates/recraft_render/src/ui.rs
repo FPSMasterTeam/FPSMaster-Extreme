@@ -13,8 +13,24 @@ pub enum GuiTexture {
     Inventory,
     /// gui/options_background.png — the tiled dirt menu background.
     OptionsBackground,
-    /// gui/title/minecraft.png — the Minecraft title logo (256×256, two halves).
+    /// Custom single-image MINECRAFT title logo bundled with the binary.
     Title,
+    /// gui/container/generic_54.png — the chest window (1..6 rows, blitted in
+    /// two parts) and the fallback for unmodelled container types.
+    Chest,
+    /// gui/container/dispenser.png — the 3×3 dispenser/dropper window.
+    Dispenser,
+    /// gui/container/hopper.png — the 5-slot hopper window.
+    Hopper,
+    /// gui/container/furnace.png — the smelting window (with the flame/arrow
+    /// progress sprites at fixed source rects).
+    Furnace,
+    /// gui/container/crafting_table.png — the 3×3 crafting window.
+    CraftingTable,
+    /// gui/container/brewing_stand.png — the brewing window.
+    BrewingStand,
+    /// gui/container/enchanting_table.png — the enchantment window.
+    EnchantingTable,
 }
 
 /// Loaded vanilla GUI textures (hotbar widget, status icons, inventory window)
@@ -27,6 +43,13 @@ pub struct GuiAtlas {
     pub inventory: Option<RgbaImage>,
     pub options_background: Option<RgbaImage>,
     pub title: Option<RgbaImage>,
+    pub chest: Option<RgbaImage>,
+    pub dispenser: Option<RgbaImage>,
+    pub hopper: Option<RgbaImage>,
+    pub furnace: Option<RgbaImage>,
+    pub crafting_table: Option<RgbaImage>,
+    pub brewing_stand: Option<RgbaImage>,
+    pub enchanting_table: Option<RgbaImage>,
     /// The 16×16-tile block atlas, used as item-icon source for block items.
     blocks: Option<RgbaImage>,
     block_uv: AtlasUv,
@@ -47,6 +70,13 @@ impl GuiAtlas {
             title: image::load_from_memory(include_bytes!("embedded/title_logo.png"))
                 .ok()
                 .map(|img| img.to_rgba8()),
+            chest: crate::texture::load_gui_image("container/generic_54"),
+            dispenser: crate::texture::load_gui_image("container/dispenser"),
+            hopper: crate::texture::load_gui_image("container/hopper"),
+            furnace: crate::texture::load_gui_image("container/furnace"),
+            crafting_table: crate::texture::load_gui_image("container/crafting_table"),
+            brewing_stand: crate::texture::load_gui_image("container/brewing_stand"),
+            enchanting_table: crate::texture::load_gui_image("container/enchanting_table"),
             blocks,
             block_uv,
             items: ItemAtlasImage::load_default(),
@@ -60,6 +90,13 @@ impl GuiAtlas {
             GuiTexture::Inventory => self.inventory.as_ref(),
             GuiTexture::OptionsBackground => self.options_background.as_ref(),
             GuiTexture::Title => self.title.as_ref(),
+            GuiTexture::Chest => self.chest.as_ref(),
+            GuiTexture::Dispenser => self.dispenser.as_ref(),
+            GuiTexture::Hopper => self.hopper.as_ref(),
+            GuiTexture::Furnace => self.furnace.as_ref(),
+            GuiTexture::CraftingTable => self.crafting_table.as_ref(),
+            GuiTexture::BrewingStand => self.brewing_stand.as_ref(),
+            GuiTexture::EnchantingTable => self.enchanting_table.as_ref(),
         }
     }
 
@@ -163,17 +200,35 @@ pub enum UiCommand {
         tile_px: i32,
         tint: UiColor,
     },
-    /// Vertical gradient from `top_color` to `bottom_color`.
+    /// A vertical gradient (vanilla `drawGradientRect`): `top` at the top edge
+    /// lerped to `bottom` at the bottom edge, alpha-composited over the buffer.
+    /// Drives the item tooltip's dark fill and purple border, the menu list
+    /// shadow lines, and the title-screen overlays.
     GradientRect {
         rect: UiRect,
-        top_color: UiColor,
-        bottom_color: UiColor,
+        top: UiColor,
+        bottom: UiColor,
     },
+}
+
+/// A block rendered as a real 3D cube into its slot rect (the GPU cube pass),
+/// instead of a flat top-face thumbnail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuiBlockItem {
+    pub dst: UiRect,
+    pub block_id: u16,
+    pub meta: u8,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UiFrame {
+    /// Background layer: drawn under the 3D block icons.
     commands: Vec<UiCommand>,
+    /// Foreground layer: stack counts, hover highlight and the carried stack,
+    /// drawn over the 3D block icons.
+    overlay: Vec<UiCommand>,
+    /// 3D block icons, rendered by the GPU cube pass between the two layers.
+    block_items: Vec<GuiBlockItem>,
 }
 
 impl UiFrame {
@@ -182,7 +237,62 @@ impl UiFrame {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.commands.is_empty()
+        self.commands.is_empty() && self.overlay.is_empty() && self.block_items.is_empty()
+    }
+
+    /// Background (under-cube) and foreground (over-cube) command layers.
+    pub fn back_commands(&self) -> &[UiCommand] {
+        &self.commands
+    }
+
+    pub fn overlay_commands(&self) -> &[UiCommand] {
+        &self.overlay
+    }
+
+    pub fn block_items(&self) -> &[GuiBlockItem] {
+        &self.block_items
+    }
+
+    /// Queue a 3D block icon (the GPU cube pass draws it; counts/highlights go
+    /// to the overlay layer so they stay on top).
+    pub fn block_item(&mut self, dst: UiRect, block_id: u16, meta: u8) {
+        self.block_items.push(GuiBlockItem {
+            dst,
+            block_id,
+            meta,
+        });
+    }
+
+    /// Overlay-layer variants (drawn over the 3D block icons).
+    pub fn overlay_rect(&mut self, rect: UiRect, color: UiColor) {
+        self.overlay.push(UiCommand::Rect { rect, color });
+    }
+
+    /// A vertical gradient on the overlay layer (item tooltip box/border).
+    pub fn overlay_gradient_rect(&mut self, rect: UiRect, top: UiColor, bottom: UiColor) {
+        self.overlay.push(UiCommand::GradientRect { rect, top, bottom });
+    }
+
+    pub fn overlay_item_icon(&mut self, dst: UiRect, item_id: i16) {
+        self.overlay.push(UiCommand::ItemIcon { dst, item_id });
+    }
+
+    pub fn overlay_text_shadowed(
+        &mut self,
+        x: i32,
+        y: i32,
+        scale: i32,
+        color: UiColor,
+        text: impl Into<String>,
+    ) {
+        self.overlay.push(UiCommand::Text {
+            x,
+            y,
+            scale: scale.max(1),
+            color,
+            text: text.into(),
+            shadow: true,
+        });
     }
 
     pub fn rect(&mut self, rect: UiRect, color: UiColor) {
@@ -250,18 +360,10 @@ impl UiFrame {
         self.commands.push(UiCommand::ItemIcon { dst, item_id });
     }
 
-    /// Vertical gradient from `top_color` to `bottom_color` across `rect`.
-    pub fn gradient_rect(
-        &mut self,
-        rect: UiRect,
-        top_color: UiColor,
-        bottom_color: UiColor,
-    ) {
-        self.commands.push(UiCommand::GradientRect {
-            rect,
-            top_color,
-            bottom_color,
-        });
+    /// Vertical gradient from `top` to `bottom` on the background layer
+    /// (menu list shadow lines, title-screen overlays).
+    pub fn gradient_rect(&mut self, rect: UiRect, top: UiColor, bottom: UiColor) {
+        self.commands.push(UiCommand::GradientRect { rect, top, bottom });
     }
 
     /// Tile `texture` across `dst` (`tile_px` screen px per repeat) with `tint`.
@@ -278,10 +380,16 @@ impl UiFrame {
     /// scale): command coordinates are divided by it, so the CPU rasterizes at
     /// GUI resolution and the GPU upscales nearest-neighbour — the vanilla
     /// chunky look at a fraction of the per-frame cost.
-    pub fn rasterize(&self, width: u32, height: u32, pixel_scale: u32, gui: &GuiAtlas) -> Vec<u8> {
+    pub fn rasterize(
+        commands: &[UiCommand],
+        width: u32,
+        height: u32,
+        pixel_scale: u32,
+        gui: &GuiAtlas,
+    ) -> Vec<u8> {
         let s = pixel_scale.max(1) as i32;
         let mut pixels = vec![0; width as usize * height as usize * 4];
-        for command in &self.commands {
+        for command in commands {
             match command {
                 UiCommand::Rect { rect, color } => {
                     fill_rect(&mut pixels, width, height, scale_rect(*rect, s), *color)
@@ -350,14 +458,6 @@ impl UiFrame {
                         fill_rect(&mut pixels, width, height, dst, UiColor::rgba(28, 22, 18, 255));
                     }
                 }
-                UiCommand::GradientRect {
-                    rect,
-                    top_color,
-                    bottom_color,
-                } => {
-                    let r = scale_rect(*rect, s);
-                    gradient_rect(&mut pixels, width, height, r, *top_color, *bottom_color);
-                }
                 UiCommand::ItemIcon { dst, item_id } => {
                     let dst = &scale_rect(*dst, s);
                     if let (Some((sx, sy)), Some(blocks)) = (gui.block_tile(*item_id), &gui.blocks)
@@ -399,6 +499,9 @@ impl UiFrame {
                             item_swatch_color(*item_id),
                         );
                     }
+                }
+                UiCommand::GradientRect { rect, top, bottom } => {
+                    gradient_rect(&mut pixels, width, height, scale_rect(*rect, s), *top, *bottom);
                 }
             }
         }
@@ -449,65 +552,6 @@ fn item_swatch_color(id: i16) -> UiColor {
     )
 }
 
-fn gradient_rect(
-    pixels: &mut [u8],
-    width: u32,
-    height: u32,
-    rect: UiRect,
-    top: UiColor,
-    bottom: UiColor,
-) {
-    let x0 = rect.x.max(0) as u32;
-    let y0 = rect.y.max(0) as u32;
-    let x1 = (rect.x + rect.width).clamp(0, width as i32) as u32;
-    let y1 = (rect.y + rect.height).clamp(0, height as i32) as u32;
-    if x0 >= x1 || y0 >= y1 {
-        return;
-    }
-    let h = rect.height.max(1) as u32;
-    let ry0 = rect.y.max(0) as u32;
-    for y in y0..y1 {
-        let row_offset = y - ry0;
-        let a = lerp_u8_fast(top.a, bottom.a, row_offset, h);
-        if a == 0 {
-            continue;
-        }
-        let r = lerp_u8_fast(top.r, bottom.r, row_offset, h);
-        let g = lerp_u8_fast(top.g, bottom.g, row_offset, h);
-        let b = lerp_u8_fast(top.b, bottom.b, row_offset, h);
-        let base = (y * width) as usize * 4;
-        if a == 255 {
-            for x in x0..x1 {
-                let i = base + x as usize * 4;
-                pixels[i] = r;
-                pixels[i + 1] = g;
-                pixels[i + 2] = b;
-                pixels[i + 3] = 255;
-            }
-        } else {
-            let a16 = a as u16;
-            let inv = 255 - a16;
-            let sr = r as u16 * a16;
-            let sg = g as u16 * a16;
-            let sb = b as u16 * a16;
-            for x in x0..x1 {
-                let i = base + x as usize * 4;
-                pixels[i] = ((sr + pixels[i] as u16 * inv) / 255) as u8;
-                pixels[i + 1] = ((sg + pixels[i + 1] as u16 * inv) / 255) as u8;
-                pixels[i + 2] = ((sb + pixels[i + 2] as u16 * inv) / 255) as u8;
-                pixels[i + 3] =
-                    (a16 + pixels[i + 3] as u16 * inv / 255).min(255) as u8;
-            }
-        }
-    }
-}
-
-fn lerp_u8_fast(a: u8, b: u8, num: u32, den: u32) -> u8 {
-    let a = a as i32;
-    let b = b as i32;
-    (a + (b - a) * num as i32 / den.max(1) as i32).clamp(0, 255) as u8
-}
-
 fn fill_rect(pixels: &mut [u8], width: u32, height: u32, rect: UiRect, color: UiColor) {
     let x0 = rect.x.max(0) as u32;
     let y0 = rect.y.max(0) as u32;
@@ -517,6 +561,58 @@ fn fill_rect(pixels: &mut [u8], width: u32, height: u32, rect: UiRect, color: Ui
         for x in x0..x1 {
             blend_pixel(pixels, width, x, y, color);
         }
+    }
+}
+
+/// Vertical gradient (`top` at the top edge → `bottom` at the bottom), alpha-
+/// composited (source-over) onto the buffer — vanilla `drawGradientRect`.
+fn gradient_rect(pixels: &mut [u8], width: u32, height: u32, rect: UiRect, top: UiColor, bottom: UiColor) {
+    let x0 = rect.x.max(0) as u32;
+    let y0 = rect.y.max(0) as u32;
+    let x1 = (rect.x + rect.width).clamp(0, width as i32) as u32;
+    let y1 = (rect.y + rect.height).clamp(0, height as i32) as u32;
+    let span = (rect.height - 1).max(1) as f32;
+    for y in y0..y1 {
+        let t = (y as i32 - rect.y) as f32 / span;
+        let color = UiColor::rgba(
+            lerp_u8(top.r, bottom.r, t),
+            lerp_u8(top.g, bottom.g, t),
+            lerp_u8(top.b, bottom.b, t),
+            lerp_u8(top.a, bottom.a, t),
+        );
+        for x in x0..x1 {
+            composite_pixel(pixels, width, x, y, color);
+        }
+    }
+}
+
+fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
+    (a as f32 + (b as f32 - a as f32) * t.clamp(0.0, 1.0)).round() as u8
+}
+
+/// Source-over composite `src` onto the existing buffer pixel (so a translucent
+/// tooltip border blends over the tooltip's own fill, like vanilla's GL blend).
+fn composite_pixel(pixels: &mut [u8], width: u32, x: u32, y: u32, src: UiColor) {
+    let index = ((y * width + x) * 4) as usize;
+    let sa = src.a as f32 / 255.0;
+    let da = pixels[index + 3] as f32 / 255.0;
+    let out_a = sa + da * (1.0 - sa);
+    if out_a <= 0.0 {
+        return;
+    }
+    for c in 0..3 {
+        let s = src_channel(src, c) as f32;
+        let d = pixels[index + c] as f32;
+        pixels[index + c] = ((s * sa + d * da * (1.0 - sa)) / out_a).round().min(255.0) as u8;
+    }
+    pixels[index + 3] = (out_a * 255.0).round().min(255.0) as u8;
+}
+
+fn src_channel(c: UiColor, i: usize) -> u8 {
+    match i {
+        0 => c.r,
+        1 => c.g,
+        _ => c.b,
     }
 }
 
@@ -610,3 +706,51 @@ fn blend_pixel(pixels: &mut [u8], width: u32, x: u32, y: u32, source: UiColor) {
     pixels[index + 3] = source.a;
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn px(buf: &[u8], width: u32, x: u32, y: u32) -> [u8; 4] {
+        let i = ((y * width + x) * 4) as usize;
+        [buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]
+    }
+
+    #[test]
+    fn gradient_rect_lerps_top_to_bottom_and_composites() {
+        // A 4-px-tall purple gradient over a transparent buffer (pixel_scale 1).
+        let mut frame = UiFrame::new();
+        frame.overlay_gradient_rect(
+            UiRect::new(0, 0, 2, 4),
+            UiColor::rgba(80, 0, 255, 80),
+            UiColor::rgba(40, 0, 127, 80),
+        );
+        let buf = UiFrame::rasterize(frame.overlay_commands(), 2, 4, 1, &GuiAtlas::default());
+        // Over a transparent backdrop the source shows at its own color; the top
+        // row is the start color, the bottom row the (darker/less-blue) end.
+        let top = px(&buf, 2, 0, 0);
+        let bottom = px(&buf, 2, 0, 3);
+        assert_eq!(top, [80, 0, 255, 80]);
+        assert_eq!(bottom, [40, 0, 127, 80]);
+        assert!(bottom[2] < top[2], "blue channel decreases downward");
+    }
+
+    #[test]
+    fn translucent_border_composites_over_the_fill() {
+        // Fill (near-opaque dark purple) then a translucent border on top: the
+        // border must blend with the fill, not the transparent backdrop.
+        let mut frame = UiFrame::new();
+        let bg = UiColor::rgba(16, 0, 16, 240);
+        frame.overlay_gradient_rect(UiRect::new(0, 0, 1, 1), bg, bg);
+        frame.overlay_gradient_rect(
+            UiRect::new(0, 0, 1, 1),
+            UiColor::rgba(80, 0, 255, 80),
+            UiColor::rgba(80, 0, 255, 80),
+        );
+        let buf = UiFrame::rasterize(frame.overlay_commands(), 1, 1, 1, &GuiAtlas::default());
+        let [r, _g, b, a] = px(&buf, 1, 0, 0);
+        // Result sits between the dark fill and the bright purple border.
+        assert!(a > 240, "compositing raises coverage above the fill alpha");
+        assert!(b > 16 && b < 255, "blue blends between fill (16) and border (255)");
+        assert!(r > 16, "red rises from the border contribution");
+    }
+}

@@ -15,6 +15,27 @@ impl ChunkPos {
     }
 }
 
+/// One 16×16×16 section of a chunk column: the chunk grid `(x, z)` plus the
+/// vertical section index `y` (0..16). This is the unit at which terrain is
+/// meshed, uploaded and frustum-culled, so editing one block only rebuilds its
+/// own section instead of the whole 16×256×16 column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SectionPos {
+    pub x: i32,
+    pub y: i32,
+    pub z: i32,
+}
+
+impl SectionPos {
+    pub const fn new(x: i32, y: i32, z: i32) -> Self {
+        Self { x, y, z }
+    }
+
+    pub const fn chunk(&self) -> ChunkPos {
+        ChunkPos::new(self.x, self.z)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ChunkSection {
     y: i32,

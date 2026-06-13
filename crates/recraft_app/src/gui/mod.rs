@@ -46,6 +46,12 @@ pub trait GuiScreen {
         Vec::new()
     }
 
+    /// A middle mouse press (the container screen uses it for the creative
+    /// clone, vanilla mode 3).
+    fn mouse_middle_clicked(&mut self, _x: f64, _y: f64, _ctx: &mut ScreenCtx) -> Vec<GuiAction> {
+        Vec::new()
+    }
+
     /// A mouse-button release. `right` is true for the right button, so a
     /// screen can tell which button ends an in-progress gesture (paint-drag).
     fn mouse_released(
@@ -194,6 +200,76 @@ pub(crate) fn draw_default_background(ui: &mut UiFrame, ctx: &DrawCtx) {
             UiColor::rgba(64, 64, 64, 255),
         );
     }
+}
+
+/// The item tooltip box (vanilla `GuiUtils.drawHoveringText`): the dark
+/// `0xF0100010` fill with a vertical purple-gradient border, anchored to the
+/// right/below the cursor and clamped to the screen. `mx`/`my` and all returned
+/// geometry are physical pixels (the GUI-px constants are scaled by `scale`).
+pub(crate) fn draw_tooltip(
+    ui: &mut UiFrame,
+    lines: &[String],
+    mx: i32,
+    my: i32,
+    screen_w: i32,
+    screen_h: i32,
+    scale: i32,
+) {
+    if lines.is_empty() {
+        return;
+    }
+    const BG: UiColor = UiColor::rgba(16, 0, 16, 240); // 0xF0100010
+    const BORDER_TOP: UiColor = UiColor::rgba(80, 0, 255, 80); // 0x505000FF
+    const BORDER_BOTTOM: UiColor = UiColor::rgba(40, 0, 127, 80); // 0x5028007F
+    const WHITE: UiColor = UiColor::rgba(255, 255, 255, 255);
+
+    let s = scale;
+    let text_w = lines
+        .iter()
+        .map(|l| recraft_render::text_width(l, s))
+        .max()
+        .unwrap_or(0);
+    let n = lines.len() as i32;
+    let mut height = 8 * s;
+    if n > 1 {
+        height += (2 + (n - 1) * 10) * s;
+    }
+    let mut x = mx + 12 * s;
+    let mut y = my - 12 * s;
+    if x + text_w > screen_w {
+        x -= 28 * s + text_w;
+    }
+    if y + height + 6 * s > screen_h {
+        y = screen_h - height - 6 * s;
+    }
+
+    // Dark fill: a center box plus the four 1-px surrounding strips (vanilla
+    // draws them separately to inset the border by one pixel).
+    grad(ui, x - 3 * s, y - 4 * s, x + text_w + 3 * s, y - 3 * s, BG, BG);
+    grad(ui, x - 3 * s, y + height + 3 * s, x + text_w + 3 * s, y + height + 4 * s, BG, BG);
+    grad(ui, x - 3 * s, y - 3 * s, x + text_w + 3 * s, y + height + 3 * s, BG, BG);
+    grad(ui, x - 4 * s, y - 3 * s, x - 3 * s, y + height + 3 * s, BG, BG);
+    grad(ui, x + text_w + 3 * s, y - 3 * s, x + text_w + 4 * s, y + height + 3 * s, BG, BG);
+    // Purple border: gradient down the left/right edges, solid top/bottom.
+    grad(ui, x - 3 * s, y - 3 * s + s, x - 3 * s + s, y + height + 3 * s - s, BORDER_TOP, BORDER_BOTTOM);
+    grad(ui, x + text_w + 2 * s, y - 3 * s + s, x + text_w + 3 * s, y + height + 3 * s - s, BORDER_TOP, BORDER_BOTTOM);
+    grad(ui, x - 3 * s, y - 3 * s, x + text_w + 3 * s, y - 3 * s + s, BORDER_TOP, BORDER_TOP);
+    grad(ui, x - 3 * s, y + height + 2 * s, x + text_w + 3 * s, y + height + 3 * s, BORDER_BOTTOM, BORDER_BOTTOM);
+
+    let mut line_y = y;
+    for (i, line) in lines.iter().enumerate() {
+        ui.overlay_text_shadowed(x, line_y, s, WHITE, line.clone());
+        if i == 0 {
+            line_y += 2 * s;
+        }
+        line_y += 10 * s;
+    }
+}
+
+/// Push an overlay gradient given corner coordinates (vanilla
+/// `drawGradientRect(left, top, right, bottom, …)`).
+fn grad(ui: &mut UiFrame, left: i32, top: i32, right: i32, bottom: i32, c0: UiColor, c1: UiColor) {
+    ui.overlay_gradient_rect(UiRect::new(left, top, right - left, bottom - top), c0, c1);
 }
 
 /// Centered shadowed text at a GUI-pixel y position.

@@ -171,6 +171,9 @@ impl TextureAtlasImage {
         for color in STAINED_COLORS {
             names.push(format!("glass_pane_top_{color}"));
         }
+        // The recessed front face of an extended piston body (the mesher draws it
+        // directly; it is not a per-face entry in any block def).
+        names.push("piston_inner".to_owned());
         // Item sprites (under textures/items/) join the atlas so the
         // first-person item renderer can draw real held items; their atlas
         // names keep the "items/" prefix.
@@ -759,6 +762,117 @@ pub fn load_entity_image(name: &str) -> Option<RgbaImage> {
     load_asset_image(&format!("assets/minecraft/textures/entity/{name}.png"))
 }
 
+/// Side length of the square sky atlas (sun + moon phases + a white star texel).
+pub const SKY_ATLAS_PX: u32 = 128;
+
+/// Sky-atlas UV rect `[u0, v0, u1, v1]` of the sun sprite.
+pub fn sky_sun_rect() -> [f32; 4] {
+    let s = SKY_ATLAS_PX as f32;
+    [0.0, 64.0 / s, 32.0 / s, 96.0 / s]
+}
+
+/// Sky-atlas UV rect `[u0, v0, u1, v1]` of moon phase `0..7` (the 4×2 grid of
+/// `moon_phases.png`, stored in the atlas's top 128×64 band).
+pub fn sky_moon_rect(phase: u32) -> [f32; 4] {
+    let s = SKY_ATLAS_PX as f32;
+    let col = (phase % 4) as f32;
+    let row = ((phase / 4) % 2) as f32;
+    [
+        col * 32.0 / s,
+        row * 32.0 / s,
+        (col + 1.0) * 32.0 / s,
+        (row + 1.0) * 32.0 / s,
+    ]
+}
+
+/// Sky-atlas UV of the opaque-white texel sampled by the (untextured) stars.
+pub fn sky_white_uv() -> [f32; 2] {
+    let s = SKY_ATLAS_PX as f32;
+    [98.0 / s, 66.0 / s]
+}
+
+/// RGBA pixels for the sky atlas: `moon_phases.png` (128×64) in the top band,
+/// `sun.png` (32×32) below it, and a small opaque-white block for star quads.
+/// Missing assets fall back to procedural discs, so it always builds.
+#[derive(Debug, Clone)]
+pub struct SkyAtlasImage {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u8>,
+}
+
+impl SkyAtlasImage {
+    pub fn load_default() -> Self {
+        let mut atlas = RgbaImage::new(SKY_ATLAS_PX, SKY_ATLAS_PX);
+
+        let moon = load_asset_image("assets/minecraft/textures/environment/moon_phases.png")
+            .map(|img| resize_exact(img, 128, 64))
+            .unwrap_or_else(procedural_moon_phases);
+        let _ = atlas.copy_from(&moon, 0, 0);
+
+        let sun = load_asset_image("assets/minecraft/textures/environment/sun.png")
+            .map(|img| resize_exact(img, 32, 32))
+            .unwrap_or_else(|| procedural_disc(32, [255, 245, 160]));
+        let _ = atlas.copy_from(&sun, 0, 64);
+
+        // Opaque-white block the star quads sample (see `sky_white_uv`).
+        for y in 64..72 {
+            for x in 96..104 {
+                atlas.put_pixel(x, y, Rgba([255, 255, 255, 255]));
+            }
+        }
+
+        if load_asset_image("assets/minecraft/textures/environment/sun.png").is_some() {
+            log::info!("loaded sky textures (sun/moon)");
+        } else {
+            log::info!("no sky textures found; using procedural sun/moon");
+        }
+
+        Self {
+            width: SKY_ATLAS_PX,
+            height: SKY_ATLAS_PX,
+            pixels: atlas.into_raw(),
+        }
+    }
+}
+
+fn resize_exact(image: RgbaImage, w: u32, h: u32) -> RgbaImage {
+    if image.dimensions() == (w, h) {
+        image
+    } else {
+        DynamicImage::ImageRgba8(image)
+            .resize_exact(w, h, FilterType::Nearest)
+            .to_rgba8()
+    }
+}
+
+/// A soft filled disc on a transparent tile, for a missing sun/moon texture.
+fn procedural_disc(size: u32, color: [u8; 3]) -> RgbaImage {
+    let r = size as f32 * 0.45;
+    let c = size as f32 / 2.0;
+    RgbaImage::from_fn(size, size, |x, y| {
+        let dx = x as f32 + 0.5 - c;
+        let dy = y as f32 + 0.5 - c;
+        if dx * dx + dy * dy <= r * r {
+            Rgba([color[0], color[1], color[2], 255])
+        } else {
+            Rgba([0, 0, 0, 0])
+        }
+    })
+}
+
+/// Eight gray moon discs across the 4×2 phase grid (procedural fallback).
+fn procedural_moon_phases() -> RgbaImage {
+    let mut image = RgbaImage::new(128, 64);
+    let disc = procedural_disc(32, [200, 200, 210]);
+    for phase in 0..8u32 {
+        let x = (phase % 4) * 32;
+        let y = (phase / 4) * 32;
+        let _ = image.copy_from(&disc, x, y);
+    }
+    image
+}
+
 pub(crate) fn load_asset_image(asset: &str) -> Option<RgbaImage> {
     for path in candidate_asset_paths() {
         let image = if path.is_dir() {
@@ -804,7 +918,7 @@ pub const ENTITY_SLOT_PX: u32 = 64;
 
 /// Number of fixed slots stacked at the top of the entity atlas (one per
 /// [`EntitySlot`], including the trailing guaranteed-white slot).
-pub const ENTITY_SLOT_COUNT: u32 = 10;
+pub const ENTITY_SLOT_COUNT: u32 = 25;
 
 /// Extra 64x64 rows reserved below the fixed slots for per-player downloaded
 /// skins, allocated at runtime by the skin loader.
@@ -846,8 +960,24 @@ pub enum EntitySlot {
     Sheep = 6,
     Chicken = 7,
     Villager = 8,
+    ZombiePigman = 9,
+    Mooshroom = 10,
+    /// Sheep wool overlay (sheep_fur.png), drawn as an inflated second layer.
+    SheepFur = 11,
+    Wolf = 12,
+    Ocelot = 13,
+    Spider = 14,
+    Enderman = 15,
+    Slime = 16,
+    MagmaCube = 17,
+    Squid = 18,
+    Snowman = 19,
+    Bat = 20,
+    Blaze = 21,
+    Ghast = 22,
+    Silverfish = 23,
     /// Guaranteed opaque-white slot sampled by solid-color geometry.
-    White = 9,
+    White = 24,
 }
 
 /// Pixel origin (top-left corner) of an entity atlas slot.
@@ -867,7 +997,7 @@ pub const ENTITY_WHITE_UV: [f32; 2] = [
 /// The 1.8 entity textures loaded into each mob slot, plus the procedural
 /// fallback tint used when the asset is missing. The player slot is handled
 /// separately (normalize_skin / procedural_skin).
-const MOB_SLOT_ASSETS: [(EntitySlot, &str, [u8; 3]); 8] = [
+const MOB_SLOT_ASSETS: [(EntitySlot, &str, [u8; 3]); 23] = [
     (EntitySlot::Zombie, "zombie/zombie", [88, 124, 80]),
     (EntitySlot::Skeleton, "skeleton/skeleton", [192, 192, 192]),
     (EntitySlot::Creeper, "creeper/creeper", [86, 170, 70]),
@@ -876,6 +1006,21 @@ const MOB_SLOT_ASSETS: [(EntitySlot, &str, [u8; 3]); 8] = [
     (EntitySlot::Sheep, "sheep/sheep", [228, 228, 228]),
     (EntitySlot::Chicken, "chicken", [238, 238, 216]),
     (EntitySlot::Villager, "villager/villager", [136, 104, 70]),
+    (EntitySlot::ZombiePigman, "zombie_pigman", [228, 150, 150]),
+    (EntitySlot::Mooshroom, "cow/mooshroom", [160, 40, 40]),
+    (EntitySlot::SheepFur, "sheep/sheep_fur", [228, 228, 228]),
+    (EntitySlot::Wolf, "wolf/wolf", [206, 200, 192]),
+    (EntitySlot::Ocelot, "cat/ocelot", [200, 168, 104]),
+    (EntitySlot::Spider, "spider/spider", [62, 48, 42]),
+    (EntitySlot::Enderman, "enderman/enderman", [22, 22, 30]),
+    (EntitySlot::Slime, "slime/slime", [112, 200, 92]),
+    (EntitySlot::MagmaCube, "slime/magmacube", [180, 70, 30]),
+    (EntitySlot::Squid, "squid", [80, 96, 152]),
+    (EntitySlot::Snowman, "snowman", [228, 236, 240]),
+    (EntitySlot::Bat, "bat", [84, 72, 62]),
+    (EntitySlot::Blaze, "blaze", [232, 170, 40]),
+    (EntitySlot::Ghast, "ghast/ghast", [220, 220, 220]),
+    (EntitySlot::Silverfish, "silverfish", [120, 120, 130]),
 ];
 
 /// RGBA pixels for the entity atlas sampled by the model pass: a vertical
@@ -1197,6 +1342,21 @@ mod tests {
             EntitySlot::Sheep,
             EntitySlot::Chicken,
             EntitySlot::Villager,
+            EntitySlot::ZombiePigman,
+            EntitySlot::Mooshroom,
+            EntitySlot::SheepFur,
+            EntitySlot::Wolf,
+            EntitySlot::Ocelot,
+            EntitySlot::Spider,
+            EntitySlot::Enderman,
+            EntitySlot::Slime,
+            EntitySlot::MagmaCube,
+            EntitySlot::Squid,
+            EntitySlot::Snowman,
+            EntitySlot::Bat,
+            EntitySlot::Blaze,
+            EntitySlot::Ghast,
+            EntitySlot::Silverfish,
             EntitySlot::White,
         ];
         let mut seen = std::collections::HashSet::new();
