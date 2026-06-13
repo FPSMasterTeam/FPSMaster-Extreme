@@ -1,50 +1,73 @@
-//! The survival inventory screen (vanilla `GuiInventory`): draws the 2×2 craft,
-//! armor, main and hotbar slots and drives full slot interaction — pick up,
-//! place, swap, merge, shift-move, number-swap, drop and paint-drag — through
-//! [`GameState`](crate::game::GameState)'s container logic, which predicts the
-//! result locally and emits the matching ClickWindow packets.
+//! The container window screen (vanilla `GuiContainer` and its subclasses):
+//! draws the active [`Container`](crate::container::Container) — the player
+//! inventory (window 0, opened with E) or any server-opened window (chest,
+//! furnace, dispenser, hopper, crafting table, brewing stand, enchanting
+//! table). It renders the per-kind background and slot grid, and drives the
+//! full vanilla slot interaction — pick up, place, swap, merge, shift-move,
+//! number-swap, drop, double-click collect, creative clone and paint-drag —
+//! through [`GameState`](crate::game::GameState), which predicts locally and
+//! emits the matching ClickWindow packets.
+
+use std::time::{Duration, Instant};
 
 use recraft_render::{GuiTexture, UiColor, UiFrame, UiRect};
 use recraft_protocol::v1_8_9::packets::ServerboundPacket;
 use winit::event::{ElementState, KeyEvent};
 use winit::keyboard::{KeyCode, PhysicalKey};
 
+use crate::container::{Container, WindowKind};
+
 use super::ingame::draw_item_icon;
 use super::{DrawCtx, GuiAction, GuiScreen, ScreenCtx};
 
-/// The vanilla survival inventory window is 176×166 px.
-const WINDOW_W: i32 = 176;
-const WINDOW_H: i32 = 166;
+/// Vanilla container title color (`0x404040`, no shadow).
+const TITLE_COLOR: UiColor = UiColor::rgba(64, 64, 64, 255);
 
 #[derive(Default)]
-pub struct GuiInventory {
+pub struct GuiContainer {
     /// Panel origin and GUI scale cached from the last `draw`, so input handlers
     /// (which receive no screen dimensions) can hit-test slots.
     px: i32,
     py: i32,
     scale: i32,
+    /// Last clicked slot + time, for vanilla double-click (mode 6) detection.
+    last_click_slot: i16,
+    last_click_at: Option<Instant>,
 }
 
-impl GuiInventory {
+impl GuiContainer {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// The window-0 slot index under a physical-pixel cursor position, if any.
-    fn slot_at(&self, mouse: (f64, f64)) -> Option<i16> {
+    /// The window slot index under a physical-pixel cursor position, if any.
+    fn slot_at(&self, mouse: (f64, f64), container: &Container) -> Option<i16> {
         if self.scale == 0 {
             return None;
         }
         let (mx, my) = (mouse.0 as i32, mouse.1 as i32);
         let icon = 16 * self.scale;
-        for (slot, sx, sy) in inventory_slot_positions() {
-            let cell_x = self.px + sx * self.scale;
-            let cell_y = self.py + sy * self.scale;
+        for (i, slot) in container.slots().iter().enumerate() {
+            let cell_x = self.px + slot.x * self.scale;
+            let cell_y = self.py + slot.y * self.scale;
             if (cell_x..cell_x + icon).contains(&mx) && (cell_y..cell_y + icon).contains(&my) {
-                return Some(slot as i16);
+                return Some(i as i16);
             }
         }
         None
+    }
+
+    /// Record this click for double-click detection and report whether it was a
+    /// double-click on `slot` (same slot, within 250 ms).
+    fn register_double_click(&mut self, slot: Option<i16>, now: Instant) -> bool {
+        let is_double = slot.is_some()
+            && slot == Some(self.last_click_slot)
+            && self
+                .last_click_at
+                .is_some_and(|t| now.duration_since(t) < Duration::from_millis(250));
+        self.last_click_at = Some(now);
+        self.last_click_slot = slot.unwrap_or(-999);
+        is_double
     }
 }
 
@@ -53,17 +76,18 @@ fn send(packets: Vec<ServerboundPacket>) -> Vec<GuiAction> {
     packets.into_iter().map(GuiAction::SendPacket).collect()
 }
 
-impl GuiScreen for GuiInventory {
+impl GuiScreen for GuiContainer {
     fn draw(&mut self, ui: &mut UiFrame, ctx: &DrawCtx) {
         ui.rect(
             UiRect::new(0, 0, ctx.width, ctx.height),
             UiColor::rgba(16, 16, 16, 160),
         );
         let Some(hud) = ctx.hud else { return };
+        let Some(container) = hud.container else { return };
 
         let scale = ctx.scale;
-        let pw = WINDOW_W * scale;
-        let ph = WINDOW_H * scale;
+        let pw = container.x_size * scale;
+        let ph = container.y_size * scale;
         let px = (ctx.width - pw) / 2;
         let py = (ctx.height - ph) / 2;
         // Cache the layout so the input handlers can map cursor → slot.
@@ -73,25 +97,21 @@ impl GuiScreen for GuiInventory {
 
         // Dark fallback panel behind the texture (readable without assets).
         ui.rect(UiRect::new(px, py, pw, ph), UiColor::rgba(0, 0, 0, 210));
-        ui.image(
-            UiRect::new(px, py, pw, ph),
-            GuiTexture::Inventory,
-            0,
-            0,
-            WINDOW_W as u32,
-            WINDOW_H as u32,
-        );
+        draw_background(ui, container, px, py, scale);
+        draw_progress(ui, container, px, py, scale);
+        draw_titles(ui, container, px, py, scale);
 
         let icon = 16 * scale;
-        let hovered = self.slot_at(ctx.mouse);
-        for (slot, sx, sy) in inventory_slot_positions() {
-            let cell = UiRect::new(px + sx * scale, py + sy * scale, icon, icon);
-            if let Some(Some(item)) = hud.inventory.get(slot) {
-                draw_item_icon(ui, cell, *item, scale.max(2));
+        let hovered = self.slot_at(ctx.mouse, container);
+        for (i, slot) in container.slots().iter().enumerate() {
+            let cell = UiRect::new(px + slot.x * scale, py + slot.y * scale, icon, icon);
+            if let Some(item) = container.slot_item(i, hud.inventory) {
+                draw_item_icon(ui, cell, item, scale.max(2), false);
             }
-            if hovered == Some(slot as i16) {
-                // Vanilla highlights the hovered slot (white at ~50% alpha).
-                ui.rect(cell, UiColor::rgba(255, 255, 255, 128));
+            if hovered == Some(i as i16) {
+                // Vanilla highlights the hovered slot (white at ~50% alpha) —
+                // on the overlay layer so it covers 3D block icons too.
+                ui.overlay_rect(cell, UiColor::rgba(255, 255, 255, 128));
             }
         }
 
@@ -103,61 +123,95 @@ impl GuiScreen for GuiInventory {
                 icon,
                 icon,
             );
-            draw_item_icon(ui, cell, item, scale.max(2));
+            draw_item_icon(ui, cell, item, scale.max(2), true);
+        } else if let Some(slot) = hovered {
+            // Hovering an item with an empty cursor: show the vanilla tooltip.
+            if let Some(item) = container.slot_item(slot as usize, hud.inventory) {
+                let name = recraft_render::item_display_name(item.id, item.damage);
+                super::draw_tooltip(
+                    ui,
+                    &[name],
+                    ctx.mouse.0 as i32,
+                    ctx.mouse.1 as i32,
+                    ctx.width,
+                    ctx.height,
+                    scale,
+                );
+            }
         }
     }
 
     fn mouse_clicked(&mut self, x: f64, y: f64, ctx: &mut ScreenCtx) -> Vec<GuiAction> {
         // Ignore a second button pressed while a paint-drag is in progress
         // (vanilla locks the drag to its owning button).
-        if ctx.game.drag_active() {
+        if ctx.game.container_drag_active() {
             return Vec::new();
         }
-        let slot = self.slot_at((x, y));
+        let slot = slot_under(self, ctx, (x, y));
         if ctx.modifiers.shift_key() {
             return match slot {
-                Some(slot) => send(ctx.game.click_slot(slot, 0, 1)),
+                Some(slot) => send(ctx.game.container_click(slot, 0, 1)),
                 None => Vec::new(),
             };
         }
+        let now = Instant::now();
         if ctx.game.cursor_item().is_some() {
-            // Holding a stack: this may become a paint-drag — defer to release.
-            ctx.game.drag_begin(false);
+            // Holding a stack: a quick second click on the same slot is a
+            // double-click collect (mode 6); otherwise begin a left paint-drag.
+            if self.register_double_click(slot, now) {
+                if let Some(slot) = slot {
+                    return send(ctx.game.container_click(slot, 0, 6));
+                }
+            }
+            ctx.game.container_drag_begin(0);
             if let Some(slot) = slot {
-                ctx.game.drag_add_slot(slot);
+                ctx.game.container_drag_add(slot);
             }
             Vec::new()
         } else {
+            self.register_double_click(slot, now);
+            // -999 (outside the window) with an empty cursor does nothing.
             match slot {
-                Some(slot) => send(ctx.game.click_slot(slot, 0, 0)),
+                Some(slot) => send(ctx.game.container_click(slot, 0, 0)),
                 None => Vec::new(),
             }
         }
     }
 
     fn mouse_right_clicked(&mut self, x: f64, y: f64, ctx: &mut ScreenCtx) -> Vec<GuiAction> {
-        if ctx.game.drag_active() {
+        if ctx.game.container_drag_active() {
             return Vec::new();
         }
-        let slot = self.slot_at((x, y));
+        let slot = slot_under(self, ctx, (x, y));
         if ctx.game.cursor_item().is_some() {
-            ctx.game.drag_begin(true);
+            ctx.game.container_drag_begin(1);
             if let Some(slot) = slot {
-                ctx.game.drag_add_slot(slot);
+                ctx.game.container_drag_add(slot);
             }
             Vec::new()
         } else {
             match slot {
-                Some(slot) => send(ctx.game.click_slot(slot, 1, 0)),
+                Some(slot) => send(ctx.game.container_click(slot, 1, 0)),
                 None => Vec::new(),
             }
         }
     }
 
+    fn mouse_middle_clicked(&mut self, x: f64, y: f64, ctx: &mut ScreenCtx) -> Vec<GuiAction> {
+        // Creative middle-click clone (mode 3); vanilla only sends it in creative.
+        if ctx.game.container_drag_active() || !ctx.game.is_creative() {
+            return Vec::new();
+        }
+        match slot_under(self, ctx, (x, y)) {
+            Some(slot) => send(ctx.game.container_click(slot, 2, 3)),
+            None => Vec::new(),
+        }
+    }
+
     fn mouse_dragged(&mut self, x: f64, y: f64, ctx: &mut ScreenCtx) {
-        if ctx.game.drag_active() {
-            if let Some(slot) = self.slot_at((x, y)) {
-                ctx.game.drag_add_slot(slot);
+        if ctx.game.container_drag_active() {
+            if let Some(slot) = slot_under(self, ctx, (x, y)) {
+                ctx.game.container_drag_add(slot);
             }
         }
     }
@@ -165,17 +219,18 @@ impl GuiScreen for GuiInventory {
     fn mouse_released(&mut self, x: f64, y: f64, right: bool, ctx: &mut ScreenCtx) -> Vec<GuiAction> {
         // Only the button that started the drag may end it; a release of the
         // other button mid-drag is ignored.
-        if !ctx.game.drag_active() || right != ctx.game.drag_is_right() {
+        let owning_right = ctx.game.container_drag_button() == 1;
+        if !ctx.game.container_drag_active() || right != owning_right {
             return Vec::new();
         }
-        if ctx.game.drag_len() > 1 {
-            return send(ctx.game.drag_commit());
+        if ctx.game.container_drag_len() > 1 {
+            return send(ctx.game.container_drag_commit());
         }
         // A drag over a single slot is just a normal click (place / drop).
-        let button = if ctx.game.drag_is_right() { 1 } else { 0 };
-        ctx.game.drag_cancel();
-        let slot = self.slot_at((x, y)).unwrap_or(-999);
-        send(ctx.game.click_slot(slot, button, 0))
+        let button = if owning_right { 1 } else { 0 };
+        ctx.game.container_drag_cancel();
+        let slot = slot_under(self, ctx, (x, y)).unwrap_or(-999);
+        send(ctx.game.container_click(slot, button, 0))
     }
 
     fn key_pressed(&mut self, event: &KeyEvent, ctx: &mut ScreenCtx) -> Vec<GuiAction> {
@@ -187,20 +242,24 @@ impl GuiScreen for GuiInventory {
         };
         match code {
             KeyCode::Escape | KeyCode::KeyE => {
-                let packet = ctx.game.close_inventory();
-                vec![GuiAction::SendPacket(packet), GuiAction::CloseScreen]
+                let mut actions = Vec::new();
+                if let Some(packet) = ctx.game.container_close() {
+                    actions.push(GuiAction::SendPacket(packet));
+                }
+                actions.push(GuiAction::CloseScreen);
+                actions
             }
-            KeyCode::KeyQ => match self.slot_at(ctx.mouse) {
+            KeyCode::KeyQ => match slot_under(self, ctx, ctx.mouse) {
                 Some(slot) => {
                     // Q drops one, Ctrl+Q drops the whole stack.
                     let button = if ctx.modifiers.control_key() { 1 } else { 0 };
-                    send(ctx.game.click_slot(slot, button, 4))
+                    send(ctx.game.container_click(slot, button, 4))
                 }
                 None => Vec::new(),
             },
             _ => match hotbar_digit(code) {
-                Some(hotbar) => match self.slot_at(ctx.mouse) {
-                    Some(slot) => send(ctx.game.click_slot(slot, hotbar, 2)),
+                Some(hotbar) => match slot_under(self, ctx, ctx.mouse) {
+                    Some(slot) => send(ctx.game.container_click(slot, hotbar, 2)),
                     None => Vec::new(),
                 },
                 None => Vec::new(),
@@ -210,6 +269,114 @@ impl GuiScreen for GuiInventory {
 
     fn draws_over_hud(&self) -> bool {
         true
+    }
+}
+
+/// Hit-test a window slot using the cached layout and the active container.
+fn slot_under(screen: &GuiContainer, ctx: &ScreenCtx, mouse: (f64, f64)) -> Option<i16> {
+    let container = ctx.game.open_container()?;
+    screen.slot_at(mouse, container)
+}
+
+/// Blit the window's background texture (the chest is two parts for a variable
+/// row count; every other kind is one full blit), falling back silently to the
+/// dark panel when the texture is missing.
+fn draw_background(ui: &mut UiFrame, container: &Container, px: i32, py: i32, scale: i32) {
+    let (x_size, y_size) = (container.x_size, container.y_size);
+    if let WindowKind::Chest(rows) = container.kind {
+        let rows = rows as i32;
+        let top = rows * 18 + 17;
+        ui.image(
+            UiRect::new(px, py, x_size * scale, top * scale),
+            GuiTexture::Chest,
+            0,
+            0,
+            x_size as u32,
+            top as u32,
+        );
+        ui.image(
+            UiRect::new(px, py + top * scale, x_size * scale, 96 * scale),
+            GuiTexture::Chest,
+            0,
+            126,
+            x_size as u32,
+            96,
+        );
+        return;
+    }
+    let texture = match container.kind {
+        WindowKind::Player => GuiTexture::Inventory,
+        WindowKind::Dispenser => GuiTexture::Dispenser,
+        WindowKind::Hopper => GuiTexture::Hopper,
+        WindowKind::Furnace => GuiTexture::Furnace,
+        WindowKind::Crafting => GuiTexture::CraftingTable,
+        WindowKind::Brewing => GuiTexture::BrewingStand,
+        WindowKind::Enchant => GuiTexture::EnchantingTable,
+        WindowKind::Chest(_) => unreachable!(),
+    };
+    ui.image(
+        UiRect::new(px, py, x_size * scale, y_size * scale),
+        texture,
+        0,
+        0,
+        x_size as u32,
+        y_size as u32,
+    );
+}
+
+/// Window titles (vanilla `drawGuiContainerForegroundLayer`): the container name
+/// top-left, plus the "Inventory" label over the player slots. The player
+/// inventory window draws no title (it is part of `inventory.png`).
+fn draw_titles(ui: &mut UiFrame, container: &Container, px: i32, py: i32, scale: i32) {
+    if container.kind == WindowKind::Player {
+        return;
+    }
+    if !container.title.is_empty() {
+        ui.text(px + 8 * scale, py + 6 * scale, scale, TITLE_COLOR, container.title.clone());
+    }
+    // "Inventory" sits 96 px up from the window bottom (vanilla offset).
+    ui.text(
+        px + 8 * scale,
+        py + (container.y_size - 96 + 2) * scale,
+        scale,
+        TITLE_COLOR,
+        "Inventory",
+    );
+}
+
+/// Progress sprites driven by WindowProperty: the furnace flame + smelt arrow.
+/// (Brewing/enchant overlays are not drawn.)
+fn draw_progress(ui: &mut UiFrame, container: &Container, px: i32, py: i32, scale: i32) {
+    if container.kind != WindowKind::Furnace {
+        return;
+    }
+    let p = container.properties;
+    let burn = p[0] as i32;
+    let burn_total = if p[1] != 0 { p[1] as i32 } else { 200 };
+    if burn > 0 {
+        // Flame fills bottom-up: k px tall (vanilla scales the 13 px sprite).
+        let k = (burn * 13 / burn_total.max(1)).clamp(0, 12);
+        ui.image(
+            UiRect::new(px + 56 * scale, py + (36 + 12 - k) * scale, 14 * scale, (k + 1) * scale),
+            GuiTexture::Furnace,
+            176,
+            (12 - k) as u32,
+            14,
+            (k + 1) as u32,
+        );
+    }
+    let cook = p[2] as i32;
+    let cook_total = p[3] as i32;
+    if cook_total != 0 && cook != 0 {
+        let l = (cook * 24 / cook_total).clamp(0, 24);
+        ui.image(
+            UiRect::new(px + 79 * scale, py + 34 * scale, (l + 1) * scale, 16 * scale),
+            GuiTexture::Furnace,
+            176,
+            14,
+            (l + 1) as u32,
+            16,
+        );
     }
 }
 
@@ -227,31 +394,4 @@ fn hotbar_digit(code: KeyCode) -> Option<i8> {
         KeyCode::Digit9 => 8,
         _ => return None,
     })
-}
-
-/// (inventory slot index, texture x, texture y) for each slot of the survival
-/// inventory window, in `inventory.png` (176×166) pixel coordinates.
-fn inventory_slot_positions() -> Vec<(usize, i32, i32)> {
-    let mut slots = Vec::with_capacity(45);
-    // Armor (5..9): left column.
-    for i in 0..4 {
-        slots.push((5 + i, 8, 8 + i as i32 * 18));
-    }
-    // Crafting 2×2 (1..5) and result (0).
-    for (i, (x, y)) in [(98, 18), (116, 18), (98, 36), (116, 36)]
-        .into_iter()
-        .enumerate()
-    {
-        slots.push((1 + i, x, y));
-    }
-    slots.push((0, 154, 28));
-    // Main inventory (9..36): 3×9 grid.
-    for i in 0..27usize {
-        slots.push((9 + i, 8 + (i % 9) as i32 * 18, 84 + (i / 9) as i32 * 18));
-    }
-    // Hotbar (36..45).
-    for i in 0..9usize {
-        slots.push((36 + i, 8 + i as i32 * 18, 142));
-    }
-    slots
 }

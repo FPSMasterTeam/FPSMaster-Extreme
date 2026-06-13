@@ -1,0 +1,118 @@
+//! Vanilla 1.8.9 sky math: time-of-day → celestial angle, sun/star brightness,
+//! sky/fog colors and the celestial (sun/moon/stars) rotation. Pure functions
+//! ported from `net.minecraft.world.World` so the renderer can drive a faithful
+//! day/night cycle from a single `world_time` (ticks).
+
+use glam::Mat4;
+use std::f32::consts::{FRAC_PI_2, PI, TAU};
+
+/// Base overworld sky color (plains biome `getSkyColorByTemp(0.8)`), the dome
+/// color at full daylight before the celestial dimming factor is applied.
+const BASE_SKY: [f32; 3] = [0.47, 0.655, 1.0];
+
+/// Sun/moon quad half-size and orbit radius (vanilla `renderSky` constants).
+pub const SUN_SIZE: f32 = 30.0;
+pub const MOON_SIZE: f32 = 20.0;
+pub const CELESTIAL_DIST: f32 = 100.0;
+
+/// Vanilla `World.getCelestialAngle`: maps world time to a 0..1 sky rotation,
+/// with the easing that holds the sun a touch longer near the horizon.
+pub fn celestial_angle(time_ticks: f64) -> f32 {
+    let i = time_ticks.rem_euclid(24000.0);
+    let mut f = (i / 24000.0) as f32 - 0.25;
+    if f < 0.0 {
+        f += 1.0;
+    }
+    if f > 1.0 {
+        f -= 1.0;
+    }
+    let f1 = 1.0 - ((f * PI).cos() + 1.0) / 2.0;
+    f + (f1 - f) / 3.0
+}
+
+/// Vanilla `World.getSunBrightness` (clear weather): 0.2 at midnight, 1.0 at
+/// noon. Used as the sky-light scale in the lightmap so caves/torch-lit areas
+/// stay lit while open ground darkens at night.
+pub fn sun_brightness(time_ticks: f64) -> f32 {
+    let angle = celestial_angle(time_ticks);
+    let mut f1 = 1.0 - ((angle * TAU).cos() * 2.0 + 0.5);
+    f1 = f1.clamp(0.0, 1.0);
+    f1 = 1.0 - f1;
+    f1 * 0.8 + 0.2
+}
+
+/// Vanilla `World.getStarBrightness` (clear weather): 0 by day, up to 0.5 at
+/// midnight. Drives the star quads' alpha.
+pub fn star_brightness(time_ticks: f64) -> f32 {
+    let angle = celestial_angle(time_ticks);
+    let mut f1 = 1.0 - ((angle * TAU).cos() * 2.0 + 0.25);
+    f1 = f1.clamp(0.0, 1.0);
+    f1 * f1 * 0.5
+}
+
+/// Vanilla moon phase 0..7 (`World.getMoonPhase`), selecting the tile in
+/// `moon_phases.png`.
+pub fn moon_phase(time_ticks: f64) -> u32 {
+    (time_ticks.div_euclid(24000.0) as i64).rem_euclid(8) as u32
+}
+
+/// The full set of time-dependent sky parameters the renderer needs in one
+/// shot, so a frame computes the celestial math once.
+#[derive(Debug, Clone, Copy)]
+pub struct SkyColors {
+    /// Upper-dome color (vanilla `getSkyColor`): deep blue by day, black at night.
+    pub zenith: [f32; 3],
+    /// Horizon/fog color (vanilla `getFogColor`): lighter, drives the gradient
+    /// near the horizon and the terrain clear color.
+    pub horizon: [f32; 3],
+    /// Sunrise/sunset glow (vanilla `calcSunriseSunsetColors`): rgb + strength;
+    /// strength is 0 away from dawn/dusk.
+    pub sunset: [f32; 4],
+    /// Sky-light scale fed to the world lightmap (== `sun_brightness`).
+    pub sun_brightness: f32,
+    /// Star quad alpha (== `star_brightness`).
+    pub star_brightness: f32,
+}
+
+pub fn sky_colors(time_ticks: f64) -> SkyColors {
+    let angle = celestial_angle(time_ticks);
+    // Celestial dimming factor shared by the sky and fog colors.
+    let f = ((angle * TAU).cos() * 2.0 + 0.5).clamp(0.0, 1.0);
+
+    let zenith = [BASE_SKY[0] * f, BASE_SKY[1] * f, BASE_SKY[2] * f];
+    let horizon = [
+        0.752_941_2 * (f * 0.94 + 0.06),
+        0.847_058_83 * (f * 0.94 + 0.06),
+        1.0 * (f * 0.91 + 0.09),
+    ];
+
+    SkyColors {
+        zenith,
+        horizon,
+        sunset: sunrise_sunset_color(angle),
+        sun_brightness: sun_brightness(time_ticks),
+        star_brightness: star_brightness(time_ticks),
+    }
+}
+
+/// Vanilla `calcSunriseSunsetColors`: an orange horizon glow that fades in only
+/// while the sun is near the horizon. Returns rgb + strength (0 = no glow).
+fn sunrise_sunset_color(angle: f32) -> [f32; 4] {
+    let f1 = (angle * TAU).cos();
+    if !(-0.4..=0.4).contains(&f1) {
+        return [0.0, 0.0, 0.0, 0.0];
+    }
+    let f3 = (f1 / 0.4) * 0.5 + 0.5;
+    let mut f4 = 1.0 - (1.0 - (f3 * PI).sin()) * 0.99;
+    f4 *= f4;
+    [f3 * 0.3 + 0.7, f3 * f3 * 0.7 + 0.2, 0.2, f4]
+}
+
+/// The celestial-sphere rotation for `time_ticks` (vanilla `renderSky`:
+/// `rotate(-90, Y)` then `rotate(angle*360, X)`). Sun/moon/star geometry is
+/// authored in this local frame and transformed by it so the sky wheels east to
+/// west with the day.
+pub fn celestial_rotation(time_ticks: f64) -> Mat4 {
+    let angle = celestial_angle(time_ticks);
+    Mat4::from_rotation_y(-FRAC_PI_2) * Mat4::from_rotation_x(angle * TAU)
+}

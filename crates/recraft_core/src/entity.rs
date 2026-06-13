@@ -29,6 +29,14 @@ pub struct EntityState {
     /// Vanilla `Entity.isInWeb`: set when the post-move box overlapped a cobweb,
     /// consumed at the start of the next move to slow the entity to a crawl.
     pub in_web: bool,
+    /// Vanilla `EntityPlayer.jumpMovementFactor` sprint state: the air-movement
+    /// acceleration lags the sprint flag by one tick because vanilla updates
+    /// `jumpMovementFactor` at the END of `onLivingUpdate` (after the move). So a
+    /// tick's airborne accel uses the PREVIOUS tick's sprint, while the jump
+    /// boost uses the current one. Grim mirrors this split (`lastSprintingForSpeed`
+    /// vs `isSprinting`); without it, a sprint flip mid-air (e.g. brushing a block)
+    /// diverges from the server simulation by ~0.006/tick.
+    pub air_sprinting: bool,
     pub aabb: Aabb,
     /// Position at the start of the current tick, for render interpolation.
     pub previous_position: DVec3,
@@ -87,6 +95,7 @@ impl EntityState {
             on_ground: false,
             collided_horizontally: false,
             in_web: false,
+            air_sprinting: false,
             aabb: Aabb::player_at(position),
             previous_position: position,
             server_position: position,
@@ -111,6 +120,7 @@ impl EntityState {
             on_ground: false,
             collided_horizontally: false,
             in_web: false,
+            air_sprinting: false,
             aabb: Aabb::player_at(DVec3::ZERO),
             previous_position: DVec3::ZERO,
             server_position: DVec3::ZERO,
@@ -155,6 +165,7 @@ impl EntityState {
             on_ground: false,
             collided_horizontally: false,
             in_web: false,
+            air_sprinting: false,
             aabb: Aabb::player_at(position),
             previous_position: position,
             server_position: position,

@@ -63,8 +63,15 @@ impl ItemRenderer {
         // first-person pose. The item-model transforms below follow vanilla's
         // RenderItem order per branch.
         let mut m = first_person_base(view);
-        do_item_used_transformations(&mut m, view.swing_progress);
-        transform_first_person_item(&mut m, view.equip_progress, view.swing_progress);
+        if view.blocking {
+            // Vanilla `EnumAction.BLOCK`: the swing is forced to 0 (no swing
+            // translation), then the sword is canted up to the block pose.
+            transform_first_person_item(&mut m, view.equip_progress, 0.0);
+            do_block_transformations(&mut m);
+        } else {
+            do_item_used_transformations(&mut m, view.swing_progress);
+            transform_first_person_item(&mut m, view.equip_progress, view.swing_progress);
+        }
 
         if (0..256).contains(&item.id) {
             let block = BlockState::new(item.id as u16, (item.damage.max(0) & 15) as u8);
@@ -244,6 +251,15 @@ fn transform_first_person_item(m: &mut Mat4, equip: f32, swing: f32) {
     gl_scale(m, 0.4, 0.4, 0.4);
 }
 
+/// `ItemRenderer` `EnumAction.BLOCK` branch: cant the raised sword into the
+/// vanilla 1.8 blocking pose (applied after `transformFirstPersonItem(_, 0)`).
+fn do_block_transformations(m: &mut Mat4) {
+    gl_translate(m, -0.5, 0.2, 0.0);
+    gl_rotate(m, 30.0, 0.0, 1.0, 0.0);
+    gl_rotate(m, -80.0, 1.0, 0.0, 0.0);
+    gl_rotate(m, 60.0, 0.0, 1.0, 0.0);
+}
+
 /// The 1.8 generated/handheld firstperson display transform
 /// (rotation [0,-135,25], translation [0,4,2]/16, scale 1.7), applied in the
 /// vanilla order: translate, rotate Y, rotate X, rotate Z, scale.
@@ -304,6 +320,7 @@ fn push_quad(
             position: (*corner).into(),
             color,
             uv,
+            light: recraft_render::FULLBRIGHT,
         });
     }
     indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
@@ -488,6 +505,7 @@ mod tests {
             swing_progress: 0.0,
             arm_lag_pitch: 0.0,
             arm_lag_yaw: 0.0,
+            blocking: false,
         }
     }
 

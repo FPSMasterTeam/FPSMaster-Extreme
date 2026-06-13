@@ -21,6 +21,7 @@ use winit::{
 };
 
 use crate::chat::{self, ChatState};
+use crate::container::{max_stack, stackable, Container};
 use crate::item_renderer::DroppedItem;
 use crate::player_list::PlayerList;
 use crate::scoreboard::Scoreboard;
@@ -36,6 +37,21 @@ pub struct MovementSnapshot {
     pub entity_id: i32,
     pub sneaking: bool,
     pub sprinting: bool,
+}
+
+/// One tick's gameplay input intents, set just before [`GameState::tick`] so the
+/// tick turns them into serverbound packets in vanilla `runTick` order — clicks
+/// are resolved BEFORE the move, so a sprint-attack/sword-block slowdown lands on
+/// the same flying packet the action does (what Grim's attack-slow / NoSlow
+/// windows expect).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TickActions {
+    pub slot_select: Option<i32>,
+    pub slot_scroll: i32,
+    pub attack_pressed: bool,
+    pub use_pressed: bool,
+    pub left_held: bool,
+    pub right_held: bool,
 }
 
 #[derive(Default)]
@@ -82,16 +98,10 @@ impl InputState {
             strafe: f32::from(self.left) - f32::from(self.right),
             jump: self.jump,
             sneak: self.sneak,
-            sprint: self.effective_sprinting(),
-            // Flight state is filled in by GameState::tick from capabilities.
+            // `sprint` is set by GameState::tick from the computed sprint state
+            // (the onLivingUpdate logic), not from the raw input.
             ..PlayerInput::default()
         }
-    }
-
-    /// Sprint requires the toggle to be on and the player to be actively pushing
-    /// forward, never while sneaking (mirrors vanilla `moveForward >= 0.8`).
-    fn effective_sprinting(&self) -> bool {
-        self.sprint && self.forward && !self.backward && !self.sneak
     }
 
     /// Clear every held key. Used when the pause menu opens so a key released
@@ -169,6 +179,9 @@ pub struct FirstPersonView {
     /// `rotateWithPlayerRotations` lag rotations, in degrees.
     pub arm_lag_pitch: f32,
     pub arm_lag_yaw: f32,
+    /// Whether the held item is actively in use (sword blocking) — drives the
+    /// vanilla `EnumAction.BLOCK` first-person pose.
+    pub blocking: bool,
 }
 
 /// Standing eye height above the feet, in blocks (vanilla 1.8).
@@ -316,6 +329,13 @@ pub struct GameState {
     previous_player_position: DVec3,
     physics: PlayerPhysics,
     has_sky_light: bool,
+    /// World time of day in ticks (0..24000), driving the day/night sky and
+    /// lightmap. Advanced locally each tick and resynced by S03 TimeUpdate;
+    /// starts at noon until the server reports otherwise.
+    world_time: i64,
+    /// Whether time advances locally (gamerule doDaylightCycle): cleared when
+    /// the server sends a negative `time_of_day`.
+    daylight_cycle: bool,
     joined_game: bool,
     /// Set once the server has sent the initial PlayerPositionLook.
     position_synced: bool,
@@ -342,19 +362,27 @@ pub struct GameState {
     /// Set when health hit 0; cleared on respawn. The UI shows the death screen
     /// and the player must click respawn (vanilla holds a dead player frozen).
     is_dead: bool,
-    /// Player inventory window (window id 0): 45 slots — 0 craft output, 1-4
-    /// crafting, 5-8 armor, 9-35 main, 36-44 hotbar. Synced from the server.
+    /// The shared 45-slot player inventory (window 0): 0 craft output, 1-4
+    /// crafting, 5-8 armor, 9-35 main, 36-44 hotbar. Server-opened windows alias
+    /// its lower 36 slots, exactly like vanilla's `InventoryPlayer`.
     inventory: Vec<Option<SlotItem>>,
-    /// The stack carried on the cursor while an inventory window is open
-    /// (vanilla `inventory.getItemStack()`, the slot -1 item).
+    /// The stack carried on the cursor while a window is open (vanilla
+    /// `inventory.getItemStack()`, the slot -1 item).
     cursor_item: Option<SlotItem>,
-    /// Per-window transaction counter for ClickWindow action numbers.
-    window_action: i16,
-    /// In-progress paint-drag: whether active, the button (false=left even split,
-    /// true=right one-each), and the slots painted so far.
+    /// The currently open window: the player inventory ([`Container::player`],
+    /// opened with E) or a server-opened container (chest/furnace/…). `None`
+    /// means no window is open.
+    open_container: Option<Container>,
+    /// In-progress paint-drag deferred to mouse-release (vanilla sends the
+    /// mode-5 sequence then): the button (0 left even-split, 1 right one-each,
+    /// 2 middle fill) and the window slots painted so far.
     drag_active: bool,
-    drag_right: bool,
+    drag_button: i8,
     drag_slots: Vec<i16>,
+    /// Set when the server opens (S2D) or force-closes (S2E) a window, so the
+    /// host can push/pop the container screen. Drained by `take_window_*`.
+    window_open_pending: bool,
+    window_close_pending: bool,
     creative: bool,
     /// Account UUID per spawned remote entity (players carry it via SpawnPlayer),
     /// linking the entity to its tab-list roster entry for names and skins.
@@ -403,12 +431,34 @@ pub struct GameState {
     selected_slot: i32,
     /// The block currently being mined (survival), with accumulated progress.
     breaking: Option<BreakProgress>,
-    /// Persistent sprint state, vanilla semantics: a sprint can only START on the
-    /// ground; once started it CONTINUES (through a jump) until forward is released,
-    /// the player sneaks, or a horizontal collision occurs. Modeling this (rather
-    /// than recomputing per tick) is what lets a mid-air sprint-cancel and a sprint
-    /// into a block edge stay in sync with the server's movement prediction.
+    /// Vanilla `itemInUse`: the held item is being used right now — set while a
+    /// sword is raised to block (right-mouse held). Drives the block pose and
+    /// the 0.2x movement slowdown, and gates the C07 release packet.
+    using_item: bool,
+    /// Vanilla `Minecraft.leftClickCounter`: a 10-tick lockout after a survival
+    /// left-click that hits nothing — blocks new attacks/digs while it runs.
+    left_click_counter: i32,
+    /// Vanilla `Minecraft.rightClickDelayTimer`: the gap (4 ticks) between
+    /// auto-repeated held right-clicks.
+    right_click_delay_timer: i32,
+    /// Vanilla `PlayerControllerMP.blockHitDelay`: 5-tick pause after a block
+    /// breaks before the next dig may progress.
+    block_hit_delay: i32,
+    /// Vanilla `PlayerControllerMP.currentPlayerItem`: the hotbar slot last
+    /// reported to the server. C09 is sent lazily (syncCurrentPlayItem) on the
+    /// next interaction, not on the slot change itself.
+    current_player_item: i32,
+    /// This tick's input intents, consumed inside `tick` before the move.
+    pending_actions: TickActions,
+    /// Vanilla `isSprinting()`. Recomputed each tick by the `onLivingUpdate`
+    /// sprint logic (start conditions then stop, in that order).
     sprinting: bool,
+    /// Vanilla `sprintToggleTimer`: the 7-tick double-tap-W window.
+    sprint_toggle_timer: i32,
+    /// `movementInput.sneak` / `moveForward` from the previous tick (vanilla's
+    /// `flag1` / `flag2`, read before `updatePlayerMoveState`).
+    prev_sneak: bool,
+    prev_move_forward: f32,
     /// Server-driven abilities (S39); `flying` is also toggled locally.
     capabilities: PlayerCapabilities,
     /// The movementSpeed attribute from S20 (sprint boost excluded); drives
@@ -438,12 +488,31 @@ struct BreakProgress {
     x: i32,
     y: i32,
     z: i32,
+    /// Vanilla `curBlockDamageMP`: accumulated 0..1 break progress.
     progress: f32,
+    /// Per-tick increment (`getPlayerRelativeBlockHardness`).
     per_tick: f32,
+    /// Vanilla `currentItemHittingBlock`: the held stack when the dig began.
+    /// A change (hotbar switch) makes `isHittingPosition` fail → the dig
+    /// restarts, exactly like vanilla.
+    item: Option<SlotItem>,
 }
 
 /// Vanilla arm-swing length in ticks (getArmSwingAnimationEnd, no haste).
 const ARM_SWING_END_TICKS: i32 = 6;
+
+/// 1.8 sword item ids (wood/gold/stone/iron/diamond) — the only items whose
+/// `getItemUseAction` is `BLOCK`, so the only ones that raise to block.
+fn is_sword(id: i16) -> bool {
+    matches!(id, 268 | 283 | 272 | 267 | 276)
+}
+
+/// Whether a held item id is a placeable block (`ItemBlock`), used to decide if
+/// a right-click on a block was consumed by placing (vanilla `onItemUse`). Block
+/// items share the block id range 1..256.
+fn is_block_item(id: i16) -> bool {
+    (1..256).contains(&id)
+}
 
 impl GameState {
     pub fn demo(aspect: f32) -> Self {
@@ -483,6 +552,8 @@ impl GameState {
             player,
             physics: PlayerPhysics::default(),
             has_sky_light: true,
+            world_time: 6000,
+            daylight_cycle: true,
             joined_game: false,
             position_synced: false,
             pending_confirm: false,
@@ -495,10 +566,12 @@ impl GameState {
             is_dead: false,
             inventory: vec![None; 45],
             cursor_item: None,
-            window_action: 0,
+            open_container: None,
             drag_active: false,
-            drag_right: false,
+            drag_button: 0,
             drag_slots: Vec::new(),
+            window_open_pending: false,
+            window_close_pending: false,
             creative: false,
             entity_uuids: std::collections::HashMap::new(),
             entity_items: std::collections::HashMap::new(),
@@ -524,7 +597,16 @@ impl GameState {
             prev_render_arm_yaw: 0.0,
             selected_slot: 0,
             breaking: None,
+            using_item: false,
+            left_click_counter: 0,
+            right_click_delay_timer: 0,
+            block_hit_delay: 0,
+            current_player_item: 0,
+            pending_actions: TickActions::default(),
             sprinting: false,
+            sprint_toggle_timer: 0,
+            prev_sneak: false,
+            prev_move_forward: 0.0,
             capabilities: PlayerCapabilities::default(),
             walk_speed_attribute: 0.1,
             fly_toggle_timer: 0,
@@ -559,21 +641,10 @@ impl GameState {
         self.selected_slot
     }
 
-    /// Select an absolute hotbar slot (0..9). Returns the HeldItemChange packet
-    /// to send when the selection actually changed.
-    pub fn set_selected_slot(&mut self, slot: i32) -> Option<ServerboundPacket> {
-        let slot = slot.clamp(0, 8);
-        if slot == self.selected_slot {
-            return None;
-        }
-        self.selected_slot = slot;
-        Some(ServerboundPacket::HeldItemChange { slot: slot as i16 })
-    }
-
-    /// Scroll the hotbar selection by `delta`, wrapping around the 9 slots.
-    pub fn cycle_slot(&mut self, delta: i32) -> Option<ServerboundPacket> {
-        let next = (self.selected_slot + delta).rem_euclid(9);
-        self.set_selected_slot(next)
+    /// Whether the player is in creative mode (drives middle-click clone and
+    /// the fill paint-drag in container windows).
+    pub fn is_creative(&self) -> bool {
+        self.creative
     }
 
     pub fn set_aspect(&mut self, aspect: f32) {
@@ -651,6 +722,12 @@ impl GameState {
         self.food
     }
 
+    /// World time of day in ticks, interpolated by `tick_alpha` (0..1) for a
+    /// smooth sky between ticks. Drives the renderer's day/night cycle.
+    pub fn world_time(&self, tick_alpha: f32) -> f64 {
+        self.world_time as f64 + (self.daylight_cycle as i32 as f64) * tick_alpha as f64
+    }
+
     /// Experience bar fill, 0..1.
     pub fn xp_bar(&self) -> f32 {
         self.xp_bar
@@ -695,320 +772,222 @@ impl GameState {
         self.cursor_item
     }
 
+    /// The open window (player inventory or a server container), if any. The
+    /// container screen reads its slot layout, kind and properties from this.
+    pub fn open_container(&self) -> Option<&Container> {
+        self.open_container.as_ref()
+    }
+
     /// Whether a paint-drag is in progress (the screen defers the commit to the
     /// mouse release, falling back to a normal click when only one slot painted).
-    pub fn drag_active(&self) -> bool {
+    pub fn container_drag_active(&self) -> bool {
         self.drag_active
     }
 
     /// Number of slots painted in the current drag.
-    pub fn drag_len(&self) -> usize {
+    pub fn container_drag_len(&self) -> usize {
         self.drag_slots.len()
     }
 
-    /// Whether the active drag is the right-button (one-each) variant.
-    pub fn drag_is_right(&self) -> bool {
-        self.drag_right
+    /// The active drag button (0 left even-split, 1 right one-each, 2 middle fill).
+    pub fn container_drag_button(&self) -> i8 {
+        self.drag_button
     }
 
-    // ─── Inventory window interaction (vanilla Container.slotClick) ───────────
+    /// Drain the "server opened a window" / "server force-closed the window"
+    /// signals so the host can push/pop the container screen.
+    pub fn take_window_open(&mut self) -> bool {
+        std::mem::take(&mut self.window_open_pending)
+    }
 
-    /// Click a window-0 slot (mode 0 normal, 1 shift, 2 number-key, 4 drop).
-    /// Applies the optimistic local prediction (vanilla updates the client
-    /// inventory immediately) and returns the ClickWindow packet to send; the
-    /// server confirms or corrects with SetSlot.
-    pub fn click_slot(&mut self, slot: i16, button: i8, mode: i8) -> Vec<ServerboundPacket> {
-        let clicked_item = self.slot_item(slot);
-        self.apply_slot_click(slot, button, mode);
-        let action = self.next_action_number();
-        vec![ServerboundPacket::ClickWindow {
-            window_id: 0,
+    pub fn take_window_close(&mut self) -> bool {
+        std::mem::take(&mut self.window_close_pending)
+    }
+
+    // ─── Window interaction (vanilla Container.slotClick via container.rs) ─────
+
+    /// Open the player inventory window (E key) — vanilla `ContainerPlayer`.
+    pub fn open_player_inventory(&mut self) {
+        self.open_container = Some(Container::player());
+    }
+
+    /// Run a click on the open window through the vanilla `Container.slotClick`
+    /// port: it predicts locally and returns the matching C0E ClickWindow
+    /// packet(s); the server confirms or corrects with SetSlot. `slot` is a
+    /// window slot index, or -999 for outside the window.
+    pub fn container_click(&mut self, slot: i16, button: i8, mode: i8) -> Vec<ServerboundPacket> {
+        let creative = self.creative;
+        let Some(container) = self.open_container.as_mut() else {
+            return Vec::new();
+        };
+        container.window_click(
             slot,
             button,
-            action_number: action,
             mode,
-            clicked_item,
-        }]
+            &mut self.inventory,
+            &mut self.cursor_item,
+            creative,
+        )
     }
 
-    /// Close the player inventory window: clear local drag/cursor state and
-    /// return the CloseWindow packet (the server drops any cursor stack and
-    /// re-syncs slots). Vanilla sends this whenever the inventory screen closes.
-    pub fn close_inventory(&mut self) -> ServerboundPacket {
-        self.drag_cancel();
+    /// Close the open window: clear local drag/cursor state and return the
+    /// CloseWindow packet (the server drops any cursor stack and re-syncs).
+    pub fn container_close(&mut self) -> Option<ServerboundPacket> {
+        self.container_drag_cancel();
         self.cursor_item = None;
-        ServerboundPacket::CloseWindow { window_id: 0 }
+        let container = self.open_container.take()?;
+        Some(ServerboundPacket::CloseWindow {
+            window_id: container.window_id,
+        })
     }
 
-    /// Begin accumulating a paint-drag (local only until [`drag_commit`]).
-    pub fn drag_begin(&mut self, right: bool) {
+    /// Begin accumulating a paint-drag (local only until [`container_drag_commit`]).
+    pub fn container_drag_begin(&mut self, button: i8) {
         if self.cursor_item.is_some() {
             self.drag_active = true;
-            self.drag_right = right;
+            self.drag_button = button;
             self.drag_slots.clear();
         }
     }
 
-    /// Add a slot to the active drag if it is a legal target with room.
-    pub fn drag_add_slot(&mut self, slot: i16) {
-        if !self.drag_active
-            || slot < 0
-            || slot as usize >= self.inventory.len()
-            || self.drag_slots.contains(&slot)
-        {
+    /// Add a window slot to the active drag if it is a legal, not-yet-painted
+    /// target with room (the Container re-checks on commit, as does the server).
+    pub fn container_drag_add(&mut self, slot: i16) {
+        if !self.drag_active || slot < 0 || self.drag_slots.contains(&slot) {
             return;
         }
         let Some(cursor) = self.cursor_item else {
             return;
         };
-        // Can't split across more slots than there are items.
-        if self.drag_slots.len() as u32 >= cursor.count as u32 {
+        let Some(container) = self.open_container.as_ref() else {
+            return;
+        };
+        if slot as usize >= container.slots().len() {
             return;
         }
-        let valid = match self.slot_item(slot) {
+        // Even-split / one-each can't paint more slots than the cursor has items;
+        // fill (middle, creative) has no such cap.
+        if self.drag_button != 2 && self.drag_slots.len() as u32 >= cursor.count as u32 {
+            return;
+        }
+        let valid = match container.slot_item(slot as usize, &self.inventory) {
             None => true,
-            Some(it) => stackable(&it, &cursor) && it.count < max_stack(&cursor),
+            Some(it) => stackable(&it, &cursor) && (it.count) < max_stack(&cursor),
         };
         if valid {
             self.drag_slots.push(slot);
         }
     }
 
-    /// Commit the accumulated drag: distribute the cursor stack across the
-    /// painted slots and return the full vanilla mode-5 ClickWindow sequence
-    /// (start, one per slot, end).
-    pub fn drag_commit(&mut self) -> Vec<ServerboundPacket> {
+    /// Commit the accumulated drag: replay the vanilla mode-5 sequence (start,
+    /// one add per painted slot, end) through the Container, which distributes
+    /// the cursor stack on the end click and yields the ClickWindow packets.
+    pub fn container_drag_commit(&mut self) -> Vec<ServerboundPacket> {
         if !self.drag_active {
             return Vec::new();
         }
-        let slots = std::mem::take(&mut self.drag_slots);
         self.drag_active = false;
-        let right = self.drag_right;
-        let Some(mut cursor) = self.cursor_item else {
+        let button = self.drag_button;
+        let slots = std::mem::take(&mut self.drag_slots);
+        if slots.len() <= 1 {
+            // Not a real paint — the caller falls back to a normal click.
             return Vec::new();
-        };
-
-        let mut packets = vec![self.drag_packet(-999, if right { 4 } else { 0 })];
-        let per = if right {
-            1
-        } else {
-            cursor.count / slots.len().max(1) as u8
-        };
-        let mut placed: u32 = 0;
-        for &s in &slots {
-            packets.push(self.drag_packet(s, if right { 5 } else { 1 }));
-            let existing = match self.slot_item(s) {
-                Some(it) if stackable(&it, &cursor) => it.count,
-                None => 0,
-                _ => continue,
-            };
-            let want = per.min(max_stack(&cursor).saturating_sub(existing));
-            if want == 0 {
-                continue;
-            }
-            self.inventory[s as usize] = Some(SlotItem {
-                count: existing + want,
-                ..cursor
-            });
-            placed += want as u32;
         }
-        packets.push(self.drag_packet(-999, if right { 6 } else { 2 }));
-
-        let left = cursor.count.saturating_sub(placed as u8);
-        cursor.count = left;
-        self.cursor_item = (left > 0).then_some(cursor);
+        let base = button << 2; // mode 0 split / 1 one-each / 2 fill in bits 2-3
+        let mut packets = self.container_click(-999, base, 5);
+        for slot in slots {
+            packets.extend(self.container_click(slot, base | 1, 5));
+        }
+        packets.extend(self.container_click(-999, base | 2, 5));
         packets
     }
 
     /// Abandon the active drag without sending anything (used when a drag
     /// collapses to a single-slot normal click).
-    pub fn drag_cancel(&mut self) {
+    pub fn container_drag_cancel(&mut self) {
         self.drag_active = false;
         self.drag_slots.clear();
-    }
-
-    fn drag_packet(&mut self, slot: i16, button: i8) -> ServerboundPacket {
-        let action = self.next_action_number();
-        ServerboundPacket::ClickWindow {
-            window_id: 0,
-            slot,
-            button,
-            action_number: action,
-            mode: 5,
-            clicked_item: None,
-        }
-    }
-
-    fn next_action_number(&mut self) -> i16 {
-        self.window_action = self.window_action.wrapping_add(1);
-        self.window_action
-    }
-
-    fn slot_item(&self, slot: i16) -> Option<SlotItem> {
-        if (0..self.inventory.len() as i16).contains(&slot) {
-            self.inventory[slot as usize]
-        } else {
-            None
-        }
-    }
-
-    fn apply_slot_click(&mut self, slot: i16, button: i8, mode: i8) {
-        match mode {
-            0 => self.normal_click(slot, button),
-            1 if slot >= 0 => self.shift_click(slot as usize),
-            2 => self.number_swap(slot, button),
-            4 => self.drop_click(slot, button),
-            _ => {}
-        }
-    }
-
-    /// Vanilla normal pick/place/swap/merge on a slot (button 0 left, 1 right),
-    /// or dropping the cursor stack when clicking outside the window (-999).
-    fn normal_click(&mut self, slot: i16, button: i8) {
-        let left = button == 0;
-        if slot < 0 {
-            // Outside the window: drop the cursor stack (whole / one).
-            if let Some(mut cursor) = self.cursor_item {
-                if left {
-                    self.cursor_item = None;
-                } else {
-                    cursor.count -= 1;
-                    self.cursor_item = (cursor.count > 0).then_some(cursor);
-                }
-            }
-            return;
-        }
-        let index = slot as usize;
-        if index >= self.inventory.len() {
-            return;
-        }
-        let mut cursor = self.cursor_item;
-        let mut slot_item = self.inventory[index];
-        match (cursor, slot_item) {
-            (None, None) => {}
-            (None, Some(item)) => {
-                // Pick up: whole stack (left) or the ceil-half (right).
-                let take = if left { item.count } else { item.count.div_ceil(2) };
-                cursor = Some(SlotItem { count: take, ..item });
-                let remain = item.count - take;
-                slot_item = (remain > 0).then_some(SlotItem { count: remain, ..item });
-            }
-            (Some(held), None) => {
-                let put = if left { held.count } else { 1 };
-                slot_item = Some(SlotItem { count: put, ..held });
-                let remain = held.count - put;
-                cursor = (remain > 0).then_some(SlotItem { count: remain, ..held });
-            }
-            (Some(held), Some(item)) => {
-                if stackable(&held, &item) {
-                    let space = max_stack(&item).saturating_sub(item.count);
-                    let move_n = if left { space.min(held.count) } else { space.min(1) };
-                    if move_n > 0 {
-                        slot_item = Some(SlotItem {
-                            count: item.count + move_n,
-                            ..item
-                        });
-                        let remain = held.count - move_n;
-                        cursor = (remain > 0).then_some(SlotItem { count: remain, ..held });
-                    }
-                } else {
-                    // Different items: swap cursor and slot.
-                    std::mem::swap(&mut cursor, &mut slot_item);
-                }
-            }
-        }
-        self.cursor_item = cursor;
-        self.inventory[index] = slot_item;
-    }
-
-    /// Vanilla shift-click quick-move: hotbar↔main, armor/craft→inventory,
-    /// merging into existing stacks first then the first empty slot.
-    fn shift_click(&mut self, from: usize) {
-        if from >= self.inventory.len() {
-            return;
-        }
-        let Some(stack) = self.inventory[from] else {
-            return;
-        };
-        let targets: Vec<usize> = match from {
-            36..=44 => (9..36).collect(),
-            9..=35 => (36..45).collect(),
-            _ => (9..45).collect(),
-        };
-        let mut remaining = stack.count;
-        for &t in &targets {
-            if remaining == 0 {
-                break;
-            }
-            if let Some(item) = self.inventory[t] {
-                if stackable(&item, &stack) {
-                    let space = max_stack(&item).saturating_sub(item.count);
-                    let move_n = space.min(remaining);
-                    self.inventory[t] = Some(SlotItem {
-                        count: item.count + move_n,
-                        ..item
-                    });
-                    remaining -= move_n;
-                }
-            }
-        }
-        for &t in &targets {
-            if remaining == 0 {
-                break;
-            }
-            if self.inventory[t].is_none() {
-                let n = remaining.min(max_stack(&stack));
-                self.inventory[t] = Some(SlotItem { count: n, ..stack });
-                remaining -= n;
-            }
-        }
-        self.inventory[from] = (remaining > 0).then_some(SlotItem {
-            count: remaining,
-            ..stack
-        });
-    }
-
-    /// Number-key (1-9) swap of a slot with the matching hotbar slot.
-    fn number_swap(&mut self, slot: i16, hotbar_button: i8) {
-        if slot < 0 || !(0..9).contains(&hotbar_button) {
-            return;
-        }
-        let a = slot as usize;
-        let b = 36 + hotbar_button as usize;
-        if a < self.inventory.len() && b < self.inventory.len() {
-            self.inventory.swap(a, b);
-        }
-    }
-
-    /// Q-drop from a slot when the cursor is empty (button 0 one, 1 stack).
-    fn drop_click(&mut self, slot: i16, button: i8) {
-        if self.cursor_item.is_some() || slot < 0 {
-            return;
-        }
-        let index = slot as usize;
-        if index >= self.inventory.len() {
-            return;
-        }
-        if let Some(mut item) = self.inventory[index] {
-            if button == 0 {
-                item.count -= 1;
-                self.inventory[index] = (item.count > 0).then_some(item);
-            } else {
-                self.inventory[index] = None;
-            }
-        }
     }
 
     pub fn loaded_chunk_count(&self) -> usize {
         self.world.chunk_count()
     }
 
+    /// Player feet position in world coordinates (vanilla `posX/posY/posZ`),
+    /// for the F3 debug overlay.
+    pub fn player_position(&self) -> DVec3 {
+        self.player.position
+    }
+
+    /// Whether the player is standing on the ground (F3 debug overlay).
+    pub fn player_on_ground(&self) -> bool {
+        self.player.on_ground
+    }
+
+    /// Stage this tick's input intents; [`tick`](Self::tick) consumes them.
+    pub fn set_pending_actions(&mut self, actions: TickActions) {
+        self.pending_actions = actions;
+    }
+
+    /// Turn this tick's input intents into serverbound packets, a 1:1 port of
+    /// the mouse/keybind section of vanilla `Minecraft.runTick`. Called inside
+    /// `tick` BEFORE the move so any state it changes (dig start, sword-block
+    /// item-use, sprint reset on a hit) lands on this tick's flying packet,
+    /// matching vanilla. The timers (left_click_counter / right_click_delay_timer)
+    /// are decremented by the caller just before this, like runTick.
+    fn process_tick_actions(&mut self) -> Vec<ServerboundPacket> {
+        let a = std::mem::take(&mut self.pending_actions);
+        let mut out = Vec::new();
+
+        // Hotbar slot change. Vanilla sets `inventory.currentItem` directly here
+        // and does NOT send C09 — that goes out lazily via syncCurrentPlayItem
+        // inside the next click/dig/use.
+        if let Some(slot) = a.slot_select {
+            self.selected_slot = slot.clamp(0, 8);
+        } else if a.slot_scroll != 0 {
+            self.selected_slot = (self.selected_slot + a.slot_scroll).rem_euclid(9);
+        }
+
+        // `if (isUsingItem()) { ... } else { ... }` — while an item is in use
+        // (sword block), attack/use presses are swallowed; otherwise they drive
+        // clickMouse / rightClickMouse.
+        if self.is_using_item() {
+            if !a.right_held {
+                self.on_stopped_using_item(&mut out);
+            }
+            // attack/use/pick presses are drained (ignored) this tick.
+        } else {
+            if a.attack_pressed {
+                self.click_mouse(&mut out);
+            }
+            if a.use_pressed {
+                self.right_click_mouse(&mut out);
+            }
+            // pick-block: not implemented.
+        }
+
+        // Auto-repeat held right-click every `rightClickDelayTimer` ticks.
+        if a.right_held && self.right_click_delay_timer == 0 && !self.is_using_item() {
+            self.right_click_mouse(&mut out);
+        }
+
+        // Continuous left-click: advance the dig (or cancel it).
+        self.send_click_block_to_controller(a.left_held, &mut out);
+
+        out
+    }
+
     /// Advance one 20 Hz simulation tick, returning the movement to report — or
     /// `None` on the tick right after a teleport, where vanilla emits only the
     /// teleport ack (already sent via [`take_position_confirm`]) and resumes
     /// movement next tick. The caller must not send a movement packet on `None`.
-    pub fn tick(&mut self, dt: f32) -> Option<MovementSnapshot> {
+    pub fn tick(&mut self, dt: f32) -> Option<(Vec<ServerboundPacket>, MovementSnapshot)> {
         self.title.tick();
+        // Advance the day/night clock one tick (vanilla ticks world time forward
+        // locally between server updates), unless daylight cycle is off.
+        if self.daylight_cycle {
+            self.world_time += 1;
+        }
         self.previous_player_position = self.player.position;
         let turn_speed = 110.0 * dt;
         if self.input.turn_left {
@@ -1068,6 +1047,22 @@ impl GameState {
             return None;
         }
 
+        // Vanilla runTick: clickMouse/rightClickMouse run BEFORE onUpdate's move,
+        // resolved against the current look and pre-move position. Refresh the
+        // camera so interaction ray-casts use this tick's look, then turn the
+        // intents into packets — the move below then reflects any sprint reset /
+        // item-use slowdown they triggered. The click timers decrement first,
+        // exactly like `runTick` (rightClickDelayTimer at the top, leftClickCounter
+        // in the mouse section), so a fresh click this tick still sees them run.
+        if self.right_click_delay_timer > 0 {
+            self.right_click_delay_timer -= 1;
+        }
+        if self.left_click_counter > 0 {
+            self.left_click_counter -= 1;
+        }
+        self.update_camera(1.0);
+        let actions = self.process_tick_actions();
+
         // While mounted, the server drives the vehicle and the player rides
         // along: skip walking physics and snap to the vehicle (vanilla
         // `updateRidden`). The player can still look around. Dismount happens
@@ -1085,7 +1080,7 @@ impl GameState {
                 self.world.upsert_entity(self.player.clone());
                 self.advance_view_state();
                 self.update_camera(1.0);
-                return Some(self.movement_snapshot());
+                return Some((actions, self.movement_snapshot()));
             }
         }
 
@@ -1094,29 +1089,66 @@ impl GameState {
         //    not-yet-generated terrain on join.
         let bx = self.player.position.x.floor() as i32;
         let bz = self.player.position.z.floor() as i32;
-        // Update the persistent sprint state at the START of the tick (before the
-        // move), using the PREVIOUS tick's on_ground / collision — exactly like
-        // vanilla EntityPlayerSP.onLivingUpdate. This keeps the simulated movement
-        // and the reported sprint flag in agreement: starting only on the ground
-        // (no mid-air sprint), and stopping the tick after a collision rather than
-        // mid-move (so block edges don't desync the prediction).
-        let wants_sprint =
-            self.input.sprint && self.input.forward && !self.input.backward && !self.input.sneak;
-        self.sprinting = if self.sprinting {
-            wants_sprint && !self.player.collided_horizontally
-        } else {
-            // Vanilla's sprint-key branch has no onGround requirement; keep
-            // the ground gate for normal play but allow starting while flying.
-            wants_sprint
-                && (self.player.on_ground || self.capabilities.flying)
-                && !self.player.collided_horizontally
-        };
+        // Sprint, a 1:1 port of `EntityPlayerSP.onLivingUpdate`. Runs before the
+        // move so the reported flag matches the simulated motion. recraft's
+        // sprint key is a toggle, so `self.input.sprint` stands in for
+        // `keyBindSprint.isKeyDown()`; the double-tap-W path (sprintToggleTimer)
+        // works regardless. (`sprintingTicksLeft` and the blindness potion are
+        // not modelled — neither is set in the 1.8 client / recraft.)
+        if self.sprint_toggle_timer > 0 {
+            self.sprint_toggle_timer -= 1;
+        }
+        let flag1 = self.prev_sneak;
+        let flag2 = self.prev_move_forward >= 0.8;
+        // updatePlayerMoveState: this tick's moveForward (raw ±1, sneak ×0.3).
+        let mut move_forward = (f32::from(self.input.forward) - f32::from(self.input.backward))
+            * if self.input.sneak { 0.3 } else { 1.0 };
+        let sprint_key_down = self.input.sprint;
+        if self.using_item {
+            // Sword block slows the input to 0.2 (below the 0.8 sprint threshold).
+            move_forward *= 0.2;
+            self.sprint_toggle_timer = 0;
+        }
+        let flag3 = self.food > 6 || self.capabilities.allow_flying;
+        // Double-tap-W start (on the ground, on a fresh forward press).
+        if self.player.on_ground
+            && !flag1
+            && !flag2
+            && move_forward >= 0.8
+            && !self.sprinting
+            && flag3
+            && !self.using_item
+        {
+            if self.sprint_toggle_timer <= 0 && !sprint_key_down {
+                self.sprint_toggle_timer = 7;
+            } else {
+                self.sprinting = true;
+            }
+        }
+        // Sprint-key-held start (no onGround requirement, exactly like vanilla).
+        if !self.sprinting && move_forward >= 0.8 && flag3 && !self.using_item && sprint_key_down {
+            self.sprinting = true;
+        }
+        // Stop: forward dropped below 0.8 (release / sneak / block), a wall, or low food.
+        if self.sprinting
+            && (move_forward < 0.8 || self.player.collided_horizontally || !flag3)
+        {
+            self.sprinting = false;
+        }
+        self.prev_sneak = self.input.sneak;
+        self.prev_move_forward = move_forward;
         if self.world.is_block_column_loaded(bx, bz) {
             let mut input = self.input.player_input();
             input.sprint = self.sprinting;
             input.flying = self.capabilities.flying;
             input.fly_speed = self.capabilities.fly_speed;
             input.walk_speed = self.walk_speed_attribute;
+            // Vanilla `EntityPlayerSP.onLivingUpdate`: using an item (sword
+            // blocking) scales movement input to 0.2 — Grim's NoSlow expects it.
+            if self.using_item {
+                input.forward *= 0.2;
+                input.strafe *= 0.2;
+            }
             self.physics.tick(&self.world, &mut self.player, input);
         } else {
             self.player.velocity = DVec3::ZERO;
@@ -1130,7 +1162,7 @@ impl GameState {
         self.world.upsert_entity(self.player.clone());
         self.advance_view_state();
         self.update_camera(1.0);
-        Some(self.movement_snapshot())
+        Some((actions, self.movement_snapshot()))
     }
 
     /// Ease the sneak/sprint view amounts toward their targets, once per tick so
@@ -1375,6 +1407,7 @@ impl GameState {
             swing_progress: self.swing_progress(partial),
             arm_lag_pitch: (self.player.pitch - arm_pitch) * 0.1,
             arm_lag_yaw: (self.player.yaw - arm_yaw) * 0.1,
+            blocking: self.using_item,
         }
     }
 
@@ -1472,114 +1505,236 @@ impl GameState {
         best
     }
 
-    /// Left-mouse press: attack the targeted entity, instantly break the
-    /// targeted block in creative, or begin a timed survival dig. Matches the
-    /// vanilla packet order (UseEntity/PlayerDigging before the swing).
-    pub fn on_attack_press(&mut self) -> Vec<ServerboundPacket> {
-        self.breaking = None;
-        let mut packets = Vec::new();
+    fn is_using_item(&self) -> bool {
+        self.using_item
+    }
+
+    /// Vanilla `EntityPlayerSP.swingItem`: start the local swing animation and
+    /// send the C0A animation packet.
+    fn swing_item(&mut self, out: &mut Vec<ServerboundPacket>) {
+        self.swing_arm();
+        out.push(ServerboundPacket::SwingArm);
+    }
+
+    /// Vanilla `PlayerControllerMP.syncCurrentPlayItem`: send C09 HeldItemChange
+    /// lazily, only when the selected slot differs from what the server was last
+    /// told (called at the start of every action method).
+    fn sync_current_play_item(&mut self, out: &mut Vec<ServerboundPacket>) {
+        if self.selected_slot != self.current_player_item {
+            self.current_player_item = self.selected_slot;
+            out.push(ServerboundPacket::HeldItemChange {
+                slot: self.selected_slot as i16,
+            });
+        }
+    }
+
+    /// Vanilla `Minecraft.clickMouse`: swing, then attack the targeted entity,
+    /// start digging the targeted block, or (on a survival miss) arm the
+    /// 10-tick left-click lockout.
+    fn click_mouse(&mut self, out: &mut Vec<ServerboundPacket>) {
+        if self.left_click_counter > 0 {
+            return;
+        }
+        self.swing_item(out);
         match self.pick_target() {
-            Some(InteractionTarget::Entity { id, .. }) => {
-                self.swing_arm();
-                packets.push(ServerboundPacket::UseEntity {
-                    target: id,
-                    kind: UseEntityKind::Attack,
-                });
-                packets.push(ServerboundPacket::SwingArm);
-            }
+            Some(InteractionTarget::Entity { id, .. }) => self.attack_entity(id, out),
             Some(InteractionTarget::Block { x, y, z, face, .. }) => {
-                if self.creative {
-                    // Creative breaks on StartDestroy alone.
-                    self.swing_arm();
-                    packets.push(ServerboundPacket::PlayerDigging {
-                        status: DiggingStatus::StartDestroy,
-                        x,
-                        y,
-                        z,
-                        face,
-                    });
-                    self.predict_break(x, y, z);
-                    packets.push(ServerboundPacket::SwingArm);
-                } else {
-                    packets.extend(self.begin_break(x, y, z, face));
-                }
+                self.click_block(x, y, z, face, out)
             }
             None => {
-                self.swing_arm();
-                packets.push(ServerboundPacket::SwingArm);
+                if !self.creative {
+                    self.left_click_counter = 10;
+                }
             }
         }
-        packets
     }
 
-    /// Called once per 20 Hz tick while the left mouse is held (survival): keep
-    /// advancing the current dig, finish it when complete, and seamlessly start
-    /// digging the next block when the crosshair moves on (vanilla "hold to
-    /// mine" sweep).
-    pub fn on_attack_hold(&mut self) -> Vec<ServerboundPacket> {
-        let mut packets = Vec::new();
+    /// Vanilla `PlayerControllerMP.attackEntity` + `attackTargetEntityWithCurrentItem`:
+    /// sync held item, send C02 ATTACK, and apply the sprint hit (halve
+    /// horizontal motion + cancel sprint — the w-tap reset; no knockback enchant
+    /// here so it fires exactly when sprinting).
+    fn attack_entity(&mut self, id: i32, out: &mut Vec<ServerboundPacket>) {
+        self.sync_current_play_item(out);
+        out.push(ServerboundPacket::UseEntity {
+            target: id,
+            kind: UseEntityKind::Attack,
+        });
+        if self.sprinting {
+            self.player.velocity.x *= 0.6;
+            self.player.velocity.z *= 0.6;
+            self.sprinting = false;
+        }
+    }
+
+    /// Vanilla `PlayerControllerMP.clickBlock`: begin (or restart) a dig. In
+    /// creative the block breaks immediately; in survival a START is sent (after
+    /// aborting any previous dig on the NEW face) and the hit state is armed
+    /// unless the block breaks instantly.
+    fn click_block(&mut self, x: i32, y: i32, z: i32, face: u8, out: &mut Vec<ServerboundPacket>) {
         if self.creative {
-            return packets;
-        }
-        let target = match self.pick_target() {
-            Some(InteractionTarget::Block { x, y, z, face, .. }) => Some((x, y, z, face)),
-            _ => None,
-        };
-        let current = self.breaking.as_ref().map(|b| (b.x, b.y, b.z));
-        match (current, target) {
-            // Still mining the same block — advance and finish. Vanilla swings the
-            // arm every tick while mining (clickMouse → swingItem each tick), so
-            // every dig packet is paired with an animation; omitting the swing on a
-            // START/FINISH tick trips NoSwingBreak.
-            (Some((bx, by, bz)), Some((x, y, z, face))) if bx == x && by == y && bz == z => {
-                let done = {
-                    let b = self.breaking.as_mut().expect("breaking is Some");
-                    b.progress += b.per_tick;
-                    b.progress >= 1.0
-                };
-                self.swing_arm();
-                packets.push(ServerboundPacket::SwingArm);
-                if done {
-                    packets.push(ServerboundPacket::PlayerDigging {
-                        status: DiggingStatus::FinishDestroy,
-                        x,
-                        y,
-                        z,
-                        face,
-                    });
-                    self.breaking = None;
-                    self.predict_break(x, y, z);
-                }
+            out.push(ServerboundPacket::PlayerDigging {
+                status: DiggingStatus::StartDestroy,
+                x,
+                y,
+                z,
+                face,
+            });
+            // clickBlockCreative → onPlayerDestroyBlock (no packet); a held sword
+            // is the one creative case that does NOT break the block.
+            if !self.held_item().is_some_and(|it| is_sword(it.id)) {
+                self.predict_break(x, y, z);
             }
-            // Crosshair moved off the block being mined — cancel it, then begin
-            // the new target if there is one. Vanilla's resetBlockRemoving always
-            // aborts with EnumFacing.DOWN (face 0); sending the block's real face
-            // makes Grim's PositionBreakB remember it and flag the next dig.
-            (Some((bx, by, bz)), maybe_new) => {
-                packets.push(ServerboundPacket::PlayerDigging {
+            self.block_hit_delay = 5;
+            return;
+        }
+        if !self.is_hitting_position(x, y, z) {
+            if let Some(b) = self.breaking {
+                // Abort the previous dig: vanilla sends the OLD block with the
+                // NEW face here (resetBlockRemoving's face-DOWN is a separate path).
+                out.push(ServerboundPacket::PlayerDigging {
                     status: DiggingStatus::CancelDestroy,
-                    x: bx,
-                    y: by,
-                    z: bz,
-                    face: 0,
+                    x: b.x,
+                    y: b.y,
+                    z: b.z,
+                    face,
                 });
+            }
+            out.push(ServerboundPacket::PlayerDigging {
+                status: DiggingStatus::StartDestroy,
+                x,
+                y,
+                z,
+                face,
+            });
+            let ticks = block_break_ticks(self.world.block_at(x, y, z));
+            if ticks <= 1.0 {
+                // Instant break (hardness ~0): START alone destroys it.
                 self.breaking = None;
-                if let Some((x, y, z, face)) = maybe_new {
-                    packets.extend(self.begin_break(x, y, z, face));
-                }
+                self.predict_break(x, y, z);
+            } else {
+                self.breaking = Some(BreakProgress {
+                    x,
+                    y,
+                    z,
+                    progress: 0.0,
+                    per_tick: 1.0 / ticks,
+                    item: self.held_item(),
+                });
             }
-            // Not mining yet but holding over a block — start it.
-            (None, Some((x, y, z, face))) => {
-                packets.extend(self.begin_break(x, y, z, face));
-            }
-            (None, None) => {}
         }
-        packets
     }
 
-    /// Left-mouse release: cancel any in-progress dig.
-    pub fn on_attack_release(&mut self) -> Vec<ServerboundPacket> {
-        self.cancel_breaking().into_iter().collect()
+    /// Vanilla `PlayerControllerMP.isHittingPosition`: the same cell AND the same
+    /// held item as when the dig began (a hotbar switch fails this → restart).
+    fn is_hitting_position(&self, x: i32, y: i32, z: i32) -> bool {
+        self.breaking
+            .is_some_and(|b| b.x == x && b.y == y && b.z == z && b.item == self.held_item())
+    }
+
+    /// Vanilla `PlayerControllerMP.onPlayerDamageBlock`: advance the held dig.
+    /// Returns whether the dig is "live" this tick (so the caller swings).
+    fn on_player_damage_block(
+        &mut self,
+        x: i32,
+        y: i32,
+        z: i32,
+        face: u8,
+        out: &mut Vec<ServerboundPacket>,
+    ) -> bool {
+        self.sync_current_play_item(out);
+        if self.block_hit_delay > 0 {
+            self.block_hit_delay -= 1;
+            return true;
+        }
+        if self.creative {
+            self.block_hit_delay = 5;
+            out.push(ServerboundPacket::PlayerDigging {
+                status: DiggingStatus::StartDestroy,
+                x,
+                y,
+                z,
+                face,
+            });
+            if !self.held_item().is_some_and(|it| is_sword(it.id)) {
+                self.predict_break(x, y, z);
+            }
+            return true;
+        }
+        if self.is_hitting_position(x, y, z) {
+            if self.world.block_at(x, y, z).is_air() {
+                self.breaking = None;
+                return false;
+            }
+            let done = {
+                let b = self.breaking.as_mut().expect("hitting position");
+                b.progress += b.per_tick;
+                b.progress >= 1.0
+            };
+            if done {
+                self.breaking = None;
+                out.push(ServerboundPacket::PlayerDigging {
+                    status: DiggingStatus::FinishDestroy,
+                    x,
+                    y,
+                    z,
+                    face,
+                });
+                self.predict_break(x, y, z);
+                self.block_hit_delay = 5;
+            }
+            true
+        } else {
+            self.click_block(x, y, z, face, out);
+            true
+        }
+    }
+
+    /// Vanilla `PlayerControllerMP.resetBlockRemoving`: abort an in-progress dig
+    /// with `EnumFacing.DOWN` (face 0).
+    fn reset_block_removing(&mut self, out: &mut Vec<ServerboundPacket>) {
+        if let Some(b) = self.breaking.take() {
+            out.push(ServerboundPacket::PlayerDigging {
+                status: DiggingStatus::CancelDestroy,
+                x: b.x,
+                y: b.y,
+                z: b.z,
+                face: 0,
+            });
+        }
+    }
+
+    /// Vanilla `Minecraft.sendClickBlockToController`: called every tick with
+    /// whether the attack key is held. Advances the dig (and swings) while held
+    /// over a block; otherwise resets the block-removing state.
+    fn send_click_block_to_controller(
+        &mut self,
+        left_click: bool,
+        out: &mut Vec<ServerboundPacket>,
+    ) {
+        if !left_click {
+            self.left_click_counter = 0;
+        }
+        if self.left_click_counter <= 0 && !self.is_using_item() {
+            let block = if left_click {
+                match self.pick_target() {
+                    Some(InteractionTarget::Block { x, y, z, face, .. })
+                        if !self.world.block_at(x, y, z).is_air() =>
+                    {
+                        Some((x, y, z, face))
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            if let Some((x, y, z, face)) = block {
+                if self.on_player_damage_block(x, y, z, face, out) {
+                    self.swing_item(out);
+                }
+            } else {
+                self.reset_block_removing(out);
+            }
+        }
     }
 
     /// Cancel an in-progress dig (e.g. on release or when leaving the game
@@ -1595,35 +1750,6 @@ impl GameState {
                 // Vanilla resetBlockRemoving aborts with EnumFacing.DOWN (face 0).
                 face: 0,
             })
-    }
-
-    /// Begin a survival dig on the block, sending StartDestroy + a swing and
-    /// arming the per-tick progress (instant for hardness-0 / unbreakable blocks
-    /// are simply not tracked).
-    fn begin_break(&mut self, x: i32, y: i32, z: i32, face: u8) -> Vec<ServerboundPacket> {
-        self.swing_arm();
-        let ticks = block_break_ticks(self.world.block_at(x, y, z));
-        self.breaking = if ticks.is_finite() {
-            Some(BreakProgress {
-                x,
-                y,
-                z,
-                progress: 0.0,
-                per_tick: 1.0 / ticks.max(1.0),
-            })
-        } else {
-            None
-        };
-        vec![
-            ServerboundPacket::PlayerDigging {
-                status: DiggingStatus::StartDestroy,
-                x,
-                y,
-                z,
-                face,
-            },
-            ServerboundPacket::SwingArm,
-        ]
     }
 
     /// Locally clear a just-broken block so the crosshair stops targeting it
@@ -1708,13 +1834,25 @@ impl GameState {
         })
     }
 
-    /// Right-click: interact with the targeted entity (InteractAt then Interact)
-    /// or place against the targeted block, then swing.
-    pub fn on_use(&mut self) -> Vec<ServerboundPacket> {
-        let mut packets = Vec::new();
+    /// Vanilla `Minecraft.rightClickMouse`: gated by `!getIsHittingBlock()` (no
+    /// place/use while a dig is open). Tries the targeted entity, then a block
+    /// place/activate; if nothing consumes the click, uses the held item — for a
+    /// sword that raises it to block.
+    #[allow(clippy::collapsible_match)] // the inner `if` has side effects; a guard would be worse
+    fn right_click_mouse(&mut self, out: &mut Vec<ServerboundPacket>) {
+        if self.breaking.is_some() {
+            return;
+        }
+        self.right_click_delay_timer = 4;
+        let mut flag = true;
         match self.pick_target() {
             Some(InteractionTarget::Entity { id, cursor }) => {
-                packets.push(ServerboundPacket::UseEntity {
+                // isPlayerRightClickingOnEntity (InteractAt) then
+                // interactWithEntitySendPacket (Interact); both return false for
+                // a player target, so `flag` stays true and we fall through to
+                // sendUseItem (a sword still blocks while aiming at a player).
+                self.sync_current_play_item(out);
+                out.push(ServerboundPacket::UseEntity {
                     target: id,
                     kind: UseEntityKind::InteractAt {
                         x: cursor[0],
@@ -1722,12 +1860,11 @@ impl GameState {
                         z: cursor[2],
                     },
                 });
-                packets.push(ServerboundPacket::UseEntity {
+                self.sync_current_play_item(out);
+                out.push(ServerboundPacket::UseEntity {
                     target: id,
                     kind: UseEntityKind::Interact,
                 });
-                self.swing_arm();
-                packets.push(ServerboundPacket::SwingArm);
             }
             Some(InteractionTarget::Block {
                 x,
@@ -1738,30 +1875,104 @@ impl GameState {
                 cursor_y,
                 cursor_z,
             }) => {
-                // 1.8 C08 carries the held stack (not an empty slot); the server
-                // and anti-cheat expect to see what the hand was holding.
-                let held = self.held_item();
-                packets.push(ServerboundPacket::PlayerBlockPlacement {
-                    x,
-                    y,
-                    z,
-                    face,
-                    held_item: held.map(|it| HeldItem {
-                        id: it.id,
-                        count: it.count,
-                        damage: it.damage,
-                    }),
-                    cursor_x,
-                    cursor_y,
-                    cursor_z,
-                });
-                self.swing_arm();
-                packets.push(ServerboundPacket::SwingArm);
-                self.predict_placement(x, y, z, face, cursor_y, held);
+                if self.on_player_right_click(x, y, z, face, cursor_x, cursor_y, cursor_z, out) {
+                    flag = false;
+                    self.swing_item(out);
+                }
             }
             None => {}
         }
-        packets
+        if flag && self.held_item().is_some() {
+            self.send_use_item(out);
+        }
+    }
+
+    /// Vanilla `PlayerControllerMP.onPlayerRightClick`: sync the held item, send
+    /// the C08 block placement, and return whether the click was consumed —
+    /// `true` if the block activated or a block item placed, `false` for a
+    /// sword/tool/empty hand (the caller then falls through to sendUseItem).
+    #[allow(clippy::too_many_arguments)]
+    fn on_player_right_click(
+        &mut self,
+        x: i32,
+        y: i32,
+        z: i32,
+        face: u8,
+        cursor_x: u8,
+        cursor_y: u8,
+        cursor_z: u8,
+        out: &mut Vec<ServerboundPacket>,
+    ) -> bool {
+        self.sync_current_play_item(out);
+        let held = self.held_item();
+        // onBlockActivated: an interactable block opens unless sneaking with an item.
+        let activated =
+            (!self.input.sneak || held.is_none()) && is_interactable(self.world.block_at(x, y, z));
+        out.push(ServerboundPacket::PlayerBlockPlacement {
+            x,
+            y,
+            z,
+            face,
+            held_item: held.map(|it| HeldItem {
+                id: it.id,
+                count: it.count,
+                damage: it.damage,
+            }),
+            cursor_x,
+            cursor_y,
+            cursor_z,
+        });
+        if activated {
+            return true;
+        }
+        // onItemUse: a block item places (and is consumed); other items don't.
+        match held {
+            Some(item) if is_block_item(item.id) => {
+                self.predict_placement(x, y, z, face, cursor_y, held);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Vanilla `PlayerControllerMP.sendUseItem`: send the in-air C08 placement
+    /// (position -1,-1,-1 / face 255 carrying the held stack) and enter the
+    /// item's use action — a sword raises to block.
+    fn send_use_item(&mut self, out: &mut Vec<ServerboundPacket>) {
+        self.sync_current_play_item(out);
+        let held = self.held_item();
+        out.push(ServerboundPacket::PlayerBlockPlacement {
+            x: -1,
+            y: -1,
+            z: -1,
+            face: 255,
+            held_item: held.map(|it| HeldItem {
+                id: it.id,
+                count: it.count,
+                damage: it.damage,
+            }),
+            cursor_x: 0,
+            cursor_y: 0,
+            cursor_z: 0,
+        });
+        // useItemRightClick: only a sword (EnumAction.BLOCK) enters the use state.
+        if held.is_some_and(|it| is_sword(it.id)) {
+            self.using_item = true;
+        }
+    }
+
+    /// Vanilla `PlayerControllerMP.onStoppedUsingItem`: send C07 RELEASE_USE_ITEM
+    /// (after syncing the held item) and clear the use state (sword lowers).
+    fn on_stopped_using_item(&mut self, out: &mut Vec<ServerboundPacket>) {
+        self.sync_current_play_item(out);
+        out.push(ServerboundPacket::PlayerDigging {
+            status: DiggingStatus::ReleaseUseItem,
+            x: 0,
+            y: 0,
+            z: 0,
+            face: 0,
+        });
+        self.using_item = false;
     }
 
     /// One-line diagnostic of the local player's physics state and the block it
@@ -2069,6 +2280,48 @@ impl GameState {
                 }
                 false
             }
+            ClientboundPlayPacket::OpenWindow {
+                window_id,
+                inventory_type,
+                title,
+                slots,
+                ..
+            } => {
+                // Replace any prior window and ask the host to push the screen.
+                let title = chat::flatten_chat_json(&title);
+                self.open_container = Some(Container::open(
+                    window_id,
+                    &inventory_type,
+                    title,
+                    slots as usize,
+                ));
+                self.container_drag_cancel();
+                self.window_open_pending = true;
+                false
+            }
+            ClientboundPlayPacket::CloseWindowS { window_id } => {
+                // Server force-close: drop the window and signal the host to pop
+                // the screen (vanilla closes without echoing a C0D back).
+                if self.open_container.as_ref().is_some_and(|c| c.window_id == window_id) {
+                    self.open_container = None;
+                    self.cursor_item = None;
+                    self.container_drag_cancel();
+                    self.window_close_pending = true;
+                }
+                false
+            }
+            ClientboundPlayPacket::WindowProperty {
+                window_id,
+                property,
+                value,
+            } => {
+                if let Some(container) = self.open_container.as_mut() {
+                    if container.window_id == window_id {
+                        container.set_property(property, value);
+                    }
+                }
+                false
+            }
             ClientboundPlayPacket::SetSlot {
                 window_id,
                 slot,
@@ -2077,13 +2330,27 @@ impl GameState {
                 // Window -1 slot -1 is the cursor stack (vanilla `setItemStack`).
                 if window_id == -1 && slot == -1 {
                     self.cursor_item = item;
+                } else if let Some(container) = self
+                    .open_container
+                    .as_mut()
+                    .filter(|c| c.window_id as i8 == window_id)
+                {
+                    container.apply_set_slot(slot, item, &mut self.inventory);
                 } else if window_id == 0 && (0..self.inventory.len() as i16).contains(&slot) {
+                    // No matching window open: the server still syncs the player
+                    // inventory directly (item pickups, hotbar updates, …).
                     self.inventory[slot as usize] = item;
                 }
                 false
             }
             ClientboundPlayPacket::WindowItems { window_id, items } => {
-                if window_id == 0 {
+                if let Some(container) = self
+                    .open_container
+                    .as_mut()
+                    .filter(|c| c.window_id == window_id)
+                {
+                    container.apply_window_items(items, &mut self.inventory);
+                } else if window_id == 0 {
                     self.inventory = items;
                     self.inventory.resize(45, None);
                 }
@@ -2241,6 +2508,13 @@ impl GameState {
                 metadata,
             } => {
                 self.apply_entity_metadata(entity_id, &metadata);
+                false
+            }
+            ClientboundPlayPacket::TimeUpdate { time_of_day, .. } => {
+                // A negative time means a fixed sky (doDaylightCycle off); its
+                // magnitude is the actual time of day.
+                self.daylight_cycle = time_of_day >= 0;
+                self.world_time = time_of_day.abs();
                 false
             }
             // Parsed in P0; handlers land in later phases (dropped items P3).
@@ -2508,44 +2782,6 @@ fn to_render_vec3(position: DVec3) -> Vec3 {
 
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
-}
-
-/// Two stacks merge only when the item id and damage match. NBT is not modeled
-/// (`SlotItem` drops it), so enchanted/named items may over-merge until the
-/// server corrects with a SetSlot.
-fn stackable(a: &SlotItem, b: &SlotItem) -> bool {
-    a.id == b.id && a.damage == b.damage
-}
-
-/// Vanilla maximum stack size, simplified: equipment (tools, weapons, armor,
-/// bow, shears, fishing rod, buckets) caps at 1; everything else at 64. The
-/// server authoritatively corrects any mis-stack the prediction makes.
-fn max_stack(item: &SlotItem) -> u8 {
-    if is_non_stackable(item.id) {
-        1
-    } else {
-        64
-    }
-}
-
-/// Whether a 1.8 item id has a maximum stack size of 1 (the common equipment).
-fn is_non_stackable(id: i16) -> bool {
-    matches!(
-        id,
-        256 | 257 | 258 | 259  // iron shovel/pickaxe/axe, flint & steel
-            | 261              // bow
-            | 267              // iron sword
-            | 268..=279        // wood/stone/diamond tool sets
-            | 283..=286        // gold tools
-            | 290..=294        // hoes
-            | 298..=317        // armor (leather → diamond)
-            | 325..=327        // bucket, water bucket, lava bucket
-            | 329              // saddle
-            | 333              // boat
-            | 346              // fishing rod
-            | 359              // shears
-            | 373              // potion
-    )
 }
 
 /// Number of 20 Hz ticks to break a block by hand in survival, matching vanilla's
@@ -2941,14 +3177,45 @@ mod interaction_tests {
         }
     }
 
+    /// Stage `a` and run the vanilla runTick input section (the real path).
+    fn act(gs: &mut GameState, a: TickActions) -> Vec<ServerboundPacket> {
+        gs.set_pending_actions(a);
+        gs.process_tick_actions()
+    }
+
+    /// A left-click press (attack held).
+    fn attack(gs: &mut GameState) -> Vec<ServerboundPacket> {
+        act(
+            gs,
+            TickActions {
+                attack_pressed: true,
+                left_held: true,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// A right-click press (use held).
+    fn use_item(gs: &mut GameState) -> Vec<ServerboundPacket> {
+        act(
+            gs,
+            TickActions {
+                use_pressed: true,
+                right_held: true,
+                ..Default::default()
+            },
+        )
+    }
+
     #[test]
     fn left_click_picks_up_then_places_a_stack() {
         let mut g = GameState::empty_for_server(1.0);
+        g.open_player_inventory();
         g.inventory[9] = Some(item(1, 64));
-        g.click_slot(9, 0, 0);
+        g.container_click(9, 0, 0);
         assert_eq!(g.cursor_item, Some(item(1, 64)));
         assert_eq!(g.inventory[9], None);
-        g.click_slot(10, 0, 0);
+        g.container_click(10, 0, 0);
         assert_eq!(g.cursor_item, None);
         assert_eq!(g.inventory[10], Some(item(1, 64)));
     }
@@ -2956,8 +3223,9 @@ mod interaction_tests {
     #[test]
     fn right_click_takes_the_ceil_half() {
         let mut g = GameState::empty_for_server(1.0);
+        g.open_player_inventory();
         g.inventory[9] = Some(item(1, 9));
-        g.click_slot(9, 1, 0);
+        g.container_click(9, 1, 0);
         assert_eq!(g.cursor_item, Some(item(1, 5)));
         assert_eq!(g.inventory[9], Some(item(1, 4)));
     }
@@ -2965,9 +3233,10 @@ mod interaction_tests {
     #[test]
     fn left_click_merges_up_to_the_max_stack() {
         let mut g = GameState::empty_for_server(1.0);
+        g.open_player_inventory();
         g.inventory[9] = Some(item(1, 60));
         g.cursor_item = Some(item(1, 20));
-        g.click_slot(9, 0, 0);
+        g.container_click(9, 0, 0);
         assert_eq!(g.inventory[9], Some(item(1, 64)));
         assert_eq!(g.cursor_item, Some(item(1, 16)));
     }
@@ -2975,9 +3244,10 @@ mod interaction_tests {
     #[test]
     fn different_items_swap_on_click() {
         let mut g = GameState::empty_for_server(1.0);
+        g.open_player_inventory();
         g.inventory[9] = Some(item(1, 10));
         g.cursor_item = Some(item(5, 3));
-        g.click_slot(9, 0, 0);
+        g.container_click(9, 0, 0);
         assert_eq!(g.inventory[9], Some(item(5, 3)));
         assert_eq!(g.cursor_item, Some(item(1, 10)));
     }
@@ -2985,8 +3255,9 @@ mod interaction_tests {
     #[test]
     fn shift_click_moves_a_hotbar_stack_into_the_main_inventory() {
         let mut g = GameState::empty_for_server(1.0);
+        g.open_player_inventory();
         g.inventory[36] = Some(item(1, 10));
-        let packets = g.click_slot(36, 0, 1);
+        let packets = g.container_click(36, 0, 1);
         assert_eq!(g.inventory[36], None);
         assert_eq!(g.inventory[9], Some(item(1, 10)));
         assert!(matches!(
@@ -2998,24 +3269,26 @@ mod interaction_tests {
     #[test]
     fn q_drops_one_outside_click_drops_the_cursor() {
         let mut g = GameState::empty_for_server(1.0);
+        g.open_player_inventory();
         g.inventory[9] = Some(item(1, 3));
-        g.click_slot(9, 0, 4); // Q
+        g.container_click(9, 0, 4); // Q
         assert_eq!(g.inventory[9], Some(item(1, 2)));
         // Outside-window click drops the cursor stack.
         g.cursor_item = Some(item(2, 5));
-        g.click_slot(-999, 0, 0);
+        g.container_click(-999, 0, 0);
         assert_eq!(g.cursor_item, None);
     }
 
     #[test]
     fn left_paint_drag_even_splits_across_painted_slots() {
         let mut g = GameState::empty_for_server(1.0);
+        g.open_player_inventory();
         g.cursor_item = Some(item(1, 6));
-        g.drag_begin(false);
-        g.drag_add_slot(9);
-        g.drag_add_slot(10);
-        g.drag_add_slot(11);
-        let packets = g.drag_commit();
+        g.container_drag_begin(0);
+        g.container_drag_add(9);
+        g.container_drag_add(10);
+        g.container_drag_add(11);
+        let packets = g.container_drag_commit();
         assert_eq!(g.inventory[9], Some(item(1, 2)));
         assert_eq!(g.inventory[10], Some(item(1, 2)));
         assert_eq!(g.inventory[11], Some(item(1, 2)));
@@ -3063,11 +3336,58 @@ mod interaction_tests {
     }
 
     #[test]
+    fn server_window_opens_routes_slots_and_closes() {
+        let mut g = GameState::empty_for_server(1.0);
+        // S2D opens a single chest (27 slots); the host is signalled to show it.
+        g.apply_play_packet(ClientboundPlayPacket::OpenWindow {
+            window_id: 5,
+            inventory_type: "minecraft:chest".to_owned(),
+            title: "{\"text\":\"Chest\"}".to_owned(),
+            slots: 27,
+            entity_id: None,
+        });
+        assert!(g.take_window_open());
+        assert!(g.open_container().is_some());
+
+        // S30 WindowItems replaces the whole window (27 chest + 36 player).
+        g.apply_play_packet(ClientboundPlayPacket::WindowItems {
+            window_id: 5,
+            items: vec![None; 63],
+        });
+        // S2F SetSlot for a chest slot routes through the container.
+        g.apply_play_packet(ClientboundPlayPacket::SetSlot {
+            window_id: 5,
+            slot: 0,
+            item: Some(item(1, 10)),
+        });
+        assert_eq!(
+            g.open_container().unwrap().slot_item(0, g.inventory_slots()),
+            Some(item(1, 10))
+        );
+
+        // Shift-click moves the chest stack into the player inventory (reverse
+        // fill → last hotbar slot, window slot 62 == inventory slot 44).
+        let packets = g.container_click(0, 0, 1);
+        assert!(matches!(
+            packets[0],
+            ServerboundPacket::ClickWindow { window_id: 5, slot: 0, mode: 1, .. }
+        ));
+        assert_eq!(g.open_container().unwrap().slot_item(0, g.inventory_slots()), None);
+        assert_eq!(g.inventory[44], Some(item(1, 10)));
+
+        // S2E force-close drops the window and signals the host to pop the screen.
+        g.apply_play_packet(ClientboundPlayPacket::CloseWindowS { window_id: 5 });
+        assert!(g.take_window_close());
+        assert!(g.open_container().is_none());
+    }
+
+    #[test]
     fn number_key_swaps_with_the_hotbar_slot() {
         let mut g = GameState::empty_for_server(1.0);
+        g.open_player_inventory();
         g.inventory[9] = Some(item(1, 5));
         g.inventory[36] = Some(item(2, 1));
-        g.click_slot(9, 0, 2); // press "1" over slot 9
+        g.container_click(9, 0, 2); // press "1" over slot 9
         assert_eq!(g.inventory[9], Some(item(2, 1)));
         assert_eq!(g.inventory[36], Some(item(1, 5)));
     }
@@ -3111,7 +3431,146 @@ mod interaction_tests {
     }
 
     #[test]
-    fn attack_entity_sends_use_entity_then_swing() {
+    fn sword_right_click_air_starts_and_releases_blocking() {
+        let mut gs = looking_along_x();
+        // Diamond sword in the selected hotbar slot, aiming at empty air.
+        gs.inventory[36] = Some(SlotItem {
+            id: 276,
+            count: 1,
+            damage: 0,
+        });
+        // Vanilla `sendUseItem`: C08 with the in-air position (-1,-1,-1)/face 255.
+        let start = use_item(&mut gs);
+        assert!(
+            matches!(
+                start.as_slice(),
+                [ServerboundPacket::PlayerBlockPlacement {
+                    x: -1,
+                    y: -1,
+                    z: -1,
+                    face: 255,
+                    ..
+                }]
+            ),
+            "got {start:?}"
+        );
+        assert!(gs.using_item);
+        // Holding keeps the item in use without re-sending anything.
+        assert!(act(
+            &mut gs,
+            TickActions {
+                right_held: true,
+                ..Default::default()
+            }
+        )
+        .is_empty());
+        assert!(gs.using_item);
+        // Releasing sends C07 RELEASE_USE_ITEM and clears the state.
+        let stop = act(&mut gs, TickActions::default());
+        assert!(
+            matches!(
+                stop.as_slice(),
+                [ServerboundPacket::PlayerDigging {
+                    status: DiggingStatus::ReleaseUseItem,
+                    ..
+                }]
+            ),
+            "got {stop:?}"
+        );
+        assert!(!gs.using_item);
+    }
+
+    #[test]
+    fn non_sword_right_click_air_sends_use_but_does_not_block() {
+        let mut gs = looking_along_x();
+        gs.inventory[36] = Some(SlotItem {
+            id: 1,
+            count: 1,
+            damage: 0,
+        });
+        // Vanilla sendUseItem fires for any held item (the "right-click air"
+        // C08), but only a sword enters the use/block state.
+        let packets = use_item(&mut gs);
+        assert!(
+            matches!(
+                packets.as_slice(),
+                [ServerboundPacket::PlayerBlockPlacement { x: -1, face: 255, .. }]
+            ),
+            "got {packets:?}"
+        );
+        assert!(!gs.using_item);
+    }
+
+    #[test]
+    fn blocking_cancels_sprint_through_the_tick() {
+        let mut gs = looking_along_x();
+        gs.player.on_ground = true;
+        gs.sprinting = true;
+        gs.input.sprint = true;
+        gs.input.forward = true;
+        // Hold a sword and keep blocking (right held) so the tick keeps the
+        // item in use and slows movement below the sprint threshold.
+        gs.inventory[36] = Some(SlotItem {
+            id: 276,
+            count: 1,
+            damage: 0,
+        });
+        gs.using_item = true;
+        gs.set_pending_actions(TickActions {
+            right_held: true,
+            ..Default::default()
+        });
+        let (_packets, movement) = gs.tick(0.05).expect("not a freeze tick");
+        assert!(gs.using_item, "still blocking while the button is held");
+        assert!(!movement.sprinting, "blocking drops sprint within the tick");
+    }
+
+    #[test]
+    fn sprint_key_with_forward_starts_and_releasing_forward_stops() {
+        let mut gs = looking_along_x();
+        gs.player.on_ground = true;
+        gs.input.forward = true;
+        gs.input.sprint = true; // toggle = keyBindSprint.isKeyDown()
+        let (_p, m) = gs.tick(0.05).expect("tick");
+        assert!(m.sprinting, "sprint key + forward starts sprinting");
+        // Release forward: moveForward drops below 0.8 → stop.
+        gs.input.forward = false;
+        let (_p, m) = gs.tick(0.05).expect("tick");
+        assert!(!m.sprinting, "releasing forward stops the sprint");
+    }
+
+    #[test]
+    fn wall_collision_ends_the_tick_not_sprinting() {
+        let mut gs = looking_along_x();
+        gs.player.on_ground = true;
+        gs.player.collided_horizontally = true;
+        gs.input.forward = true;
+        gs.input.sprint = true;
+        // Vanilla starts (no collision check) then stops (collidedHorizontally)
+        // in the same onLivingUpdate, so it never flickers on in the report.
+        let (_p, m) = gs.tick(0.05).expect("tick");
+        assert!(!m.sprinting, "pressing into a wall reports not-sprinting");
+    }
+
+    #[test]
+    fn double_tap_forward_starts_sprint_without_the_sprint_key() {
+        let mut gs = looking_along_x();
+        gs.player.on_ground = true;
+        gs.input.sprint = false; // no sprint key — only the double-tap can start
+        // First fresh forward press: arms the 7-tick window, no sprint yet.
+        gs.input.forward = true;
+        let (_p, m1) = gs.tick(0.05).expect("tick");
+        assert!(!m1.sprinting, "first tap only arms sprintToggleTimer");
+        // Release, then re-press within the window → sprint starts.
+        gs.input.forward = false;
+        let _ = gs.tick(0.05).expect("tick");
+        gs.input.forward = true;
+        let (_p, m3) = gs.tick(0.05).expect("tick");
+        assert!(m3.sprinting, "a second tap within 7 ticks starts the sprint");
+    }
+
+    #[test]
+    fn sprint_attack_resets_sprint_and_halves_horizontal_motion() {
         let mut gs = looking_along_x();
         gs.world.upsert_entity(EntityState::new_remote(
             EntityId(1),
@@ -3120,16 +3579,35 @@ mod interaction_tests {
             0.0,
             0.0,
         ));
-        let packets = gs.on_attack_press();
+        gs.sprinting = true;
+        gs.player.velocity = DVec3::new(1.0, 0.0, 2.0);
+        let _ = attack(&mut gs);
+        assert!(!gs.sprinting, "a sprint hit cancels the sprint");
+        assert!((gs.player.velocity.x - 0.6).abs() < 1e-9);
+        assert!((gs.player.velocity.z - 1.2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn attack_entity_swings_then_sends_use_entity() {
+        let mut gs = looking_along_x();
+        gs.world.upsert_entity(EntityState::new_remote(
+            EntityId(1),
+            EntityKind::Mob(54),
+            DVec3::new(2.0, 0.0, 0.5),
+            0.0,
+            0.0,
+        ));
+        let packets = attack(&mut gs);
+        // Vanilla `clickMouse`: swingItem (C0A) precedes attackEntity (C02).
         assert!(
             matches!(
                 packets.as_slice(),
                 [
+                    ServerboundPacket::SwingArm,
                     ServerboundPacket::UseEntity {
                         target: 1,
                         kind: UseEntityKind::Attack
                     },
-                    ServerboundPacket::SwingArm,
                 ]
             ),
             "got {packets:?}"
@@ -3140,12 +3618,14 @@ mod interaction_tests {
     fn survival_dig_starts_on_press_and_finishes_after_holding() {
         let mut gs = looking_along_x();
         gs.world.set_block(3, 0, 0, BlockState::STONE);
-        // Press begins the dig (StartDestroy + swing), no FinishDestroy yet.
-        let packets = gs.on_attack_press();
+        // Vanilla press tick: clickMouse swings + sends START, then
+        // sendClickBlockToController advances the dig and swings again (two C0A).
+        let packets = attack(&mut gs);
         assert!(
             matches!(
                 packets.as_slice(),
                 [
+                    ServerboundPacket::SwingArm,
                     ServerboundPacket::PlayerDigging {
                         status: DiggingStatus::StartDestroy,
                         x: 3,
@@ -3159,11 +3639,17 @@ mod interaction_tests {
         assert!(gs.breaking.is_some(), "dig should be in progress");
         // Holding for enough ticks finishes the dig with FinishDestroy.
         let mut finished = false;
-        for _ in 0..200 {
+        for _ in 0..400 {
             if gs.world.block_at(3, 0, 0).is_air() {
                 break;
             }
-            for packet in gs.on_attack_hold() {
+            for packet in act(
+                &mut gs,
+                TickActions {
+                    left_held: true,
+                    ..Default::default()
+                },
+            ) {
                 if matches!(
                     packet,
                     ServerboundPacket::PlayerDigging {
@@ -3187,14 +3673,13 @@ mod interaction_tests {
     fn use_block_sends_block_placement() {
         let mut gs = looking_along_x();
         gs.world.set_block(3, 0, 0, BlockState::STONE);
-        let packets = gs.on_use();
+        // Empty hand: vanilla sends the C08 to trigger onBlockActivated but does
+        // NOT swing (onPlayerRightClick returns false with no item).
+        let packets = use_item(&mut gs);
         assert!(
             matches!(
                 packets.as_slice(),
-                [
-                    ServerboundPacket::PlayerBlockPlacement { x: 3, face: 4, .. },
-                    ServerboundPacket::SwingArm,
-                ]
+                [ServerboundPacket::PlayerBlockPlacement { x: 3, face: 4, .. }]
             ),
             "got {packets:?}"
         );
@@ -3212,7 +3697,7 @@ mod interaction_tests {
         }); // stone in hotbar slot 0
         assert!(gs.world.block_at(2, 0, 0).is_air());
 
-        let packets = gs.on_use();
+        let packets = use_item(&mut gs);
 
         // The block shows immediately at the adjacent cell, without a server echo.
         assert_eq!(gs.world.block_at(2, 0, 0), BlockState::new(1, 0));
@@ -3239,7 +3724,7 @@ mod interaction_tests {
             count: 64,
             damage: 0,
         });
-        let _ = gs.on_use();
+        let _ = use_item(&mut gs);
         assert_eq!(
             gs.world.block_at(2, 0, 0),
             BlockState::new(1, 0),
@@ -3272,7 +3757,7 @@ mod interaction_tests {
             count: 64,
             damage: 0,
         });
-        let _ = gs.on_use();
+        let _ = use_item(&mut gs);
         assert!(
             gs.world.block_at(2, 0, 0).is_air(),
             "right-clicking a chest must not conjure a phantom block in front of it"

@@ -49,6 +49,13 @@ pub enum Shape {
     Hopper,
     /// Nether portal panel (axis from meta).
     Portal,
+    /// Door (wood/iron): a 3/16 panel on an edge from facing/open/hinge. The
+    /// renderer resolves the cross-half state; collision is a best-effort panel.
+    Door,
+    /// Piston body (normal/sticky): facing + extended state from meta.
+    Piston,
+    /// Extended piston head/arm (block 34): facing + sticky from meta.
+    PistonHead,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -375,6 +382,9 @@ fn parse_shape(value: &str) -> Shape {
         "cauldron" => Shape::Cauldron,
         "hopper" => Shape::Hopper,
         "portal" => Shape::Portal,
+        "door" => Shape::Door,
+        "piston" => Shape::Piston,
+        "piston_head" => Shape::PistonHead,
         _ => Shape::Cube,
     }
 }

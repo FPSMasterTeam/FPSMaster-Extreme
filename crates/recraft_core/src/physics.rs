@@ -386,11 +386,15 @@ impl PlayerPhysics {
                 } else {
                     1.0
                 };
+            // Airborne accel uses the PREVIOUS tick's sprint (vanilla
+            // `jumpMovementFactor`, set at the end of `onLivingUpdate` after the
+            // move). The ground accel above and the jump boost both use the
+            // current sprint — only this air factor lags by a tick.
             let acceleration = if player.on_ground {
                 move_speed * (0.16277136 / (horizontal_drag * horizontal_drag * horizontal_drag))
             } else {
                 self.config.air_acceleration
-                    * if input.sprint {
+                    * if player.air_sprinting {
                         self.config.sprint_multiplier
                     } else {
                         1.0
@@ -475,6 +479,11 @@ impl PlayerPhysics {
         let post_box = player.aabb;
         player.in_web =
             apply_inside_block_effects(world, post_box, &mut player.velocity, input.flying);
+
+        // Vanilla updates `jumpMovementFactor` from the current sprint state at
+        // the end of `EntityPlayer.onLivingUpdate` (after the move), so next
+        // tick's airborne accel reflects this tick's sprint.
+        player.air_sprinting = input.sprint;
     }
 }
 
@@ -1283,6 +1292,52 @@ mod tests {
             },
         );
         assert!((sneaker.position.y - 39.85).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn airborne_accel_lags_sprint_by_one_tick() {
+        // Vanilla `jumpMovementFactor` is set after the move, so a tick's
+        // airborne acceleration uses the PREVIOUS tick's sprint state, not the
+        // current one. Grim mirrors this (`lastSprintingForSpeed`); a mid-air
+        // sprint flip while brushing a block desyncs without it.
+        let world = World::new(); // empty: the player stays airborne
+        let physics = PlayerPhysics::default();
+        // One airborne tick of forward input from rest; returns the +z velocity
+        // gained, given the lagged (air_sprinting) and current (sprint) flags.
+        let air_gain = |air_sprinting: bool, sprint: bool| {
+            let mut player = EntityState::new_local_player(EntityId(1), DVec3::new(0.5, 40.0, 0.5));
+            player.air_sprinting = air_sprinting;
+            physics.tick(
+                &world,
+                &mut player,
+                PlayerInput {
+                    forward: 1.0,
+                    sprint,
+                    ..PlayerInput::default()
+                },
+            );
+            (player.velocity.z, player.air_sprinting)
+        };
+
+        // Per airborne tick the +z gain is 0.98 (move-input scale) × accel ×
+        // 0.91 (airborne drag); accel is 0.02, or ×1.3 when sprint-boosted.
+        let base = 0.98 * 0.02 * 0.91;
+        let boosted = 0.98 * 0.026 * 0.91;
+
+        // Current sprint is irrelevant to the air accel: only the lagged flag is.
+        let (z_lag_off_cur_on, next) = air_gain(false, true);
+        assert!(
+            (z_lag_off_cur_on - base).abs() < 1.0e-6,
+            "air accel must ignore current sprint when last tick wasn't sprinting, z={z_lag_off_cur_on}"
+        );
+        // The stored flag now reflects this tick's sprint, arming next tick.
+        assert!(next, "air_sprinting must latch the current sprint after the move");
+
+        let (z_lag_on_cur_off, _) = air_gain(true, false);
+        assert!(
+            (z_lag_on_cur_off - boosted).abs() < 1.0e-6,
+            "air accel must keep the sprint boost the tick after sprint drops, z={z_lag_on_cur_off}"
+        );
     }
 
     #[test]

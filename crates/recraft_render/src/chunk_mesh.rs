@@ -1,6 +1,7 @@
 use bytemuck::{Pod, Zeroable};
 use recraft_core::{
-    collision, BlockFace, BlockState, Chunk, ChunkPos, RenderLayer, RenderShape, Tint, World,
+    collision, door_box, BlockFace, BlockState, Chunk, ChunkPos, RenderLayer, RenderShape, Tint,
+    World,
 };
 
 use crate::texture::STAINED_COLORS;
@@ -10,14 +11,26 @@ use crate::AtlasUv;
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct Vertex {
     pub position: [f32; 3],
-    /// Tint multiplied with the sampled texel; alpha lets leaves/glass blend.
+    /// Material tint × directional face shade × ambient occlusion, multiplied
+    /// with the sampled texel; alpha lets leaves/glass blend. The day/night
+    /// light level is applied separately in the shader via `light`.
     pub color: [f32; 4],
     pub uv: [f32; 2],
+    /// Per-vertex `(sky_light, block_light)` brightness curves (each 0..1). The
+    /// shader combines them with the time-of-day sky factor —
+    /// `max(sky * sky_brightness, block)` — so sky-lit surfaces darken at night
+    /// while torch/lava-lit ones stay lit. Non-world geometry (items, GUI cubes,
+    /// the break overlay) uses `(0, 1)` to render full-bright.
+    pub light: [f32; 2],
 }
 
+/// `light` value for geometry that should ignore the day/night lightmap and
+/// always render at full brightness.
+pub const FULLBRIGHT: [f32; 2] = [0.0, 1.0];
+
 impl Vertex {
-    pub const ATTRIBUTES: [wgpu::VertexAttribute; 3] =
-        wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4, 2 => Float32x2];
+    pub const ATTRIBUTES: [wgpu::VertexAttribute; 4] =
+        wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4, 2 => Float32x2, 3 => Float32x2];
 
     pub fn layout<'a>() -> wgpu::VertexBufferLayout<'a> {
         wgpu::VertexBufferLayout {
@@ -65,14 +78,28 @@ impl BlockSource for World {
     }
 }
 
-/// A clone of one chunk plus its four horizontal neighbours — everything the
-/// mesher needs (including border-face culling) to build a chunk mesh on a
-/// worker thread without touching the live `World`.
+/// Chunk-grid offsets of the 8 chunks surrounding the centre, in storage order.
+/// Includes diagonals so the smooth-lighting mesher can sample corner-adjacent
+/// blocks across chunk boundaries without seams.
+const NEIGHBOR_OFFSETS: [(i32, i32); 8] = [
+    (-1, 0),
+    (1, 0),
+    (0, -1),
+    (0, 1),
+    (-1, -1),
+    (1, -1),
+    (-1, 1),
+    (1, 1),
+];
+
+/// A clone of one chunk plus its eight surrounding neighbours (axis + diagonal)
+/// — everything the mesher needs (border-face culling and smooth-lighting AO)
+/// to build a chunk mesh on a worker thread without touching the live `World`.
 pub struct ChunkNeighborhood {
     pos: ChunkPos,
     center: Chunk,
-    /// -x, +x, -z, +z (None when the neighbour isn't loaded).
-    neighbors: [Option<Chunk>; 4],
+    /// Surrounding chunks in `NEIGHBOR_OFFSETS` order (None when not loaded).
+    neighbors: [Option<Chunk>; 8],
 }
 
 impl ChunkNeighborhood {
@@ -81,12 +108,10 @@ impl ChunkNeighborhood {
     /// and let the actual mesh build happen off the render thread.
     pub fn snapshot(world: &World, pos: ChunkPos) -> Option<Self> {
         let center = world.chunk(pos)?.clone();
-        let neighbors = [
-            world.chunk(ChunkPos::new(pos.x - 1, pos.z)).cloned(),
-            world.chunk(ChunkPos::new(pos.x + 1, pos.z)).cloned(),
-            world.chunk(ChunkPos::new(pos.x, pos.z - 1)).cloned(),
-            world.chunk(ChunkPos::new(pos.x, pos.z + 1)).cloned(),
-        ];
+        let neighbors = std::array::from_fn(|i| {
+            let (dx, dz) = NEIGHBOR_OFFSETS[i];
+            world.chunk(ChunkPos::new(pos.x + dx, pos.z + dz)).cloned()
+        });
         Some(Self {
             pos,
             center,
@@ -99,24 +124,12 @@ impl ChunkNeighborhood {
     }
 
     fn chunk_for(&self, cx: i32, cz: i32) -> Option<&Chunk> {
-        if cx == self.pos.x && cz == self.pos.z {
+        let offset = (cx - self.pos.x, cz - self.pos.z);
+        if offset == (0, 0) {
             return Some(&self.center);
         }
-        if cz == self.pos.z {
-            if cx == self.pos.x - 1 {
-                return self.neighbors[0].as_ref();
-            }
-            if cx == self.pos.x + 1 {
-                return self.neighbors[1].as_ref();
-            }
-        }
-        if cx == self.pos.x {
-            if cz == self.pos.z - 1 {
-                return self.neighbors[2].as_ref();
-            }
-            if cz == self.pos.z + 1 {
-                return self.neighbors[3].as_ref();
-            }
+        if let Some(i) = NEIGHBOR_OFFSETS.iter().position(|&o| o == offset) {
+            return self.neighbors[i].as_ref();
         }
         None
     }
@@ -148,13 +161,51 @@ impl MeshBuffers {
         self.indices.is_empty()
     }
 
-    fn push_quad(&mut self, corners: [[f32; 3]; 4], uvs: [[f32; 2]; 4], color: [f32; 4]) {
+    fn push_quad(
+        &mut self,
+        corners: [[f32; 3]; 4],
+        uvs: [[f32; 2]; 4],
+        color: [f32; 4],
+        light: [f32; 2],
+    ) {
+        self.push_quad_smooth(corners, uvs, [color; 4], [light; 4]);
+    }
+
+    /// Emit `corners`/`uvs` as a double-sided quad: the front face plus a
+    /// reverse-wound back face, so the shape stays visible from both sides under
+    /// back-face culling. Used by the genuinely 2D shapes (cross plants, rails,
+    /// ladders), mirroring how vanilla's `cross` model carries a face per side.
+    fn push_quad_double_sided(
+        &mut self,
+        corners: [[f32; 3]; 4],
+        uvs: [[f32; 2]; 4],
+        color: [f32; 4],
+        light: [f32; 2],
+    ) {
+        self.push_quad(corners, uvs, color, light);
+        let back = [corners[3], corners[2], corners[1], corners[0]];
+        let back_uvs = [uvs[3], uvs[2], uvs[1], uvs[0]];
+        self.push_quad(back, back_uvs, color, light);
+    }
+
+    /// Like [`push_quad`](Self::push_quad) but with an independent color and
+    /// light pair per corner, for smooth (per-vertex) lighting.
+    fn push_quad_smooth(
+        &mut self,
+        corners: [[f32; 3]; 4],
+        uvs: [[f32; 2]; 4],
+        colors: [[f32; 4]; 4],
+        lights: [[f32; 2]; 4],
+    ) {
         let start = self.vertices.len() as u32;
-        for (position, uv) in corners.into_iter().zip(uvs) {
+        for (((position, uv), color), light) in
+            corners.into_iter().zip(uvs).zip(colors).zip(lights)
+        {
             self.vertices.push(Vertex {
                 position,
                 color,
                 uv,
+                light,
             });
         }
         self.indices
@@ -197,7 +248,8 @@ const FACES: [Face; 6] = [
             [1.0, 1.0, 1.0],
             [1.0, 0.0, 1.0],
         ],
-        light: 0.78,
+        // Vanilla east/west (±X) face shade.
+        light: 0.6,
         face: BlockFace::Side,
     },
     Face {
@@ -208,7 +260,8 @@ const FACES: [Face; 6] = [
             [0.0, 1.0, 0.0],
             [0.0, 0.0, 0.0],
         ],
-        light: 0.62,
+        // Vanilla east/west (±X) face shade.
+        light: 0.6,
         face: BlockFace::Side,
     },
     Face {
@@ -230,7 +283,8 @@ const FACES: [Face; 6] = [
             [1.0, 0.0, 1.0],
             [0.0, 0.0, 1.0],
         ],
-        light: 0.48,
+        // Vanilla down (−Y) face shade.
+        light: 0.5,
         face: BlockFace::Bottom,
     },
     Face {
@@ -241,7 +295,8 @@ const FACES: [Face; 6] = [
             [0.0, 1.0, 1.0],
             [0.0, 0.0, 1.0],
         ],
-        light: 0.72,
+        // Vanilla north/south (±Z) face shade.
+        light: 0.8,
         face: BlockFace::Side,
     },
     Face {
@@ -252,7 +307,8 @@ const FACES: [Face; 6] = [
             [1.0, 1.0, 0.0],
             [1.0, 0.0, 0.0],
         ],
-        light: 0.72,
+        // Vanilla north/south (±Z) face shade.
+        light: 0.8,
         face: BlockFace::Side,
     },
 ];
@@ -348,8 +404,22 @@ fn append_block<S: BlockSource>(
         RenderShape::Rail => append_rail(mesh, ctx, x, y, z, block),
         RenderShape::Ladder => append_ladder(mesh, ctx, x, y, z, block),
         RenderShape::Boxes => append_boxes(mesh, ctx, x, y, z, block),
+        RenderShape::Door => append_door(mesh, ctx, x, y, z, block),
+        RenderShape::Piston => append_piston(mesh, ctx, x, y, z, block),
+        RenderShape::PistonHead => append_piston_head(mesh, ctx, x, y, z, block),
     }
 }
+
+/// Outward normal of each piston/door facing index (vanilla `EnumFacing`:
+/// 0 down, 1 up, 2 north, 3 south, 4 west, 5 east).
+const FACING_NORMAL: [[i32; 3]; 6] = [
+    [0, -1, 0],
+    [0, 1, 0],
+    [0, 0, -1],
+    [0, 0, 1],
+    [-1, 0, 0],
+    [1, 0, 0],
+];
 
 fn buffer_for(mesh: &mut ChunkMesh, block: BlockState) -> &mut MeshBuffers {
     match block.render_layer() {
@@ -374,7 +444,11 @@ fn append_cube<S: BlockSource>(
     for face in &FACES {
         let (nx, ny, nz) = (x + face.normal[0], y + face.normal[1], z + face.normal[2]);
         let neighbor = neighbor_block(ctx, nx, ny, nz);
-        if neighbor.is_opaque_cube() || neighbor.id == block.id {
+        // Cull faces against an opaque neighbour, and against a same-id neighbour
+        // for blocks that merge (glass/ice/water). Leaves are the vanilla Fancy
+        // exception: they keep the face between adjacent leaf blocks for the
+        // layered, bushy look.
+        if neighbor.is_opaque_cube() || (neighbor.id == block.id && !block.is_leaves()) {
             continue;
         }
         emit_face(
@@ -535,18 +609,14 @@ fn emit_face<S: BlockSource>(
     ny: i32,
     nz: i32,
 ) {
-    let light = face_light(ctx, nx, ny, nz);
     let tint = tint_color(block.tint(face.face), ctx.biome);
-    let color = [
-        tint[0] * face.light * light,
-        tint[1] * face.light * light,
-        tint[2] * face.light * light,
-        alpha,
-    ];
     warn_if_missing(ctx.atlas, block, face_context(face.face), texture);
     let rect = ctx.atlas.tile_rect(texture);
+    let front = [nx, ny, nz];
     let mut corners = [[0.0f32; 3]; 4];
     let mut uvs = [[0.0f32; 2]; 4];
+    let mut colors = [[0.0f32; 4]; 4];
+    let mut lights = [[0.0f32; 2]; 4];
     for (i, corner) in face.corners.iter().enumerate() {
         let px = lerp_axis(corner[0], mn[0], mx[0]);
         let py = lerp_axis(corner[1], mn[1], mx[1]);
@@ -554,8 +624,19 @@ fn emit_face<S: BlockSource>(
         corners[i] = [x as f32 + px, y as f32 + py, z as f32 + pz];
         let (u, v) = face_uv(face.normal, px, py, pz);
         uvs[i] = [rect[0] + u * rect[2], rect[1] + v * rect[3]];
+        // Smooth (per-vertex) light: the material color carries the directional
+        // face shade and ambient occlusion, while the sky/block light curves go
+        // to the `light` attribute so the shader applies the day/night factor.
+        let (sky, block, ao) = vertex_light(ctx, face.normal, front, *corner);
+        colors[i] = [
+            tint[0] * face.light * ao,
+            tint[1] * face.light * ao,
+            tint[2] * face.light * ao,
+            alpha,
+        ];
+        lights[i] = [sky, block];
     }
-    buffer.push_quad(corners, uvs, color);
+    buffer.push_quad_smooth(corners, uvs, colors, lights);
 }
 
 /// Surface a magenta-fallback texture resolution in the log (deduplicated per
@@ -597,8 +678,9 @@ fn lerp_axis(corner: f32, lo: f32, hi: f32) -> f32 {
     }
 }
 
-/// Cross-shaped plant: two diagonal double-sided quads (the transparent
-/// pipeline disables back-face culling, so one quad per diagonal suffices).
+/// Cross-shaped plant: two diagonal planes, each emitted double-sided so the
+/// plant is visible from every direction under back-face culling (the vanilla
+/// `cross` model likewise carries a face for each side of each plane).
 fn append_cross<S: BlockSource>(
     mesh: &mut ChunkMesh,
     ctx: &BlockCtx<S>,
@@ -609,12 +691,7 @@ fn append_cross<S: BlockSource>(
 ) {
     let light = face_light(ctx, x, y, z);
     let tint = tint_color(block.tint(BlockFace::Side), ctx.biome);
-    let color = [
-        tint[0] * light,
-        tint[1] * light,
-        tint[2] * light,
-        block.render_alpha(),
-    ];
+    let color = [tint[0], tint[1], tint[2], block.render_alpha()];
     let texture = block.texture_name(BlockFace::Side);
     warn_if_missing(ctx.atlas, block, "its cross texture", texture);
     let uvs = ctx.atlas.uv(texture);
@@ -626,7 +703,7 @@ fn append_cross<S: BlockSource>(
     // Corner order matches the UV table convention (bottom, top, top, bottom)
     // so the texture stands upright instead of twisting across the quad.
     let buffer = buffer_for(mesh, block);
-    buffer.push_quad(
+    buffer.push_quad_double_sided(
         [
             [fx + lo, fy, fz + lo],
             [fx + lo, fy + 1.0, fz + lo],
@@ -635,8 +712,9 @@ fn append_cross<S: BlockSource>(
         ],
         uvs,
         color,
+        light,
     );
-    buffer.push_quad(
+    buffer.push_quad_double_sided(
         [
             [fx + hi, fy, fz + lo],
             [fx + hi, fy + 1.0, fz + lo],
@@ -645,6 +723,7 @@ fn append_cross<S: BlockSource>(
         ],
         uvs,
         color,
+        light,
     );
 }
 
@@ -668,12 +747,7 @@ fn append_rail<S: BlockSource>(
     };
     let light = face_light(ctx, x, y + 1, z);
     let tint = tint_color(block.tint(BlockFace::Top), ctx.biome);
-    let color = [
-        tint[0] * light,
-        tint[1] * light,
-        tint[2] * light,
-        block.render_alpha(),
-    ];
+    let color = [tint[0], tint[1], tint[2], block.render_alpha()];
 
     let (fx, fy, fz) = (x as f32, y as f32, z as f32);
     let low = fy + 0.0625;
@@ -726,7 +800,9 @@ fn append_rail<S: BlockSource>(
         [rect[0], rect[1] + rect[3]],
     ];
     uvs.rotate_right(turns);
-    buffer_for(mesh, block).push_quad(corners, uvs, color);
+    // Double-sided so the track is visible from above and (through a glass
+    // floor) below, under back-face culling.
+    buffer_for(mesh, block).push_quad_double_sided(corners, uvs, color, light);
 }
 
 fn append_ladder<S: BlockSource>(
@@ -740,16 +816,13 @@ fn append_ladder<S: BlockSource>(
     let (corners, sample) = ladder_quad(x, y, z, block.meta);
     let light = face_light(ctx, x + sample[0], y + sample[1], z + sample[2]);
     let tint = tint_color(block.tint(BlockFace::Side), ctx.biome);
-    let color = [
-        tint[0] * light,
-        tint[1] * light,
-        tint[2] * light,
-        block.render_alpha(),
-    ];
+    let color = [tint[0], tint[1], tint[2], block.render_alpha()];
     let texture = block.texture_name(BlockFace::Side);
     warn_if_missing(ctx.atlas, block, "its ladder texture", texture);
     let uvs = ctx.atlas.uv(texture);
-    buffer_for(mesh, block).push_quad(corners, uvs, color);
+    // Double-sided so the rungs show under back-face culling regardless of which
+    // way the single quad happens to wind.
+    buffer_for(mesh, block).push_quad_double_sided(corners, uvs, color, light);
 }
 
 fn ladder_quad(x: i32, y: i32, z: i32, meta: u8) -> ([[f32; 3]; 4], [i32; 3]) {
@@ -807,6 +880,173 @@ fn ladder_quad(x: i32, y: i32, z: i32, meta: u8) -> ([[f32; 3]; 4], [i32; 3]) {
     }
 }
 
+/// Door (wood/iron): a 3/16 panel on the edge given by the combined two-half
+/// state. The lower half carries facing+open and the upper half the hinge, so
+/// each half reads its sibling to resolve the full state (vanilla
+/// `BlockDoor.getActualState`). The lower half textures from `door_*_lower`,
+/// the upper from `door_*_upper`.
+fn append_door<S: BlockSource>(
+    mesh: &mut ChunkMesh,
+    ctx: &BlockCtx<S>,
+    x: i32,
+    y: i32,
+    z: i32,
+    block: BlockState,
+) {
+    let upper = block.meta & 8 != 0;
+    let (facing, open, hinge_right) = if upper {
+        // Hinge is local; facing/open come from the lower half below.
+        let hinge_right = block.meta & 1 != 0;
+        let lower = neighbor_block(ctx, x, y - 1, z);
+        if lower.id == block.id {
+            (lower.meta & 3, lower.meta & 4 != 0, hinge_right)
+        } else {
+            (block.meta & 3, false, hinge_right)
+        }
+    } else {
+        // Facing/open are local; the hinge comes from the upper half above.
+        let above = neighbor_block(ctx, x, y + 1, z);
+        let hinge_right = above.id == block.id && above.meta & 1 != 0;
+        (block.meta & 3, block.meta & 4 != 0, hinge_right)
+    };
+
+    let bx = door_box(facing, open, hinge_right);
+    let mn = [bx.min[0] as f32, bx.min[1] as f32, bx.min[2] as f32];
+    let mx = [bx.max[0] as f32, bx.max[1] as f32, bx.max[2] as f32];
+    // Upper half samples door_*_upper (the def's `top`), lower the `bottom`.
+    let texture = block.texture_name(if upper { BlockFace::Top } else { BlockFace::Bottom });
+    let alpha = block.render_alpha();
+    let buffer = buffer_for(mesh, block);
+    for face in &FACES {
+        let (nx, ny, nz) = (x + face.normal[0], y + face.normal[1], z + face.normal[2]);
+        emit_face(
+            buffer, ctx, face, x, y, z, mn, mx, texture, block, alpha, nx, ny, nz,
+        );
+    }
+}
+
+/// Piston body (normal/sticky): a full cube whose front face (the `facing`
+/// direction) is the piston top when retracted or the recessed `piston_inner`
+/// when extended; the opposite face is `piston_bottom` and the rest
+/// `piston_side`. Faces cull against opaque neighbours like any cube.
+fn append_piston<S: BlockSource>(
+    mesh: &mut ChunkMesh,
+    ctx: &BlockCtx<S>,
+    x: i32,
+    y: i32,
+    z: i32,
+    block: BlockState,
+) {
+    let facing = (block.meta & 7) as usize;
+    let extended = block.meta & 8 != 0;
+    let front = FACING_NORMAL[facing];
+    let back = [-front[0], -front[1], -front[2]];
+    let front_tex = if extended {
+        Some("piston_inner")
+    } else {
+        block.texture_name(BlockFace::Top)
+    };
+    let back_tex = block.texture_name(BlockFace::Bottom);
+    let side_tex = block.texture_name(BlockFace::Side);
+    let alpha = block.render_alpha();
+    let buffer = buffer_for(mesh, block);
+    for face in &FACES {
+        let (nx, ny, nz) = (x + face.normal[0], y + face.normal[1], z + face.normal[2]);
+        if neighbor_block(ctx, nx, ny, nz).is_opaque_cube() {
+            continue;
+        }
+        let texture = if face.normal == front {
+            front_tex
+        } else if face.normal == back {
+            back_tex
+        } else {
+            side_tex
+        };
+        emit_face(
+            buffer,
+            ctx,
+            face,
+            x,
+            y,
+            z,
+            [0.0; 3],
+            [1.0; 3],
+            texture,
+            block,
+            alpha,
+            nx,
+            ny,
+            nz,
+        );
+    }
+}
+
+/// Extended piston head (block 34): the 4/16 head plate at the `facing` end
+/// (platform texture on its outer face) plus the 4×4 arm reaching back toward
+/// the body. Sticky bit (meta 8) selects the sticky platform texture.
+fn append_piston_head<S: BlockSource>(
+    mesh: &mut ChunkMesh,
+    ctx: &BlockCtx<S>,
+    x: i32,
+    y: i32,
+    z: i32,
+    block: BlockState,
+) {
+    let facing = (block.meta & 7) as usize;
+    let sticky = block.meta & 8 != 0;
+    let front = FACING_NORMAL[facing];
+    // The def stores piston_top_normal in `top` and piston_top_sticky in
+    // `bottom` so both reach the atlas; pick per the sticky bit.
+    let head_tex = block.texture_name(if sticky { BlockFace::Bottom } else { BlockFace::Top });
+    let side_tex = block.texture_name(BlockFace::Side);
+
+    let axis = match facing {
+        0 | 1 => 1, // up/down → y
+        2 | 3 => 2, // north/south → z
+        _ => 0,     // west/east → x
+    };
+    let positive = matches!(facing, 1 | 3 | 5);
+    // Plate: outer 4/16 on the facing side, full cross-section. Arm: inner 12/16,
+    // 4×4 cross-section.
+    let (plate_lo, plate_hi, arm_lo, arm_hi) = if positive {
+        (0.75, 1.0, 0.0, 0.75)
+    } else {
+        (0.0, 0.25, 0.25, 1.0)
+    };
+    let plate = axis_box(axis, plate_lo, plate_hi, 0.0, 1.0);
+    let arm = axis_box(axis, arm_lo, arm_hi, 0.375, 0.625);
+
+    let alpha = block.render_alpha();
+    let buffer = buffer_for(mesh, block);
+    for (b, is_plate) in [(plate, true), (arm, false)] {
+        let mn = [b[0] as f32, b[1] as f32, b[2] as f32];
+        let mx = [b[3] as f32, b[4] as f32, b[5] as f32];
+        for face in &FACES {
+            let (nx, ny, nz) = (x + face.normal[0], y + face.normal[1], z + face.normal[2]);
+            // The plate's outer face shows the platform; everything else is the
+            // piston side.
+            let texture = if is_plate && face.normal == front {
+                head_tex
+            } else {
+                side_tex
+            };
+            emit_face(
+                buffer, ctx, face, x, y, z, mn, mx, texture, block, alpha, nx, ny, nz,
+            );
+        }
+    }
+}
+
+/// A unit-space box spanning `[lo,hi]` on `axis` and `[cross_lo,cross_hi]` on
+/// the other two axes, as `[x0,y0,z0,x1,y1,z1]`.
+fn axis_box(axis: usize, lo: f64, hi: f64, cross_lo: f64, cross_hi: f64) -> [f64; 6] {
+    let mut mn = [cross_lo; 3];
+    let mut mx = [cross_hi; 3];
+    mn[axis] = lo;
+    mx[axis] = hi;
+    [mn[0], mn[1], mn[2], mx[0], mx[1], mx[2]]
+}
+
 fn tint_color(tint: Tint, biome: BiomeColors) -> [f32; 3] {
     match tint {
         Tint::None => [1.0, 1.0, 1.0],
@@ -841,11 +1081,85 @@ fn neighbor_light<S: BlockSource>(ctx: &BlockCtx<S>, x: i32, y: i32, z: i32) -> 
     }
 }
 
-fn face_light<S: BlockSource>(ctx: &BlockCtx<S>, x: i32, y: i32, z: i32) -> f32 {
+/// Map a 0..15 light level to a 0..1 brightness, keeping dark areas readable
+/// while preserving the chunk light signal (the original flat-light curve).
+#[inline]
+fn light_curve(level: f32) -> f32 {
+    0.18 + (level / 15.0) * 0.82
+}
+
+/// Flat per-face light: the light of the single block in front of the face,
+/// as a `(sky_curve, block_curve)` pair so the shader applies the day/night
+/// factor. Used by the non-cube shapes (cross plants, rails, ladders) where
+/// vanilla does not apply smooth lighting.
+fn face_light<S: BlockSource>(ctx: &BlockCtx<S>, x: i32, y: i32, z: i32) -> [f32; 2] {
     let (block_light, sky_light) = neighbor_light(ctx, x, y, z);
-    let level = block_light.max(sky_light);
-    // Keep dark areas readable while preserving the 0..15 chunk light signal.
-    0.18 + (level as f32 / 15.0) * 0.82
+    [light_curve(sky_light as f32), light_curve(block_light as f32)]
+}
+
+/// Vanilla-style smooth lighting for one corner of a block face: averages the
+/// light of the four cells touching the corner in the face's outer layer and
+/// the ambient occlusion from the three corner-adjacent blocks. Returns
+/// `(sky_curve, block_curve, ao)`: the sky/block light curves (combined in the
+/// shader with the day/night factor) and the occlusion multiplier (baked into
+/// the vertex color).
+fn vertex_light<S: BlockSource>(
+    ctx: &BlockCtx<S>,
+    normal: [i32; 3],
+    front: [i32; 3],
+    corner: [f32; 3],
+) -> (f32, f32, f32) {
+    // The two in-plane (tangent) axes — those the face normal doesn't run along.
+    let (a, b) = if normal[0] != 0 {
+        (1, 2)
+    } else if normal[1] != 0 {
+        (0, 2)
+    } else {
+        (0, 1)
+    };
+    let sa = if corner[a] >= 0.5 { 1 } else { -1 };
+    let sb = if corner[b] >= 0.5 { 1 } else { -1 };
+
+    let mut side1 = front;
+    side1[a] += sa;
+    let mut side2 = front;
+    side2[b] += sb;
+    let mut diag = front;
+    diag[a] += sa;
+    diag[b] += sb;
+
+    let opaque = |p: [i32; 3]| neighbor_block(ctx, p[0], p[1], p[2]).is_opaque_cube();
+    let o1 = opaque(side1);
+    let o2 = opaque(side2);
+    // When both sides are opaque the diagonal cell is hidden behind them.
+    let oc = (o1 && o2) || opaque(diag);
+
+    // Light average, matching vanilla `getAoBrightness`, but keeping sky and
+    // block light separate so the shader can dim only the sky contribution at
+    // night. Each of the four cells touching the corner contributes; an opaque
+    // cell is replaced by the centre's light, pulling the corner toward the
+    // face's own light.
+    let level_at = |p: [i32; 3]| -> (f32, f32) {
+        let (block_light, sky_light) = neighbor_light(ctx, p[0], p[1], p[2]);
+        (sky_light as f32, block_light as f32)
+    };
+    let avg = |get: &dyn Fn((f32, f32)) -> f32| -> f32 {
+        let center = get(level_at(front));
+        let l1 = if o1 { center } else { get(level_at(side1)) };
+        let l2 = if o2 { center } else { get(level_at(side2)) };
+        let lc = if oc { center } else { get(level_at(diag)) };
+        (center + l1 + l2 + lc) * 0.25
+    };
+    let sky = light_curve(avg(&|(s, _)| s));
+    let block = light_curve(avg(&|(_, b)| b));
+
+    // Ambient occlusion, matching vanilla: the mean of the three neighbours'
+    // occlusion value (1.0 open, 0.2 opaque) and the always-lit centre — i.e.
+    // 1.0 − 0.2 × (opaque neighbours), giving 1.0 / 0.8 / 0.6 / 0.4.
+    let occ = |o: bool| if o { 0.2 } else { 1.0 };
+    let ao = (occ(o1) + occ(o2) + occ(oc) + 1.0) * 0.25;
+
+    (sky, block, ao)
 }
 
 #[cfg(test)]
@@ -867,6 +1181,55 @@ mod tests {
         let mesh = build_world_mesh(&world, &atlas(), BiomeColors::default());
         assert_eq!(mesh.solid.vertices.len(), 24);
         assert_eq!(mesh.solid.indices.len(), 36);
+    }
+
+    #[test]
+    fn smooth_lighting_is_flat_on_an_unoccluded_block() {
+        // With no neighbours, every face's four corners get the same light, so
+        // smooth lighting must not introduce any per-vertex variation.
+        let mut world = World::new();
+        world.set_block(0, 0, 0, BlockState::STONE);
+        let mesh = build_world_mesh(&world, &atlas(), BiomeColors::default());
+        for quad in mesh.solid.vertices.chunks(4) {
+            let c0 = quad[0].color;
+            assert!(
+                quad.iter().all(|v| v.color == c0),
+                "an unoccluded face should be uniformly lit",
+            );
+        }
+    }
+
+    #[test]
+    fn ambient_occlusion_darkens_occluded_top_corners() {
+        let mut world = World::new();
+        world.set_block(0, 0, 0, BlockState::STONE);
+        // A block on the +x edge of the top face occludes two of its corners.
+        world.set_block(1, 1, 0, BlockState::STONE);
+        let mesh = build_world_mesh(&world, &atlas(), BiomeColors::default());
+        // The origin block's top face is the quad whose four corners span the
+        // full [0,1]×[0,1] footprint at y = 1.
+        let span = |q: &[Vertex], axis: usize| {
+            let lo = q.iter().map(|v| v.position[axis]).fold(f32::MAX, f32::min);
+            let hi = q.iter().map(|v| v.position[axis]).fold(f32::MIN, f32::max);
+            (lo, hi)
+        };
+        let top = mesh
+            .solid
+            .vertices
+            .chunks(4)
+            .find(|q| {
+                q.iter().all(|v| (v.position[1] - 1.0).abs() < 1.0e-6)
+                    && span(q, 0) == (0.0, 1.0)
+                    && span(q, 2) == (0.0, 1.0)
+            })
+            .expect("origin top face quad");
+        let lum = |v: &Vertex| v.color[0];
+        let min = top.iter().map(lum).fold(f32::MAX, f32::min);
+        let max = top.iter().map(lum).fold(f32::MIN, f32::max);
+        assert!(
+            max - min > 0.05,
+            "ambient occlusion should darken the occluded corners (min {min}, max {max})",
+        );
     }
 
     #[test]
@@ -895,14 +1258,26 @@ mod tests {
     }
 
     #[test]
+    fn adjacent_leaves_keep_internal_faces() {
+        // Vanilla Fancy: two touching leaf blocks render all 12 faces (the
+        // shared faces are NOT culled), unlike opaque or glass/ice blocks.
+        let mut world = World::new();
+        world.set_block(0, 0, 0, BlockState::new(18, 0));
+        world.set_block(1, 0, 0, BlockState::new(18, 0));
+        let mesh = build_world_mesh(&world, &atlas(), BiomeColors::default());
+        assert_eq!(mesh.cutout.indices.len(), 2 * 36, "leaves keep their shared faces");
+    }
+
+    #[test]
     fn tall_grass_renders_as_cross() {
         let mut world = World::new();
         world.set_block(0, 0, 0, BlockState::new(31, 1));
         let mesh = build_world_mesh(&world, &atlas(), BiomeColors::default());
-        // Two double-sided quads → 8 vertices, 12 indices, in the cutout pass.
+        // Two planes, each emitted double-sided (front + back) for back-face
+        // culling → 4 quads = 16 vertices, 24 indices, in the cutout pass.
         assert!(mesh.solid.is_empty());
-        assert_eq!(mesh.cutout.vertices.len(), 8);
-        assert_eq!(mesh.cutout.indices.len(), 12);
+        assert_eq!(mesh.cutout.vertices.len(), 16);
+        assert_eq!(mesh.cutout.indices.len(), 24);
     }
 
     #[test]
@@ -1019,7 +1394,8 @@ mod tests {
         world.set_block(0, 0, 0, BlockState::new(66, 0)); // flat north-south
         world.set_block(1, 0, 0, BlockState::new(66, 2)); // ascending east
         let mesh = build_world_mesh(&world, &atlas(), BiomeColors::default());
-        assert_eq!(mesh.cutout.vertices.len(), 8, "one quad per rail");
+        // One double-sided quad per rail (front + back) → 8 vertices each.
+        assert_eq!(mesh.cutout.vertices.len(), 16, "one double-sided quad per rail");
         let max_y = mesh
             .cutout
             .vertices
@@ -1073,5 +1449,100 @@ mod tests {
             checked += 1;
         }
         assert_eq!(checked, 4, "expected four side faces");
+    }
+
+    #[test]
+    fn closed_door_is_a_thin_panel_on_the_facing_edge() {
+        let mut world = World::new();
+        // Wood door lower half, facing index 1 (south) → closed panel on the
+        // north edge: z in [0, 3/16], full x and y.
+        world.set_block(0, 0, 0, BlockState::new(64, 1));
+        let mesh = build_world_mesh(&world, &atlas(), BiomeColors::default());
+        // One thin box → 6 faces × 4 vertices, in the cutout layer.
+        assert_eq!(mesh.cutout.vertices.len(), 24);
+        let max_z = mesh
+            .cutout
+            .vertices
+            .iter()
+            .map(|v| v.position[2])
+            .fold(f32::MIN, f32::max);
+        assert!((max_z - 0.1875).abs() < 1.0e-6, "panel z extent was {max_z}");
+    }
+
+    #[test]
+    fn opening_a_door_swings_the_panel_to_an_adjacent_edge() {
+        // Same facing as above but open (bit 2) with a left hinge → the panel
+        // moves from the north edge to the east edge (x in [13/16, 1]).
+        let mut world = World::new();
+        world.set_block(0, 0, 0, BlockState::new(64, 1 | 4));
+        let mesh = build_world_mesh(&world, &atlas(), BiomeColors::default());
+        let min_x = mesh
+            .cutout
+            .vertices
+            .iter()
+            .map(|v| v.position[0])
+            .fold(f32::MAX, f32::min);
+        assert!((min_x - 0.8125).abs() < 1.0e-6, "open panel min x was {min_x}");
+    }
+
+    #[test]
+    fn piston_is_a_full_cube_and_head_is_plate_plus_arm() {
+        let mut world = World::new();
+        world.set_block(0, 0, 0, BlockState::new(33, 1)); // piston facing up
+        let mesh = build_world_mesh(&world, &atlas(), BiomeColors::default());
+        assert_eq!(mesh.solid.vertices.len(), 24, "piston body is a full cube");
+
+        let mut world = World::new();
+        world.set_block(0, 0, 0, BlockState::new(34, 1)); // extended head facing up
+        let mesh = build_world_mesh(&world, &atlas(), BiomeColors::default());
+        // Plate + arm = 2 boxes × 6 faces × 4 vertices.
+        assert_eq!(mesh.solid.vertices.len(), 48);
+        // The head plate reaches the top of the block (facing up).
+        let max_y = mesh
+            .solid
+            .vertices
+            .iter()
+            .map(|v| v.position[1])
+            .fold(f32::MIN, f32::max);
+        assert!((max_y - 1.0).abs() < 1.0e-6);
+        // The arm is the 4-wide inner rod (x within [6/16, 10/16]).
+        let arm_min_x = mesh
+            .solid
+            .vertices
+            .iter()
+            .filter(|v| v.position[1] < 0.75) // below the plate
+            .map(|v| v.position[0])
+            .fold(f32::MAX, f32::min);
+        assert!((arm_min_x - 0.375).abs() < 1.0e-6, "arm min x was {arm_min_x}");
+    }
+
+    #[test]
+    fn door_and_piston_states_resolve_textures() {
+        let uv = atlas();
+        // Door upper/lower halves resolve to the matching texture.
+        for &(id, meta) in &[(64, 0), (64, 8), (71, 0), (71, 8), (193, 8), (197, 0)] {
+            let block = BlockState::new(id, meta);
+            let face = if meta & 8 != 0 {
+                BlockFace::Top
+            } else {
+                BlockFace::Bottom
+            };
+            assert!(
+                !uv.is_missing_tile(block.texture_name(face)),
+                "door {id}:{meta} resolves a tile"
+            );
+        }
+        // Piston bodies + extended head resolve every face, and the inner face
+        // the extended body needs is registered in the atlas.
+        for &(id, meta) in &[(33, 1), (29, 9), (34, 1), (34, 9)] {
+            let block = BlockState::new(id, meta);
+            for face in [BlockFace::Top, BlockFace::Bottom, BlockFace::Side] {
+                assert!(
+                    !uv.is_missing_tile(block.texture_name(face)),
+                    "piston {id}:{meta} {face:?} resolves a tile"
+                );
+            }
+        }
+        assert!(!uv.is_missing_tile(Some("piston_inner")));
     }
 }

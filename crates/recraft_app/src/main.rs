@@ -1,5 +1,6 @@
 mod auth;
 mod chat;
+mod container;
 mod game;
 mod gui;
 mod item_renderer;
@@ -26,7 +27,7 @@ use gui::chat_screen::GuiChat;
 use gui::game_over::GuiGameOver;
 use gui::ingame::{GuiIngame, HudState};
 use gui::ingame_menu::GuiIngameMenu;
-use gui::inventory::GuiInventory;
+use gui::inventory::GuiContainer;
 use gui::main_menu::GuiMainMenu;
 use gui::progress::{GuiAuthCode, GuiConnecting, GuiDisconnected, GuiProgress, Parent};
 use gui::{AccountEntry, DrawCtx, GuiAction, GuiScreen, ScreenCtx};
@@ -104,10 +105,11 @@ impl App {
 
     /// Release held movement keys and abort any in-progress dig — called when
     /// a screen opens over gameplay.
-    fn suspend_gameplay_input(&mut self, left_held: &mut bool) {
+    fn suspend_gameplay_input(&mut self, left_held: &mut bool, right_held: &mut bool) {
         self.game.input.release_all();
         self.tab_open = false;
         *left_held = false;
+        *right_held = false;
         if let Some(packet) = self.game.cancel_breaking() {
             if let Some(network) = &self.network {
                 network.send_packet(packet);
@@ -222,17 +224,21 @@ fn main() -> anyhow::Result<()> {
     let mut mouse_down_right = false;
     // Whether the left mouse button is held in gameplay (continuous mining).
     let mut left_held = false;
+    // Whether the right mouse button is held in gameplay (sword blocking holds
+    // the item in use until released).
+    let mut right_held = false;
     // Per-tick input intents. Frame events only RECORD intent here; the tick loop
     // turns them into packets in vanilla order (held-item, then click actions, then
     // the flying packet) using that tick's player state — exactly how vanilla's
     // runTick processes input before onUpdateWalkingPlayer sends movement. This is
     // why interactions never land in Grim's "post-flying" window.
     let mut attack_pressed = false;
-    let mut attack_released = false;
     let mut use_pressed = false;
     let mut slot_select: Option<i32> = None;
     let mut slot_scroll = 0i32;
     let mut was_dead = false;
+    // F3 debug overlay (coords, chunk info, render profiler).
+    let mut f3_debug = false;
 
     let mut last_frame = Instant::now();
     // The physics/network simulation advances on its own wall-clock so it runs
@@ -271,6 +277,19 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
                 WindowEvent::KeyboardInput { event, .. } => {
+                    // F3 toggles the debug overlay in-world, regardless of any
+                    // open screen, but not while typing in a chat field.
+                    if event.state == ElementState::Pressed
+                        && !event.repeat
+                        && matches!(event.physical_key, PhysicalKey::Code(KeyCode::F3))
+                        && app.in_world
+                        && app
+                            .screen
+                            .as_ref()
+                            .is_none_or(|screen| screen.chat_input().is_none())
+                    {
+                        f3_debug = !f3_debug;
+                    }
                     if app.screen.is_some() {
                         // Screen input: route through the screen, collect actions.
                         let mut taken = app.screen.take();
@@ -294,15 +313,16 @@ fn main() -> anyhow::Result<()> {
                         if pressed
                             && matches!(event.physical_key, PhysicalKey::Code(KeyCode::Escape))
                         {
-                            app.suspend_gameplay_input(&mut left_held);
+                            app.suspend_gameplay_input(&mut left_held, &mut right_held);
                             app.screen = Some(Box::new(GuiIngameMenu::new()));
                         } else if pressed
                             && matches!(event.physical_key, PhysicalKey::Code(KeyCode::KeyE))
                         {
-                            app.suspend_gameplay_input(&mut left_held);
-                            app.screen = Some(Box::new(GuiInventory::new()));
+                            app.suspend_gameplay_input(&mut left_held, &mut right_held);
+                            app.game.open_player_inventory();
+                            app.screen = Some(Box::new(GuiContainer::new()));
                         } else if let Some(prefill) = chat_open_key(&event) {
-                            app.suspend_gameplay_input(&mut left_held);
+                            app.suspend_gameplay_input(&mut left_held, &mut right_held);
                             app.game.chat.reset_recall();
                             app.screen = Some(Box::new(GuiChat::new(prefill)));
                         } else if let Some(slot) = hotbar_slot_key(&event) {
@@ -352,6 +372,7 @@ fn main() -> anyhow::Result<()> {
                 WindowEvent::MouseInput { state, button, .. } => {
                     let is_left = button == MouseButton::Left;
                     let is_right = button == MouseButton::Right;
+                    let is_middle = button == MouseButton::Middle;
                     if state == ElementState::Released {
                         if is_left {
                             mouse_down_left = false;
@@ -359,6 +380,7 @@ fn main() -> anyhow::Result<()> {
                         }
                         if is_right {
                             mouse_down_right = false;
+                            right_held = false;
                         }
                         if app.screen.is_some() && (is_left || is_right) {
                             // Route the release to the screen (commits an
@@ -383,16 +405,12 @@ fn main() -> anyhow::Result<()> {
                             };
                             app.screen = taken;
                             handle_actions(&mut app, &mut renderer, actions);
-                        } else if is_left && app.in_world {
-                            // Record the release; the cancel-dig packet (if any)
-                            // is sent inside the tick.
-                            attack_released = true;
                         }
                     } else if app.screen.is_some() {
-                        if is_left || is_right {
+                        if is_left || is_right || is_middle {
                             if is_left {
                                 mouse_down_left = true;
-                            } else {
+                            } else if is_right {
                                 mouse_down_right = true;
                             }
                             let mut taken = app.screen.take();
@@ -404,14 +422,13 @@ fn main() -> anyhow::Result<()> {
                                     modifiers,
                                     mouse: cursor_position,
                                 };
+                                let (mx, my) = cursor_position;
                                 if is_left {
-                                    screen.mouse_clicked(cursor_position.0, cursor_position.1, &mut ctx)
+                                    screen.mouse_clicked(mx, my, &mut ctx)
+                                } else if is_right {
+                                    screen.mouse_right_clicked(mx, my, &mut ctx)
                                 } else {
-                                    screen.mouse_right_clicked(
-                                        cursor_position.0,
-                                        cursor_position.1,
-                                        &mut ctx,
-                                    )
+                                    screen.mouse_middle_clicked(mx, my, &mut ctx)
                                 }
                             } else {
                                 Vec::new()
@@ -429,7 +446,10 @@ fn main() -> anyhow::Result<()> {
                                 left_held = true;
                                 attack_pressed = true;
                             }
-                            MouseButton::Right => use_pressed = true,
+                            MouseButton::Right => {
+                                right_held = true;
+                                use_pressed = true;
+                            }
                             _ => {}
                         }
                         sync_cursor(window, &mut cursor_captured, &app);
@@ -451,6 +471,16 @@ fn main() -> anyhow::Result<()> {
             Event::AboutToWait => {
                 // --- Network event pump (bounded per iteration). ---
                 pump_network(&mut app, window, &mut cursor_captured);
+
+                // The server opened (S2D) or force-closed (S2E) a window: push or
+                // pop the container screen to match.
+                if app.game.take_window_open() {
+                    app.suspend_gameplay_input(&mut left_held, &mut right_held);
+                    app.screen = Some(Box::new(GuiContainer::new()));
+                }
+                if app.game.take_window_close() {
+                    app.screen = None;
+                }
 
                 // Per-frame screen upkeep (ping results, auto-close).
                 let mut taken = app.screen.take();
@@ -511,17 +541,24 @@ fn main() -> anyhow::Result<()> {
                 if app.in_world {
                     tick_accumulator += sim_dt;
                     while tick_accumulator >= 0.05 {
-                        // `None` on the teleport-ack tick: hold, send no movement.
-                        if let Some(movement) = app.game.tick(0.05) {
-                            let actions = collect_tick_actions(
-                                &mut app.game,
-                                slot_select.take(),
-                                &mut slot_scroll,
-                                &mut attack_pressed,
-                                &mut attack_released,
-                                &mut use_pressed,
-                                left_held,
-                            );
+                        // Stage this tick's input intents; the tick resolves them
+                        // (in vanilla order) BEFORE the move, so a sprint-attack or
+                        // sword-block slowdown lands on this tick's flying packet.
+                        app.game.set_pending_actions(game::TickActions {
+                            slot_select,
+                            slot_scroll,
+                            attack_pressed,
+                            use_pressed,
+                            left_held,
+                            right_held,
+                        });
+                        // `None` on the teleport-ack tick: hold, send no movement
+                        // and keep the intents for the next tick.
+                        if let Some((actions, movement)) = app.game.tick(0.05) {
+                            slot_select = None;
+                            slot_scroll = 0;
+                            attack_pressed = false;
+                            use_pressed = false;
                             // Abilities echo (C13) goes out after the click
                             // actions and before the flying packet, matching
                             // vanilla's runTick → onLivingUpdate →
@@ -574,6 +611,7 @@ fn main() -> anyhow::Result<()> {
                     tick_accumulator,
                     cursor_position,
                     mouse_down_left,
+                    f3_debug,
                 );
 
                 // Keep the OS IME in sync with whichever field is focused: enable
@@ -838,6 +876,7 @@ fn render_frame(
     tick_accumulator: f32,
     cursor_position: (f64, f64),
     mouse_down: bool,
+    f3_debug: bool,
 ) {
     let now = Instant::now();
     fps_counter.tick(now);
@@ -888,8 +927,12 @@ fn render_frame(
             let (vertices, indices) =
                 ItemRenderer::build_held_item(&app.game.camera, &first_person, atlas_uv);
             renderer.set_first_person_item(&vertices, &indices);
+            // 3D world-space player nametags (billboarded, depth-occluded).
+            let nametags = app.game.player_nametags(tick_alpha);
+            renderer.set_nametags(&app.game.camera, &nametags);
         } else {
             renderer.set_first_person_item(&[], &[]);
+            renderer.set_nametags(&app.game.camera, &[]);
         }
         renderer.upload_model(&model);
         let dropped = app.game.dropped_items(tick_alpha);
@@ -900,6 +943,7 @@ fn render_frame(
         renderer.upload_model(&recraft_render::ModelMesh::new());
         renderer.set_first_person_item(&[], &[]);
         renderer.set_world_items(&[], &[]);
+        renderer.set_nametags(&app.game.camera, &[]);
     }
     // Mining crack overlay (vanilla destroy_stage_N textures over the dig target).
     renderer.set_break_overlay(app.game.breaking_overlay());
@@ -928,6 +972,7 @@ fn render_frame(
         selected_slot: game.selected_slot(),
         hotbar: game.hotbar_items(),
         inventory: game.inventory_slots(),
+        container: game.open_container(),
         cursor_item: game.cursor_item(),
         chat: &game.chat,
         scoreboard: &game.scoreboard,
@@ -936,7 +981,15 @@ fn render_frame(
         title: game.title_overlay(tick_accumulator / 0.05),
     };
     if hud_visible {
-        draw_nametags(&mut ui, game, width, height, tick_alpha);
+        // The render stats are the previous frame's (collected after the draw);
+        // one frame stale is fine for a live debug readout.
+        let debug = f3_debug.then(|| gui::ingame::DebugInfo {
+            pos: game.player_position().to_array(),
+            on_ground: game.player_on_ground(),
+            yaw: game.camera.yaw,
+            pitch: game.camera.pitch,
+            stats: renderer.last_stats(),
+        });
         let chat_input = screen.as_mut().and_then(|screen| screen.chat_input_mut());
         GuiIngame::render(
             &mut ui,
@@ -946,6 +999,7 @@ fn render_frame(
             game.loaded_chunk_count(),
             &hud,
             chat_input,
+            debug.as_ref(),
         );
     }
     if let Some(screen) = screen.as_mut() {
@@ -965,55 +1019,11 @@ fn render_frame(
         screen.draw(&mut ui, &ctx);
     }
 
+    // Drive the day/night sky and lightmap from the world clock (interpolated
+    // for smooth motion between ticks).
+    renderer.set_world_time(app.game.world_time(tick_alpha));
     if let Err(err) = renderer.render_with_ui(&app.game.camera, &ui) {
         log::error!("render error: {err}");
-    }
-}
-
-/// Project each visible player's head anchor to screen space and draw its
-/// nametag — a translucent dark plate with centered, shadowed text — like
-/// vanilla `EntityRenderer.drawNameplate`. Names are pre-filtered (distance and
-/// block occlusion) by [`GameState::player_nametags`]; here we cull anything
-/// behind or off the screen and lay out the 2D text.
-fn draw_nametags(
-    ui: &mut recraft_render::UiFrame,
-    game: &GameState,
-    width: i32,
-    height: i32,
-    tick_alpha: f32,
-) {
-    let view_proj = game.camera.view_projection();
-    let scale = gui::gui_scale(height);
-    for (name, world) in game.player_nametags(tick_alpha) {
-        let clip = view_proj * glam::Vec4::new(world.x, world.y, world.z, 1.0);
-        if clip.w <= 0.05 {
-            continue; // anchor is behind the camera
-        }
-        let ndc_x = clip.x / clip.w;
-        let ndc_y = clip.y / clip.w;
-        if !(-1.5..=1.5).contains(&ndc_x) || !(-1.5..=1.5).contains(&ndc_y) {
-            continue;
-        }
-        let sx = ((ndc_x * 0.5 + 0.5) * width as f32) as i32;
-        let sy = ((1.0 - (ndc_y * 0.5 + 0.5)) * height as f32) as i32;
-        let text_w = recraft_render::text_width(&name, scale);
-        let pad = 2 * scale;
-        ui.rect(
-            recraft_render::UiRect::new(
-                sx - text_w / 2 - pad,
-                sy - 5 * scale,
-                text_w + 2 * pad,
-                10 * scale,
-            ),
-            recraft_render::UiColor::rgba(0, 0, 0, 96),
-        );
-        ui.text_shadowed(
-            sx - text_w / 2,
-            sy - 4 * scale,
-            scale,
-            recraft_render::UiColor::rgba(255, 255, 255, 255),
-            name,
-        );
     }
 }
 
@@ -1097,56 +1107,6 @@ impl LaunchConfig {
     }
 }
 
-/// Build a tick's serverbound gameplay packets in vanilla order — held-item
-/// change first (which, like `PlayerControllerMP.resetBlockRemoving`, cancels any
-/// in-progress dig when the item changes), then the click actions. The caller
-/// sends these before the tick's flying packet, matching runTick →
-/// onUpdateWalkingPlayer. Input edges are consumed here.
-fn collect_tick_actions(
-    game: &mut GameState,
-    slot_select: Option<i32>,
-    slot_scroll: &mut i32,
-    attack_pressed: &mut bool,
-    attack_released: &mut bool,
-    use_pressed: &mut bool,
-    left_held: bool,
-) -> Vec<ServerboundPacket> {
-    let mut packets = Vec::new();
-
-    let slot_packet = if let Some(slot) = slot_select {
-        game.set_selected_slot(slot)
-    } else if *slot_scroll != 0 {
-        let p = game.cycle_slot(*slot_scroll);
-        *slot_scroll = 0;
-        p
-    } else {
-        None
-    };
-    if let Some(slot_packet) = slot_packet {
-        if let Some(cancel) = game.cancel_breaking() {
-            packets.push(cancel);
-        }
-        packets.push(slot_packet);
-    }
-
-    if *attack_pressed {
-        packets.extend(game.on_attack_press());
-    } else if left_held {
-        packets.extend(game.on_attack_hold());
-    }
-    if *attack_released {
-        packets.extend(game.on_attack_release());
-    }
-    if *use_pressed {
-        packets.extend(game.on_use());
-    }
-    *attack_pressed = false;
-    *attack_released = false;
-    *use_pressed = false;
-
-    packets
-}
-
 /// Stand still, aim down at the ground, and continuously mine the targeted block
 /// — to exercise the block-interaction checks (rotation/reach) in isolation from
 /// movement. The look is fixed and sent every tick, so any rotation-place/break
@@ -1225,32 +1185,27 @@ fn run_headless_interact(config: &LaunchConfig, seconds: f32) -> anyhow::Result<
 
             // Drive the same per-tick action pipeline the windowed loop uses:
             // continuous mining (held), plus a hotbar switch every ~1.5 s to
-            // exercise HeldItemChange ordering and the dig-reset-on-switch.
-            if let Some(movement) = game.tick(0.05) {
+            // exercise HeldItemChange ordering and the dig-reset-on-switch. The
+            // intents are staged before the tick, which resolves them in order.
+            let want_mine = game.debug_has_block_target();
+            let attack_pressed = want_mine && !started_attack;
+            if want_mine {
+                started_attack = true;
+            }
+            game.set_pending_actions(game::TickActions {
+                slot_select: if tick_count % 30 == 15 {
+                    Some((tick_count / 30 % 9) as i32)
+                } else {
+                    None
+                },
+                slot_scroll: 0,
+                attack_pressed,
+                use_pressed: false,
+                left_held: want_mine,
+                right_held: false,
+            });
+            if let Some((actions, movement)) = game.tick(0.05) {
                 if game.can_send_movement_packets() {
-                    let want_mine = game.debug_has_block_target();
-                    let mut attack_pressed = want_mine && !started_attack;
-                    let mut attack_released = false;
-                    let mut use_pressed = false;
-                    if want_mine {
-                        started_attack = true;
-                    }
-                    let left_held = want_mine;
-                    let slot_select = if tick_count % 30 == 15 {
-                        Some((tick_count / 30 % 9) as i32)
-                    } else {
-                        None
-                    };
-                    let mut slot_scroll = 0;
-                    let actions = collect_tick_actions(
-                        &mut game,
-                        slot_select,
-                        &mut slot_scroll,
-                        &mut attack_pressed,
-                        &mut attack_released,
-                        &mut use_pressed,
-                        left_held,
-                    );
                     for packet in actions {
                         network.send_packet(packet);
                     }
@@ -1335,7 +1290,7 @@ fn run_headless_smoke(config: &LaunchConfig, seconds: f32) -> anyhow::Result<()>
         let _ = game.take_position_confirm();
         game.apply_scripted_smoke_input(elapsed, seconds);
         if in_game {
-            if let Some(movement) = game.tick(0.05) {
+            if let Some((_actions, movement)) = game.tick(0.05) {
                 if game.can_send_movement_packets() {
                     network.send_movement(movement);
                 }

@@ -68,8 +68,11 @@ const FACES: [([usize; 4], f32); 6] = [
 /// face (in `FACES` order), relative to the part's atlas slot.
 type Part = ([f32; 3], [f32; 3], [[f32; 4]; 6]);
 
-/// Humanoid models are 32 px tall (legs 12 + body 12 + head 8).
-const HUMANOID_PX: f32 = 32.0;
+/// World scale of one model pixel: vanilla renders entity models at 1/16 block
+/// per pixel (independent of the hitbox height), so a 32 px humanoid is 2.0
+/// blocks tall. Tying the scale to a fixed 1/16 (rather than `height/model_px`)
+/// keeps wide/short mobs — spiders, slimes, quadrupeds — in correct proportion.
+const MODEL_SCALE: f32 = 1.0 / 16.0;
 
 /// Per-frame animation inputs for one entity, in vanilla terms. Built by the
 /// app from the entity's interpolated motion and metadata.
@@ -208,66 +211,12 @@ impl ModelMesh {
                 let row = skin_row
                     .map(|i| PLAYER_SKIN_BASE_ROW + i)
                     .unwrap_or(EntitySlot::Player as u32);
-                self.push_parts(
-                    &humanoid_parts(true),
-                    &humanoid_poses(anim),
-                    HUMANOID_PX,
-                    row,
-                    feet,
-                    height,
-                    yaw_degrees,
-                );
+                self.push_parts(&humanoid_parts(true), &humanoid_poses(anim), row, feet, yaw_degrees);
             }
             EntityKind::Mob(id) => match mob_model(id) {
-                Some(MobModel::Biped(slot)) => {
-                    self.push_parts(
-                        &humanoid_parts(false),
-                        &humanoid_poses(anim),
-                        HUMANOID_PX,
-                        slot as u32,
-                        feet,
-                        height,
-                        yaw_degrees,
-                    );
-                }
-                Some(MobModel::Quadruped { slot, leg_px }) => {
-                    let (parts, model_px) = quadruped_parts(leg_px);
-                    self.push_parts(
-                        &parts,
-                        &quadruped_poses(anim, leg_px),
-                        model_px,
-                        slot as u32,
-                        feet,
-                        height,
-                        yaw_degrees,
-                    );
-                }
-                Some(MobModel::Creeper) => {
-                    let (parts, model_px) = creeper_parts();
-                    self.push_parts(
-                        &parts,
-                        &creeper_poses(anim),
-                        model_px,
-                        EntitySlot::Creeper as u32,
-                        feet,
-                        height,
-                        yaw_degrees,
-                    );
-                }
-                Some(MobModel::Chicken) => {
-                    let (parts, model_px) = chicken_parts();
-                    self.push_parts(
-                        &parts,
-                        &chicken_poses(anim),
-                        model_px,
-                        EntitySlot::Chicken as u32,
-                        feet,
-                        height,
-                        yaw_degrees,
-                    );
-                }
+                Some(model) => self.push_mob(model, feet, yaw_degrees, anim),
                 None => {
-                    // Unknown mob type: a solid colored box at the entity AABB
+                    // Unmodelled mob type: a solid colored box at the entity AABB
                     // so it never reads as a player.
                     let w = half_width.max(0.1);
                     let min = Vec3::new(feet.x - w, feet.y, feet.z - w);
@@ -284,22 +233,73 @@ impl ModelMesh {
         }
     }
 
-    /// Build a model from px-space parts: scale `model_px` (the model's total
-    /// px height) to `height`, rotate every part about the vertical axis
+    /// Build one known mob from its archetype: pick the part list, pose list and
+    /// atlas slot, then emit the boxes. Sheep layer their wool over the body.
+    fn push_mob(&mut self, model: MobModel, feet: Vec3, yaw: f32, anim: &EntityAnim) {
+        match model {
+            MobModel::Humanoid { slot, separate } => {
+                self.push_parts(&humanoid_parts(separate), &humanoid_poses(anim), slot as u32, feet, yaw);
+            }
+            MobModel::Villager => {
+                self.push_parts(&villager_parts(), &villager_poses(anim), EntitySlot::Villager as u32, feet, yaw);
+            }
+            MobModel::Enderman => {
+                self.push_parts(&enderman_parts(), &enderman_poses(anim), EntitySlot::Enderman as u32, feet, yaw);
+            }
+            MobModel::Quadruped { slot, leg_px } => {
+                self.push_parts(&quadruped_parts(leg_px), &quadruped_poses(anim, leg_px), slot as u32, feet, yaw);
+            }
+            MobModel::Sheep => {
+                let poses = quadruped_poses(anim, SHEEP_LEG_PX);
+                self.push_parts(&quadruped_parts(SHEEP_LEG_PX), &poses, EntitySlot::Sheep as u32, feet, yaw);
+                self.push_parts(&sheep_wool_parts(), &poses, EntitySlot::SheepFur as u32, feet, yaw);
+            }
+            MobModel::Wolf => {
+                self.push_parts(&wolf_parts(), &wolf_poses(anim), EntitySlot::Wolf as u32, feet, yaw);
+            }
+            MobModel::Spider { slot } => {
+                self.push_parts(&spider_parts(), &spider_poses(anim), slot as u32, feet, yaw);
+            }
+            MobModel::Cat => {
+                self.push_parts(&cat_parts(), &cat_poses(anim), EntitySlot::Ocelot as u32, feet, yaw);
+            }
+            MobModel::Creeper => {
+                self.push_parts(&creeper_parts(), &creeper_poses(anim), EntitySlot::Creeper as u32, feet, yaw);
+            }
+            MobModel::Chicken => {
+                self.push_parts(&chicken_parts(), &chicken_poses(anim), EntitySlot::Chicken as u32, feet, yaw);
+            }
+            MobModel::Cube { slot, size_px } => {
+                self.push_parts(&cube_parts(size_px), &[], slot as u32, feet, yaw);
+            }
+            MobModel::Squid => {
+                self.push_parts(&squid_parts(), &[], EntitySlot::Squid as u32, feet, yaw);
+            }
+            MobModel::Snowman => {
+                self.push_parts(&snowman_parts(), &snowman_poses(anim), EntitySlot::Snowman as u32, feet, yaw);
+            }
+            MobModel::Bat => {
+                self.push_parts(&bat_parts(), &bat_poses(anim), EntitySlot::Bat as u32, feet, yaw);
+            }
+            MobModel::Insect { slot } => {
+                self.push_parts(&insect_parts(), &insect_poses(anim), slot as u32, feet, yaw);
+            }
+        }
+    }
+
+    /// Build a model from px-space parts (feet at y=0, +y up, +z front): scale
+    /// px→world by [`MODEL_SCALE`], rotate every part about the vertical axis
     /// through `feet` by `yaw_degrees`, and sample each face's texture rect
     /// inside `slot` of the entity atlas.
-    #[allow(clippy::too_many_arguments)]
     fn push_parts(
         &mut self,
         parts: &[Part],
         poses: &[PartPose],
-        model_px: f32,
         slot_row: u32,
         feet: Vec3,
-        height: f32,
         yaw_degrees: f32,
     ) {
-        let scale = height / model_px;
+        let scale = MODEL_SCALE;
         let yaw = yaw_degrees.to_radians();
         let (sin, cos) = (yaw.sin(), yaw.cos());
         let origin = [0.0, (slot_row * ENTITY_SLOT_PX) as f32];
@@ -351,47 +351,59 @@ impl ModelMesh {
     }
 }
 
-/// Which model + atlas slot a 1.8 SpawnMob entity-type id maps to.
+/// Which model archetype a 1.8 SpawnMob entity-type id maps to.
 enum MobModel {
-    Biped(EntitySlot),
+    /// Player-shaped biped. `separate` uses the 64x64 left-limb regions (zombie,
+    /// pigman); false mirrors the right limbs for 64x32 skins (skeleton).
+    Humanoid { slot: EntitySlot, separate: bool },
+    Villager,
+    Enderman,
     Quadruped { slot: EntitySlot, leg_px: f32 },
+    Sheep,
+    Wolf,
+    Spider { slot: EntitySlot },
+    Cat,
     Creeper,
     Chicken,
+    /// A single textured cube (slime / magma cube), `size_px` on a side.
+    Cube { slot: EntitySlot, size_px: f32 },
+    Squid,
+    Snowman,
+    Bat,
+    /// A small ground crawler (silverfish / endermite).
+    Insect { slot: EntitySlot },
 }
 
-/// 1.8 SpawnMob type ids -> model archetype. Unknown ids return None and are
-/// drawn as a solid colored box.
+/// 1.8 SpawnMob type ids -> model archetype. Ids without a model return None and
+/// are drawn as a solid colored box (wither, ender dragon, guardian, witch,
+/// iron golem, horse, ghast, blaze — texture too large or model not yet built).
 fn mob_model(id: u8) -> Option<MobModel> {
-    match id {
-        50 => Some(MobModel::Creeper),
-        51 => Some(MobModel::Biped(EntitySlot::Skeleton)),
-        54 => Some(MobModel::Biped(EntitySlot::Zombie)),
-        57 => Some(MobModel::Biped(EntitySlot::Zombie)), // zombie pigman
-        // Villager is 120 in vanilla 1.8; 100 kept as an alias.
-        100 | 120 => Some(MobModel::Biped(EntitySlot::Villager)),
-        90 => Some(MobModel::Quadruped {
-            slot: EntitySlot::Pig,
-            leg_px: 6.0,
-        }),
-        91 => Some(MobModel::Quadruped {
-            slot: EntitySlot::Sheep,
-            leg_px: 12.0,
-        }),
-        92 | 96 => Some(MobModel::Quadruped {
-            slot: EntitySlot::Cow,
-            leg_px: 12.0,
-        }), // cow, mooshroom
-        95 => Some(MobModel::Quadruped {
-            slot: EntitySlot::Pig,
-            leg_px: 8.0,
-        }), // wolf
-        98 => Some(MobModel::Quadruped {
-            slot: EntitySlot::Pig,
-            leg_px: 6.0,
-        }), // ocelot
-        93 => Some(MobModel::Chicken),
-        _ => None,
-    }
+    use EntitySlot::*;
+    Some(match id {
+        50 => MobModel::Creeper,
+        51 => MobModel::Humanoid { slot: Skeleton, separate: false },
+        // Giant is a scaled-up zombie; render it as a zombie biped.
+        53 | 54 => MobModel::Humanoid { slot: Zombie, separate: true },
+        57 => MobModel::Humanoid { slot: ZombiePigman, separate: true },
+        120 => MobModel::Villager,
+        58 => MobModel::Enderman,
+        52 | 59 => MobModel::Spider { slot: Spider }, // spider, cave spider
+        90 => MobModel::Quadruped { slot: Pig, leg_px: 6.0 },
+        91 => MobModel::Sheep,
+        92 => MobModel::Quadruped { slot: Cow, leg_px: 12.0 },
+        96 => MobModel::Quadruped { slot: Mooshroom, leg_px: 12.0 },
+        93 => MobModel::Chicken,
+        94 => MobModel::Squid,
+        95 => MobModel::Wolf,
+        97 => MobModel::Snowman,
+        98 => MobModel::Cat,
+        55 => MobModel::Cube { slot: Slime, size_px: 8.0 },
+        62 => MobModel::Cube { slot: MagmaCube, size_px: 8.0 },
+        65 => MobModel::Bat,
+        60 => MobModel::Insect { slot: Silverfish },
+        67 => MobModel::Insect { slot: Silverfish }, // endermite (silverfish stand-in)
+        _ => return None,
+    })
 }
 
 /// Texture pixel rects per face (in `FACES` order: bottom, top, back, front,
@@ -440,8 +452,7 @@ fn humanoid_parts(separate_left_limbs: bool) -> [Part; 6] {
 /// Quadruped (pig/cow/sheep family): a horizontal 10x8x16 body on four
 /// `leg_px`-tall legs with an 8x8x8 head at the front (+z). Uses the standard
 /// 1.8 quadruped texture layout (head at 0,0; legs at 0,16; body at 28,8).
-/// Returns the parts and the model's total px height.
-fn quadruped_parts(leg_px: f32) -> ([Part; 6], f32) {
+fn quadruped_parts(leg_px: f32) -> [Part; 6] {
     let head = box_region(0.0, 0.0, 8.0, 8.0, 8.0);
     let leg = box_region(0.0, 16.0, 4.0, leg_px, 4.0);
     // Vanilla models the body as a vertical texture box rotated 90° onto its
@@ -450,55 +461,97 @@ fn quadruped_parts(leg_px: f32) -> ([Part; 6], f32) {
     let b = box_region(28.0, 8.0, 10.0, 16.0, 8.0);
     let body = [b[2], b[3], b[0], b[1], b[4], b[5]];
     let top = leg_px + 8.0;
-    (
-        [
-            ([-5.0, 0.0, 3.0], [-1.0, leg_px, 7.0], leg), // front right leg
-            ([1.0, 0.0, 3.0], [5.0, leg_px, 7.0], leg),   // front left leg
-            ([-5.0, 0.0, -7.0], [-1.0, leg_px, -3.0], leg), // back right leg
-            ([1.0, 0.0, -7.0], [5.0, leg_px, -3.0], leg), // back left leg
-            ([-5.0, leg_px, -8.0], [5.0, top, 8.0], body), // body
-            ([-4.0, leg_px, 5.0], [4.0, top, 13.0], head), // head
-        ],
-        top,
-    )
+    [
+        ([-5.0, 0.0, 3.0], [-1.0, leg_px, 7.0], leg), // front right leg
+        ([1.0, 0.0, 3.0], [5.0, leg_px, 7.0], leg),   // front left leg
+        ([-5.0, 0.0, -7.0], [-1.0, leg_px, -3.0], leg), // back right leg
+        ([1.0, 0.0, -7.0], [5.0, leg_px, -3.0], leg), // back left leg
+        ([-5.0, leg_px, -8.0], [5.0, top, 8.0], body), // body
+        ([-4.0, leg_px, 5.0], [4.0, top, 13.0], head), // head
+    ]
+}
+
+/// Sheep wool: the quadruped boxes inflated ~0.9 px and sampled from the
+/// `sheep_fur` slot (whose UV layout matches the body), so the fleece sits
+/// proud of the body. Shares the body's poses so it walks with the sheep.
+fn sheep_wool_parts() -> [Part; 6] {
+    let g = 0.9;
+    let mut parts = quadruped_parts(SHEEP_LEG_PX);
+    for (min, max, _) in parts.iter_mut() {
+        for k in 0..3 {
+            min[k] -= g;
+            max[k] += g;
+        }
+    }
+    parts
 }
 
 /// Creeper: four short legs, a tall upright body and a head on top, using the
 /// 1.8 creeper texture layout (head 0,0; body 16,16; legs 0,16).
-fn creeper_parts() -> ([Part; 6], f32) {
+fn creeper_parts() -> [Part; 6] {
     let head = box_region(0.0, 0.0, 8.0, 8.0, 8.0);
     let body = box_region(16.0, 16.0, 8.0, 12.0, 4.0);
     let leg = box_region(0.0, 16.0, 4.0, 6.0, 4.0);
-    (
-        [
-            ([-4.0, 0.0, 2.0], [0.0, 6.0, 6.0], leg), // front right leg
-            ([0.0, 0.0, 2.0], [4.0, 6.0, 6.0], leg),  // front left leg
-            ([-4.0, 0.0, -6.0], [0.0, 6.0, -2.0], leg), // back right leg
-            ([0.0, 0.0, -6.0], [4.0, 6.0, -2.0], leg), // back left leg
-            ([-4.0, 6.0, -2.0], [4.0, 18.0, 2.0], body), // body
-            ([-4.0, 18.0, -4.0], [4.0, 26.0, 4.0], head), // head
-        ],
-        26.0,
-    )
+    [
+        ([-4.0, 0.0, 2.0], [0.0, 6.0, 6.0], leg), // front right leg
+        ([0.0, 0.0, 2.0], [4.0, 6.0, 6.0], leg),  // front left leg
+        ([-4.0, 0.0, -6.0], [0.0, 6.0, -2.0], leg), // back right leg
+        ([0.0, 0.0, -6.0], [4.0, 6.0, -2.0], leg), // back left leg
+        ([-4.0, 6.0, -2.0], [4.0, 18.0, 2.0], body), // body
+        ([-4.0, 18.0, -4.0], [4.0, 26.0, 4.0], head), // head
+    ]
 }
 
 /// Chicken: two legs, a small horizontal body and a head at the front, using
 /// the 1.8 chicken texture layout (head 0,0; body 0,9; legs 26,0). The body
 /// box is rotated like the quadruped's.
-fn chicken_parts() -> ([Part; 4], f32) {
+fn chicken_parts() -> [Part; 4] {
     let head = box_region(0.0, 0.0, 4.0, 6.0, 3.0);
     let leg = box_region(26.0, 0.0, 3.0, 5.0, 3.0);
     let b = box_region(0.0, 9.0, 6.0, 8.0, 6.0);
     let body = [b[2], b[3], b[0], b[1], b[4], b[5]];
-    (
-        [
-            ([-3.0, 0.0, -1.0], [-1.0, 5.0, 1.0], leg),  // right leg
-            ([1.0, 0.0, -1.0], [3.0, 5.0, 1.0], leg),    // left leg
-            ([-3.0, 5.0, -4.0], [3.0, 11.0, 4.0], body), // body
-            ([-2.0, 9.0, 3.0], [2.0, 15.0, 7.0], head),  // head
-        ],
-        15.0,
-    )
+    [
+        ([-3.0, 0.0, -1.0], [-1.0, 5.0, 1.0], leg),  // right leg
+        ([1.0, 0.0, -1.0], [3.0, 5.0, 1.0], leg),    // left leg
+        ([-3.0, 5.0, -4.0], [3.0, 11.0, 4.0], body), // body
+        ([-2.0, 9.0, 3.0], [2.0, 15.0, 7.0], head),  // head
+    ]
+}
+
+/// Sheep legs are the vanilla 12 px-tall quadruped legs.
+const SHEEP_LEG_PX: f32 = 12.0;
+
+/// Port a vanilla 1.8 model box into an engine [`Part`]. Vanilla model space is
+/// y-down with the feet at y=24 and the entity facing -z; the engine builds
+/// feet-up (+y), front +z. `rp` is the part's rotation point, `off`/`size` the
+/// `addBox` offset and dimensions, `tex` the texture-offset (u, v); `grow`
+/// inflates the box outward on every axis (vanilla's `addBox` scale) for
+/// overlay layers while keeping the original texture rect.
+fn vbox(rp: [f32; 3], off: [f32; 3], size: [f32; 3], tex: [f32; 2], grow: f32) -> Part {
+    let [rx, ry, rz] = rp;
+    let [ox, oy, oz] = off;
+    let [w, h, d] = size;
+    let min = [
+        rx + ox - grow,
+        24.0 - (ry + oy + h) - grow,
+        -(rz + oz + d) - grow,
+    ];
+    let max = [rx + ox + w + grow, 24.0 - (ry + oy) + grow, -(rz + oz) + grow];
+    (min, max, box_region(tex[0], tex[1], w, h, d))
+}
+
+/// Engine-space pivot of a vanilla rotation point (feet-up, front +z).
+fn vpivot(rp: [f32; 3]) -> Vec3 {
+    Vec3::new(rp[0], 24.0 - rp[1], -rp[2])
+}
+
+/// Same as [`vbox`] but for a part rendered lying on its back (vanilla
+/// `rotateAngleX = PI/2`): the texture's front/back map to the box's top/bottom
+/// and its top/bottom to the z faces, like the quadruped body. The world box is
+/// built directly from `(min, max)` in engine px.
+fn vbox_prone(min: [f32; 3], max: [f32; 3], tex: [f32; 2], size: [f32; 3]) -> Part {
+    let b = box_region(tex[0], tex[1], size[0], size[1], size[2]);
+    (min, max, [b[2], b[3], b[0], b[1], b[4], b[5]])
 }
 
 /// Walk-cycle leg/arm angle: `cos(limbSwing*0.6662 + phase) * scale * amount`.
@@ -629,6 +682,327 @@ fn chicken_poses(anim: &EntityAnim) -> [PartPose; 4] {
         PartPose::still(),
         head_pose(anim, Vec3::new(0.0, 9.0, 4.0)),
     ]
+}
+
+/// Villager (`ModelVillager`): a big head with a protruding nose, a long robed
+/// body, crossed arms held across the belly, and two legs. Order: head, nose,
+/// body, robe, right arm, left arm, crossed forearms, right leg, left leg.
+fn villager_parts() -> [Part; 9] {
+    [
+        vbox([0.0, 0.0, 0.0], [-4.0, -10.0, -4.0], [8.0, 10.0, 8.0], [0.0, 0.0], 0.0), // head
+        vbox([0.0, -2.0, 0.0], [-1.0, -1.0, -6.0], [2.0, 4.0, 2.0], [24.0, 0.0], 0.0), // nose
+        vbox([0.0, 0.0, 0.0], [-4.0, 0.0, -3.0], [8.0, 20.0, 6.0], [16.0, 20.0], 0.0), // body
+        vbox([0.0, 0.0, 0.0], [-4.0, 0.0, -3.0], [8.0, 18.0, 6.0], [0.0, 38.0], 0.5), // robe
+        vbox([0.0, 3.0, -1.0], [-8.0, -2.0, -2.0], [4.0, 8.0, 4.0], [44.0, 22.0], 0.0), // right arm
+        vbox([0.0, 3.0, -1.0], [4.0, -2.0, -2.0], [4.0, 8.0, 4.0], [44.0, 22.0], 0.0), // left arm
+        vbox([0.0, 3.0, -1.0], [-4.0, 2.0, -2.0], [8.0, 4.0, 4.0], [40.0, 38.0], 0.0), // crossed forearms
+        vbox([-2.0, 12.0, 0.0], [-2.0, 0.0, -2.0], [4.0, 12.0, 4.0], [0.0, 22.0], 0.0), // right leg
+        vbox([2.0, 12.0, 0.0], [-2.0, 0.0, -2.0], [4.0, 12.0, 4.0], [0.0, 22.0], 0.0), // left leg
+    ]
+}
+
+fn villager_poses(anim: &EntityAnim) -> [PartPose; 9] {
+    use std::f32::consts::PI;
+    let (s, a) = (anim.limb_swing, anim.limb_swing_amount);
+    let head = head_pose(anim, vpivot([0.0, 0.0, 0.0]));
+    // The three arm boxes share one downward tilt so they read as crossed.
+    let arms = PartPose {
+        pivot: vpivot([0.0, 3.0, -1.0]),
+        angles: Vec3::new(-0.75, 0.0, 0.0),
+        group_pivot: Vec3::ZERO,
+        group_angle_x: 0.0,
+    };
+    [
+        head,
+        head, // nose tracks the head
+        PartPose::still(),
+        PartPose::still(),
+        arms,
+        arms,
+        arms,
+        leg_pose(vpivot([-2.0, 12.0, 0.0]), swing(s, a, 0.0, 1.4)),
+        leg_pose(vpivot([2.0, 12.0, 0.0]), swing(s, a, PI, 1.4)),
+    ]
+}
+
+/// Enderman: a tall, slim biped using the 1.8 biped texture layout with the
+/// limbs stretched long (the leg/arm texture is stretched over the longer box,
+/// exactly as vanilla does). Order: right leg, left leg, body, right arm, left
+/// arm, head.
+fn enderman_parts() -> [Part; 6] {
+    let head = box_region(0.0, 0.0, 8.0, 8.0, 8.0);
+    let body = box_region(16.0, 16.0, 8.0, 12.0, 4.0);
+    let arm = box_region(40.0, 16.0, 4.0, 12.0, 4.0);
+    let leg = box_region(0.0, 16.0, 4.0, 12.0, 4.0);
+    [
+        ([-4.0, 0.0, -2.0], [0.0, 30.0, 2.0], leg),  // right leg
+        ([0.0, 0.0, -2.0], [4.0, 30.0, 2.0], leg),   // left leg
+        ([-4.0, 30.0, -2.0], [4.0, 42.0, 2.0], body), // body
+        ([-6.0, 12.0, -2.0], [-2.0, 42.0, 2.0], arm), // right arm
+        ([2.0, 12.0, -2.0], [6.0, 42.0, 2.0], arm),  // left arm
+        ([-4.0, 42.0, -4.0], [4.0, 50.0, 4.0], head), // head
+    ]
+}
+
+fn enderman_poses(anim: &EntityAnim) -> [PartPose; 6] {
+    use std::f32::consts::PI;
+    let (s, a) = (anim.limb_swing, anim.limb_swing_amount);
+    [
+        leg_pose(Vec3::new(-2.0, 30.0, 0.0), swing(s, a, 0.0, 1.0)),
+        leg_pose(Vec3::new(2.0, 30.0, 0.0), swing(s, a, PI, 1.0)),
+        PartPose::still(),
+        leg_pose(Vec3::new(-4.0, 42.0, 0.0), swing(s, a, PI, 0.6)),
+        leg_pose(Vec3::new(4.0, 42.0, 0.0), swing(s, a, 0.0, 0.6)),
+        head_pose(anim, Vec3::new(0.0, 42.0, 0.0)),
+    ]
+}
+
+/// Wolf (`ModelWolf`): four legs, a horizontal body and mane, a boxy head at
+/// the front and a hanging tail. Order: 4 legs (back-right, back-left,
+/// front-right, front-left), body, mane, head, tail.
+fn wolf_parts() -> [Part; 8] {
+    let leg = box_region(0.0, 18.0, 2.0, 8.0, 2.0);
+    [
+        ([-3.5, 0.0, -8.0], [-1.5, 8.0, -6.0], leg), // back right
+        ([-0.5, 0.0, -8.0], [1.5, 8.0, -6.0], leg),  // back left
+        ([-3.5, 0.0, 3.0], [-1.5, 8.0, 5.0], leg),   // front right
+        ([-0.5, 0.0, 3.0], [1.5, 8.0, 5.0], leg),    // front left
+        vbox_prone([-3.0, 8.0, -6.0], [3.0, 14.0, 3.0], [18.0, 14.0], [6.0, 9.0, 6.0]), // body
+        vbox_prone([-4.0, 8.0, -1.0], [4.0, 15.0, 5.0], [21.0, 0.0], [8.0, 6.0, 7.0]), // mane
+        ([-4.0, 7.5, 5.0], [2.0, 13.5, 9.0], box_region(0.0, 0.0, 6.0, 6.0, 4.0)), // head
+        ([-2.0, 4.0, -9.0], [0.0, 12.0, -7.0], box_region(9.0, 18.0, 2.0, 8.0, 2.0)), // tail
+    ]
+}
+
+fn wolf_poses(anim: &EntityAnim) -> [PartPose; 8] {
+    use std::f32::consts::PI;
+    let (s, a) = (anim.limb_swing, anim.limb_swing_amount);
+    let (pa, pb) = (swing(s, a, 0.0, 1.4), swing(s, a, PI, 1.4));
+    [
+        leg_pose(Vec3::new(-2.5, 8.0, -7.0), pb), // back right
+        leg_pose(Vec3::new(0.5, 8.0, -7.0), pa),  // back left
+        leg_pose(Vec3::new(-2.5, 8.0, 4.0), pa),  // front right
+        leg_pose(Vec3::new(0.5, 8.0, 4.0), pb),   // front left
+        PartPose::still(),                        // body
+        PartPose::still(),                        // mane
+        head_pose(anim, Vec3::new(-1.0, 10.5, 7.0)),
+        PartPose::still(), // tail
+    ]
+}
+
+/// Spider (`ModelSpider`): head, thorax and abdomen along the body axis with
+/// eight legs splayed out — four to each side, fanned front-to-back and angled
+/// down. Order: head, thorax, abdomen, 4 right legs, 4 left legs.
+fn spider_parts() -> [Part; 11] {
+    let leg = box_region(18.0, 0.0, 16.0, 2.0, 2.0);
+    let right = ([-19.0, 8.0, -1.0], [-3.0, 10.0, 1.0], leg); // extends -x
+    let left = ([3.0, 8.0, -1.0], [19.0, 10.0, 1.0], leg); // extends +x
+    [
+        vbox([0.0, 15.0, -3.0], [-4.0, -4.0, -8.0], [8.0, 8.0, 8.0], [32.0, 4.0], 0.0), // head
+        vbox([0.0, 15.0, 0.0], [-3.0, -3.0, -3.0], [6.0, 6.0, 6.0], [0.0, 0.0], 0.0), // thorax
+        vbox([0.0, 15.0, 9.0], [-5.0, -4.0, -6.0], [10.0, 8.0, 12.0], [0.0, 12.0], 0.0), // abdomen
+        right, right, right, right,
+        left, left, left, left,
+    ]
+}
+
+fn spider_poses(anim: &EntityAnim) -> [PartPose; 11] {
+    use std::f32::consts::PI;
+    let (s, a) = (anim.limb_swing, anim.limb_swing_amount);
+    let fans = [0.95, 0.35, -0.35, -0.95];
+    // side = -1 right / +1 left; legs tilt down and fan, with a small walk wiggle.
+    let mk = |side: f32, i: usize| PartPose {
+        pivot: Vec3::new(3.0 * side, 9.0, 0.0),
+        angles: Vec3::new(0.0, fans[i] + swing(s, a, i as f32 * PI, 0.3) * side, -0.55 * side),
+        group_pivot: Vec3::ZERO,
+        group_angle_x: 0.0,
+    };
+    [
+        head_pose(anim, Vec3::new(0.0, 9.0, 3.0)),
+        PartPose::still(),
+        PartPose::still(),
+        mk(-1.0, 0),
+        mk(-1.0, 1),
+        mk(-1.0, 2),
+        mk(-1.0, 3),
+        mk(1.0, 0),
+        mk(1.0, 1),
+        mk(1.0, 2),
+        mk(1.0, 3),
+    ]
+}
+
+/// Ocelot / cat (`ModelOcelot`): a small low body with a head, tail and four
+/// legs (taller in front). Order: head, body, tail, front-right, front-left,
+/// back-right, back-left legs.
+fn cat_parts() -> [Part; 7] {
+    let front = box_region(40.0, 0.0, 2.0, 10.0, 2.0);
+    let back = box_region(8.0, 13.0, 2.0, 6.0, 2.0);
+    [
+        vbox([0.0, 15.0, -9.0], [-2.5, -2.0, -3.0], [5.0, 4.0, 5.0], [0.0, 0.0], 0.0), // head
+        vbox_prone([-2.0, 6.0, -8.0], [2.0, 12.0, 8.0], [20.0, 0.0], [4.0, 16.0, 6.0]), // body
+        vbox([0.0, 15.0, 8.0], [-0.5, 0.0, 0.0], [1.0, 8.0, 1.0], [0.0, 15.0], 0.0), // tail
+        ([-2.2, 0.0, 3.0], [-0.2, 10.0, 5.0], front), // front right
+        ([0.2, 0.0, 3.0], [2.2, 10.0, 5.0], front),   // front left
+        ([-2.1, 0.0, -8.0], [-0.1, 6.0, -6.0], back), // back right
+        ([0.1, 0.0, -8.0], [2.1, 6.0, -6.0], back),   // back left
+    ]
+}
+
+fn cat_poses(anim: &EntityAnim) -> [PartPose; 7] {
+    use std::f32::consts::PI;
+    let (s, a) = (anim.limb_swing, anim.limb_swing_amount);
+    [
+        head_pose(anim, Vec3::new(0.0, 9.0, 9.0)),
+        PartPose::still(), // body
+        PartPose::still(), // tail
+        leg_pose(Vec3::new(-1.2, 10.0, 4.0), swing(s, a, 0.0, 1.0)), // front right
+        leg_pose(Vec3::new(1.2, 10.0, 4.0), swing(s, a, PI, 1.0)),   // front left
+        leg_pose(Vec3::new(-1.1, 6.0, -7.0), swing(s, a, PI, 1.0)),  // back right
+        leg_pose(Vec3::new(1.1, 6.0, -7.0), swing(s, a, 0.0, 1.0)),  // back left
+    ]
+}
+
+/// Slime / magma cube: a single textured cube `size` px on a side.
+fn cube_parts(size: f32) -> [Part; 1] {
+    let h = size / 2.0;
+    [(
+        [-h, 0.0, -h],
+        [h, size, h],
+        box_region(0.0, 0.0, size, size, size),
+    )]
+}
+
+/// Squid: a mantle box with eight tentacles hanging beneath it. Order: mantle,
+/// then eight tentacles. All parts are static (poses default to still).
+fn squid_parts() -> [Part; 9] {
+    let mantle = box_region(0.0, 0.0, 8.0, 8.0, 8.0);
+    let tent = box_region(48.0, 0.0, 2.0, 18.0, 2.0);
+    let t = |x: f32, z: f32| ([x - 1.0, 0.0, z - 1.0], [x + 1.0, 6.0, z + 1.0], tent);
+    [
+        ([-4.0, 6.0, -4.0], [4.0, 14.0, 4.0], mantle),
+        t(3.0, 0.0),
+        t(-3.0, 0.0),
+        t(0.0, 3.0),
+        t(0.0, -3.0),
+        t(2.0, 2.0),
+        t(-2.0, 2.0),
+        t(2.0, -2.0),
+        t(-2.0, -2.0),
+    ]
+}
+
+/// Snowman: two stacked snow balls, a pumpkin head and two stick arms. Order:
+/// bottom, upper, head, right arm, left arm.
+fn snowman_parts() -> [Part; 5] {
+    [
+        (
+            [-6.0, 0.0, -6.0],
+            [6.0, 12.0, 6.0],
+            box_region(0.0, 36.0, 12.0, 12.0, 12.0),
+        ), // bottom
+        (
+            [-5.0, 10.0, -5.0],
+            [5.0, 20.0, 5.0],
+            box_region(0.0, 16.0, 10.0, 10.0, 10.0),
+        ), // upper
+        (
+            [-4.0, 20.0, -4.0],
+            [4.0, 28.0, 4.0],
+            box_region(0.0, 0.0, 8.0, 8.0, 8.0),
+        ), // head (pumpkin)
+        (
+            [-10.0, 14.0, -1.0],
+            [-5.0, 16.0, 1.0],
+            box_region(32.0, 0.0, 5.0, 2.0, 2.0),
+        ), // right arm
+        (
+            [5.0, 14.0, -1.0],
+            [10.0, 16.0, 1.0],
+            box_region(32.0, 0.0, 5.0, 2.0, 2.0),
+        ), // left arm
+    ]
+}
+
+fn snowman_poses(anim: &EntityAnim) -> [PartPose; 5] {
+    [
+        PartPose::still(),
+        PartPose::still(),
+        head_pose(anim, Vec3::new(0.0, 20.0, 0.0)),
+        PartPose::still(),
+        PartPose::still(),
+    ]
+}
+
+/// Bat: a small hanging body, a head and two wings that flap with movement.
+/// Order: body, head, right wing, left wing.
+fn bat_parts() -> [Part; 4] {
+    [
+        (
+            [-3.0, 2.0, -3.0],
+            [3.0, 12.0, 3.0],
+            box_region(0.0, 16.0, 6.0, 10.0, 6.0),
+        ), // body
+        (
+            [-3.0, 10.0, 2.0],
+            [3.0, 16.0, 6.0],
+            box_region(0.0, 0.0, 6.0, 6.0, 6.0),
+        ), // head
+        (
+            [-13.0, 4.0, -0.5],
+            [-3.0, 12.0, 0.5],
+            box_region(42.0, 0.0, 10.0, 8.0, 1.0),
+        ), // right wing
+        (
+            [3.0, 4.0, -0.5],
+            [13.0, 12.0, 0.5],
+            box_region(42.0, 0.0, 10.0, 8.0, 1.0),
+        ), // left wing
+    ]
+}
+
+fn bat_poses(anim: &EntityAnim) -> [PartPose; 4] {
+    let (s, a) = (anim.limb_swing, anim.limb_swing_amount);
+    let flap = 0.4 + swing(s, a, 0.0, 0.8).abs();
+    let wing = |pivot: Vec3, sign: f32| PartPose {
+        pivot,
+        angles: Vec3::new(0.0, 0.0, sign * flap),
+        group_pivot: Vec3::ZERO,
+        group_angle_x: 0.0,
+    };
+    [
+        PartPose::still(),
+        head_pose(anim, Vec3::new(0.0, 12.0, 3.0)),
+        wing(Vec3::new(-3.0, 8.0, 0.0), 1.0),
+        wing(Vec3::new(3.0, 8.0, 0.0), -1.0),
+    ]
+}
+
+/// Silverfish / endermite: three low body segments tapering to a tail. All
+/// parts are static (poses default to still).
+fn insect_parts() -> [Part; 3] {
+    [
+        (
+            [-1.5, 0.0, 2.0],
+            [1.5, 3.0, 5.0],
+            box_region(0.0, 0.0, 3.0, 3.0, 3.0),
+        ), // front
+        (
+            [-2.5, 0.0, -3.0],
+            [2.5, 4.0, 2.0],
+            box_region(0.0, 9.0, 5.0, 4.0, 5.0),
+        ), // middle
+        (
+            [-1.0, 0.0, -6.0],
+            [1.0, 2.0, -3.0],
+            box_region(20.0, 0.0, 2.0, 2.0, 3.0),
+        ), // tail
+    ]
+}
+
+fn insect_poses(anim: &EntityAnim) -> [PartPose; 3] {
+    let _ = anim;
+    [PartPose::still(), PartPose::still(), PartPose::still()]
 }
 
 /// Rotate a local offset about the vertical (Y) axis.
@@ -971,6 +1345,76 @@ mod tests {
         assert!(
             !parts_differ(&rest, &sneaking, RIGHT_LEG),
             "sneak keeps the legs planted"
+        );
+    }
+
+    /// Every 1.8 mob id that now has a model must build a well-formed, textured
+    /// mesh (no panic, in-range UVs, not just the white-texel fallback box).
+    #[test]
+    fn modeled_mobs_are_well_formed_and_textured() {
+        for id in [
+            50, 51, 53, 54, 57, 120, 58, 52, 59, 90, 91, 92, 96, 93, 94, 95, 97, 98, 55, 62, 65,
+            60, 67,
+        ] {
+            let mesh = build_mob(id);
+            assert_well_formed(&mesh);
+            assert!(
+                mesh.vertices.iter().any(|v| v.uv != ENTITY_WHITE_UV),
+                "mob {id} should be textured, not a solid fallback box"
+            );
+        }
+    }
+
+    /// Single-slot mobs must sample only their own atlas slot (a mismatched slot
+    /// is exactly the bug that textured villagers/pigmen wrong before).
+    #[test]
+    fn single_slot_mobs_sample_their_own_slot() {
+        use EntitySlot::*;
+        for (id, slot) in [
+            (54u8, Zombie),
+            (51, Skeleton),
+            (57, ZombiePigman),
+            (120, Villager),
+            (58, Enderman),
+            (52, Spider),
+            (90, Pig),
+            (92, Cow),
+            (96, Mooshroom),
+            (95, Wolf),
+            (98, Ocelot),
+            (94, Squid),
+            (55, Slime),
+            (62, MagmaCube),
+            (97, Snowman),
+            (65, Bat),
+            (60, Silverfish),
+        ] {
+            let mesh = build_mob(id);
+            let (v0, v1) = slot_v_range(slot);
+            assert!(
+                mesh.vertices
+                    .iter()
+                    .all(|v| (v0 - 1e-6..=v1 + 1e-6).contains(&v.uv[1])),
+                "mob {id} sampled outside its slot"
+            );
+        }
+    }
+
+    /// The sheep is drawn as a body layer plus an inflated wool overlay, so its
+    /// mesh samples both the sheep slot and the sheep-fur slot.
+    #[test]
+    fn sheep_layers_body_and_wool() {
+        let mesh = build_mob(91);
+        assert_well_formed(&mesh);
+        let (b0, b1) = slot_v_range(EntitySlot::Sheep);
+        let (w0, w1) = slot_v_range(EntitySlot::SheepFur);
+        assert!(
+            mesh.vertices.iter().any(|v| (b0..=b1).contains(&v.uv[1])),
+            "sheep is missing its body layer"
+        );
+        assert!(
+            mesh.vertices.iter().any(|v| (w0..=w1).contains(&v.uv[1])),
+            "sheep is missing its wool overlay"
         );
     }
 }
