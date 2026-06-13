@@ -4,7 +4,7 @@ use std::{
     fs::{self, File},
     io::Read,
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use image::{imageops::FilterType, DynamicImage, GenericImage, Rgba, RgbaImage};
@@ -33,6 +33,9 @@ pub struct AtlasUv {
     rows: u32,
     /// Tile indices whose texture failed to load (magenta placeholders).
     missing: HashSet<u32>,
+    /// The atlas RGBA pixels (Arc-shared so clones stay cheap), used to read a
+    /// sprite tile's alpha mask for first-person item extrusion.
+    pixels: Option<Arc<Vec<u8>>>,
 }
 
 impl AtlasUv {
@@ -67,6 +70,30 @@ impl AtlasUv {
             TILE_SIZE as f32 / atlas_w,
             TILE_SIZE as f32 / atlas_h,
         ]
+    }
+
+    /// The `TILE_SIZE`×`TILE_SIZE` opacity mask of a sprite tile in row-major
+    /// order (`true` = opaque, alpha > 127, matching the cutout threshold).
+    /// `None` when the name is unmapped (index 0) or the atlas pixels were not
+    /// captured. Used by the first-person item renderer to extrude the sprite's
+    /// silhouette edges.
+    pub fn tile_alpha_mask(&self, name: Option<&str>) -> Option<Vec<bool>> {
+        let pixels = self.pixels.as_ref()?;
+        let index = self.tile_index(name);
+        if index == 0 {
+            return None;
+        }
+        let atlas_w = ATLAS_COLUMNS * TILE_SIZE;
+        let ox = index % ATLAS_COLUMNS * TILE_SIZE;
+        let oy = index / ATLAS_COLUMNS * TILE_SIZE;
+        let mut mask = vec![false; (TILE_SIZE * TILE_SIZE) as usize];
+        for ty in 0..TILE_SIZE {
+            for tx in 0..TILE_SIZE {
+                let p = (((oy + ty) * atlas_w + (ox + tx)) * 4) as usize;
+                mask[(ty * TILE_SIZE + tx) as usize] = pixels.get(p + 3).copied().unwrap_or(0) > 127;
+            }
+        }
+        Some(mask)
     }
 }
 
@@ -124,6 +151,7 @@ impl TextureAtlasImage {
             } else {
                 self.missing_indices.iter().copied().collect()
             },
+            pixels: Some(Arc::new(self.pixels.clone())),
         }
     }
 
@@ -761,15 +789,34 @@ pub(crate) fn load_asset_bytes(asset: &str) -> Option<Vec<u8>> {
 /// Side length in pixels of one slot in the entity texture atlas grid.
 pub const ENTITY_SLOT_PX: u32 = 64;
 
-/// Number of slots stacked vertically in the entity atlas (including the
-/// trailing guaranteed-white slot).
+/// Number of fixed slots stacked at the top of the entity atlas (one per
+/// [`EntitySlot`], including the trailing guaranteed-white slot).
 pub const ENTITY_SLOT_COUNT: u32 = 10;
 
-/// Fixed dimensions of the entity texture atlas: a single column of
-/// `ENTITY_SLOT_COUNT` slots of `ENTITY_SLOT_PX` square pixels each, one per
-/// [`EntitySlot`].
+/// Extra 64x64 rows reserved below the fixed slots for per-player downloaded
+/// skins, allocated at runtime by the skin loader.
+pub const PLAYER_SKIN_SLOTS: u32 = 64;
+
+/// First atlas row of the per-player skin region.
+pub const PLAYER_SKIN_BASE_ROW: u32 = ENTITY_SLOT_COUNT;
+
+/// Dimensions of the entity texture atlas: a single column of fixed
+/// [`EntitySlot`] rows followed by [`PLAYER_SKIN_SLOTS`] per-player skin rows,
+/// each `ENTITY_SLOT_PX` square.
 pub const ENTITY_ATLAS_WIDTH: u32 = ENTITY_SLOT_PX;
-pub const ENTITY_ATLAS_HEIGHT: u32 = ENTITY_SLOT_COUNT * ENTITY_SLOT_PX;
+pub const ENTITY_ATLAS_HEIGHT: u32 = (ENTITY_SLOT_COUNT + PLAYER_SKIN_SLOTS) * ENTITY_SLOT_PX;
+
+/// Pixel origin (top-left) of per-player skin row `index` (0-based).
+pub fn player_skin_row_origin(index: u32) -> (u32, u32) {
+    (0, (PLAYER_SKIN_BASE_ROW + index) * ENTITY_SLOT_PX)
+}
+
+/// Decode a downloaded skin PNG and normalize it to the modern 64x64 layout,
+/// returning tightly-packed RGBA (64×64×4 bytes) for upload into a skin row.
+pub fn normalize_skin_png(bytes: &[u8]) -> Option<Vec<u8>> {
+    let image = image::load_from_memory(bytes).ok()?.to_rgba8();
+    Some(normalize_skin(image).into_raw())
+}
 
 /// One 64x64 slot of the entity texture atlas. The discriminant is the slot's
 /// row index from the top; `entity_slot_origin` yields its pixel origin.

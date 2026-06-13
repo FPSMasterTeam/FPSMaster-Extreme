@@ -2077,6 +2077,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arboard",
+ "base64",
  "env_logger",
  "glam",
  "hickory-resolver",

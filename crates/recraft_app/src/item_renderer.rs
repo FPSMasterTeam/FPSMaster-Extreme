@@ -6,9 +6,10 @@
 //!
 //! Chains replicated verbatim:
 //! - `doItemUsedTransformations` (swing translation) →
-//!   `transformFirstPersonItem` (base pose + swing rotations) → the single
-//!   2× scale → the model's firstperson display transform (identity for 1.8
-//!   block models; `[0,-135,25]/[0,4,2]/1.7` for generated/handheld items) →
+//!   `transformFirstPersonItem` (base pose + swing rotations) → the model's
+//!   `RenderItem.preTransform` (`2×` only for non-gui3d generated items) →
+//!   the model's firstperson display transform (identity for normal block
+//!   items; `[0,-135,25]/[0,4,2]/1.7` for generated/handheld sprite items) →
 //!   `RenderItem.renderItem`'s `scale(0.5)` + `translate(-0.5,-0.5,-0.5)`.
 //! - `renderPlayerArm` for the empty hand, including the `ModelRenderer`
 //!   rotation point and the 0.1 rad idle z-roll.
@@ -16,10 +17,19 @@
 
 use glam::{Mat4, Vec3};
 use recraft_core::{BlockFace, BlockState, RenderShape, Tint};
+use recraft_protocol::v1_8_9::packets::SlotItem;
 use recraft_render::texture::item_texture_name;
 use recraft_render::{AtlasUv, BiomeColors, Camera, ModelMesh, Vertex};
 
 use crate::game::FirstPersonView;
+
+/// One dropped item to render in the world: its stack, world position (entity
+/// feet) and animation phase (`age + partialTicks`) driving bob and spin.
+pub struct DroppedItem {
+    pub item: SlotItem,
+    pub pos: Vec3,
+    pub phase: f32,
+}
 
 pub struct ItemRenderer;
 
@@ -49,48 +59,129 @@ impl ItemRenderer {
             return (vertices, indices);
         };
 
-        // Common head of the chain: swing translation, base first-person
-        // pose, and the one 2x scale every first-person item receives.
+        // Common head of the chain: swing translation and the base
+        // first-person pose. The item-model transforms below follow vanilla's
+        // RenderItem order per branch.
         let mut m = first_person_base(view);
         do_item_used_transformations(&mut m, view.swing_progress);
         transform_first_person_item(&mut m, view.equip_progress, view.swing_progress);
-        gl_scale(&mut m, 2.0, 2.0, 2.0);
 
         if (0..256).contains(&item.id) {
             let block = BlockState::new(item.id as u16, (item.damage.max(0) & 15) as u8);
-            if block.is_air() {
+            if block.is_air() || block.render_shape() == RenderShape::None {
                 return (vertices, indices);
             }
             match block.render_shape() {
                 // Flat blocks (torches, flowers, rails, ladders) use generated
                 // sprite item models in vanilla.
                 RenderShape::Cross | RenderShape::Rail | RenderShape::Ladder => {
+                    gl_scale(&mut m, 2.0, 2.0, 2.0);
                     apply_first_person_display(&mut m);
                     finish_item_model(&mut m);
                     let name = block.texture_name(BlockFace::Side).map(str::to_owned);
                     let tint = tint3(block.tint(BlockFace::Side));
-                    push_sprite(&mut vertices, &mut indices, camera, &m, name.as_deref(), atlas, tint);
+                    let to_world = |c: Vec3| view_to_world(camera, m.transform_point3(c));
+                    push_sprite(&mut vertices, &mut indices, &to_world, name.as_deref(), atlas, tint);
                 }
                 _ => {
                     // 1.8 block models have NO firstperson display entry —
-                    // identity — so the pose comes purely from the code chain.
+                    // identity — so the camera transform contributes no extra
+                    // rotation. The outer first-person renderer applies 2x for
+                    // gui3d models; RenderItem.renderItem's 0.5 cancels it.
+                    gl_scale(&mut m, 2.0, 2.0, 2.0);
                     finish_item_model(&mut m);
-                    push_block_cube(&mut vertices, &mut indices, camera, &m, block, atlas);
+                    let to_world = |c: Vec3| view_to_world(camera, m.transform_point3(c));
+                    push_block_cube(&mut vertices, &mut indices, &to_world, block, atlas);
                 }
             }
         } else if let Some(name) = item_texture_name(item.id) {
+            gl_scale(&mut m, 2.0, 2.0, 2.0);
             apply_first_person_display(&mut m);
             finish_item_model(&mut m);
             let name = format!("items/{name}");
+            let to_world = |c: Vec3| view_to_world(camera, m.transform_point3(c));
             push_sprite(
                 &mut vertices,
                 &mut indices,
-                camera,
-                &m,
+                &to_world,
                 Some(&name),
                 atlas,
                 [1.0, 1.0, 1.0],
             );
+        }
+        (vertices, indices)
+    }
+
+    /// Build geometry for every dropped item in the world this frame: block
+    /// items spin as a small cube, sprite items billboard toward the camera, and
+    /// all bob up and down like vanilla `RenderEntityItem`.
+    pub fn build_world_items(
+        camera: &Camera,
+        items: &[DroppedItem],
+        atlas: &AtlasUv,
+    ) -> (Vec<Vertex>, Vec<u32>) {
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+        // Camera basis so sprite items face the viewer.
+        let forward = camera.direction();
+        let right = forward.cross(Vec3::Y).normalize_or_zero();
+        let up = right.cross(forward).normalize_or_zero();
+
+        for d in items {
+            // Vanilla hover: sin(age/10 + start) * 0.1 + 0.1, lifted off the floor.
+            let bob = (d.phase * 0.1).sin() * 0.1 + 0.1;
+            let base = d.pos + Vec3::new(0.0, 0.2 + bob, 0.0);
+
+            // Sprite billboard: model x→camera right, y→up, thin depth toward view.
+            let sprite_to_world = |size: f32| {
+                move |c: Vec3| {
+                    base + right * ((c.x - 0.5) * size)
+                        + up * ((c.y - 0.5) * size)
+                        + forward * ((c.z - 0.5) * size * 0.25)
+                }
+            };
+
+            let item = d.item;
+            if (0..256).contains(&item.id) {
+                let block = BlockState::new(item.id as u16, (item.damage.max(0) & 15) as u8);
+                if block.is_air() || block.render_shape() == RenderShape::None {
+                    continue;
+                }
+                match block.render_shape() {
+                    RenderShape::Cross | RenderShape::Rail | RenderShape::Ladder => {
+                        let name = block.texture_name(BlockFace::Side).map(str::to_owned);
+                        let tint = tint3(block.tint(BlockFace::Side));
+                        push_sprite(
+                            &mut vertices,
+                            &mut indices,
+                            &sprite_to_world(0.5),
+                            name.as_deref(),
+                            atlas,
+                            tint,
+                        );
+                    }
+                    _ => {
+                        // Spinning cube about Y (vanilla item entities rotate).
+                        let (s, c) = (d.phase * 0.08).sin_cos();
+                        let size = 0.42;
+                        let spin_to_world = |v: Vec3| {
+                            let p = (v - Vec3::splat(0.5)) * size;
+                            base + Vec3::new(p.x * c - p.z * s, p.y, p.x * s + p.z * c)
+                        };
+                        push_block_cube(&mut vertices, &mut indices, &spin_to_world, block, atlas);
+                    }
+                }
+            } else if let Some(name) = item_texture_name(item.id) {
+                let name = format!("items/{name}");
+                push_sprite(
+                    &mut vertices,
+                    &mut indices,
+                    &sprite_to_world(0.5),
+                    Some(&name),
+                    atlas,
+                    [1.0, 1.0, 1.0],
+                );
+            }
         }
         (vertices, indices)
     }
@@ -236,69 +327,70 @@ fn tint3(tint: Tint) -> [f32; 3] {
 fn push_block_cube(
     vertices: &mut Vec<Vertex>,
     indices: &mut Vec<u32>,
-    camera: &Camera,
-    m: &Mat4,
+    to_world: &dyn Fn(Vec3) -> Vec3,
     block: BlockState,
     atlas: &AtlasUv,
 ) {
-    // Per face: 4 unit-cube corners in (bottom-left, top-left, top-right,
-    // bottom-right) texture order, the texture face, and the diffuse shade.
+    // Per face: vanilla FaceBakery vertex order (outward CCW), the texture
+    // face, and the diffuse shade. Outward winding matters because first-person
+    // items use vanilla back-face culling.
     let v = |x: f32, y: f32, z: f32| Vec3::new(x, y, z);
     let faces: [([Vec3; 4], BlockFace, f32); 6] = [
-        // up (+y): u→x, v→z
         (
-            [v(0.0, 1.0, 1.0), v(0.0, 1.0, 0.0), v(1.0, 1.0, 0.0), v(1.0, 1.0, 1.0)],
-            BlockFace::Top,
-            1.0,
-        ),
-        // down (−y)
-        (
-            [v(0.0, 0.0, 0.0), v(0.0, 0.0, 1.0), v(1.0, 0.0, 1.0), v(1.0, 0.0, 0.0)],
+            [v(0.0, 0.0, 1.0), v(0.0, 0.0, 0.0), v(1.0, 0.0, 0.0), v(1.0, 0.0, 1.0)],
             BlockFace::Bottom,
             0.5,
         ),
-        // south (+z): u→x, v→1−y
         (
-            [v(0.0, 0.0, 1.0), v(0.0, 1.0, 1.0), v(1.0, 1.0, 1.0), v(1.0, 0.0, 1.0)],
+            [v(0.0, 1.0, 0.0), v(0.0, 1.0, 1.0), v(1.0, 1.0, 1.0), v(1.0, 1.0, 0.0)],
+            BlockFace::Top,
+            1.0,
+        ),
+        (
+            [v(1.0, 1.0, 0.0), v(1.0, 0.0, 0.0), v(0.0, 0.0, 0.0), v(0.0, 1.0, 0.0)],
             BlockFace::Side,
             0.8,
         ),
-        // north (−z): mirrored u
         (
-            [v(1.0, 0.0, 0.0), v(1.0, 1.0, 0.0), v(0.0, 1.0, 0.0), v(0.0, 0.0, 0.0)],
+            [v(0.0, 1.0, 1.0), v(0.0, 0.0, 1.0), v(1.0, 0.0, 1.0), v(1.0, 1.0, 1.0)],
             BlockFace::Side,
             0.8,
         ),
-        // east (+x)
         (
-            [v(1.0, 0.0, 1.0), v(1.0, 1.0, 1.0), v(1.0, 1.0, 0.0), v(1.0, 0.0, 0.0)],
+            [v(0.0, 1.0, 0.0), v(0.0, 0.0, 0.0), v(0.0, 0.0, 1.0), v(0.0, 1.0, 1.0)],
             BlockFace::Side,
             0.6,
         ),
-        // west (−x)
         (
-            [v(0.0, 0.0, 0.0), v(0.0, 1.0, 0.0), v(0.0, 1.0, 1.0), v(0.0, 0.0, 1.0)],
+            [v(1.0, 1.0, 1.0), v(1.0, 0.0, 1.0), v(1.0, 0.0, 0.0), v(1.0, 1.0, 0.0)],
             BlockFace::Side,
             0.6,
         ),
     ];
     for (corners, face, shade) in faces {
-        let uvs = atlas.uv(block.texture_name(face));
+        let rect = atlas.tile_rect(block.texture_name(face));
+        let uvs = [
+            [rect[0], rect[1]],
+            [rect[0], rect[1] + rect[3]],
+            [rect[0] + rect[2], rect[1] + rect[3]],
+            [rect[0] + rect[2], rect[1]],
+        ];
         let tint = tint3(block.tint(face));
         let color = [tint[0] * shade, tint[1] * shade, tint[2] * shade, 1.0];
-        let world = corners.map(|c| view_to_world(camera, m.transform_point3(c)));
+        let world = corners.map(to_world);
         push_quad(vertices, indices, world, uvs, color);
     }
 }
 
 /// A held sprite item: vanilla `ItemModelGenerator` geometry — the 16×16
-/// layer as front/back quads on a 1px slab from z 7.5/16 to 8.5/16 (the
-/// per-pixel edge extrusion is omitted).
+/// layer extruded into a 1px-deep slab (z 7.5/16 to 8.5/16). Front and back
+/// faces carry the texture (alpha-cut by the cutout shader), and every pixel
+/// edge on the silhouette gets a side face so the item reads as a solid 3D
+/// object instead of two crossing planes when viewed at an angle.
 fn push_sprite(
     vertices: &mut Vec<Vertex>,
     indices: &mut Vec<u32>,
-    camera: &Camera,
-    m: &Mat4,
+    to_world: &dyn Fn(Vec3) -> Vec3,
     name: Option<&str>,
     atlas: &AtlasUv,
     tint: [f32; 3],
@@ -306,40 +398,69 @@ fn push_sprite(
     let rect = atlas.tile_rect(name);
     let uv = |u: f32, v: f32| [rect[0] + u * rect[2], rect[1] + v * rect[3]];
     let color = [tint[0], tint[1], tint[2], 1.0];
+    let w = |x: f32, y: f32, z: f32| to_world(Vec3::new(x, y, z));
 
-    // South face (z = 8.5/16), UV [0,0,16,16]: u→x, v→1−y.
-    let z = 8.5 / 16.0;
-    let corners = [
-        Vec3::new(0.0, 0.0, z),
-        Vec3::new(0.0, 1.0, z),
-        Vec3::new(1.0, 1.0, z),
-        Vec3::new(1.0, 0.0, z),
-    ]
-    .map(|c| view_to_world(camera, m.transform_point3(c)));
+    const ZF: f32 = 8.5 / 16.0; // front (+Z, "south")
+    const ZB: f32 = 7.5 / 16.0; // back (−Z, "north")
+
+    // Vanilla ItemModelGenerator emits one south-facing quad and one
+    // north-facing quad. The renderer keeps back-face culling enabled for
+    // items, so only the visible side draws; otherwise the far side of a thin,
+    // diagonal sprite (swords) shows through the alpha holes as a second sword.
     push_quad(
         vertices,
         indices,
-        corners,
-        [uv(0.0, 1.0), uv(0.0, 0.0), uv(1.0, 0.0), uv(1.0, 1.0)],
+        [w(0.0, 1.0, ZF), w(0.0, 0.0, ZF), w(1.0, 0.0, ZF), w(1.0, 1.0, ZF)],
+        [uv(0.0, 0.0), uv(0.0, 1.0), uv(1.0, 1.0), uv(1.0, 0.0)],
         color,
     );
-
-    // North face (z = 7.5/16), UV [16,0,0,16]: mirrored u.
-    let z = 7.5 / 16.0;
-    let corners = [
-        Vec3::new(1.0, 0.0, z),
-        Vec3::new(1.0, 1.0, z),
-        Vec3::new(0.0, 1.0, z),
-        Vec3::new(0.0, 0.0, z),
-    ]
-    .map(|c| view_to_world(camera, m.transform_point3(c)));
     push_quad(
         vertices,
         indices,
-        corners,
-        [uv(0.0, 1.0), uv(0.0, 0.0), uv(1.0, 0.0), uv(1.0, 1.0)],
+        [w(1.0, 1.0, ZB), w(1.0, 0.0, ZB), w(0.0, 0.0, ZB), w(0.0, 1.0, ZB)],
+        [uv(1.0, 0.0), uv(1.0, 1.0), uv(0.0, 1.0), uv(0.0, 0.0)],
         color,
     );
+
+    // Per-pixel silhouette extrusion: a side face wherever an opaque texel
+    // borders a transparent one (or the tile edge). Side faces are flat-shaded
+    // a touch darker so the 1px depth reads. (No mask → flat front/back only.)
+    let Some(mask) = atlas.tile_alpha_mask(name) else {
+        return;
+    };
+    let opaque = |tx: i32, ty: i32| {
+        (0..16).contains(&tx) && (0..16).contains(&ty) && mask[(ty * 16 + tx) as usize]
+    };
+    let edge = [color[0] * 0.85, color[1] * 0.85, color[2] * 0.85, 1.0];
+    let px = 1.0 / 16.0;
+    for ty in 0..16i32 {
+        for tx in 0..16i32 {
+            if !opaque(tx, ty) {
+                continue;
+            }
+            // Texel (tx,ty): u∈[tx,tx+1]/16, v∈[ty,ty+1]/16; model x=u, y=1−v.
+            let (x0, x1) = (tx as f32 * px, (tx as f32 + 1.0) * px);
+            let (y0, y1) = (1.0 - (ty as f32 + 1.0) * px, 1.0 - ty as f32 * px);
+            let suv = uv((tx as f32 + 0.5) * px, (ty as f32 + 0.5) * px);
+            let suvs = [suv; 4];
+            if !opaque(tx - 1, ty) {
+                push_quad(vertices, indices,
+                    [w(x0, y0, ZF), w(x0, y1, ZF), w(x0, y1, ZB), w(x0, y0, ZB)], suvs, edge);
+            }
+            if !opaque(tx + 1, ty) {
+                push_quad(vertices, indices,
+                    [w(x1, y0, ZB), w(x1, y1, ZB), w(x1, y1, ZF), w(x1, y0, ZF)], suvs, edge);
+            }
+            if !opaque(tx, ty - 1) {
+                push_quad(vertices, indices,
+                    [w(x0, y1, ZB), w(x0, y1, ZF), w(x1, y1, ZF), w(x1, y1, ZB)], suvs, edge);
+            }
+            if !opaque(tx, ty + 1) {
+                push_quad(vertices, indices,
+                    [w(x0, y0, ZF), w(x0, y0, ZB), w(x1, y0, ZB), w(x1, y0, ZF)], suvs, edge);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -379,24 +500,76 @@ mod tests {
     }
 
     #[test]
-    fn sprite_items_build_front_and_back_quads() {
+    fn sprite_items_build_extruded_geometry() {
         let uv = atlas();
         let (vertices, indices) =
             ItemRenderer::build_held_item(&camera(), &view(Some(276)), &uv);
-        assert_eq!(vertices.len(), 8);
-        assert_eq!(indices.len(), 12);
+        // Front + back quads (8 verts) plus extruded silhouette edges; every
+        // face is a quad, so verts are a multiple of 4 and indices = 6/quad.
+        assert!(vertices.len() >= 8, "at least the front/back faces");
+        assert_eq!(vertices.len() % 4, 0);
+        assert_eq!(indices.len(), vertices.len() / 4 * 6);
         assert!(!uv.is_missing_tile(Some("items/diamond_sword")));
     }
 
     #[test]
     fn flat_blocks_hold_as_sprites() {
         let (vertices, _) = ItemRenderer::build_held_item(&camera(), &view(Some(50)), &atlas());
-        assert_eq!(vertices.len(), 8, "torch should render as a sprite");
+        assert!(
+            vertices.len() >= 8 && vertices.len() % 4 == 0,
+            "torch should render as an extruded sprite"
+        );
+    }
+
+    #[test]
+    fn barrier_item_builds_nothing() {
+        let (vertices, indices) =
+            ItemRenderer::build_held_item(&camera(), &view(Some(166)), &atlas());
+        assert!(vertices.is_empty() && indices.is_empty());
     }
 
     #[test]
     fn empty_hand_builds_nothing() {
         let (vertices, indices) = ItemRenderer::build_held_item(&camera(), &view(None), &atlas());
+        assert!(vertices.is_empty() && indices.is_empty());
+    }
+
+    fn dropped(id: i16) -> DroppedItem {
+        DroppedItem {
+            item: SlotItem {
+                id,
+                count: 1,
+                damage: 0,
+            },
+            pos: Vec3::new(0.0, 64.0, -3.0),
+            phase: 5.0,
+        }
+    }
+
+    #[test]
+    fn dropped_block_builds_a_spinning_cube() {
+        let (vertices, indices) =
+            ItemRenderer::build_world_items(&camera(), &[dropped(1)], &atlas());
+        assert_eq!(vertices.len(), 24); // one cube
+        assert_eq!(indices.len(), 36);
+        // The cube sits roughly at the item's world position (bobbed up a little).
+        let centroid: Vec3 =
+            vertices.iter().map(|v| Vec3::from(v.position)).sum::<Vec3>() / vertices.len() as f32;
+        assert!((centroid - Vec3::new(0.0, 64.0, -3.0)).length() < 1.0);
+    }
+
+    #[test]
+    fn dropped_sprite_billboards_toward_the_camera() {
+        let (vertices, indices) =
+            ItemRenderer::build_world_items(&camera(), &[dropped(276)], &atlas());
+        assert!(vertices.len() >= 8);
+        assert_eq!(vertices.len() % 4, 0);
+        assert_eq!(indices.len(), vertices.len() / 4 * 6);
+    }
+
+    #[test]
+    fn no_dropped_items_builds_nothing() {
+        let (vertices, indices) = ItemRenderer::build_world_items(&camera(), &[], &atlas());
         assert!(vertices.is_empty() && indices.is_empty());
     }
 
@@ -413,5 +586,19 @@ mod tests {
         assert!((center.x - 0.56).abs() < 1.0e-6);
         assert!((center.y + 0.52).abs() < 1.0e-6);
         assert!((center.z + 0.72).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn sprite_rest_pose_uses_vanilla_pretransform_scale() {
+        let mut m = first_person_base(&view(None));
+        do_item_used_transformations(&mut m, 0.0);
+        transform_first_person_item(&mut m, 0.0, 0.0);
+        gl_scale(&mut m, 2.0, 2.0, 2.0);
+        apply_first_person_display(&mut m);
+        finish_item_model(&mut m);
+        let a = m.transform_point3(Vec3::new(0.0, 0.0, 8.5 / 16.0));
+        let b = m.transform_point3(Vec3::new(1.0, 0.0, 8.5 / 16.0));
+        let expected = 0.4 * 2.0 * 1.7 * 0.5;
+        assert!((a.distance(b) - expected).abs() < 1.0e-6);
     }
 }

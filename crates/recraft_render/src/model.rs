@@ -3,7 +3,8 @@ use glam::Vec3;
 use recraft_core::EntityKind;
 
 use crate::texture::{
-    entity_slot_origin, EntitySlot, ENTITY_ATLAS_HEIGHT, ENTITY_ATLAS_WIDTH, ENTITY_WHITE_UV,
+    entity_slot_origin, EntitySlot, ENTITY_ATLAS_HEIGHT, ENTITY_ATLAS_WIDTH, ENTITY_SLOT_PX,
+    ENTITY_WHITE_UV, PLAYER_SKIN_BASE_ROW,
 };
 
 /// Vertex for the model pass used by entities and the first-person hand: a
@@ -70,6 +71,73 @@ type Part = ([f32; 3], [f32; 3], [[f32; 4]; 6]);
 /// Humanoid models are 32 px tall (legs 12 + body 12 + head 8).
 const HUMANOID_PX: f32 = 32.0;
 
+/// Per-frame animation inputs for one entity, in vanilla terms. Built by the
+/// app from the entity's interpolated motion and metadata.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EntityAnim {
+    /// Walk-cycle phase (vanilla `limbSwing`).
+    pub limb_swing: f32,
+    /// Walk-cycle amplitude 0..1 (vanilla `limbSwingAmount`).
+    pub limb_swing_amount: f32,
+    /// Head yaw minus body yaw, in degrees (vanilla `netHeadYaw`).
+    pub net_head_yaw: f32,
+    /// Head pitch in degrees (vanilla `headPitch`).
+    pub head_pitch: f32,
+    /// Arm-swing (attack) progress 0..1.
+    pub swing_progress: f32,
+    /// Whether the entity is crouching (drives the sneak pose).
+    pub sneaking: bool,
+}
+
+/// Articulation for one model part: a primary rotation about `pivot`, plus an
+/// optional secondary rotation about `group_pivot` (used to tilt the upper body
+/// as a unit when sneaking). All offsets are model px; angles are radians.
+#[derive(Debug, Clone, Copy)]
+struct PartPose {
+    pivot: Vec3,
+    /// Euler angles (x, y, z), applied Z·Y·X like vanilla `ModelRenderer`.
+    angles: Vec3,
+    group_pivot: Vec3,
+    /// Secondary X rotation about `group_pivot`; 0 disables it.
+    group_angle_x: f32,
+}
+
+impl PartPose {
+    /// A static (unrotated) part — pivot is irrelevant when the angle is zero.
+    fn still() -> Self {
+        Self {
+            pivot: Vec3::ZERO,
+            angles: Vec3::ZERO,
+            group_pivot: Vec3::ZERO,
+            group_angle_x: 0.0,
+        }
+    }
+}
+
+fn rotate_x(v: Vec3, sin: f32, cos: f32) -> Vec3 {
+    Vec3::new(v.x, v.y * cos - v.z * sin, v.y * sin + v.z * cos)
+}
+
+fn rotate_z(v: Vec3, sin: f32, cos: f32) -> Vec3 {
+    Vec3::new(v.x * cos - v.y * sin, v.x * sin + v.y * cos, v.z)
+}
+
+/// Apply a part's Euler rotation about its pivot (vanilla glRotate order Z, Y,
+/// X means the vertex is transformed Rz·Ry·Rx·v).
+fn apply_part_rotation(local_px: Vec3, pose: &PartPose) -> Vec3 {
+    let rel = local_px - pose.pivot;
+    let (sx, cx) = pose.angles.x.sin_cos();
+    let (sy, cy) = pose.angles.y.sin_cos();
+    let (sz, cz) = pose.angles.z.sin_cos();
+    let rotated = rotate_z(rotate_y(rotate_x(rel, sx, cx), sy, cy), sz, cz);
+    let mut out = rotated + pose.pivot;
+    if pose.group_angle_x != 0.0 {
+        let (s, c) = pose.group_angle_x.sin_cos();
+        out = rotate_x(out - pose.group_pivot, s, c) + pose.group_pivot;
+    }
+    out
+}
+
 impl ModelMesh {
     pub fn new() -> Self {
         Self::default()
@@ -122,6 +190,7 @@ impl ModelMesh {
     /// quadruped, creeper or chicken) sampling that mob's atlas slot; unknown
     /// mobs render as a solid colored box at the entity AABB and objects as a
     /// small colored box.
+    #[allow(clippy::too_many_arguments)]
     pub fn push_entity(
         &mut self,
         kind: EntityKind,
@@ -129,13 +198,21 @@ impl ModelMesh {
         half_width: f32,
         height: f32,
         yaw_degrees: f32,
+        anim: &EntityAnim,
+        skin_row: Option<u32>,
     ) {
         match kind {
             EntityKind::LocalPlayer | EntityKind::RemotePlayer => {
+                // A downloaded skin row when one is allocated, else the shared
+                // default player slot.
+                let row = skin_row
+                    .map(|i| PLAYER_SKIN_BASE_ROW + i)
+                    .unwrap_or(EntitySlot::Player as u32);
                 self.push_parts(
                     &humanoid_parts(true),
+                    &humanoid_poses(anim),
                     HUMANOID_PX,
-                    EntitySlot::Player,
+                    row,
                     feet,
                     height,
                     yaw_degrees,
@@ -145,8 +222,9 @@ impl ModelMesh {
                 Some(MobModel::Biped(slot)) => {
                     self.push_parts(
                         &humanoid_parts(false),
+                        &humanoid_poses(anim),
                         HUMANOID_PX,
-                        slot,
+                        slot as u32,
                         feet,
                         height,
                         yaw_degrees,
@@ -154,14 +232,23 @@ impl ModelMesh {
                 }
                 Some(MobModel::Quadruped { slot, leg_px }) => {
                     let (parts, model_px) = quadruped_parts(leg_px);
-                    self.push_parts(&parts, model_px, slot, feet, height, yaw_degrees);
+                    self.push_parts(
+                        &parts,
+                        &quadruped_poses(anim, leg_px),
+                        model_px,
+                        slot as u32,
+                        feet,
+                        height,
+                        yaw_degrees,
+                    );
                 }
                 Some(MobModel::Creeper) => {
                     let (parts, model_px) = creeper_parts();
                     self.push_parts(
                         &parts,
+                        &creeper_poses(anim),
                         model_px,
-                        EntitySlot::Creeper,
+                        EntitySlot::Creeper as u32,
                         feet,
                         height,
                         yaw_degrees,
@@ -171,8 +258,9 @@ impl ModelMesh {
                     let (parts, model_px) = chicken_parts();
                     self.push_parts(
                         &parts,
+                        &chicken_poses(anim),
                         model_px,
-                        EntitySlot::Chicken,
+                        EntitySlot::Chicken as u32,
                         feet,
                         height,
                         yaw_degrees,
@@ -200,11 +288,13 @@ impl ModelMesh {
     /// px height) to `height`, rotate every part about the vertical axis
     /// through `feet` by `yaw_degrees`, and sample each face's texture rect
     /// inside `slot` of the entity atlas.
+    #[allow(clippy::too_many_arguments)]
     fn push_parts(
         &mut self,
         parts: &[Part],
+        poses: &[PartPose],
         model_px: f32,
-        slot: EntitySlot,
+        slot_row: u32,
         feet: Vec3,
         height: f32,
         yaw_degrees: f32,
@@ -212,13 +302,16 @@ impl ModelMesh {
         let scale = height / model_px;
         let yaw = yaw_degrees.to_radians();
         let (sin, cos) = (yaw.sin(), yaw.cos());
-        let (ox, oy) = entity_slot_origin(slot);
-        let origin = [ox as f32, oy as f32];
-        for (min_px, max_px, region) in parts {
-            let min = Vec3::from(*min_px) * scale;
-            let max = Vec3::from(*max_px) * scale;
-            self.push_textured_box(min, max, region, origin, 1.0, &|local| {
-                rotate_y(local, sin, cos) + feet
+        let origin = [0.0, (slot_row * ENTITY_SLOT_PX) as f32];
+        // Box bounds stay in model px; the per-part closure articulates each
+        // box about its pivot, scales px→world, then rotates by the body yaw.
+        for (i, (min_px, max_px, region)) in parts.iter().enumerate() {
+            let pose = poses.get(i).copied().unwrap_or_else(PartPose::still);
+            let min = Vec3::from(*min_px);
+            let max = Vec3::from(*max_px);
+            self.push_textured_box(min, max, region, origin, 1.0, &|local_px| {
+                let articulated = apply_part_rotation(local_px, &pose) * scale;
+                rotate_y(articulated, sin, cos) + feet
             });
         }
     }
@@ -408,6 +501,136 @@ fn chicken_parts() -> ([Part; 4], f32) {
     )
 }
 
+/// Walk-cycle leg/arm angle: `cos(limbSwing*0.6662 + phase) * scale * amount`.
+fn swing(limb_swing: f32, amount: f32, phase: f32, scale: f32) -> f32 {
+    (limb_swing * 0.6662 + phase).cos() * scale * amount
+}
+
+/// Humanoid (player / biped mob) articulation: opposite-phase leg/arm swing,
+/// head yaw+pitch, the attack arm-swing on the right arm, and the sneak crouch.
+/// Order matches [`humanoid_parts`]: right leg, left leg, body, right arm, left
+/// arm, head.
+fn humanoid_poses(anim: &EntityAnim) -> [PartPose; 6] {
+    use std::f32::consts::PI;
+    let (s, a) = (anim.limb_swing, anim.limb_swing_amount);
+    let head_y = anim.net_head_yaw.to_radians();
+    let head_x = anim.head_pitch.to_radians();
+
+    // Right arm and right leg are a half-cycle apart (natural opposite swing).
+    let mut arm_r_x = swing(s, a, PI, 1.0);
+    let arm_l_x = swing(s, a, 0.0, 1.0);
+    let mut arm_r_z = 0.0;
+    let mut body_y = 0.0;
+    if anim.swing_progress > 0.0 {
+        let sp = anim.swing_progress;
+        let mut f = 1.0 - sp;
+        f = 1.0 - f * f * f;
+        let f1 = (f * PI).sin();
+        let f2 = (sp * PI).sin() * -(head_x - 0.7) * 0.75;
+        arm_r_x -= f1 * 1.2 + f2;
+        arm_r_z = (sp * PI).sin() * -0.4;
+        body_y = (sp.sqrt() * PI * 2.0).sin() * 0.2;
+    }
+
+    let waist = Vec3::new(0.0, 12.0, 0.0);
+    let body_tilt = if anim.sneaking { 0.5 } else { 0.0 };
+    let arm_extra = if anim.sneaking { 0.4 } else { 0.0 };
+    let still = |pivot: Vec3, angles: Vec3| PartPose {
+        pivot,
+        angles,
+        group_pivot: waist,
+        group_angle_x: 0.0,
+    };
+    let grouped = |pivot: Vec3, angles: Vec3| PartPose {
+        pivot,
+        angles,
+        group_pivot: waist,
+        group_angle_x: body_tilt,
+    };
+    [
+        still(Vec3::new(-2.0, 12.0, 0.0), Vec3::new(swing(s, a, 0.0, 1.4), 0.0, 0.0)),
+        still(Vec3::new(2.0, 12.0, 0.0), Vec3::new(swing(s, a, PI, 1.4), 0.0, 0.0)),
+        still(waist, Vec3::new(body_tilt, body_y, 0.0)),
+        grouped(
+            Vec3::new(-6.0, 24.0, 0.0),
+            Vec3::new(arm_r_x + arm_extra, 0.0, arm_r_z),
+        ),
+        grouped(
+            Vec3::new(6.0, 24.0, 0.0),
+            Vec3::new(arm_l_x + arm_extra, 0.0, 0.0),
+        ),
+        grouped(Vec3::new(0.0, 24.0, 0.0), Vec3::new(head_x, head_y, 0.0)),
+    ]
+}
+
+/// Head pose shared by the non-humanoid models: yaw+pitch about a neck pivot.
+fn head_pose(anim: &EntityAnim, pivot: Vec3) -> PartPose {
+    PartPose {
+        pivot,
+        angles: Vec3::new(anim.head_pitch.to_radians(), anim.net_head_yaw.to_radians(), 0.0),
+        group_pivot: Vec3::ZERO,
+        group_angle_x: 0.0,
+    }
+}
+
+/// A simple X-swing leg pose about a hip pivot.
+fn leg_pose(pivot: Vec3, angle_x: f32) -> PartPose {
+    PartPose {
+        pivot,
+        angles: Vec3::new(angle_x, 0.0, 0.0),
+        group_pivot: Vec3::ZERO,
+        group_angle_x: 0.0,
+    }
+}
+
+/// Quadruped articulation: diagonal leg pairs trot together; head turns.
+/// Order matches [`quadruped_parts`]: front-right, front-left, back-right,
+/// back-left legs, body, head.
+fn quadruped_poses(anim: &EntityAnim, leg_px: f32) -> [PartPose; 6] {
+    use std::f32::consts::PI;
+    let (s, a) = (anim.limb_swing, anim.limb_swing_amount);
+    let pa = swing(s, a, 0.0, 1.4);
+    let pb = swing(s, a, PI, 1.4);
+    [
+        leg_pose(Vec3::new(-3.0, leg_px, 5.0), pb), // front right
+        leg_pose(Vec3::new(3.0, leg_px, 5.0), pa),  // front left
+        leg_pose(Vec3::new(-3.0, leg_px, -5.0), pa), // back right
+        leg_pose(Vec3::new(3.0, leg_px, -5.0), pb), // back left
+        PartPose::still(),                          // body
+        head_pose(anim, Vec3::new(0.0, leg_px + 4.0, 5.0)),
+    ]
+}
+
+/// Creeper articulation: the same diagonal leg trot plus head turn. Order
+/// matches [`creeper_parts`].
+fn creeper_poses(anim: &EntityAnim) -> [PartPose; 6] {
+    use std::f32::consts::PI;
+    let (s, a) = (anim.limb_swing, anim.limb_swing_amount);
+    let pa = swing(s, a, 0.0, 1.4);
+    let pb = swing(s, a, PI, 1.4);
+    [
+        leg_pose(Vec3::new(-2.0, 6.0, 4.0), pb),  // front right
+        leg_pose(Vec3::new(2.0, 6.0, 4.0), pa),   // front left
+        leg_pose(Vec3::new(-2.0, 6.0, -4.0), pa), // back right
+        leg_pose(Vec3::new(2.0, 6.0, -4.0), pb),  // back left
+        PartPose::still(),                        // body
+        head_pose(anim, Vec3::new(0.0, 18.0, 0.0)),
+    ]
+}
+
+/// Chicken articulation: legs alternate; head turns. Order matches
+/// [`chicken_parts`]: right leg, left leg, body, head.
+fn chicken_poses(anim: &EntityAnim) -> [PartPose; 4] {
+    use std::f32::consts::PI;
+    let (s, a) = (anim.limb_swing, anim.limb_swing_amount);
+    [
+        leg_pose(Vec3::new(-2.0, 5.0, 0.0), swing(s, a, 0.0, 1.4)),
+        leg_pose(Vec3::new(2.0, 5.0, 0.0), swing(s, a, PI, 1.4)),
+        PartPose::still(),
+        head_pose(anim, Vec3::new(0.0, 9.0, 4.0)),
+    ]
+}
+
 /// Rotate a local offset about the vertical (Y) axis.
 fn rotate_y(local: Vec3, sin: f32, cos: f32) -> Vec3 {
     Vec3::new(
@@ -486,6 +709,8 @@ mod tests {
             0.3,
             1.9,
             30.0,
+            &EntityAnim::default(),
+            None,
         );
         mesh
     }
@@ -526,6 +751,8 @@ mod tests {
             0.3,
             1.8,
             45.0,
+            &EntityAnim::default(),
+            None,
         );
         // 6 parts × 6 faces × 4 verts; 6 parts × 6 faces × 6 indices.
         assert_eq!(mesh.vertices.len(), 144);
@@ -603,8 +830,147 @@ mod tests {
         assert!(mesh.vertices.iter().all(|v| v.uv == ENTITY_WHITE_UV));
 
         let mut object = ModelMesh::new();
-        object.push_entity(EntityKind::Object(1), Vec3::ZERO, 0.125, 0.25, 0.0);
+        object.push_entity(
+            EntityKind::Object(1),
+            Vec3::ZERO,
+            0.125,
+            0.25,
+            0.0,
+            &EntityAnim::default(),
+            None,
+        );
         assert_eq!(object.vertices.len(), 24); // a single box
         assert!(object.vertices.iter().all(|v| v.uv == ENTITY_WHITE_UV));
+    }
+
+    /// Build a player mesh at the origin (yaw 0) with the given animation.
+    fn player_mesh(anim: &EntityAnim) -> ModelMesh {
+        let mut mesh = ModelMesh::new();
+        mesh.push_entity(
+            EntityKind::RemotePlayer,
+            Vec3::ZERO,
+            0.3,
+            1.8,
+            0.0,
+            anim,
+            None,
+        );
+        mesh
+    }
+
+    // Humanoid part vertex ranges (24 verts/part, in push order).
+    const RIGHT_LEG: std::ops::Range<usize> = 0..24;
+    const BODY: std::ops::Range<usize> = 48..72;
+    const HEAD: std::ops::Range<usize> = 120..144;
+
+    fn max_y(mesh: &ModelMesh, range: std::ops::Range<usize>) -> f32 {
+        mesh.vertices[range]
+            .iter()
+            .map(|v| v.position[1])
+            .fold(f32::MIN, f32::max)
+    }
+
+    fn parts_differ(a: &ModelMesh, b: &ModelMesh, range: std::ops::Range<usize>) -> bool {
+        a.vertices[range.clone()]
+            .iter()
+            .zip(&b.vertices[range])
+            .any(|(x, y)| (Vec3::from(x.position) - Vec3::from(y.position)).length() > 1e-4)
+    }
+
+    #[test]
+    fn walking_swings_legs_but_not_the_body() {
+        let rest = player_mesh(&EntityAnim::default());
+        let walking = player_mesh(&EntityAnim {
+            limb_swing: 2.0,
+            limb_swing_amount: 1.0,
+            ..EntityAnim::default()
+        });
+        assert!(parts_differ(&rest, &walking, RIGHT_LEG), "leg should swing");
+        assert!(
+            !parts_differ(&rest, &walking, BODY),
+            "body must stay still while walking"
+        );
+    }
+
+    #[test]
+    fn head_yaw_moves_only_the_head() {
+        let rest = player_mesh(&EntityAnim::default());
+        let turned = player_mesh(&EntityAnim {
+            net_head_yaw: 60.0,
+            ..EntityAnim::default()
+        });
+        assert!(parts_differ(&rest, &turned, HEAD), "head should turn");
+        assert!(
+            !parts_differ(&rest, &turned, BODY),
+            "body must not move when only the head turns"
+        );
+        assert!(
+            !parts_differ(&rest, &turned, RIGHT_LEG),
+            "legs must not move when only the head turns"
+        );
+    }
+
+    #[test]
+    fn looking_down_tilts_the_head_below_its_resting_top() {
+        let rest = player_mesh(&EntityAnim::default());
+        let looking_down = player_mesh(&EntityAnim {
+            head_pitch: 90.0, // straight down
+            ..EntityAnim::default()
+        });
+        // At rest the head top is the tallest point (entity height). Pitching the
+        // head fully down must lower its highest vertex.
+        assert!(
+            max_y(&looking_down, HEAD) < max_y(&rest, HEAD) - 0.1,
+            "looking down should drop the head's top: {} !< {}",
+            max_y(&looking_down, HEAD),
+            max_y(&rest, HEAD)
+        );
+    }
+
+    #[test]
+    fn skin_row_samples_the_per_player_atlas_region() {
+        let player = |row: Option<u32>| {
+            let mut mesh = ModelMesh::new();
+            mesh.push_entity(
+                EntityKind::RemotePlayer,
+                Vec3::ZERO,
+                0.3,
+                1.8,
+                0.0,
+                &EntityAnim::default(),
+                row,
+            );
+            mesh
+        };
+        let default = player(None);
+        let skinned = player(Some(0));
+        // Same geometry but different V: the shared player slot (row 0) vs the
+        // first per-player skin row.
+        let v_default: Vec<f32> = default.vertices.iter().map(|v| v.uv[1]).collect();
+        let v_skinned: Vec<f32> = skinned.vertices.iter().map(|v| v.uv[1]).collect();
+        assert_ne!(v_default, v_skinned);
+        let region_start =
+            (PLAYER_SKIN_BASE_ROW * ENTITY_SLOT_PX) as f32 / ENTITY_ATLAS_HEIGHT as f32;
+        assert!(
+            skinned.vertices.iter().all(|v| v.uv[1] >= region_start - 1e-6),
+            "skinned player must sample the per-player region"
+        );
+    }
+
+    #[test]
+    fn sneaking_tilts_the_body_forward() {
+        let rest = player_mesh(&EntityAnim::default());
+        let sneaking = player_mesh(&EntityAnim {
+            sneaking: true,
+            ..EntityAnim::default()
+        });
+        // The crouch tilts the upper body, so the body and head move while the
+        // legs stay planted.
+        assert!(parts_differ(&rest, &sneaking, BODY), "sneak tilts the body");
+        assert!(parts_differ(&rest, &sneaking, HEAD), "sneak lowers the head");
+        assert!(
+            !parts_differ(&rest, &sneaking, RIGHT_LEG),
+            "sneak keeps the legs planted"
+        );
     }
 }

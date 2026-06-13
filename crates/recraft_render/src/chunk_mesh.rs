@@ -342,6 +342,7 @@ fn append_block<S: BlockSource>(
     block: BlockState,
 ) {
     match block.render_shape() {
+        RenderShape::None => {}
         RenderShape::Cube => append_cube(mesh, ctx, x, y, z, block),
         RenderShape::Cross => append_cross(mesh, ctx, x, y, z, block),
         RenderShape::Rail => append_rail(mesh, ctx, x, y, z, block),
@@ -934,10 +935,10 @@ mod tests {
         ];
         for &(id, meta) in states {
             let block = BlockState::new(id, meta);
-            if matches!(block.render_shape(), RenderShape::Boxes)
-                && block.render_boxes().as_slice().is_empty()
-            {
-                continue; // renders nothing — no texture needed
+            match block.render_shape() {
+                RenderShape::None => continue,
+                RenderShape::Boxes if block.render_boxes().as_slice().is_empty() => continue,
+                _ => {}
             }
             for face in [BlockFace::Top, BlockFace::Bottom, BlockFace::Side] {
                 let name = block.texture_name(face);
@@ -947,6 +948,16 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn barrier_renders_no_geometry() {
+        let mut world = World::new();
+        world.set_block(0, 0, 0, BlockState::new(166, 0));
+        let mesh = build_world_mesh(&world, &atlas(), BiomeColors::default());
+        assert!(mesh.is_empty());
+        assert_eq!(BlockState::new(166, 0).render_shape(), RenderShape::None);
+        assert!(!BlockState::new(166, 0).is_opaque_cube());
     }
 
     #[test]

@@ -105,15 +105,21 @@ pub struct Renderer<'window> {
     size: PhysicalSize<u32>,
     pipeline: wgpu::RenderPipeline,
     cutout_pipeline: wgpu::RenderPipeline,
+    item_pipeline: wgpu::RenderPipeline,
     transparent_pipeline: wgpu::RenderPipeline,
     model_pipeline: wgpu::RenderPipeline,
     model_mesh: Option<DynamicMesh>,
     /// First-person held-item geometry (block-atlas textured), per frame.
     first_person_item: Option<DynamicMesh>,
+    /// Dropped-item entities in the world (block-atlas textured), per frame.
+    world_items: Option<DynamicMesh>,
     /// Crack overlay over the block being mined (vanilla destroy_stage_N).
     break_overlay: Option<DynamicMesh>,
     last_break_overlay: Option<(i32, i32, i32, u8)>,
     entity_bind_group: wgpu::BindGroup,
+    /// The entity atlas texture, retained so downloaded player skins can be
+    /// written into their rows at runtime (the bind group references it by view).
+    entity_texture: wgpu::Texture,
     sky_pipeline: wgpu::RenderPipeline,
     ui_pipeline: wgpu::RenderPipeline,
     ui_bind_group_layout: wgpu::BindGroupLayout,
@@ -125,6 +131,8 @@ pub struct Renderer<'window> {
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     chunk_meshes: HashMap<ChunkPos, GpuChunkMesh>,
+    chunk_mesh_generations: HashMap<ChunkPos, u64>,
+    next_chunk_mesh_generation: u64,
     biome_colors: BiomeColors,
     atlas_uv: AtlasUv,
     mesh_worker: MeshWorker,
@@ -218,7 +226,7 @@ impl<'window> Renderer<'window> {
         });
         let (texture_layout, texture_bind_group, biome_colors, atlas_uv, block_image) =
             create_texture_bind_group(&device, &queue);
-        let (entity_texture_layout, entity_bind_group) =
+        let (entity_texture_layout, entity_bind_group, entity_texture) =
             create_entity_texture_bind_group(&device, &queue);
         // The UI reuses the block atlas (and its name→tile map) for item icons.
         let gui_atlas = GuiAtlas::load(block_image, atlas_uv.clone());
@@ -316,6 +324,45 @@ impl<'window> Renderer<'window> {
                 strip_index_format: None,
                 front_face: wgpu::FrontFace::Ccw,
                 cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+        });
+        // First-person item sprites use the same alpha test but keep vanilla's
+        // item culling. Drawing both sides makes the far side of a 1px-thick
+        // sword visible through alpha holes, which looks like two crossed swords.
+        let item_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("item-cutout-pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_main",
+                buffers: &[Vertex::layout()],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_cutout",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: Some(wgpu::Face::Back),
                 polygon_mode: wgpu::PolygonMode::Fill,
                 unclipped_depth: false,
                 conservative: false,
@@ -500,13 +547,16 @@ impl<'window> Renderer<'window> {
             size,
             pipeline,
             cutout_pipeline,
+            item_pipeline,
             transparent_pipeline,
             model_pipeline,
             model_mesh: None,
             first_person_item: None,
+            world_items: None,
             break_overlay: None,
             last_break_overlay: None,
             entity_bind_group,
+            entity_texture,
             sky_pipeline,
             ui_pipeline,
             ui_bind_group_layout,
@@ -518,6 +568,8 @@ impl<'window> Renderer<'window> {
             camera_buffer,
             camera_bind_group,
             chunk_meshes: HashMap::new(),
+            chunk_mesh_generations: HashMap::new(),
+            next_chunk_mesh_generation: 1,
             biome_colors,
             atlas_uv,
             mesh_worker,
@@ -570,6 +622,7 @@ impl<'window> Renderer<'window> {
 
     pub fn upload_world(&mut self, world: &World) {
         self.chunk_meshes.clear();
+        self.chunk_mesh_generations.clear();
         let positions: Vec<_> = world.chunks().map(|chunk| chunk.position).collect();
         self.upload_dirty_chunks(world, positions);
     }
@@ -579,6 +632,7 @@ impl<'window> Renderer<'window> {
         I: IntoIterator<Item = ChunkPos>,
     {
         for pos in positions {
+            self.invalidate_chunk_mesh_jobs(pos);
             let mesh = build_chunk_mesh(world, pos, &self.atlas_uv, self.biome_colors);
             self.upload_chunk_mesh(pos, &mesh);
         }
@@ -594,8 +648,12 @@ impl<'window> Renderer<'window> {
     {
         for pos in positions {
             match ChunkNeighborhood::snapshot(world, pos) {
-                Some(neighborhood) => self.mesh_worker.submit(neighborhood),
+                Some(neighborhood) => {
+                    let generation = self.invalidate_chunk_mesh_jobs(pos);
+                    self.mesh_worker.submit(neighborhood, generation);
+                }
                 None => {
+                    self.invalidate_chunk_mesh_jobs(pos);
                     self.chunk_meshes.remove(&pos);
                 }
             }
@@ -605,19 +663,31 @@ impl<'window> Renderer<'window> {
     /// Upload up to `max` finished background meshes to the GPU. Results for
     /// chunks unloaded since they were queued are discarded.
     pub fn process_ready_meshes(&mut self, world: &World, max: usize) -> usize {
+        let mut processed = 0;
         let mut uploaded = 0;
-        while uploaded < max {
-            let Some((pos, mesh)) = self.mesh_worker.try_recv() else {
+        while processed < max {
+            let Some((pos, generation, mesh)) = self.mesh_worker.try_recv() else {
                 break;
             };
+            processed += 1;
+            if self.chunk_mesh_generations.get(&pos).copied() != Some(generation) {
+                continue;
+            }
             if world.chunk(pos).is_none() {
                 self.chunk_meshes.remove(&pos);
             } else {
                 self.upload_chunk_mesh(pos, &mesh);
+                uploaded += 1;
             }
-            uploaded += 1;
         }
         uploaded
+    }
+
+    fn invalidate_chunk_mesh_jobs(&mut self, pos: ChunkPos) -> u64 {
+        let generation = self.next_chunk_mesh_generation;
+        self.next_chunk_mesh_generation = self.next_chunk_mesh_generation.wrapping_add(1).max(1);
+        self.chunk_mesh_generations.insert(pos, generation);
+        generation
     }
 
     fn upload_chunk_mesh(&mut self, pos: ChunkPos, mesh: &ChunkMesh) {
@@ -670,6 +740,51 @@ impl<'window> Renderer<'window> {
             bytemuck::cast_slice(indices),
             indices.len() as u32,
             "first-person-item",
+        );
+    }
+
+    /// Replace the dropped-item world geometry (block-atlas textured `Vertex`
+    /// data), drawn in the world with depth testing. Pass empty slices to clear.
+    pub fn set_world_items(&mut self, vertices: &[Vertex], indices: &[u32]) {
+        fill_dynamic_mesh(
+            &self.device,
+            &self.queue,
+            &mut self.world_items,
+            bytemuck::cast_slice(vertices),
+            bytemuck::cast_slice(indices),
+            indices.len() as u32,
+            "world-items",
+        );
+    }
+
+    /// Write a normalized 64×64 RGBA player skin into per-player skin row
+    /// `row` of the entity atlas. The bind group references the texture by
+    /// view, so the in-place write needs no bind-group rebuild.
+    pub fn upload_player_skin(&mut self, row: u32, rgba: &[u8]) {
+        let px = crate::texture::ENTITY_SLOT_PX;
+        let expected = (px * px * 4) as usize;
+        if rgba.len() != expected || row >= crate::texture::PLAYER_SKIN_SLOTS {
+            return;
+        }
+        let (x, y) = crate::texture::player_skin_row_origin(row);
+        self.queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &self.entity_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x, y, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            rgba,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * px),
+                rows_per_image: Some(px),
+            },
+            wgpu::Extent3d {
+                width: px,
+                height: px,
+                depth_or_array_layers: 1,
+            },
         );
     }
 
@@ -878,9 +993,20 @@ impl<'window> Renderer<'window> {
                 draw_calls += 1;
             }
 
+            // Dropped items in the world, textured from the block/item atlas.
+            if let Some(items) = self.world_items.as_ref().filter(|m| m.index_count > 0) {
+                pass.set_pipeline(&self.item_pipeline);
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                pass.set_bind_group(1, &self.texture_bind_group, &[]);
+                pass.set_vertex_buffer(0, items.vertex_buffer.slice(..));
+                pass.set_index_buffer(items.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..items.index_count, 0, 0..1);
+                draw_calls += 1;
+            }
+
             // First-person held item, textured from the block/item atlas.
             if let Some(item) = self.first_person_item.as_ref().filter(|m| m.index_count > 0) {
-                pass.set_pipeline(&self.cutout_pipeline);
+                pass.set_pipeline(&self.item_pipeline);
                 pass.set_bind_group(0, &self.camera_bind_group, &[]);
                 pass.set_bind_group(1, &self.texture_bind_group, &[]);
                 pass.set_vertex_buffer(0, item.vertex_buffer.slice(..));
@@ -1245,7 +1371,7 @@ fn create_depth_view(
 fn create_entity_texture_bind_group(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
-) -> (wgpu::BindGroupLayout, wgpu::BindGroup) {
+) -> (wgpu::BindGroupLayout, wgpu::BindGroup, wgpu::Texture) {
     let atlas = EntityAtlasImage::load_default();
     if atlas.player_skin_loaded {
         log::info!("loaded entity player skin texture");
@@ -1331,7 +1457,7 @@ fn create_entity_texture_bind_group(
             },
         ],
     });
-    (layout, bind_group)
+    (layout, bind_group, texture)
 }
 
 fn create_ui_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {

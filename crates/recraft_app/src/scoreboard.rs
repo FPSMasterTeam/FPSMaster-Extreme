@@ -172,6 +172,12 @@ impl Scoreboard {
         }
     }
 
+    /// Entry text as displayed (team prefix + name + suffix), for the tab list
+    /// and player nametags. Vanilla `ScorePlayerTeam.formatPlayerName`.
+    pub fn decorate_entry(&self, entry: &str) -> String {
+        self.decorate(entry)
+    }
+
     /// Entry text as displayed: team prefix + name + suffix.
     fn decorate(&self, entry: &str) -> String {
         match self

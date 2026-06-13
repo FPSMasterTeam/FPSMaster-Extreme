@@ -29,7 +29,7 @@ impl BlockState {
     /// Whether this block fully occludes the neighbouring face touching it
     /// (data-driven). Unknown non-air blocks are treated as opaque cubes.
     pub fn is_opaque_cube(self) -> bool {
-        if self.is_air() {
+        if self.is_air() || self.id == 166 {
             return false;
         }
         blocks::registry().def(self.id).is_none_or(|def| def.opaque)
@@ -37,11 +37,15 @@ impl BlockState {
 
     /// Render geometry: full cube, crossed plant, or partial boxes.
     pub fn render_shape(self) -> RenderShape {
+        if self.id == 166 {
+            return RenderShape::None;
+        }
         match self.shape() {
             Shape::Cross => RenderShape::Cross,
             Shape::Rail => RenderShape::Rail,
             Shape::Ladder => RenderShape::Ladder,
             Shape::Cube => RenderShape::Cube,
+            Shape::None => RenderShape::None,
             _ => RenderShape::Boxes,
         }
     }
@@ -72,6 +76,56 @@ impl BlockState {
 
     pub fn is_solid_collision(self) -> bool {
         !self.collision_boxes().is_empty()
+    }
+
+    /// Vanilla `Block.slipperiness`: the horizontal friction factor of the
+    /// block a walking entity stands on (multiplied by 0.91 to form the drag).
+    /// Default 0.6; the ice family is 0.98; slime blocks are 0.8. 1.8 has no
+    /// blue/frosted ice, so packed ice (174) is the only other slick block.
+    pub fn slipperiness(self) -> f32 {
+        match self.id {
+            79 | 174 => 0.98, // ice, packed ice
+            165 => 0.8,       // slime block
+            _ => 0.6,
+        }
+    }
+
+    /// Vanilla `Entity.isOnLadder` material: ladders and vines in 1.8. Trapdoor-
+    /// as-ladder is a 1.9 feature and excluded.
+    pub fn is_climbable(self) -> bool {
+        matches!(self.id, 65 | 106) // ladder, vine
+    }
+
+    /// `BlockWeb` — applies the cobweb stuck-speed when an entity is inside it.
+    pub fn is_cobweb(self) -> bool {
+        self.id == 30
+    }
+
+    /// `BlockSoulSand` — multiplies an entity's horizontal motion by 0.4 while
+    /// it is inside the block (1.8 `onEntityCollidedWithBlock`).
+    pub fn is_soul_sand(self) -> bool {
+        self.id == 88
+    }
+
+    /// `BlockSlime` — bounces an entity that lands on it.
+    pub fn is_slime_block(self) -> bool {
+        self.id == 165
+    }
+
+    /// Flowing or still water (1.8 `Material.water`).
+    pub fn is_water(self) -> bool {
+        matches!(self.id, 8 | 9)
+    }
+
+    /// Flowing or still lava (1.8 `Material.lava`).
+    pub fn is_lava(self) -> bool {
+        matches!(self.id, 10 | 11)
+    }
+
+    /// Either liquid material — used by the swim-up-against-a-ledge bump, which
+    /// only fires onto a position free of both collision and liquid.
+    pub fn is_liquid(self) -> bool {
+        self.is_water() || self.is_lava()
     }
 
     /// Collision boxes in unit (0..1) block space; empty means no collision
@@ -188,6 +242,7 @@ impl BlockState {
 /// A block's render geometry kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenderShape {
+    None,
     Cube,
     Cross,
     Rail,

@@ -4,9 +4,12 @@ mod game;
 mod gui;
 mod item_renderer;
 mod network;
+mod player_list;
 mod scoreboard;
+mod skin;
 mod servers;
 mod settings;
+mod text_input;
 
 use std::{
     env,
@@ -39,10 +42,10 @@ const MESH_SUBMITS_PER_FRAME: usize = 8;
 /// Finished background meshes uploaded to the GPU each frame.
 const MESH_UPLOADS_PER_FRAME: usize = 12;
 use winit::{
-    dpi::LogicalSize,
+    dpi::{LogicalSize, PhysicalPosition, PhysicalSize},
     event::{DeviceEvent, ElementState, Event, MouseButton, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
-    keyboard::{KeyCode, PhysicalKey},
+    keyboard::{KeyCode, ModifiersState, PhysicalKey},
     window::{CursorGrabMode, WindowBuilder},
 };
 
@@ -72,6 +75,10 @@ struct App {
     accounts: auth::AccountStore,
     clipboard: Option<arboard::Clipboard>,
     username: String,
+    /// Whether the Tab key is held — shows the player-list overlay.
+    tab_open: bool,
+    /// Per-player skin downloads and atlas-row allocation.
+    skin_manager: skin::SkinManager,
     quit: bool,
 }
 
@@ -99,6 +106,7 @@ impl App {
     /// a screen opens over gameplay.
     fn suspend_gameplay_input(&mut self, left_held: &mut bool) {
         self.game.input.release_all();
+        self.tab_open = false;
         *left_held = false;
         if let Some(packet) = self.game.cancel_breaking() {
             if let Some(network) = &self.network {
@@ -194,13 +202,24 @@ fn main() -> anyhow::Result<()> {
         accounts: auth::AccountStore::load(),
         clipboard: arboard::Clipboard::new().ok(),
         username,
+        tab_open: false,
+        skin_manager: skin::SkinManager::new(),
         quit: false,
     };
     renderer.upload_world(&app.game.world);
 
     let mut cursor_captured = false;
     let mut cursor_position = (0.0f64, 0.0f64);
+    // Held modifier keys (for text-field shortcuts like Ctrl/Cmd+V).
+    let mut modifiers = ModifiersState::empty();
+    // Whether IME input is currently enabled on the window. We turn it on only
+    // while a text field is focused, so gameplay keys stay raw and no candidate
+    // window pops up mid-game. `last_ime_area` avoids redundant area updates.
+    let mut ime_enabled = false;
+    let mut last_ime_area: Option<(i32, i32, i32, i32)> = None;
     let mut mouse_down_left = false;
+    // Right button held over a screen, for right-button inventory paint-drag.
+    let mut mouse_down_right = false;
     // Whether the left mouse button is held in gameplay (continuous mining).
     let mut left_held = false;
     // Per-tick input intents. Frame events only RECORD intent here; the tick loop
@@ -238,6 +257,19 @@ fn main() -> anyhow::Result<()> {
                     renderer.resize(size);
                     app.game.set_aspect(renderer.aspect());
                 }
+                WindowEvent::ModifiersChanged(state) => {
+                    modifiers = state.state();
+                }
+                WindowEvent::Ime(ime) => {
+                    // Route IME composition/commit to the focused text field.
+                    if let Some(input) = app
+                        .screen
+                        .as_mut()
+                        .and_then(|screen| screen.focused_text_input())
+                    {
+                        input.handle_ime(&ime);
+                    }
+                }
                 WindowEvent::KeyboardInput { event, .. } => {
                     if app.screen.is_some() {
                         // Screen input: route through the screen, collect actions.
@@ -247,6 +279,8 @@ fn main() -> anyhow::Result<()> {
                                 game: &mut app.game,
                                 settings: &mut app.settings,
                                 clipboard: app.clipboard.as_mut(),
+                                modifiers,
+                                mouse: cursor_position,
                             };
                             screen.key_pressed(&event, &mut ctx)
                         } else {
@@ -273,6 +307,12 @@ fn main() -> anyhow::Result<()> {
                             app.screen = Some(Box::new(GuiChat::new(prefill)));
                         } else if let Some(slot) = hotbar_slot_key(&event) {
                             slot_select = Some(slot);
+                        } else if matches!(
+                            event.physical_key,
+                            PhysicalKey::Code(KeyCode::Tab)
+                        ) {
+                            // Hold Tab to show the player-list overlay.
+                            app.tab_open = pressed;
                         } else {
                             app.game.input.handle_key(event);
                         }
@@ -294,13 +334,15 @@ fn main() -> anyhow::Result<()> {
                 }
                 WindowEvent::CursorMoved { position, .. } => {
                     cursor_position = (position.x, position.y);
-                    if mouse_down_left {
+                    if mouse_down_left || mouse_down_right {
                         let mut taken = app.screen.take();
                         if let Some(screen) = taken.as_mut() {
                             let mut ctx = ScreenCtx {
                                 game: &mut app.game,
                                 settings: &mut app.settings,
                                 clipboard: app.clipboard.as_mut(),
+                                modifiers,
+                                mouse: cursor_position,
                             };
                             screen.mouse_dragged(position.x, position.y, &mut ctx);
                         }
@@ -308,33 +350,69 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
                 WindowEvent::MouseInput { state, button, .. } => {
+                    let is_left = button == MouseButton::Left;
+                    let is_right = button == MouseButton::Right;
                     if state == ElementState::Released {
-                        if button == MouseButton::Left {
+                        if is_left {
                             mouse_down_left = false;
                             left_held = false;
-                            if let Some(screen) = app.screen.as_mut() {
-                                screen.mouse_released(cursor_position.0, cursor_position.1);
-                            } else if app.in_world {
-                                // Record the release; the cancel-dig packet (if
-                                // any) is sent inside the tick.
-                                attack_released = true;
-                            }
                         }
-                    } else if app.screen.is_some() {
-                        if button == MouseButton::Left {
-                            mouse_down_left = true;
+                        if is_right {
+                            mouse_down_right = false;
+                        }
+                        if app.screen.is_some() && (is_left || is_right) {
+                            // Route the release to the screen (commits an
+                            // inventory paint-drag, or collapses it to a click).
                             let mut taken = app.screen.take();
                             let actions = if let Some(screen) = taken.as_mut() {
                                 let mut ctx = ScreenCtx {
                                     game: &mut app.game,
                                     settings: &mut app.settings,
                                     clipboard: app.clipboard.as_mut(),
+                                    modifiers,
+                                    mouse: cursor_position,
                                 };
-                                screen.mouse_clicked(
+                                screen.mouse_released(
                                     cursor_position.0,
                                     cursor_position.1,
+                                    is_right,
                                     &mut ctx,
                                 )
+                            } else {
+                                Vec::new()
+                            };
+                            app.screen = taken;
+                            handle_actions(&mut app, &mut renderer, actions);
+                        } else if is_left && app.in_world {
+                            // Record the release; the cancel-dig packet (if any)
+                            // is sent inside the tick.
+                            attack_released = true;
+                        }
+                    } else if app.screen.is_some() {
+                        if is_left || is_right {
+                            if is_left {
+                                mouse_down_left = true;
+                            } else {
+                                mouse_down_right = true;
+                            }
+                            let mut taken = app.screen.take();
+                            let actions = if let Some(screen) = taken.as_mut() {
+                                let mut ctx = ScreenCtx {
+                                    game: &mut app.game,
+                                    settings: &mut app.settings,
+                                    clipboard: app.clipboard.as_mut(),
+                                    modifiers,
+                                    mouse: cursor_position,
+                                };
+                                if is_left {
+                                    screen.mouse_clicked(cursor_position.0, cursor_position.1, &mut ctx)
+                                } else {
+                                    screen.mouse_right_clicked(
+                                        cursor_position.0,
+                                        cursor_position.1,
+                                        &mut ctx,
+                                    )
+                                }
                             } else {
                                 Vec::new()
                             };
@@ -381,6 +459,8 @@ fn main() -> anyhow::Result<()> {
                         game: &mut app.game,
                         settings: &mut app.settings,
                         clipboard: app.clipboard.as_mut(),
+                        modifiers,
+                        mouse: cursor_position,
                     };
                     screen.update(&mut ctx)
                 } else {
@@ -495,6 +575,35 @@ fn main() -> anyhow::Result<()> {
                     cursor_position,
                     mouse_down_left,
                 );
+
+                // Keep the OS IME in sync with whichever field is focused: enable
+                // it only while editing text (so gameplay keys stay raw and no
+                // candidate window pops up mid-game), and pin the candidate
+                // window to the caret recorded during this frame's draw.
+                let focused_caret = app
+                    .screen
+                    .as_mut()
+                    .and_then(|screen| screen.focused_text_input())
+                    .map(|input| input.caret_area());
+                let want_ime = focused_caret.is_some();
+                if want_ime != ime_enabled {
+                    window.set_ime_allowed(want_ime);
+                    ime_enabled = want_ime;
+                    if !want_ime {
+                        last_ime_area = None;
+                    }
+                }
+                if let Some(area) = focused_caret.flatten() {
+                    if last_ime_area != Some(area) {
+                        last_ime_area = Some(area);
+                        let (cx, cy, cw, ch) = area;
+                        window.set_ime_cursor_area(
+                            PhysicalPosition::new(cx as f64, cy as f64),
+                            PhysicalSize::new(cw.max(1) as f64, ch.max(1) as f64),
+                        );
+                    }
+                }
+
                 target.set_control_flow(ControlFlow::Poll);
             }
             _ => {}
@@ -599,6 +708,11 @@ fn handle_actions(app: &mut App, renderer: &mut Renderer, actions: Vec<GuiAction
                 }
             }
             GuiAction::SetVsync(on) => renderer.set_vsync(on),
+            GuiAction::SendPacket(packet) => {
+                if let Some(network) = &app.network {
+                    network.send_packet(packet);
+                }
+            }
         }
     }
 }
@@ -729,9 +843,15 @@ fn render_frame(
     fps_counter.tick(now);
     *last_frame = now;
 
-    // Hand a bounded number of dirty chunks to the background mesher, then
-    // upload whatever finished — both off the frame's critical path.
-    let dirty_chunks = app.game.take_dirty_chunks_budget(MESH_SUBMITS_PER_FRAME);
+    // Local block prediction gets submitted to the background mesher first, but
+    // never rebuilt on the render thread; placing/breaking must not stall a
+    // frame.
+    let urgent_chunks = app.game.take_urgent_remesh();
+    if !urgent_chunks.is_empty() {
+        renderer.queue_chunk_meshes(&app.game.world, urgent_chunks.iter().copied());
+    }
+    let dirty_budget = MESH_SUBMITS_PER_FRAME.saturating_sub(urgent_chunks.len());
+    let dirty_chunks = app.game.take_dirty_chunks_budget(dirty_budget);
     if !dirty_chunks.is_empty() {
         renderer.queue_chunk_meshes(&app.game.world, dirty_chunks);
     }
@@ -745,8 +865,24 @@ fn render_frame(
     let tick_alpha = (tick_accumulator / 0.05).clamp(0.0, 1.0);
     if app.in_world {
         app.game.update_camera(tick_alpha);
+        // Start skin downloads for newly-seen textured players, then upload any
+        // that finished, so the entity model can sample their atlas rows.
+        let new_skins: Vec<([u8; 16], String)> = app
+            .game
+            .player_list
+            .iter()
+            .filter(|(uuid, _)| !app.skin_manager.is_requested(uuid))
+            .filter_map(|(uuid, info)| info.texture_property().map(|t| (*uuid, t.to_owned())))
+            .collect();
+        for (uuid, property) in new_skins {
+            app.skin_manager.request(uuid, &property);
+        }
+        app.skin_manager.poll(renderer);
+
         let first_person = app.game.first_person_view(tick_alpha);
-        let mut model = app.game.build_entity_model(tick_alpha);
+        let mut model = app
+            .game
+            .build_entity_model(tick_alpha, app.skin_manager.rows());
         if hud_visible {
             ItemRenderer::render_arm(&mut model, &app.game.camera, &first_person);
             let (vertices, indices) =
@@ -756,9 +892,14 @@ fn render_frame(
             renderer.set_first_person_item(&[], &[]);
         }
         renderer.upload_model(&model);
+        let dropped = app.game.dropped_items(tick_alpha);
+        let (item_vertices, item_indices) =
+            ItemRenderer::build_world_items(&app.game.camera, &dropped, atlas_uv);
+        renderer.set_world_items(&item_vertices, &item_indices);
     } else {
         renderer.upload_model(&recraft_render::ModelMesh::new());
         renderer.set_first_person_item(&[], &[]);
+        renderer.set_world_items(&[], &[]);
     }
     // Mining crack overlay (vanilla destroy_stage_N textures over the dig target).
     renderer.set_break_overlay(app.game.breaking_overlay());
@@ -774,8 +915,11 @@ fn render_frame(
         game,
         settings,
         ms_session,
+        tab_open,
         ..
     } = app;
+    // The overlay only makes sense in pure gameplay, never under an open screen.
+    let tab_open = *tab_open && screen.is_none();
     let hud = HudState {
         health: game.health(),
         food: game.food(),
@@ -784,14 +928,16 @@ fn render_frame(
         selected_slot: game.selected_slot(),
         hotbar: game.hotbar_items(),
         inventory: game.inventory_slots(),
+        cursor_item: game.cursor_item(),
         chat: &game.chat,
         scoreboard: &game.scoreboard,
+        player_list: &game.player_list,
+        tab_open,
         title: game.title_overlay(tick_accumulator / 0.05),
     };
     if hud_visible {
-        let chat_input: Option<String> = screen
-            .as_ref()
-            .and_then(|screen| screen.chat_input().map(str::to_owned));
+        draw_nametags(&mut ui, game, width, height, tick_alpha);
+        let chat_input = screen.as_mut().and_then(|screen| screen.chat_input_mut());
         GuiIngame::render(
             &mut ui,
             width,
@@ -799,7 +945,7 @@ fn render_frame(
             fps_counter.fps(),
             game.loaded_chunk_count(),
             &hud,
-            chat_input.as_deref(),
+            chat_input,
         );
     }
     if let Some(screen) = screen.as_mut() {
@@ -821,6 +967,53 @@ fn render_frame(
 
     if let Err(err) = renderer.render_with_ui(&app.game.camera, &ui) {
         log::error!("render error: {err}");
+    }
+}
+
+/// Project each visible player's head anchor to screen space and draw its
+/// nametag — a translucent dark plate with centered, shadowed text — like
+/// vanilla `EntityRenderer.drawNameplate`. Names are pre-filtered (distance and
+/// block occlusion) by [`GameState::player_nametags`]; here we cull anything
+/// behind or off the screen and lay out the 2D text.
+fn draw_nametags(
+    ui: &mut recraft_render::UiFrame,
+    game: &GameState,
+    width: i32,
+    height: i32,
+    tick_alpha: f32,
+) {
+    let view_proj = game.camera.view_projection();
+    let scale = gui::gui_scale(height);
+    for (name, world) in game.player_nametags(tick_alpha) {
+        let clip = view_proj * glam::Vec4::new(world.x, world.y, world.z, 1.0);
+        if clip.w <= 0.05 {
+            continue; // anchor is behind the camera
+        }
+        let ndc_x = clip.x / clip.w;
+        let ndc_y = clip.y / clip.w;
+        if !(-1.5..=1.5).contains(&ndc_x) || !(-1.5..=1.5).contains(&ndc_y) {
+            continue;
+        }
+        let sx = ((ndc_x * 0.5 + 0.5) * width as f32) as i32;
+        let sy = ((1.0 - (ndc_y * 0.5 + 0.5)) * height as f32) as i32;
+        let text_w = recraft_render::text_width(&name, scale);
+        let pad = 2 * scale;
+        ui.rect(
+            recraft_render::UiRect::new(
+                sx - text_w / 2 - pad,
+                sy - 5 * scale,
+                text_w + 2 * pad,
+                10 * scale,
+            ),
+            recraft_render::UiColor::rgba(0, 0, 0, 96),
+        );
+        ui.text_shadowed(
+            sx - text_w / 2,
+            sy - 4 * scale,
+            scale,
+            recraft_render::UiColor::rgba(255, 255, 255, 255),
+            name,
+        );
     }
 }
 

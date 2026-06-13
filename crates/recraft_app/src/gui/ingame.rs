@@ -12,6 +12,7 @@ use crate::chat::{self, ChatState};
 use crate::game::TitleOverlay;
 use crate::gui::widgets::trim_to_tail;
 use crate::scoreboard::Scoreboard;
+use crate::text_input::TextInput;
 
 /// HUD data snapshot for one frame.
 #[derive(Debug, Clone, Copy)]
@@ -23,8 +24,14 @@ pub struct HudState<'a> {
     pub selected_slot: i32,
     pub hotbar: &'a [Option<SlotItem>],
     pub inventory: &'a [Option<SlotItem>],
+    /// The stack carried on the cursor in an open inventory (vanilla slot -1).
+    pub cursor_item: Option<SlotItem>,
     pub chat: &'a ChatState,
     pub scoreboard: &'a Scoreboard,
+    /// Tab-list roster; drawn as the player-list overlay while `tab_open`.
+    pub player_list: &'a crate::player_list::PlayerList,
+    /// Whether the Tab key is held (show the player-list overlay).
+    pub tab_open: bool,
     pub title: Option<TitleOverlay<'a>>,
 }
 
@@ -52,8 +59,9 @@ fn faded_white(alpha: f32) -> UiColor {
 pub struct GuiIngame;
 
 impl GuiIngame {
-    /// Render the full HUD. `chat_input` is the live chat-box content when the
-    /// chat overlay screen is open.
+    /// Render the full HUD. `chat_input` is the live chat-box buffer when the
+    /// chat overlay screen is open (its caret and IME composition are drawn,
+    /// and its caret area recorded for IME candidate-window placement).
     pub fn render(
         ui: &mut UiFrame,
         width: i32,
@@ -61,7 +69,7 @@ impl GuiIngame {
         fps: f32,
         chunk_count: usize,
         hud: &HudState,
-        chat_input: Option<&str>,
+        chat_input: Option<&mut TextInput>,
     ) {
         let scale = gui_scale(height);
         draw_fps_panel(ui, scale, fps, chunk_count);
@@ -84,6 +92,7 @@ impl GuiIngame {
         draw_action_bar(ui, width, height, hud);
         draw_sidebar(ui, width, height, hud);
         draw_chat(ui, width, height, hud, chat_input);
+        draw_tab_list(ui, width, height, hud);
     }
 }
 
@@ -258,7 +267,7 @@ pub(crate) fn draw_item_icon(ui: &mut UiFrame, rect: UiRect, item: SlotItem, tex
 
 /// The chat panel: recent lines above the hotbar (fading when closed, full
 /// backlog when open) plus the input bar when the chat overlay is open.
-fn draw_chat(ui: &mut UiFrame, width: i32, height: i32, hud: &HudState, input: Option<&str>) {
+fn draw_chat(ui: &mut UiFrame, width: i32, height: i32, hud: &HudState, input: Option<&mut TextInput>) {
     let scale = gui_scale(height);
     let open = input.is_some();
     let now = Instant::now();
@@ -279,8 +288,19 @@ fn draw_chat(ui: &mut UiFrame, width: i32, height: i32, hud: &HudState, input: O
             line_height + 2 * pad,
         );
         ui.rect(bar, BLACK_170);
-        let visible = trim_to_tail(&format!("{input}_"), wrap_width, scale);
-        ui.text_shadowed(bar.x + pad, bar.y + pad + scale, scale, faded_white(1.0), visible);
+        let text_x = bar.x + pad;
+        let text_y = bar.y + pad + scale;
+        // Render committed text with the active IME composition spliced in at
+        // the caret, plus a trailing "_" caret marker.
+        let (before, preedit, after) = input.segments();
+        let display = format!("{before}{preedit}_{after}");
+        let prefix = format!("{before}{preedit}");
+        let visible = trim_to_tail(&display, wrap_width, scale);
+        ui.text_shadowed(text_x, text_y, scale, faded_white(1.0), visible);
+        // Anchor the IME candidate window at the caret (physical px).
+        let prefix_visible = trim_to_tail(&prefix, wrap_width, scale);
+        let caret_x = text_x + text_width(&prefix_visible, scale);
+        input.set_caret_area(caret_x, bar.y, 2 * scale, bar.height);
         bottom = bar.y - 2 * scale;
     } else {
         bottom -= 42 * scale; // sit above the hotbar + status rows when closed
@@ -419,4 +439,148 @@ fn draw_sidebar(ui: &mut UiFrame, width: i32, height: i32, hud: &HudState) {
         );
         y += line_height;
     }
+}
+
+/// Connection-bar sprite row in icons.png for a latency (vanilla
+/// `GuiPlayerTabOverlay.drawPing`): 0 = full (green) … 5 = no signal.
+fn ping_bars_index(ping: i32) -> u32 {
+    match ping {
+        p if p < 0 => 5,
+        p if p < 150 => 0,
+        p if p < 300 => 1,
+        p if p < 600 => 2,
+        p if p < 1000 => 3,
+        _ => 4,
+    }
+}
+
+/// The tab player-list overlay (vanilla `GuiPlayerTabOverlay`): a translucent
+/// panel of player names laid out in up-to-20-row columns, each row showing a
+/// connection-bar icon, with the server header above and footer below.
+fn draw_tab_list(ui: &mut UiFrame, width: i32, height: i32, hud: &HudState) {
+    if !hud.tab_open {
+        return;
+    }
+    let players = hud.player_list.sorted();
+    if players.is_empty() {
+        return;
+    }
+    let scale = gui_scale(height);
+
+    // Display text per player: explicit display name, else team-decorated name.
+    let names: Vec<String> = players
+        .iter()
+        .map(|p| match &p.display_name {
+            Some(json) => chat::flatten_chat_json(json),
+            None => hud.scoreboard.decorate_entry(&p.name),
+        })
+        .collect();
+
+    // Column layout: at most 20 rows per column (vanilla).
+    let count = players.len();
+    let mut columns = 1usize;
+    let mut rows = count;
+    while rows > 20 {
+        columns += 1;
+        rows = count.div_ceil(columns);
+    }
+
+    let line_h = 9 * scale;
+    let ping_w = 10 * scale;
+    let cell_gap = 5 * scale; // space between name and the ping bar
+    let col_gap = 6 * scale; // space between columns
+
+    // Per-column name width, then per-column total cell width.
+    let mut col_name_w = vec![0i32; columns];
+    for (i, name) in names.iter().enumerate() {
+        let col = i / rows;
+        col_name_w[col] = col_name_w[col].max(text_width(name, scale));
+    }
+    let col_w: Vec<i32> = col_name_w.iter().map(|w| w + cell_gap + ping_w).collect();
+    // Left offset of each column inside the grid.
+    let mut col_x = vec![0i32; columns];
+    for c in 1..columns {
+        col_x[c] = col_x[c - 1] + col_w[c - 1] + col_gap;
+    }
+    let grid_w: i32 = col_w.iter().sum::<i32>() + col_gap * (columns as i32 - 1);
+    let grid_h = rows as i32 * line_h;
+
+    let header_lines: Vec<&str> = split_nonempty(&hud.player_list.header);
+    let footer_lines: Vec<&str> = split_nonempty(&hud.player_list.footer);
+    let gap = line_h / 2;
+    let header_block = if header_lines.is_empty() {
+        0
+    } else {
+        header_lines.len() as i32 * line_h + gap
+    };
+    let footer_block = if footer_lines.is_empty() {
+        0
+    } else {
+        footer_lines.len() as i32 * line_h + gap
+    };
+
+    // Content width is the widest of the grid and any header/footer line.
+    let mut content_w = grid_w;
+    for line in header_lines.iter().chain(footer_lines.iter()) {
+        content_w = content_w.max(text_width(line, scale));
+    }
+
+    let pad = 2 * scale;
+    let center_x = width / 2;
+    let block_h = header_block + grid_h + footer_block;
+    let top = ((height - block_h) / 2).max(2 * scale);
+
+    // One translucent backing panel (vanilla draws faint per-cell rects; a
+    // single panel reads the same and keeps the columns legible).
+    let bg_w = content_w + 2 * pad;
+    ui.rect(
+        UiRect::new(center_x - bg_w / 2, top - pad, bg_w, block_h + 2 * pad),
+        BLACK_170,
+    );
+
+    let mut y = top;
+    for line in &header_lines {
+        let w = text_width(line, scale);
+        ui.text_shadowed(center_x - w / 2, y + scale, scale, faded_white(1.0), *line);
+        y += line_h;
+    }
+    if !header_lines.is_empty() {
+        y += gap;
+    }
+
+    let grid_x = center_x - grid_w / 2;
+    for (i, (player, name)) in players.iter().zip(names.iter()).enumerate() {
+        let col = i / rows;
+        let row = (i % rows) as i32;
+        let cell_x = grid_x + col_x[col];
+        let cell_y = y + row * line_h;
+        ui.text_shadowed(cell_x, cell_y + scale, scale, faded_white(1.0), name.clone());
+        let bar_x = cell_x + col_w[col] - ping_w;
+        ui.image(
+            UiRect::new(bar_x, cell_y + scale, ping_w, 8 * scale),
+            GuiTexture::Icons,
+            0,
+            176 + ping_bars_index(player.ping) * 8,
+            10,
+            8,
+        );
+    }
+    y += grid_h;
+
+    if !footer_lines.is_empty() {
+        y += gap;
+        for line in &footer_lines {
+            let w = text_width(line, scale);
+            ui.text_shadowed(center_x - w / 2, y + scale, scale, faded_white(1.0), *line);
+            y += line_h;
+        }
+    }
+}
+
+/// Split flattened header/footer text into lines, dropping an all-empty result.
+fn split_nonempty(text: &str) -> Vec<&str> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    text.split('\n').collect()
 }

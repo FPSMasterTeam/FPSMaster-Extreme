@@ -4,6 +4,8 @@ use recraft_render::{UiColor, UiFrame, UiRect};
 use winit::event::{ElementState, KeyEvent};
 use winit::keyboard::{KeyCode, PhysicalKey};
 
+use crate::text_input::TextInput;
+
 use super::main_menu::GuiMainMenu;
 use super::widgets::{GuiButton, GuiTextField};
 use super::{
@@ -166,7 +168,7 @@ impl GuiAddToken {
     }
 
     fn submit(&self) -> Vec<GuiAction> {
-        let token = self.token.text.trim().to_owned();
+        let token = self.token.text().trim().to_owned();
         if token.is_empty() {
             return Vec::new();
         }
@@ -208,7 +210,7 @@ impl GuiScreen for GuiAddToken {
         Vec::new()
     }
 
-    fn key_pressed(&mut self, event: &KeyEvent, _ctx: &mut ScreenCtx) -> Vec<GuiAction> {
+    fn key_pressed(&mut self, event: &KeyEvent, ctx: &mut ScreenCtx) -> Vec<GuiAction> {
         if event.state == ElementState::Pressed {
             match event.physical_key {
                 PhysicalKey::Code(KeyCode::Escape) => {
@@ -220,7 +222,12 @@ impl GuiScreen for GuiAddToken {
                 _ => {}
             }
         }
-        self.token.key_pressed(event);
+        self.token
+            .key_pressed(event, ctx.modifiers, ctx.clipboard.as_deref_mut());
         Vec::new()
+    }
+
+    fn focused_text_input(&mut self) -> Option<&mut TextInput> {
+        self.token.focused_input()
     }
 }

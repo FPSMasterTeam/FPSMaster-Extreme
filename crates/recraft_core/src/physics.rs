@@ -1,7 +1,13 @@
 use glam::DVec3;
 
 use crate::mc_math::{mc_cos, mc_sin, DEG_TO_RAD};
-use crate::{EntityState, World};
+use crate::{BlockState, EntityState, World};
+
+/// Vanilla/Grim collision tolerance. A box that merely touches a face — or sits
+/// a hair (≤ this) past it from accumulated float error — is still treated as
+/// colliding, so a player resting flush against a wall can never be nudged
+/// through it by rounding. Mirrors `SimpleCollisionBox.COLLISION_EPSILON`.
+const COLLISION_EPSILON: f64 = 1.0e-7;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Aabb {
@@ -63,67 +69,91 @@ impl Aabb {
             && self.min.z < other.max.z
     }
 
-    fn calculate_x_offset(self, other: Self, mut offset: f64) -> f64 {
-        if other.max.y > self.min.y
-            && other.min.y < self.max.y
-            && other.max.z > self.min.z
-            && other.min.z < self.max.z
+    /// Clamp an x move so `other` (the moving box) cannot pass through `self`
+    /// (a collider). Ported 1:1 from Grim `SimpleCollisionBox.collideX`: the
+    /// perpendicular (y/z) overlap must exceed the epsilon, and a face merely
+    /// touched — or overshot by ≤ epsilon — still blocks. Only a box already
+    /// more than epsilon past the face is let through (so a deeply-embedded box
+    /// is never yanked back).
+    fn calculate_x_offset(self, other: Self, offset: f64) -> f64 {
+        if offset != 0.0
+            && (other.min.y - self.max.y) < -COLLISION_EPSILON
+            && (other.max.y - self.min.y) > COLLISION_EPSILON
+            && (other.min.z - self.max.z) < -COLLISION_EPSILON
+            && (other.max.z - self.min.z) > COLLISION_EPSILON
         {
-            if offset > 0.0 && other.max.x <= self.min.x {
-                let limit = self.min.x - other.max.x;
-                if limit < offset {
-                    offset = limit;
+            if offset >= 0.0 {
+                let max_move = self.min.x - other.max.x;
+                if max_move < -COLLISION_EPSILON {
+                    offset
+                } else {
+                    max_move.min(offset)
                 }
-            } else if offset < 0.0 && other.min.x >= self.max.x {
-                let limit = self.max.x - other.min.x;
-                if limit > offset {
-                    offset = limit;
+            } else {
+                let max_move = self.max.x - other.min.x;
+                if max_move > COLLISION_EPSILON {
+                    offset
+                } else {
+                    max_move.max(offset)
                 }
             }
+        } else {
+            offset
         }
-        offset
     }
 
-    fn calculate_y_offset(self, other: Self, mut offset: f64) -> f64 {
-        if other.max.x > self.min.x
-            && other.min.x < self.max.x
-            && other.max.z > self.min.z
-            && other.min.z < self.max.z
+    fn calculate_y_offset(self, other: Self, offset: f64) -> f64 {
+        if offset != 0.0
+            && (other.min.x - self.max.x) < -COLLISION_EPSILON
+            && (other.max.x - self.min.x) > COLLISION_EPSILON
+            && (other.min.z - self.max.z) < -COLLISION_EPSILON
+            && (other.max.z - self.min.z) > COLLISION_EPSILON
         {
-            if offset > 0.0 && other.max.y <= self.min.y {
-                let limit = self.min.y - other.max.y;
-                if limit < offset {
-                    offset = limit;
+            if offset >= 0.0 {
+                let max_move = self.min.y - other.max.y;
+                if max_move < -COLLISION_EPSILON {
+                    offset
+                } else {
+                    max_move.min(offset)
                 }
-            } else if offset < 0.0 && other.min.y >= self.max.y {
-                let limit = self.max.y - other.min.y;
-                if limit > offset {
-                    offset = limit;
+            } else {
+                let max_move = self.max.y - other.min.y;
+                if max_move > COLLISION_EPSILON {
+                    offset
+                } else {
+                    max_move.max(offset)
                 }
             }
+        } else {
+            offset
         }
-        offset
     }
 
-    fn calculate_z_offset(self, other: Self, mut offset: f64) -> f64 {
-        if other.max.x > self.min.x
-            && other.min.x < self.max.x
-            && other.max.y > self.min.y
-            && other.min.y < self.max.y
+    fn calculate_z_offset(self, other: Self, offset: f64) -> f64 {
+        if offset != 0.0
+            && (other.min.x - self.max.x) < -COLLISION_EPSILON
+            && (other.max.x - self.min.x) > COLLISION_EPSILON
+            && (other.min.y - self.max.y) < -COLLISION_EPSILON
+            && (other.max.y - self.min.y) > COLLISION_EPSILON
         {
-            if offset > 0.0 && other.max.z <= self.min.z {
-                let limit = self.min.z - other.max.z;
-                if limit < offset {
-                    offset = limit;
+            if offset >= 0.0 {
+                let max_move = self.min.z - other.max.z;
+                if max_move < -COLLISION_EPSILON {
+                    offset
+                } else {
+                    max_move.min(offset)
                 }
-            } else if offset < 0.0 && other.min.z >= self.max.z {
-                let limit = self.max.z - other.min.z;
-                if limit > offset {
-                    offset = limit;
+            } else {
+                let max_move = self.max.z - other.min.z;
+                if max_move > COLLISION_EPSILON {
+                    offset
+                } else {
+                    max_move.max(offset)
                 }
             }
+        } else {
+            offset
         }
-        offset
     }
 }
 
@@ -195,6 +225,8 @@ impl PlayerPhysics {
     pub fn tick(&self, world: &World, player: &mut EntityState, input: PlayerInput) {
         let mut velocity = player.velocity;
 
+        // Vanilla EntityLivingBase.onLivingUpdate zeroes sub-0.005 motion before
+        // anything else this tick.
         if velocity.x.abs() < 0.005 {
             velocity.x = 0.0;
         }
@@ -205,9 +237,15 @@ impl PlayerPhysics {
             velocity.z = 0.0;
         }
 
+        // Fluid/ladder state for this tick. Vanilla caches isInWater in
+        // handleWaterMovement (run before the heading move) and computes
+        // isInLava/isOnLadder live; all read the pre-move box, so sample once.
+        let in_water = is_in_water(world, player.aabb);
+        let in_lava = is_in_lava(world, player.aabb);
+        let on_ladder = is_on_ladder(world, player.position, player.aabb);
+
         // Vanilla EntityPlayerSP flight thrust, applied to motionY before the
-        // move: sneak descends, jump ascends, both ±flySpeed*3 (and both can
-        // cancel out in the same tick).
+        // move: sneak descends, jump ascends, both ±flySpeed*3.
         if input.flying {
             if input.sneak {
                 velocity.y -= (input.fly_speed * 3.0) as f64;
@@ -216,9 +254,12 @@ impl PlayerPhysics {
                 velocity.y += (input.fly_speed * 3.0) as f64;
             }
         }
-        if input.jump && player.on_ground {
-            // Vanilla jump() assigns (not adds) motionY, so it also overrides
-            // any flight thrust applied above.
+        // Vanilla EntityLivingBase.onLivingUpdate jump handling: inside a fluid a
+        // held jump only adds 0.04 buoyancy; otherwise a grounded jump assigns
+        // the 0.42 launch (plus the sprint boost).
+        if input.jump && !input.flying && (in_water || in_lava) {
+            velocity.y += 0.04;
+        } else if input.jump && player.on_ground {
             velocity.y = self.config.jump_velocity;
             if input.sprint {
                 // Vanilla sprint-jump boost: 0.2 in the facing direction, using
@@ -229,33 +270,8 @@ impl PlayerPhysics {
             }
         }
 
-        let horizontal_drag = if player.on_ground {
-            self.config.default_block_slipperiness * 0.91
-        } else {
-            0.91
-        };
-
-        let move_speed = input.walk_speed
-            * if input.sprint {
-                self.config.sprint_multiplier
-            } else {
-                1.0
-            };
-        let acceleration = if player.on_ground {
-            move_speed * (0.16277136 / (horizontal_drag * horizontal_drag * horizontal_drag))
-        } else if input.flying {
-            // Vanilla EntityPlayer.moveEntityWithHeading overrides the airborne
-            // jumpMovementFactor with flySpeed (doubled while sprinting).
-            input.fly_speed * if input.sprint { 2.0 } else { 1.0 }
-        } else {
-            self.config.air_acceleration
-                * if input.sprint {
-                    self.config.sprint_multiplier
-                } else {
-                    1.0
-                }
-        };
-
+        // Movement input shaping (vanilla onLivingUpdate): sneaking shrinks it to
+        // 0.3, then everything is scaled by 0.98.
         let mut forward = input.forward;
         let mut strafe = input.strafe;
         if input.sneak {
@@ -265,44 +281,200 @@ impl PlayerPhysics {
         forward *= 0.98;
         strafe *= 0.98;
 
-        velocity += movement_vector(forward, strafe, player.yaw, acceleration);
-
-        // Vanilla 1.8 sneak edge protection: while sneaking on the ground, the
-        // intended horizontal movement is shrunk in 0.05 steps until the player
-        // box (lowered by one block) would still rest on a collider, so the
-        // player never walks off a ledge.
-        if input.sneak && player.on_ground {
-            let (clamped_x, clamped_z) =
-                clamp_sneak_to_edges(world, player.aabb, velocity.x, velocity.z);
-            velocity.x = clamped_x;
-            velocity.z = clamped_z;
-        }
-
-        // Pre-move vertical motion: while flying, vanilla restores this (×0.6)
-        // after the move, discarding gravity/drag and any vertical collision.
-        let pre_move_y = velocity.y;
-        let result = move_with_collisions(
-            world,
-            player.aabb,
-            velocity,
-            self.config.step_height,
-            player.on_ground,
-        );
-        let mut adjusted_velocity = result.velocity;
-        if input.flying {
-            adjusted_velocity.y = pre_move_y * 0.6;
+        // Block friction of the support block (vanilla slipperiness * 0.91),
+        // only consulted while standing; airborne friction is a flat 0.91.
+        let block_friction: f32 = if player.on_ground {
+            block_below_slipperiness(world, player.position, player.aabb)
         } else {
-            adjusted_velocity.y -= self.config.gravity;
-            adjusted_velocity.y *= self.config.air_drag_y;
-        }
-        adjusted_velocity.x *= horizontal_drag as f64;
-        adjusted_velocity.z *= horizontal_drag as f64;
+            1.0
+        };
+        let horizontal_drag = block_friction * 0.91;
 
-        player.position = result.feet;
-        player.velocity = adjusted_velocity;
-        player.on_ground = result.on_ground;
-        player.collided_horizontally = result.collided_horizontally;
+        let was_in_web = player.in_web;
+
+        // Vanilla moveEntityWithHeading has three mutually exclusive branches
+        // (water, lava, normal) plus the client-only flight override of the
+        // normal branch's vertical motion.
+        let (feet, on_ground, collided, out_velocity) = if input.flying {
+            let acceleration = input.fly_speed * if input.sprint { 2.0 } else { 1.0 };
+            velocity += movement_vector(forward, strafe, player.yaw, acceleration);
+            let pre_move_y = velocity.y;
+            let result = web_aware_move(
+                world,
+                player.aabb,
+                velocity,
+                self.config.step_height,
+                player.on_ground,
+                was_in_web,
+            );
+            let mut v = result.velocity;
+            // While flying, vanilla restores the pre-move vertical motion (×0.6),
+            // discarding gravity/drag and any vertical collision.
+            v.y = pre_move_y * 0.6;
+            v.x *= horizontal_drag as f64;
+            v.z *= horizontal_drag as f64;
+            (
+                result.feet,
+                result.on_ground,
+                result.collided_horizontally,
+                v,
+            )
+        } else if in_water {
+            // Vanilla water branch: 0.02 accel, 0.8 horizontal drag, 0.8 vertical
+            // drag, a flat 0.02 sink, and a swim-up bump against ledges.
+            velocity += movement_vector(forward, strafe, player.yaw, 0.02);
+            let pre_pos_y = player.position.y;
+            let result = web_aware_move(
+                world,
+                player.aabb,
+                velocity,
+                self.config.step_height,
+                player.on_ground,
+                was_in_web,
+            );
+            let mut v = result.velocity;
+            v.x *= 0.8;
+            v.z *= 0.8;
+            v.y *= 0.8;
+            v.y -= 0.02;
+            apply_swim_up_bump(
+                world,
+                result.feet,
+                result.collided_horizontally,
+                pre_pos_y,
+                &mut v,
+            );
+            (
+                result.feet,
+                result.on_ground,
+                result.collided_horizontally,
+                v,
+            )
+        } else if in_lava {
+            // Vanilla lava branch: 0.02 accel, 0.5 drag on every axis, 0.02 sink.
+            velocity += movement_vector(forward, strafe, player.yaw, 0.02);
+            let pre_pos_y = player.position.y;
+            let result = web_aware_move(
+                world,
+                player.aabb,
+                velocity,
+                self.config.step_height,
+                player.on_ground,
+                was_in_web,
+            );
+            let mut v = result.velocity * 0.5;
+            v.y -= 0.02;
+            apply_swim_up_bump(
+                world,
+                result.feet,
+                result.collided_horizontally,
+                pre_pos_y,
+                &mut v,
+            );
+            (
+                result.feet,
+                result.on_ground,
+                result.collided_horizontally,
+                v,
+            )
+        } else {
+            // Normal branch: friction-scaled ground accel or the airborne
+            // jumpMovementFactor, then climbable clamping, gravity and drag.
+            let move_speed = input.walk_speed
+                * if input.sprint {
+                    self.config.sprint_multiplier
+                } else {
+                    1.0
+                };
+            let acceleration = if player.on_ground {
+                move_speed * (0.16277136 / (horizontal_drag * horizontal_drag * horizontal_drag))
+            } else {
+                self.config.air_acceleration
+                    * if input.sprint {
+                        self.config.sprint_multiplier
+                    } else {
+                        1.0
+                    }
+            };
+            velocity += movement_vector(forward, strafe, player.yaw, acceleration);
+
+            // Vanilla 1.8 sneak edge protection: while sneaking on the ground, the
+            // intended horizontal movement is shrunk in 0.05 steps until the
+            // player box (lowered by one block) would still rest on a collider,
+            // so the player never walks off a ledge.
+            if input.sneak && player.on_ground {
+                let (clamped_x, clamped_z) =
+                    clamp_sneak_to_edges(world, player.aabb, velocity.x, velocity.z);
+                velocity.x = clamped_x;
+                velocity.z = clamped_z;
+            }
+
+            // Vanilla isOnLadder clamp, applied to motion before the move: the
+            // horizontal speed is capped at ±0.15, descent at 0.15, and a
+            // sneaking player stops sliding down entirely.
+            if on_ladder {
+                velocity.x = velocity.x.clamp(-0.15, 0.15);
+                velocity.z = velocity.z.clamp(-0.15, 0.15);
+                if velocity.y < -0.15 {
+                    velocity.y = -0.15;
+                }
+                if input.sneak && velocity.y < 0.0 {
+                    velocity.y = 0.0;
+                }
+            }
+
+            let pre_move_y = velocity.y;
+            let result = web_aware_move(
+                world,
+                player.aabb,
+                velocity,
+                self.config.step_height,
+                player.on_ground,
+                was_in_web,
+            );
+            let mut v = result.velocity;
+
+            // Pushing into a ladder climbs it (vanilla sets motionY = 0.2 after
+            // the move when isCollidedHorizontally on a ladder).
+            if result.collided_horizontally && on_ladder {
+                v.y = 0.2;
+            }
+
+            // Slime block bounce (vanilla BlockSlime.onLanded): a non-sneaking
+            // entity that lands reflects its descent velocity; sneaking cancels
+            // it (handled by the default zero already in `result`).
+            if result.landed
+                && pre_move_y < 0.0
+                && !input.sneak
+                && slime_block_below(world, result.feet)
+            {
+                v.y = -pre_move_y;
+            }
+
+            v.y -= self.config.gravity;
+            v.y *= self.config.air_drag_y;
+            v.x *= horizontal_drag as f64;
+            v.z *= horizontal_drag as f64;
+            (
+                result.feet,
+                result.on_ground,
+                result.collided_horizontally,
+                v,
+            )
+        };
+
+        player.position = feet;
+        player.on_ground = on_ground;
+        player.collided_horizontally = collided;
+        player.velocity = out_velocity;
         player.sync_aabb_to_position();
+
+        // Vanilla Entity.doBlockCollisions over the post-move box: cobwebs arm
+        // the stuck flag for next tick, soul sand multiplies horizontal motion by
+        // 0.4. Flying players are exempt from cobwebs (matching the client).
+        let post_box = player.aabb;
+        player.in_web =
+            apply_inside_block_effects(world, post_box, &mut player.velocity, input.flying);
     }
 }
 
@@ -475,6 +647,7 @@ fn move_with_collisions(
         velocity: adjusted_velocity,
         on_ground,
         collided_horizontally,
+        landed,
     }
 }
 
@@ -483,6 +656,177 @@ struct MoveResult {
     velocity: DVec3,
     on_ground: bool,
     collided_horizontally: bool,
+    /// A downward move was stopped by collision this tick (vanilla
+    /// `isCollidedVertically && d1 < 0`). Drives the slime-block bounce, which
+    /// only fires on a genuine landing rather than mere resting support.
+    landed: bool,
+}
+
+/// Run a move while honouring the cobweb stuck-speed. Vanilla
+/// `Entity.moveEntity` scales the desired motion to (0.25, 0.05, 0.25) and
+/// zeroes the stored motion when the entity entered a web the previous tick;
+/// the scaled motion still drives collision so the box barely creeps along.
+fn web_aware_move(
+    world: &World,
+    aabb: Aabb,
+    velocity: DVec3,
+    step_height: f64,
+    was_on_ground: bool,
+    in_web: bool,
+) -> MoveResult {
+    let move_velocity = if in_web {
+        DVec3::new(velocity.x * 0.25, velocity.y * 0.05, velocity.z * 0.25)
+    } else {
+        velocity
+    };
+    let mut result = move_with_collisions(world, aabb, move_velocity, step_height, was_on_ground);
+    if in_web {
+        result.velocity = DVec3::ZERO;
+    }
+    result
+}
+
+/// Slipperiness of the block supporting the player. Vanilla samples one block
+/// below `floor(boundingBox.minY)` in the feet column.
+fn block_below_slipperiness(world: &World, position: DVec3, aabb: Aabb) -> f32 {
+    let x = position.x.floor() as i32;
+    let y = (aabb.min.y.floor() as i32) - 1;
+    let z = position.z.floor() as i32;
+    world.block_at(x, y, z).slipperiness()
+}
+
+/// Vanilla `Entity.isOnLadder`: a ladder or vine in the block the feet occupy.
+fn is_on_ladder(world: &World, position: DVec3, aabb: Aabb) -> bool {
+    let x = position.x.floor() as i32;
+    let y = aabb.min.y.floor() as i32;
+    let z = position.z.floor() as i32;
+    world.block_at(x, y, z).is_climbable()
+}
+
+/// Whether the block the player just landed on (vanilla `floor(posY - 0.2)`) is
+/// a slime block.
+fn slime_block_below(world: &World, feet: DVec3) -> bool {
+    let x = feet.x.floor() as i32;
+    let y = (feet.y - 0.2).floor() as i32;
+    let z = feet.z.floor() as i32;
+    world.block_at(x, y, z).is_slime_block()
+}
+
+/// True if any block cell touching `b` satisfies `pred`.
+fn any_cell<F: Fn(BlockState) -> bool>(world: &World, b: Aabb, pred: F) -> bool {
+    let min_x = b.min.x.floor() as i32;
+    let max_x = b.max.x.floor() as i32;
+    let min_y = b.min.y.floor() as i32;
+    let max_y = b.max.y.floor() as i32;
+    let min_z = b.min.z.floor() as i32;
+    let max_z = b.max.z.floor() as i32;
+    for x in min_x..=max_x {
+        for y in min_y..=max_y {
+            for z in min_z..=max_z {
+                if pred(world.block_at(x, y, z)) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Vanilla `handleWaterMovement` test box: the player box pulled in by 0.4 on
+/// the top and bottom and 0.001 on every side, intersected against water cells.
+/// The 1.8 liquid-height nuance (a source surface sits 1/9 below the cell top)
+/// and the current flow vector are not modelled, so each water cell is treated
+/// as full — exact for submerged play, slightly eager at a flowing edge, and
+/// with no downstream push.
+fn is_in_water(world: &World, aabb: Aabb) -> bool {
+    let b = Aabb::new(
+        DVec3::new(aabb.min.x + 0.001, aabb.min.y + 0.401, aabb.min.z + 0.001),
+        DVec3::new(aabb.max.x - 0.001, aabb.max.y - 0.401, aabb.max.z - 0.001),
+    );
+    any_cell(world, b, |s| s.is_water())
+}
+
+/// Vanilla `isInLava` test box: the player box pulled in by 0.1 on x/z and 0.4
+/// on y, intersected against lava cells.
+fn is_in_lava(world: &World, aabb: Aabb) -> bool {
+    let b = Aabb::new(
+        DVec3::new(aabb.min.x + 0.1, aabb.min.y + 0.4, aabb.min.z + 0.1),
+        DVec3::new(aabb.max.x - 0.1, aabb.max.y - 0.4, aabb.max.z - 0.1),
+    );
+    any_cell(world, b, |s| s.is_lava())
+}
+
+/// Vanilla water/lava swim-up: when an entity is pinned against a wall and the
+/// position 0.6 above its feet is free of collision and liquid (a ledge to climb
+/// onto), its vertical motion is bumped to 0.3 so it hops out.
+fn apply_swim_up_bump(
+    world: &World,
+    feet: DVec3,
+    collided_horizontally: bool,
+    pre_pos_y: f64,
+    velocity: &mut DVec3,
+) {
+    if !collided_horizontally {
+        return;
+    }
+    // Vanilla offset: (motionX, motionY + 0.6 - posY + d0, motionZ), where d0 is
+    // the feet height before this tick's move.
+    let offset = DVec3::new(
+        velocity.x,
+        velocity.y + 0.6 - feet.y + pre_pos_y,
+        velocity.z,
+    );
+    if is_offset_position_free(world, feet, offset) {
+        velocity.y = 0.3;
+    }
+}
+
+/// Vanilla `isOffsetPositionInLiquid`: the player box moved to `feet + offset`
+/// overlaps neither a collider nor any liquid.
+fn is_offset_position_free(world: &World, feet: DVec3, offset: DVec3) -> bool {
+    let probe = Aabb::player_at(feet).offset(offset);
+    !has_collision(world, probe) && !any_cell(world, probe, |s| s.is_liquid())
+}
+
+/// Vanilla `Entity.doBlockCollisions` over the post-move box (pulled in 0.001):
+/// a cobweb arms the stuck flag (returned, consumed at the next move), and each
+/// soul-sand cell multiplies horizontal motion by 0.4. Flying players ignore
+/// cobwebs (the client clears the stuck multiplier for them).
+fn apply_inside_block_effects(
+    world: &World,
+    aabb: Aabb,
+    velocity: &mut DVec3,
+    flying: bool,
+) -> bool {
+    let b = Aabb::new(
+        DVec3::new(aabb.min.x + 0.001, aabb.min.y + 0.001, aabb.min.z + 0.001),
+        DVec3::new(aabb.max.x - 0.001, aabb.max.y - 0.001, aabb.max.z - 0.001),
+    );
+    let min_x = b.min.x.floor() as i32;
+    let max_x = b.max.x.floor() as i32;
+    let min_y = b.min.y.floor() as i32;
+    let max_y = b.max.y.floor() as i32;
+    let min_z = b.min.z.floor() as i32;
+    let max_z = b.max.z.floor() as i32;
+    let mut in_web = false;
+    for x in min_x..=max_x {
+        for y in min_y..=max_y {
+            for z in min_z..=max_z {
+                let block = world.block_at(x, y, z);
+                if block.is_air() {
+                    continue;
+                }
+                if block.is_cobweb() {
+                    in_web = true;
+                }
+                if block.is_soul_sand() {
+                    velocity.x *= 0.4;
+                    velocity.z *= 0.4;
+                }
+            }
+        }
+    }
+    in_web && !flying
 }
 
 /// Reduce the desired sneak movement so the player stays supported. Mirrors the
@@ -864,8 +1208,7 @@ mod tests {
         }
         let physics = PlayerPhysics::default();
         let first_tick_speed = |walk_speed: f32| {
-            let mut player =
-                EntityState::new_local_player(EntityId(1), DVec3::new(0.5, 1.0, 0.5));
+            let mut player = EntityState::new_local_player(EntityId(1), DVec3::new(0.5, 1.0, 0.5));
             player.on_ground = true;
             physics.tick(
                 &world,
@@ -947,8 +1290,7 @@ mod tests {
         let world = World::new();
         let physics = PlayerPhysics::default();
         let fly = |sprint: bool| {
-            let mut player =
-                EntityState::new_local_player(EntityId(1), DVec3::new(0.5, 40.0, 0.5));
+            let mut player = EntityState::new_local_player(EntityId(1), DVec3::new(0.5, 40.0, 0.5));
             physics.tick(
                 &world,
                 &mut player,
@@ -987,6 +1329,376 @@ mod tests {
             "y was {}",
             player.position.y
         );
+    }
+
+    /// A flat floor of `block` over a generous footprint at y=0.
+    fn flat_floor(block: BlockState) -> World {
+        let mut world = World::new();
+        for x in -3..=6 {
+            for z in -3..=6 {
+                world.set_block(x, 0, z, block);
+            }
+        }
+        world
+    }
+
+    /// One tick of pure horizontal coasting (no input) from 0.1 m/tick, resting
+    /// at `feet_y`. Returns the retained x velocity.
+    fn coast_x(world: &World, feet_y: f64) -> f64 {
+        let mut player = EntityState::new_local_player(EntityId(1), DVec3::new(0.5, feet_y, 0.5));
+        player.on_ground = true;
+        player.velocity = DVec3::new(0.1, 0.0, 0.0);
+        PlayerPhysics::default().tick(world, &mut player, PlayerInput::default());
+        player.velocity.x
+    }
+
+    #[test]
+    fn ground_friction_varies_by_block_underfoot() {
+        // Coasting drag is slipperiness * 0.91 applied to the 0.1 start speed.
+        let stone = coast_x(&flat_floor(BlockState::STONE), 1.0);
+        let ice = coast_x(&flat_floor(BlockState::new(79, 0)), 1.0);
+        let packed_ice = coast_x(&flat_floor(BlockState::new(174, 0)), 1.0);
+        let slime = coast_x(&flat_floor(BlockState::new(165, 0)), 1.0);
+        assert!((stone - 0.1 * 0.6 * 0.91).abs() < 1.0e-6, "stone {stone}");
+        assert!((ice - 0.1 * 0.98 * 0.91).abs() < 1.0e-6, "ice {ice}");
+        assert!(
+            (packed_ice - 0.1 * 0.98 * 0.91).abs() < 1.0e-6,
+            "packed ice {packed_ice}"
+        );
+        assert!((slime - 0.1 * 0.8 * 0.91).abs() < 1.0e-6, "slime {slime}");
+        assert!(
+            ice > stone && slime > stone,
+            "slick blocks should coast further"
+        );
+    }
+
+    fn fluid_column(id: u16) -> World {
+        let mut world = World::new();
+        for y in -5..=8 {
+            for x in -1..=1 {
+                for z in -1..=1 {
+                    world.set_block(x, y, z, BlockState::new(id, 0));
+                }
+            }
+        }
+        world
+    }
+
+    #[test]
+    fn submerged_player_sinks_at_water_gravity() {
+        let world = fluid_column(8); // still water
+        let mut player = EntityState::new_local_player(EntityId(1), DVec3::new(0.5, 2.0, 0.5));
+        PlayerPhysics::default().tick(&world, &mut player, PlayerInput::default());
+        // From rest: motionY = 0 * 0.8 - 0.02.
+        assert!(
+            (player.velocity.y + 0.02).abs() < 1.0e-9,
+            "water sink was {}",
+            player.velocity.y
+        );
+        assert!(!player.on_ground);
+    }
+
+    #[test]
+    fn water_applies_strong_vertical_drag() {
+        let world = fluid_column(8);
+        let mut player = EntityState::new_local_player(EntityId(1), DVec3::new(0.5, 2.0, 0.5));
+        player.velocity.y = -0.4;
+        PlayerPhysics::default().tick(&world, &mut player, PlayerInput::default());
+        assert!(
+            (player.velocity.y - (-0.4 * 0.8 - 0.02)).abs() < 1.0e-9,
+            "water drag y was {}",
+            player.velocity.y
+        );
+    }
+
+    #[test]
+    fn jump_in_water_pushes_up() {
+        let world = fluid_column(8);
+        let mut player = EntityState::new_local_player(EntityId(1), DVec3::new(0.5, 2.0, 0.5));
+        PlayerPhysics::default().tick(
+            &world,
+            &mut player,
+            PlayerInput {
+                jump: true,
+                ..PlayerInput::default()
+            },
+        );
+        // (0 + 0.04) * 0.8 - 0.02 = 0.012.
+        assert!(
+            (player.velocity.y - 0.012).abs() < 1.0e-9,
+            "y {}",
+            player.velocity.y
+        );
+    }
+
+    #[test]
+    fn lava_applies_half_drag() {
+        let world = fluid_column(10); // still lava
+        let mut player = EntityState::new_local_player(EntityId(1), DVec3::new(0.5, 2.0, 0.5));
+        player.velocity.y = -0.4;
+        PlayerPhysics::default().tick(&world, &mut player, PlayerInput::default());
+        assert!(
+            (player.velocity.y - (-0.4 * 0.5 - 0.02)).abs() < 1.0e-9,
+            "lava drag y was {}",
+            player.velocity.y
+        );
+    }
+
+    /// A single vine column (fully non-colliding) at x=z=0.
+    fn vine_column() -> World {
+        let mut world = World::new();
+        for y in 0..=6 {
+            world.set_block(0, y, 0, BlockState::new(106, 0));
+        }
+        world
+    }
+
+    #[test]
+    fn ladder_clamps_descent_speed() {
+        let world = vine_column();
+        let mut player = EntityState::new_local_player(EntityId(1), DVec3::new(0.5, 3.0, 0.5));
+        player.velocity.y = -0.5;
+        let before = player.position.y;
+        PlayerPhysics::default().tick(&world, &mut player, PlayerInput::default());
+        // Descent is clamped to 0.15 this tick regardless of the -0.5 momentum.
+        assert!(
+            (before - player.position.y - 0.15).abs() < 1.0e-9,
+            "descended {}",
+            before - player.position.y
+        );
+    }
+
+    #[test]
+    fn sneaking_on_ladder_stops_descent() {
+        let world = vine_column();
+        let mut player = EntityState::new_local_player(EntityId(1), DVec3::new(0.5, 3.0, 0.5));
+        player.velocity.y = -0.5;
+        let before = player.position.y;
+        PlayerPhysics::default().tick(
+            &world,
+            &mut player,
+            PlayerInput {
+                sneak: true,
+                ..PlayerInput::default()
+            },
+        );
+        assert!(
+            (player.position.y - before).abs() < 1.0e-9,
+            "sneaking should cling to the ladder, moved {}",
+            before - player.position.y
+        );
+    }
+
+    #[test]
+    fn pressing_into_a_ladder_climbs() {
+        let mut world = vine_column();
+        for y in 0..=6 {
+            world.set_block(0, y, 1, BlockState::STONE); // wall on the +z side
+        }
+        let mut player = EntityState::new_local_player(EntityId(1), DVec3::new(0.5, 3.0, 0.7));
+        player.yaw = 0.0; // forward drives +z, into the wall
+        PlayerPhysics::default().tick(
+            &world,
+            &mut player,
+            PlayerInput {
+                forward: 1.0,
+                ..PlayerInput::default()
+            },
+        );
+        // Colliding horizontally on a ladder bumps motionY to 0.2 (0.1176 after
+        // this tick's gravity and drag), so the player climbs.
+        assert!(
+            player.velocity.y > 0.1,
+            "should climb, velocity.y was {}",
+            player.velocity.y
+        );
+    }
+
+    #[test]
+    fn cobweb_drastically_slows_falling() {
+        let mut world = World::new();
+        for y in 0..=12 {
+            world.set_block(0, y, 0, BlockState::new(30, 0)); // cobweb
+        }
+        let mut player = EntityState::new_local_player(EntityId(1), DVec3::new(0.5, 8.0, 0.5));
+        let physics = PlayerPhysics::default();
+        let start = player.position.y;
+        for _ in 0..40 {
+            physics.tick(&world, &mut player, PlayerInput::default());
+        }
+        assert!(player.in_web, "player should be flagged as stuck in web");
+        assert!(
+            start - player.position.y < 0.5,
+            "web fall too fast: descended {}",
+            start - player.position.y
+        );
+    }
+
+    #[test]
+    fn soul_sand_quarters_horizontal_speed() {
+        // Both stand on a 0.6-slipperiness surface, so only the soul-sand 0.4
+        // inside-block multiplier should differ. Soul sand rests the feet at its
+        // 0.875 top; stone at 1.0.
+        let stone = coast_x(&flat_floor(BlockState::STONE), 1.0);
+        let soul = coast_x(&flat_floor(BlockState::new(88, 0)), 0.875);
+        assert!(
+            (soul - stone * 0.4).abs() < 1.0e-9,
+            "soul {soul} vs stone {stone}"
+        );
+    }
+
+    #[test]
+    fn slime_block_bounces_a_falling_player() {
+        let mut world = World::new();
+        for x in -1..=1 {
+            for z in -1..=1 {
+                world.set_block(x, 0, z, BlockState::new(165, 0)); // slime
+            }
+        }
+        let mut player = EntityState::new_local_player(EntityId(1), DVec3::new(0.5, 4.0, 0.5));
+        let physics = PlayerPhysics::default();
+        let mut landed = false;
+        let mut max_upward = f64::MIN;
+        for _ in 0..80 {
+            physics.tick(&world, &mut player, PlayerInput::default());
+            if player.position.y <= 1.5 {
+                landed = true;
+            }
+            if landed {
+                max_upward = max_upward.max(player.velocity.y);
+            }
+        }
+        assert!(
+            max_upward > 0.3,
+            "player should rebound off slime, peak upward velocity {max_upward}"
+        );
+    }
+
+    /// Whether the player box penetrates any block collision box by more than a
+    /// hair (1e-4) — i.e. is genuinely clipped inside, not merely resting against
+    /// a face.
+    fn deeply_penetrating(world: &World, aabb: Aabb) -> bool {
+        let probe = Aabb::new(
+            aabb.min + DVec3::splat(1.0e-4),
+            aabb.max - DVec3::splat(1.0e-4),
+        );
+        !colliding_boxes(world, probe).is_empty()
+    }
+
+    /// Sealed 5x5 room (interior x,z in [0,5]) walled with `wall`, 5 blocks tall.
+    fn sealed_room(wall: BlockState) -> World {
+        let mut world = World::new();
+        for x in -1..=5 {
+            for z in -1..=5 {
+                world.set_block(x, 0, z, BlockState::STONE);
+            }
+        }
+        for y in 1..=5 {
+            for a in -1..=5 {
+                world.set_block(a, y, -1, wall);
+                world.set_block(a, y, 5, wall);
+                world.set_block(-1, y, a, wall);
+                world.set_block(5, y, a, wall);
+            }
+        }
+        world
+    }
+
+    #[test]
+    fn fuzz_full_block_walls_are_never_clipped() {
+        // Full solid cubes: the 0.6-wide player must stay strictly inside the
+        // interior [0.3, 4.7] at every tick, for every launch angle and speed.
+        let physics = PlayerPhysics::default();
+        for &wall in &[
+            BlockState::STONE,
+            BlockState::new(20, 0),  // glass
+            BlockState::new(98, 0),  // stone bricks
+            BlockState::new(49, 0),  // obsidian
+        ] {
+            let world = sealed_room(wall);
+            for angle in (0..360).step_by(12) {
+                for &speed in &[0.5, 1.0, 2.0, 4.0, 8.0, 16.0] {
+                    let mut player =
+                        EntityState::new_local_player(EntityId(1), DVec3::new(2.5, 1.0, 2.5));
+                    player.on_ground = true;
+                    player.yaw = angle as f32;
+                    let rad = (angle as f64).to_radians();
+                    player.velocity = DVec3::new(speed * rad.cos(), 0.0, speed * rad.sin());
+                    for tick in 0..50 {
+                        physics.tick(
+                            &world,
+                            &mut player,
+                            PlayerInput {
+                                forward: 1.0,
+                                sprint: true,
+                                ..PlayerInput::default()
+                            },
+                        );
+                        assert!(
+                            player.position.x > 0.299
+                                && player.position.x < 4.701
+                                && player.position.z > 0.299
+                                && player.position.z < 4.701
+                                && !deeply_penetrating(&world, player.aabb),
+                            "clip: wall {:?} angle {angle} speed {speed} tick {tick} pos {:?}",
+                            wall,
+                            player.position,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fuzz_thin_walls_are_never_clipped_through() {
+        // Fences/panes/walls/bars don't fill their cell, so the player may dip
+        // partway in; what must never happen is full passage to the far side or
+        // deep penetration of an actual collision box.
+        let physics = PlayerPhysics::default();
+        for &wall in &[
+            BlockState::new(85, 0),  // oak fence
+            BlockState::new(102, 0), // glass pane
+            BlockState::new(101, 0), // iron bars
+            BlockState::new(139, 0), // cobblestone wall
+            BlockState::new(53, 0),  // oak stairs
+        ] {
+            let world = sealed_room(wall);
+            for angle in (0..360).step_by(12) {
+                for &speed in &[0.5, 1.0, 2.0, 4.0, 8.0, 16.0] {
+                    let mut player =
+                        EntityState::new_local_player(EntityId(1), DVec3::new(2.5, 1.0, 2.5));
+                    player.on_ground = true;
+                    player.yaw = angle as f32;
+                    let rad = (angle as f64).to_radians();
+                    player.velocity = DVec3::new(speed * rad.cos(), 0.0, speed * rad.sin());
+                    for tick in 0..50 {
+                        physics.tick(
+                            &world,
+                            &mut player,
+                            PlayerInput {
+                                forward: 1.0,
+                                sprint: true,
+                                ..PlayerInput::default()
+                            },
+                        );
+                        // The far face of the perimeter wall cell is at ±0/6; if
+                        // the centre reaches past the wall cell entirely it has
+                        // tunnelled.
+                        assert!(
+                            player.position.x > -0.51
+                                && player.position.x < 5.51
+                                && player.position.z > -0.51
+                                && player.position.z < 5.51
+                                && !deeply_penetrating(&world, player.aabb),
+                            "tunnel: wall {:?} angle {angle} speed {speed} tick {tick} pos {:?}",
+                            wall,
+                            player.position,
+                        );
+                    }
+                }
+            }
+        }
     }
 
     fn single_block_platform() -> World {

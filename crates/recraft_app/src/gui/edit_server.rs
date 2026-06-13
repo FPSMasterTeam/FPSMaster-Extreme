@@ -6,6 +6,7 @@ use winit::event::{ElementState, KeyEvent};
 use winit::keyboard::{KeyCode, PhysicalKey};
 
 use crate::servers::{self, ServerEntry, ServerList};
+use crate::text_input::TextInput;
 
 use super::multiplayer::GuiMultiplayer;
 use super::widgets::{GuiButton, GuiTextField};
@@ -56,8 +57,8 @@ impl GuiEditServer {
     }
 
     fn save(&self) -> Vec<GuiAction> {
-        let name = self.name.text.trim();
-        let address = self.address.text.trim();
+        let name = self.name.text().trim();
+        let address = self.address.text().trim();
         if address.is_empty() {
             return Vec::new();
         }
@@ -116,7 +117,7 @@ impl GuiScreen for GuiEditServer {
         Vec::new()
     }
 
-    fn key_pressed(&mut self, event: &KeyEvent, _ctx: &mut ScreenCtx) -> Vec<GuiAction> {
+    fn key_pressed(&mut self, event: &KeyEvent, ctx: &mut ScreenCtx) -> Vec<GuiAction> {
         if event.state == ElementState::Pressed {
             match event.physical_key {
                 PhysicalKey::Code(KeyCode::Escape) => {
@@ -134,9 +135,18 @@ impl GuiScreen for GuiEditServer {
                 _ => {}
             }
         }
-        self.name.key_pressed(event);
-        self.address.key_pressed(event);
+        self.name
+            .key_pressed(event, ctx.modifiers, ctx.clipboard.as_deref_mut());
+        self.address
+            .key_pressed(event, ctx.modifiers, ctx.clipboard.as_deref_mut());
         Vec::new()
+    }
+
+    fn focused_text_input(&mut self) -> Option<&mut TextInput> {
+        if let Some(input) = self.name.focused_input() {
+            return Some(input);
+        }
+        self.address.focused_input()
     }
 }
 
@@ -168,7 +178,7 @@ impl GuiDirectConnect {
     }
 
     fn join(&self) -> Vec<GuiAction> {
-        match servers::parse_server_address(&self.address.text) {
+        match servers::parse_server_address(self.address.text()) {
             Some((host, port)) => vec![GuiAction::Connect { host, port }],
             None => Vec::new(),
         }
@@ -208,7 +218,7 @@ impl GuiScreen for GuiDirectConnect {
         Vec::new()
     }
 
-    fn key_pressed(&mut self, event: &KeyEvent, _ctx: &mut ScreenCtx) -> Vec<GuiAction> {
+    fn key_pressed(&mut self, event: &KeyEvent, ctx: &mut ScreenCtx) -> Vec<GuiAction> {
         if event.state == ElementState::Pressed {
             match event.physical_key {
                 PhysicalKey::Code(KeyCode::Escape) => {
@@ -220,7 +230,12 @@ impl GuiScreen for GuiDirectConnect {
                 _ => {}
             }
         }
-        self.address.key_pressed(event);
+        self.address
+            .key_pressed(event, ctx.modifiers, ctx.clipboard.as_deref_mut());
         Vec::new()
+    }
+
+    fn focused_text_input(&mut self) -> Option<&mut TextInput> {
+        self.address.focused_input()
     }
 }

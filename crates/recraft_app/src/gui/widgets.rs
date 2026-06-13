@@ -3,8 +3,10 @@
 //! vanilla label colors.
 
 use recraft_render::{text_width, GuiTexture, UiColor, UiFrame, UiRect};
-use winit::event::{ElementState, KeyEvent};
-use winit::keyboard::{Key, KeyCode, PhysicalKey};
+use winit::event::KeyEvent;
+use winit::keyboard::ModifiersState;
+
+use crate::text_input::TextInput;
 
 /// Vanilla button label colors.
 const LABEL_ENABLED: UiColor = UiColor::rgba(224, 224, 224, 255);
@@ -104,12 +106,12 @@ impl GuiButton {
     }
 }
 
-/// A vanilla-styled single-line text field (`GuiTextField`).
+/// A vanilla-styled single-line text field (`GuiTextField`). All editing,
+/// cursor movement and IME composition live in the shared [`TextInput`].
 pub struct GuiTextField {
     pub rect: UiRect,
-    pub text: String,
+    input: TextInput,
     pub focused: bool,
-    pub max_len: usize,
     /// Show only a character count instead of the content (token entry).
     pub masked: bool,
 }
@@ -118,15 +120,14 @@ impl GuiTextField {
     pub fn new(rect: UiRect, max_len: usize) -> Self {
         Self {
             rect,
-            text: String::new(),
+            input: TextInput::new(max_len),
             focused: true,
-            max_len,
             masked: false,
         }
     }
 
     pub fn with_text(mut self, text: impl Into<String>) -> Self {
-        self.text = text.into();
+        self.input.set_text(text);
         self
     }
 
@@ -135,49 +136,39 @@ impl GuiTextField {
         self
     }
 
+    /// The current committed text.
+    pub fn text(&self) -> &str {
+        self.input.text()
+    }
+
+    /// The shared buffer when this field is focused — the host routes IME
+    /// events here and reads the caret area for candidate-window placement.
+    pub fn focused_input(&mut self) -> Option<&mut TextInput> {
+        self.focused.then_some(&mut self.input)
+    }
+
     /// Focus follows clicks (click inside focuses, outside blurs).
     pub fn mouse_clicked(&mut self, x: f64, y: f64) {
         self.focused = self.rect.contains(x, y);
     }
 
-    /// Consume a key event when focused: backspace, space and characters.
-    /// Returns true when the event edited the field.
-    pub fn key_pressed(&mut self, event: &KeyEvent) -> bool {
-        if !self.focused || event.state != ElementState::Pressed {
+    /// Consume a key event when focused. Returns true when it was handled.
+    pub fn key_pressed(
+        &mut self,
+        event: &KeyEvent,
+        modifiers: ModifiersState,
+        clipboard: Option<&mut arboard::Clipboard>,
+    ) -> bool {
+        if !self.focused {
             return false;
         }
-        match event.physical_key {
-            PhysicalKey::Code(KeyCode::Backspace) => {
-                self.text.pop();
-                true
-            }
-            // Space arrives as Key::Named(Space), not a Character.
-            PhysicalKey::Code(KeyCode::Space) => {
-                if self.text.chars().count() < self.max_len {
-                    self.text.push(' ');
-                }
-                true
-            }
-            _ => {
-                if let Key::Character(s) = &event.logical_key {
-                    let mut edited = false;
-                    for c in s.chars() {
-                        if !c.is_control() && self.text.chars().count() < self.max_len {
-                            self.text.push(c);
-                            edited = true;
-                        }
-                    }
-                    edited
-                } else {
-                    false
-                }
-            }
-        }
+        self.input.handle_key(event, modifiers, clipboard)
     }
 
     /// Vanilla text-field look: black fill, gray border, light gray text with
-    /// a trailing caret while focused; overflowing text shows its tail.
-    pub fn draw(&self, ui: &mut UiFrame, scale: i32) {
+    /// the caret (and any IME composition) at the cursor while focused;
+    /// overflowing text shows its tail.
+    pub fn draw(&mut self, ui: &mut UiFrame, scale: i32) {
         let border = UiColor::rgba(160, 160, 160, 255);
         ui.rect(
             UiRect::new(
@@ -190,25 +181,38 @@ impl GuiTextField {
         );
         ui.rect(self.rect, UiColor::rgba(0, 0, 0, 255));
 
-        let display = if self.masked && !self.text.is_empty() {
-            format!("{} characters", self.text.chars().count())
-        } else {
-            self.text.clone()
-        };
-        let display = if self.focused {
-            format!("{display}_")
-        } else {
-            display
-        };
+        let color = UiColor::rgba(224, 224, 224, 255);
         let avail = self.rect.width - 8 * scale;
+        let text_x = self.rect.x + 4 * scale;
+        let text_y = self.rect.y + (self.rect.height - 8 * scale) / 2;
+        let caret = if self.focused { "_" } else { "" };
+
+        // A masked field never shows its content (or composition).
+        if self.masked && !self.input.is_empty() {
+            let display = format!("{} characters{caret}", self.input.char_count());
+            let visible = trim_to_tail(&display, avail, scale);
+            ui.text_shadowed(text_x, text_y, scale, color, visible);
+            if self.focused {
+                self.input
+                    .set_caret_area(text_x, self.rect.y, 2 * scale, self.rect.height);
+            }
+            return;
+        }
+
+        let (before, preedit, after) = self.input.segments();
+        let display = format!("{before}{preedit}{caret}{after}");
+        let prefix = format!("{before}{preedit}");
         let visible = trim_to_tail(&display, avail, scale);
-        ui.text_shadowed(
-            self.rect.x + 4 * scale,
-            self.rect.y + (self.rect.height - 8 * scale) / 2,
-            scale,
-            UiColor::rgba(224, 224, 224, 255),
-            visible,
-        );
+        ui.text_shadowed(text_x, text_y, scale, color, visible);
+
+        if self.focused {
+            // Caret x = box left + width of the (front-trimmed) prefix; the
+            // host uses it to anchor the IME candidate window at the cursor.
+            let prefix_visible = trim_to_tail(&prefix, avail, scale);
+            let caret_x = text_x + text_width(&prefix_visible, scale);
+            self.input
+                .set_caret_area(caret_x, self.rect.y, 2 * scale, self.rect.height);
+        }
     }
 }
 

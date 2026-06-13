@@ -12,7 +12,7 @@ pub use chunk_mesh::{
     build_chunk_mesh, build_world_mesh, BiomeColors, ChunkMesh, MeshBuffers, Vertex,
 };
 pub use font::char_width;
-pub use model::{ModelMesh, ModelVertex};
+pub use model::{EntityAnim, ModelMesh, ModelVertex};
 pub use renderer::{RenderStats, Renderer, RendererError};
 pub use texture::{AtlasUv, TextureAtlasImage};
 pub use ui::{

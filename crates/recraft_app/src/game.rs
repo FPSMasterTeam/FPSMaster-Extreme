@@ -2,23 +2,27 @@ use std::collections::HashSet;
 
 use glam::{DVec3, Vec3};
 use recraft_core::{
+    collision::{is_fence, is_pane, is_stairs},
+    mc_math::wrap_degrees,
     resting_on_ground, BlockState, ChunkPos, EntityId, EntityKind, EntityState, PlayerInput,
-    PlayerPhysics, World,
+    PlayerPhysics, RenderShape, World,
 };
 use recraft_protocol::v1_8_9::{
     chunk::{decode_chunk_column, ChunkColumnData},
     packets::{
-        ClientboundPlayPacket, DiggingStatus, ServerboundPacket, SlotItem, TitleAction,
-        UseEntityKind,
+        ClientboundPlayPacket, DiggingStatus, HeldItem, MetadataValue, ServerboundPacket, SlotItem,
+        TitleAction, UseEntityKind,
     },
 };
-use recraft_render::{Camera, ModelMesh};
+use recraft_render::{Camera, EntityAnim, ModelMesh};
 use winit::{
     event::{ElementState, KeyEvent},
     keyboard::{KeyCode, PhysicalKey},
 };
 
 use crate::chat::{self, ChatState};
+use crate::item_renderer::DroppedItem;
+use crate::player_list::PlayerList;
 use crate::scoreboard::Scoreboard;
 
 #[derive(Debug, Clone, Copy)]
@@ -341,8 +345,31 @@ pub struct GameState {
     /// Player inventory window (window id 0): 45 slots — 0 craft output, 1-4
     /// crafting, 5-8 armor, 9-35 main, 36-44 hotbar. Synced from the server.
     inventory: Vec<Option<SlotItem>>,
+    /// The stack carried on the cursor while an inventory window is open
+    /// (vanilla `inventory.getItemStack()`, the slot -1 item).
+    cursor_item: Option<SlotItem>,
+    /// Per-window transaction counter for ClickWindow action numbers.
+    window_action: i16,
+    /// In-progress paint-drag: whether active, the button (false=left even split,
+    /// true=right one-each), and the slots painted so far.
+    drag_active: bool,
+    drag_right: bool,
+    drag_slots: Vec<i16>,
     creative: bool,
+    /// Account UUID per spawned remote entity (players carry it via SpawnPlayer),
+    /// linking the entity to its tab-list roster entry for names and skins.
+    entity_uuids: std::collections::HashMap<EntityId, [u8; 16]>,
+    /// The item stack carried by each dropped-item entity (from EntityMetadata
+    /// index 10), used to render the floating item.
+    entity_items: std::collections::HashMap<EntityId, SlotItem>,
+    /// Passenger → vehicle mount relationships (S1B AttachEntity). Drives the
+    /// rider render offset and the local player following its mount.
+    vehicles: std::collections::HashMap<EntityId, EntityId>,
     dirty_chunks: HashSet<ChunkPos>,
+    /// Chunks changed by local place/break prediction. They are submitted to the
+    /// background mesher before ordinary dirty chunks, but never rebuilt on the
+    /// render thread.
+    urgent_remesh: HashSet<ChunkPos>,
     /// Block changes received for chunks that weren't loaded yet, replayed once
     /// the chunk arrives (otherwise spawn-platform blocks can be lost).
     pending_block_changes: std::collections::HashMap<ChunkPos, Vec<(i32, i32, i32, BlockState)>>,
@@ -398,6 +425,9 @@ pub struct GameState {
     pub chat: ChatState,
     /// Objectives/scores/teams driving the sidebar (S3B/S3C/S3D/S3E).
     pub scoreboard: Scoreboard,
+    /// Tab-list roster keyed by UUID (S38/S47), drives the tab overlay, player
+    /// nametags and skin lookups.
+    pub player_list: PlayerList,
     title: TitleState,
 }
 
@@ -464,8 +494,17 @@ impl GameState {
             xp_level: 0,
             is_dead: false,
             inventory: vec![None; 45],
+            cursor_item: None,
+            window_action: 0,
+            drag_active: false,
+            drag_right: false,
+            drag_slots: Vec::new(),
             creative: false,
+            entity_uuids: std::collections::HashMap::new(),
+            entity_items: std::collections::HashMap::new(),
+            vehicles: std::collections::HashMap::new(),
             dirty_chunks: HashSet::new(),
+            urgent_remesh: HashSet::new(),
             pending_block_changes: std::collections::HashMap::new(),
             sneak_amount: 0.0,
             previous_sneak_amount: 0.0,
@@ -493,6 +532,7 @@ impl GameState {
             abilities_dirty: false,
             chat: ChatState::default(),
             scoreboard: Scoreboard::default(),
+            player_list: PlayerList::default(),
             title: TitleState::default(),
         }
     }
@@ -650,6 +690,315 @@ impl GameState {
         &self.inventory
     }
 
+    /// The stack currently carried on the cursor (vanilla slot -1).
+    pub fn cursor_item(&self) -> Option<SlotItem> {
+        self.cursor_item
+    }
+
+    /// Whether a paint-drag is in progress (the screen defers the commit to the
+    /// mouse release, falling back to a normal click when only one slot painted).
+    pub fn drag_active(&self) -> bool {
+        self.drag_active
+    }
+
+    /// Number of slots painted in the current drag.
+    pub fn drag_len(&self) -> usize {
+        self.drag_slots.len()
+    }
+
+    /// Whether the active drag is the right-button (one-each) variant.
+    pub fn drag_is_right(&self) -> bool {
+        self.drag_right
+    }
+
+    // ─── Inventory window interaction (vanilla Container.slotClick) ───────────
+
+    /// Click a window-0 slot (mode 0 normal, 1 shift, 2 number-key, 4 drop).
+    /// Applies the optimistic local prediction (vanilla updates the client
+    /// inventory immediately) and returns the ClickWindow packet to send; the
+    /// server confirms or corrects with SetSlot.
+    pub fn click_slot(&mut self, slot: i16, button: i8, mode: i8) -> Vec<ServerboundPacket> {
+        let clicked_item = self.slot_item(slot);
+        self.apply_slot_click(slot, button, mode);
+        let action = self.next_action_number();
+        vec![ServerboundPacket::ClickWindow {
+            window_id: 0,
+            slot,
+            button,
+            action_number: action,
+            mode,
+            clicked_item,
+        }]
+    }
+
+    /// Close the player inventory window: clear local drag/cursor state and
+    /// return the CloseWindow packet (the server drops any cursor stack and
+    /// re-syncs slots). Vanilla sends this whenever the inventory screen closes.
+    pub fn close_inventory(&mut self) -> ServerboundPacket {
+        self.drag_cancel();
+        self.cursor_item = None;
+        ServerboundPacket::CloseWindow { window_id: 0 }
+    }
+
+    /// Begin accumulating a paint-drag (local only until [`drag_commit`]).
+    pub fn drag_begin(&mut self, right: bool) {
+        if self.cursor_item.is_some() {
+            self.drag_active = true;
+            self.drag_right = right;
+            self.drag_slots.clear();
+        }
+    }
+
+    /// Add a slot to the active drag if it is a legal target with room.
+    pub fn drag_add_slot(&mut self, slot: i16) {
+        if !self.drag_active
+            || slot < 0
+            || slot as usize >= self.inventory.len()
+            || self.drag_slots.contains(&slot)
+        {
+            return;
+        }
+        let Some(cursor) = self.cursor_item else {
+            return;
+        };
+        // Can't split across more slots than there are items.
+        if self.drag_slots.len() as u32 >= cursor.count as u32 {
+            return;
+        }
+        let valid = match self.slot_item(slot) {
+            None => true,
+            Some(it) => stackable(&it, &cursor) && it.count < max_stack(&cursor),
+        };
+        if valid {
+            self.drag_slots.push(slot);
+        }
+    }
+
+    /// Commit the accumulated drag: distribute the cursor stack across the
+    /// painted slots and return the full vanilla mode-5 ClickWindow sequence
+    /// (start, one per slot, end).
+    pub fn drag_commit(&mut self) -> Vec<ServerboundPacket> {
+        if !self.drag_active {
+            return Vec::new();
+        }
+        let slots = std::mem::take(&mut self.drag_slots);
+        self.drag_active = false;
+        let right = self.drag_right;
+        let Some(mut cursor) = self.cursor_item else {
+            return Vec::new();
+        };
+
+        let mut packets = vec![self.drag_packet(-999, if right { 4 } else { 0 })];
+        let per = if right {
+            1
+        } else {
+            cursor.count / slots.len().max(1) as u8
+        };
+        let mut placed: u32 = 0;
+        for &s in &slots {
+            packets.push(self.drag_packet(s, if right { 5 } else { 1 }));
+            let existing = match self.slot_item(s) {
+                Some(it) if stackable(&it, &cursor) => it.count,
+                None => 0,
+                _ => continue,
+            };
+            let want = per.min(max_stack(&cursor).saturating_sub(existing));
+            if want == 0 {
+                continue;
+            }
+            self.inventory[s as usize] = Some(SlotItem {
+                count: existing + want,
+                ..cursor
+            });
+            placed += want as u32;
+        }
+        packets.push(self.drag_packet(-999, if right { 6 } else { 2 }));
+
+        let left = cursor.count.saturating_sub(placed as u8);
+        cursor.count = left;
+        self.cursor_item = (left > 0).then_some(cursor);
+        packets
+    }
+
+    /// Abandon the active drag without sending anything (used when a drag
+    /// collapses to a single-slot normal click).
+    pub fn drag_cancel(&mut self) {
+        self.drag_active = false;
+        self.drag_slots.clear();
+    }
+
+    fn drag_packet(&mut self, slot: i16, button: i8) -> ServerboundPacket {
+        let action = self.next_action_number();
+        ServerboundPacket::ClickWindow {
+            window_id: 0,
+            slot,
+            button,
+            action_number: action,
+            mode: 5,
+            clicked_item: None,
+        }
+    }
+
+    fn next_action_number(&mut self) -> i16 {
+        self.window_action = self.window_action.wrapping_add(1);
+        self.window_action
+    }
+
+    fn slot_item(&self, slot: i16) -> Option<SlotItem> {
+        if (0..self.inventory.len() as i16).contains(&slot) {
+            self.inventory[slot as usize]
+        } else {
+            None
+        }
+    }
+
+    fn apply_slot_click(&mut self, slot: i16, button: i8, mode: i8) {
+        match mode {
+            0 => self.normal_click(slot, button),
+            1 if slot >= 0 => self.shift_click(slot as usize),
+            2 => self.number_swap(slot, button),
+            4 => self.drop_click(slot, button),
+            _ => {}
+        }
+    }
+
+    /// Vanilla normal pick/place/swap/merge on a slot (button 0 left, 1 right),
+    /// or dropping the cursor stack when clicking outside the window (-999).
+    fn normal_click(&mut self, slot: i16, button: i8) {
+        let left = button == 0;
+        if slot < 0 {
+            // Outside the window: drop the cursor stack (whole / one).
+            if let Some(mut cursor) = self.cursor_item {
+                if left {
+                    self.cursor_item = None;
+                } else {
+                    cursor.count -= 1;
+                    self.cursor_item = (cursor.count > 0).then_some(cursor);
+                }
+            }
+            return;
+        }
+        let index = slot as usize;
+        if index >= self.inventory.len() {
+            return;
+        }
+        let mut cursor = self.cursor_item;
+        let mut slot_item = self.inventory[index];
+        match (cursor, slot_item) {
+            (None, None) => {}
+            (None, Some(item)) => {
+                // Pick up: whole stack (left) or the ceil-half (right).
+                let take = if left { item.count } else { item.count.div_ceil(2) };
+                cursor = Some(SlotItem { count: take, ..item });
+                let remain = item.count - take;
+                slot_item = (remain > 0).then_some(SlotItem { count: remain, ..item });
+            }
+            (Some(held), None) => {
+                let put = if left { held.count } else { 1 };
+                slot_item = Some(SlotItem { count: put, ..held });
+                let remain = held.count - put;
+                cursor = (remain > 0).then_some(SlotItem { count: remain, ..held });
+            }
+            (Some(held), Some(item)) => {
+                if stackable(&held, &item) {
+                    let space = max_stack(&item).saturating_sub(item.count);
+                    let move_n = if left { space.min(held.count) } else { space.min(1) };
+                    if move_n > 0 {
+                        slot_item = Some(SlotItem {
+                            count: item.count + move_n,
+                            ..item
+                        });
+                        let remain = held.count - move_n;
+                        cursor = (remain > 0).then_some(SlotItem { count: remain, ..held });
+                    }
+                } else {
+                    // Different items: swap cursor and slot.
+                    std::mem::swap(&mut cursor, &mut slot_item);
+                }
+            }
+        }
+        self.cursor_item = cursor;
+        self.inventory[index] = slot_item;
+    }
+
+    /// Vanilla shift-click quick-move: hotbar↔main, armor/craft→inventory,
+    /// merging into existing stacks first then the first empty slot.
+    fn shift_click(&mut self, from: usize) {
+        if from >= self.inventory.len() {
+            return;
+        }
+        let Some(stack) = self.inventory[from] else {
+            return;
+        };
+        let targets: Vec<usize> = match from {
+            36..=44 => (9..36).collect(),
+            9..=35 => (36..45).collect(),
+            _ => (9..45).collect(),
+        };
+        let mut remaining = stack.count;
+        for &t in &targets {
+            if remaining == 0 {
+                break;
+            }
+            if let Some(item) = self.inventory[t] {
+                if stackable(&item, &stack) {
+                    let space = max_stack(&item).saturating_sub(item.count);
+                    let move_n = space.min(remaining);
+                    self.inventory[t] = Some(SlotItem {
+                        count: item.count + move_n,
+                        ..item
+                    });
+                    remaining -= move_n;
+                }
+            }
+        }
+        for &t in &targets {
+            if remaining == 0 {
+                break;
+            }
+            if self.inventory[t].is_none() {
+                let n = remaining.min(max_stack(&stack));
+                self.inventory[t] = Some(SlotItem { count: n, ..stack });
+                remaining -= n;
+            }
+        }
+        self.inventory[from] = (remaining > 0).then_some(SlotItem {
+            count: remaining,
+            ..stack
+        });
+    }
+
+    /// Number-key (1-9) swap of a slot with the matching hotbar slot.
+    fn number_swap(&mut self, slot: i16, hotbar_button: i8) {
+        if slot < 0 || !(0..9).contains(&hotbar_button) {
+            return;
+        }
+        let a = slot as usize;
+        let b = 36 + hotbar_button as usize;
+        if a < self.inventory.len() && b < self.inventory.len() {
+            self.inventory.swap(a, b);
+        }
+    }
+
+    /// Q-drop from a slot when the cursor is empty (button 0 one, 1 stack).
+    fn drop_click(&mut self, slot: i16, button: i8) {
+        if self.cursor_item.is_some() || slot < 0 {
+            return;
+        }
+        let index = slot as usize;
+        if index >= self.inventory.len() {
+            return;
+        }
+        if let Some(mut item) = self.inventory[index] {
+            if button == 0 {
+                item.count -= 1;
+                self.inventory[index] = (item.count > 0).then_some(item);
+            } else {
+                self.inventory[index] = None;
+            }
+        }
+    }
+
     pub fn loaded_chunk_count(&self) -> usize {
         self.world.chunk_count()
     }
@@ -717,6 +1066,27 @@ impl GameState {
             self.advance_view_state();
             self.update_camera(1.0);
             return None;
+        }
+
+        // While mounted, the server drives the vehicle and the player rides
+        // along: skip walking physics and snap to the vehicle (vanilla
+        // `updateRidden`). The player can still look around. Dismount happens
+        // server-side when the player sneaks (the sneak packet is already sent),
+        // which sends an AttachEntity(-1) that clears this.
+        if let Some(&vehicle_id) = self.vehicles.get(&self.player.id) {
+            if let Some(vehicle) = self.world.entity(vehicle_id) {
+                let (_, vehicle_height) = vehicle.size();
+                self.player.position =
+                    vehicle.position + DVec3::new(0.0, vehicle_height * 0.75, 0.0);
+                self.player.velocity = DVec3::ZERO;
+                self.player.on_ground = false;
+                self.player.sync_aabb_to_position();
+                self.sprinting = false;
+                self.world.upsert_entity(self.player.clone());
+                self.advance_view_state();
+                self.update_camera(1.0);
+                return Some(self.movement_snapshot());
+            }
         }
 
         // Hold the player still (no physics) while:
@@ -828,23 +1198,133 @@ impl GameState {
     /// overlay is drawn by the renderer from `breaking_overlay()`.
     /// `tick_alpha` interpolates entity positions between simulation ticks
     /// (vanilla partialTicks) so movement stays smooth at any frame rate.
-    pub fn build_entity_model(&self, tick_alpha: f32) -> ModelMesh {
+    pub fn build_entity_model(
+        &self,
+        tick_alpha: f32,
+        skin_rows: &std::collections::HashMap<[u8; 16], u32>,
+    ) -> ModelMesh {
         let mut mesh = ModelMesh::new();
         for entity in self.world.entities() {
             if entity.id == self.player.id {
                 continue;
             }
-            let feet = to_render_vec3(entity.render_position(tick_alpha as f64));
+            // Item entities (object type 2) are drawn as item geometry in the
+            // separate world-item pass, not as a placeholder box.
+            if entity.kind == EntityKind::Object(2) {
+                continue;
+            }
+            // Resolve the player's downloaded-skin row through its uuid, if any.
+            let skin_row = (entity.kind == EntityKind::RemotePlayer)
+                .then(|| self.entity_uuids.get(&entity.id))
+                .flatten()
+                .and_then(|uuid| skin_rows.get(uuid))
+                .copied();
+            // A passenger renders on top of its vehicle (vanilla mount offset),
+            // not at its own server position.
+            let feet = match self
+                .vehicles
+                .get(&entity.id)
+                .and_then(|vehicle_id| self.world.entity(*vehicle_id))
+            {
+                Some(vehicle) => {
+                    let (_, vehicle_height) = vehicle.size();
+                    to_render_vec3(
+                        vehicle.render_position(tick_alpha as f64)
+                            + DVec3::new(0.0, vehicle_height * 0.75, 0.0),
+                    )
+                }
+                None => to_render_vec3(entity.render_position(tick_alpha as f64)),
+            };
             let (half_width, height) = entity.size();
+            let body_yaw = entity.render_yaw(tick_alpha);
+            let (limb_swing, limb_swing_amount) = entity.render_limb_swing(tick_alpha);
+            // Net head yaw is clamped so a stale head target never spins the
+            // head past a natural turn (vanilla mobs clamp head rotation too).
+            let net_head_yaw =
+                wrap_degrees(entity.render_head_yaw(tick_alpha) - body_yaw).clamp(-75.0, 75.0);
+            let anim = EntityAnim {
+                limb_swing,
+                limb_swing_amount,
+                net_head_yaw,
+                head_pitch: entity.render_pitch(tick_alpha),
+                swing_progress: entity.render_swing(tick_alpha),
+                sneaking: entity.sneaking,
+            };
             mesh.push_entity(
                 entity.kind,
                 feet,
                 half_width as f32,
                 height as f32,
-                entity.yaw,
+                body_yaw,
+                &anim,
+                skin_row,
             );
         }
         mesh
+    }
+
+    /// The dropped items to render this frame (object type 2 with a known
+    /// stack), each with its interpolated world position and bob/spin phase.
+    pub fn dropped_items(&self, tick_alpha: f32) -> Vec<DroppedItem> {
+        let mut items = Vec::new();
+        for entity in self.world.entities() {
+            if entity.kind != EntityKind::Object(2) {
+                continue;
+            }
+            let Some(&item) = self.entity_items.get(&entity.id) else {
+                continue;
+            };
+            let pos = to_render_vec3(entity.render_position(tick_alpha as f64));
+            // A per-entity offset desynchronises the bob/spin of nearby items.
+            let phase = entity.age as f32 + tick_alpha + (entity.id.0 as f32) * 0.5;
+            items.push(DroppedItem { item, pos, phase });
+        }
+        items
+    }
+
+    /// Player nametag labels to draw this frame: the decorated name and the
+    /// world anchor above each visible remote player's head. Filtered by view
+    /// distance and a coarse block-occlusion check; screen projection and the
+    /// behind-camera cull happen at the draw site.
+    pub fn player_nametags(&self, tick_alpha: f32) -> Vec<(String, Vec3)> {
+        let eye = DVec3::new(
+            self.camera.position.x as f64,
+            self.camera.position.y as f64,
+            self.camera.position.z as f64,
+        );
+        let mut tags = Vec::new();
+        for entity in self.world.entities() {
+            if entity.kind != EntityKind::RemotePlayer || entity.id == self.player.id {
+                continue;
+            }
+            let Some(uuid) = self.entity_uuids.get(&entity.id) else {
+                continue;
+            };
+            let Some(info) = self.player_list.get(uuid) else {
+                continue;
+            };
+            let pos = entity.render_position(tick_alpha as f64);
+            let (_, height) = entity.size();
+            // Distance cutoff (vanilla renders names within ~64 blocks).
+            let head = pos + DVec3::new(0.0, height + 0.5, 0.0);
+            if head.distance(eye) > 64.0 {
+                continue;
+            }
+            // Coarse occlusion: hide the name if a block sits between eye and head.
+            let to_head = head - eye;
+            let dist = to_head.length();
+            if let Some(hit) = raycast_block(&self.world, eye, to_head / dist, dist) {
+                if hit.distance < dist - 0.3 {
+                    continue;
+                }
+            }
+            let name = match &info.display_name {
+                Some(json) => chat::flatten_chat_json(json),
+                None => self.scoreboard.decorate_entry(&info.name),
+            };
+            tags.push((name, to_render_vec3(head)));
+        }
+        tags
     }
 
     /// Swing progress interpolated between ticks (vanilla `getSwingProgress`
@@ -1153,7 +1633,69 @@ impl GameState {
             .world
             .set_block_if_chunk_loaded(x, y, z, BlockState::AIR)
         {
-            self.mark_chunk_dirty(ChunkPos::new(x.div_euclid(16), z.div_euclid(16)));
+            self.mark_block_dirty_urgent(x, z);
+        }
+    }
+
+    /// Mirror vanilla's client-side placement: the instant we send a block
+    /// placement, set the block locally so it shows without waiting for — or
+    /// depending on — a server BlockChange. Some servers never echo the player's
+    /// own placement, so without this the block would never appear.
+    ///
+    /// Predicts only when the outcome is unambiguous: a real block item, a
+    /// target that isn't being right-click-activated, a replaceable destination,
+    /// and a state we can orient correctly (so we never leave a phantom block a
+    /// no-echo server won't correct). Anything else just sends the packet and
+    /// waits for the server.
+    fn predict_placement(
+        &mut self,
+        x: i32,
+        y: i32,
+        z: i32,
+        face: u8,
+        cursor_y: u8,
+        held: Option<SlotItem>,
+    ) {
+        let Some(item) = held else { return };
+        // Right-clicking an interactable block (without sneaking) activates it
+        // rather than placing — don't conjure a phantom block in that case.
+        if !self.input.sneak && is_interactable(self.world.block_at(x, y, z)) {
+            return;
+        }
+        let Some(state) = placement_block_state(item, face, self.player.yaw, cursor_y) else {
+            return;
+        };
+        let (dx, dy, dz) = face_offset(face);
+        let (px, py, pz) = (x + dx, y + dy, z + dz);
+        if !is_replaceable(self.world.block_at(px, py, pz)) {
+            return;
+        }
+        // Vanilla forbids placing a block whose collision box would intersect the
+        // player (you can't seal yourself inside a cube).
+        let pa = self.player.aabb;
+        for b in state.collision_boxes().as_slice() {
+            let min = DVec3::new(
+                px as f64 + b.min[0],
+                py as f64 + b.min[1],
+                pz as f64 + b.min[2],
+            );
+            let max = DVec3::new(
+                px as f64 + b.max[0],
+                py as f64 + b.max[1],
+                pz as f64 + b.max[2],
+            );
+            if pa.max.x > min.x
+                && pa.min.x < max.x
+                && pa.max.y > min.y
+                && pa.min.y < max.y
+                && pa.max.z > min.z
+                && pa.min.z < max.z
+            {
+                return;
+            }
+        }
+        if self.world.set_block_if_chunk_loaded(px, py, pz, state) {
+            self.mark_block_dirty_urgent(px, pz);
         }
     }
 
@@ -1196,18 +1738,26 @@ impl GameState {
                 cursor_y,
                 cursor_z,
             }) => {
+                // 1.8 C08 carries the held stack (not an empty slot); the server
+                // and anti-cheat expect to see what the hand was holding.
+                let held = self.held_item();
                 packets.push(ServerboundPacket::PlayerBlockPlacement {
                     x,
                     y,
                     z,
                     face,
-                    held_item: None,
+                    held_item: held.map(|it| HeldItem {
+                        id: it.id,
+                        count: it.count,
+                        damage: it.damage,
+                    }),
                     cursor_x,
                     cursor_y,
                     cursor_z,
                 });
                 self.swing_arm();
                 packets.push(ServerboundPacket::SwingArm);
+                self.predict_placement(x, y, z, face, cursor_y, held);
             }
             None => {}
         }
@@ -1414,6 +1964,7 @@ impl GameState {
             }
             ClientboundPlayPacket::SpawnPlayer {
                 entity_id,
+                uuid,
                 x,
                 y,
                 z,
@@ -1421,6 +1972,7 @@ impl GameState {
                 pitch,
             } => {
                 self.spawn_remote_entity(entity_id, EntityKind::RemotePlayer, x, y, z, yaw, pitch);
+                self.entity_uuids.insert(EntityId(entity_id), uuid);
                 false
             }
             ClientboundPlayPacket::SpawnMob {
@@ -1431,6 +1983,7 @@ impl GameState {
                 z,
                 yaw,
                 pitch,
+                ..
             } => {
                 self.spawn_remote_entity(entity_id, EntityKind::Mob(kind), x, y, z, yaw, pitch);
                 false
@@ -1441,6 +1994,9 @@ impl GameState {
                 x,
                 y,
                 z,
+                yaw,
+                pitch,
+                ..
             } => {
                 self.spawn_remote_entity(
                     entity_id,
@@ -1448,8 +2004,8 @@ impl GameState {
                     x,
                     y,
                     z,
-                    0.0,
-                    0.0,
+                    yaw,
+                    pitch,
                 );
                 false
             }
@@ -1518,9 +2074,10 @@ impl GameState {
                 slot,
                 item,
             } => {
-                // Window 0 is the player inventory. Slot -1 is the held cursor
-                // item during drags; other windows aren't modelled here.
-                if window_id == 0 && (0..self.inventory.len() as i16).contains(&slot) {
+                // Window -1 slot -1 is the cursor stack (vanilla `setItemStack`).
+                if window_id == -1 && slot == -1 {
+                    self.cursor_item = item;
+                } else if window_id == 0 && (0..self.inventory.len() as i16).contains(&slot) {
                     self.inventory[slot as usize] = item;
                 }
                 false
@@ -1539,7 +2096,13 @@ impl GameState {
             }
             ClientboundPlayPacket::DestroyEntities { entity_ids } => {
                 for id in entity_ids {
-                    self.world.remove_entity(EntityId(id));
+                    let id = EntityId(id);
+                    self.world.remove_entity(id);
+                    self.entity_uuids.remove(&id);
+                    self.entity_items.remove(&id);
+                    // Drop both directions of any mount relationship.
+                    self.vehicles.remove(&id);
+                    self.vehicles.retain(|_, vehicle| *vehicle != id);
                 }
                 false
             }
@@ -1625,6 +2188,64 @@ impl GameState {
                 log::warn!("server disconnected: {reason_json}");
                 false
             }
+            ClientboundPlayPacket::PlayerListItem { entries } => {
+                self.player_list.apply(entries);
+                false
+            }
+            ClientboundPlayPacket::PlayerListHeaderFooter { header, footer } => {
+                self.player_list.set_header_footer(
+                    chat::flatten_chat_json(&header),
+                    chat::flatten_chat_json(&footer),
+                );
+                false
+            }
+            ClientboundPlayPacket::EntityHeadLook {
+                entity_id,
+                head_yaw,
+            } => {
+                if let Some(entity) = self.remote_entity_mut(entity_id) {
+                    entity.set_head_yaw(head_yaw);
+                }
+                false
+            }
+            ClientboundPlayPacket::AttachEntity {
+                entity_id,
+                vehicle_id,
+                leash,
+            } => {
+                // Leashes (leash = true) don't move the entity; only rides do.
+                if !leash {
+                    if vehicle_id == -1 {
+                        self.vehicles.remove(&EntityId(entity_id));
+                    } else {
+                        self.vehicles
+                            .insert(EntityId(entity_id), EntityId(vehicle_id));
+                    }
+                }
+                false
+            }
+            ClientboundPlayPacket::EntityAnimation {
+                entity_id,
+                animation,
+            } => {
+                // 0 = swing main arm; the rest (hurt/crit/…) aren't modelled.
+                if animation == 0 {
+                    if let Some(entity) = self.remote_entity_mut(entity_id) {
+                        entity.start_swing();
+                    }
+                }
+                false
+            }
+            ClientboundPlayPacket::EntityMetadata {
+                entity_id,
+                metadata,
+            } => {
+                self.apply_entity_metadata(entity_id, &metadata);
+                false
+            }
+            // Parsed in P0; handlers land in later phases (dropped items P3).
+            ClientboundPlayPacket::EntityEquipment { .. }
+            | ClientboundPlayPacket::CollectItem { .. } => false,
             // ConfirmTransaction is ponged on the network thread (vanilla replies
             // immediately), so the game loop never needs to act on it.
             ClientboundPlayPacket::KeepAlive { .. }
@@ -1663,6 +2284,29 @@ impl GameState {
             yaw,
             pitch,
         ));
+    }
+
+    /// Apply an EntityMetadata update to a tracked entity. Index 0 is the shared
+    /// entity flags byte (bit 0x02 = crouching, drives the sneak pose); index 10
+    /// is the dropped-item entity's ItemStack.
+    fn apply_entity_metadata(
+        &mut self,
+        entity_id: i32,
+        metadata: &[recraft_protocol::v1_8_9::packets::MetadataEntry],
+    ) {
+        for entry in metadata {
+            match (entry.index, &entry.value) {
+                (0, MetadataValue::Byte(flags)) => {
+                    if let Some(entity) = self.remote_entity_mut(entity_id) {
+                        entity.sneaking = flags & 0x02 != 0;
+                    }
+                }
+                (10, MetadataValue::Slot(Some(item))) => {
+                    self.entity_items.insert(EntityId(entity_id), *item);
+                }
+                _ => {}
+            }
+        }
     }
 
     fn move_remote_entity(
@@ -1708,6 +2352,17 @@ impl GameState {
         all
     }
 
+    /// Drain locally predicted chunks so the renderer can queue them before
+    /// ordinary dirty chunks. They are removed from the regular queue to avoid
+    /// submitting duplicate mesh jobs in the same frame.
+    pub fn take_urgent_remesh(&mut self) -> Vec<ChunkPos> {
+        let chunks: Vec<_> = self.urgent_remesh.drain().collect();
+        for pos in &chunks {
+            self.dirty_chunks.remove(pos);
+        }
+        chunks
+    }
+
     fn apply_block_change(&mut self, x: i32, y: i32, z: i32, id: u16, meta: u8) -> bool {
         let block = BlockState::new(id, meta);
         if !self.world.set_block_if_chunk_loaded(x, y, z, block) {
@@ -1719,7 +2374,7 @@ impl GameState {
                 .push((x, y, z, block));
             return false;
         }
-        self.mark_chunk_dirty(ChunkPos::new(x.div_euclid(16), z.div_euclid(16)));
+        self.mark_block_dirty(x, z);
         true
     }
 
@@ -1797,6 +2452,41 @@ impl GameState {
         }
     }
 
+    fn mark_block_dirty(&mut self, x: i32, z: i32) {
+        let pos = ChunkPos::new(x.div_euclid(16), z.div_euclid(16));
+        self.dirty_chunks.insert(pos);
+        let lx = x.rem_euclid(16);
+        let lz = z.rem_euclid(16);
+        if lx == 0 {
+            self.dirty_chunks.insert(ChunkPos::new(pos.x - 1, pos.z));
+        } else if lx == 15 {
+            self.dirty_chunks.insert(ChunkPos::new(pos.x + 1, pos.z));
+        }
+        if lz == 0 {
+            self.dirty_chunks.insert(ChunkPos::new(pos.x, pos.z - 1));
+        } else if lz == 15 {
+            self.dirty_chunks.insert(ChunkPos::new(pos.x, pos.z + 1));
+        }
+    }
+
+    fn mark_block_dirty_urgent(&mut self, x: i32, z: i32) {
+        self.mark_block_dirty(x, z);
+        let pos = ChunkPos::new(x.div_euclid(16), z.div_euclid(16));
+        self.urgent_remesh.insert(pos);
+        let lx = x.rem_euclid(16);
+        let lz = z.rem_euclid(16);
+        if lx == 0 {
+            self.urgent_remesh.insert(ChunkPos::new(pos.x - 1, pos.z));
+        } else if lx == 15 {
+            self.urgent_remesh.insert(ChunkPos::new(pos.x + 1, pos.z));
+        }
+        if lz == 0 {
+            self.urgent_remesh.insert(ChunkPos::new(pos.x, pos.z - 1));
+        } else if lz == 15 {
+            self.urgent_remesh.insert(ChunkPos::new(pos.x, pos.z + 1));
+        }
+    }
+
     fn movement_snapshot(&self) -> MovementSnapshot {
         MovementSnapshot {
             x: self.player.position.x,
@@ -1818,6 +2508,44 @@ fn to_render_vec3(position: DVec3) -> Vec3 {
 
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
+}
+
+/// Two stacks merge only when the item id and damage match. NBT is not modeled
+/// (`SlotItem` drops it), so enchanted/named items may over-merge until the
+/// server corrects with a SetSlot.
+fn stackable(a: &SlotItem, b: &SlotItem) -> bool {
+    a.id == b.id && a.damage == b.damage
+}
+
+/// Vanilla maximum stack size, simplified: equipment (tools, weapons, armor,
+/// bow, shears, fishing rod, buckets) caps at 1; everything else at 64. The
+/// server authoritatively corrects any mis-stack the prediction makes.
+fn max_stack(item: &SlotItem) -> u8 {
+    if is_non_stackable(item.id) {
+        1
+    } else {
+        64
+    }
+}
+
+/// Whether a 1.8 item id has a maximum stack size of 1 (the common equipment).
+fn is_non_stackable(id: i16) -> bool {
+    matches!(
+        id,
+        256 | 257 | 258 | 259  // iron shovel/pickaxe/axe, flint & steel
+            | 261              // bow
+            | 267              // iron sword
+            | 268..=279        // wood/stone/diamond tool sets
+            | 283..=286        // gold tools
+            | 290..=294        // hoes
+            | 298..=317        // armor (leather → diamond)
+            | 325..=327        // bucket, water bucket, lava bucket
+            | 329              // saddle
+            | 333              // boat
+            | 346              // fishing rod
+            | 359              // shears
+            | 373              // potion
+    )
 }
 
 /// Number of 20 Hz ticks to break a block by hand in survival, matching vanilla's
@@ -1943,6 +2671,104 @@ struct EntityHit {
 /// air and fluids; includes leaves and glass).
 fn is_pickable(block: BlockState) -> bool {
     !block.is_air() && (block.is_solid_collision() || block.is_opaque_cube())
+}
+
+/// The neighbour cell a placement lands in, for a clicked face (vanilla
+/// EnumFacing offsets: 0=down,1=up,2=north,3=south,4=west,5=east).
+fn face_offset(face: u8) -> (i32, i32, i32) {
+    match face {
+        0 => (0, -1, 0),
+        1 => (0, 1, 0),
+        2 => (0, 0, -1),
+        3 => (0, 0, 1),
+        4 => (-1, 0, 0),
+        _ => (1, 0, 0),
+    }
+}
+
+/// Cells a block may be placed into (vanilla `Material.isReplaceable`): air,
+/// liquids, and the small plants/fire/snow that placement overwrites.
+fn is_replaceable(block: BlockState) -> bool {
+    block.is_air()
+        || block.is_water()
+        || block.is_lava()
+        || matches!(block.id, 31 | 32 | 37 | 38 | 39 | 40 | 51 | 78 | 106 | 175)
+}
+
+/// Blocks whose right-click activates them (so a non-sneaking placement is
+/// suppressed): containers, doors/trapdoors/gates, redstone toggles, and
+/// workstations.
+fn is_interactable(block: BlockState) -> bool {
+    matches!(
+        block.id,
+        23 | 25 | 26 | 54 | 58 | 61 | 62 | 64 | 69 | 71 | 77 | 84 | 92 | 93 | 94 | 96 | 107 | 116
+            | 117 | 130 | 137 | 138 | 143 | 145 | 146 | 149 | 150 | 154 | 158 | 167
+            | 183..=187
+            | 193..=197
+    )
+}
+
+/// The block state vanilla `onBlockPlaced` would yield for a held block item, or
+/// None when the placement isn't safely predictable — a non-block item (tools,
+/// food, or doors/beds whose item id differs from the block id), or an oriented
+/// block whose placement context we don't model (torches, rails, …), which then
+/// waits for the server rather than risk a wrong phantom.
+fn placement_block_state(item: SlotItem, face: u8, yaw: f32, cursor_y: u8) -> Option<BlockState> {
+    let raw = item.id;
+    if !(1..=255).contains(&raw) {
+        return None;
+    }
+    let id = raw as u16;
+    let dmg = item.damage as u8;
+    // Vanilla half rule (slabs/stairs): top when clicked on the underside, or on
+    // a side above the cursor midline (hitY > 0.5 ⟺ cursor_y > 8).
+    let upper_half = face == 0 || (face != 1 && cursor_y > 8);
+
+    if matches!(id, 44 | 126 | 182) {
+        // Slab: variant in the low bits, top half in bit 8.
+        return Some(BlockState::new(
+            id,
+            (dmg & 7) | if upper_half { 8 } else { 0 },
+        ));
+    }
+    if matches!(id, 17 | 162 | 170) {
+        // Rotated pillar (log / hay): axis from the clicked face.
+        let axis = match face {
+            0 | 1 => 0,
+            2 | 3 => 8,
+            _ => 4,
+        };
+        return Some(BlockState::new(id, (dmg & 3) | axis));
+    }
+    if is_stairs(id) {
+        // Facing from the player; half from the cursor.
+        return Some(BlockState::new(
+            id,
+            stair_facing_meta(yaw) | if upper_half { 4 } else { 0 },
+        ));
+    }
+
+    // Blocks whose meta carries no placement orientation: full cubes, plus the
+    // auto-connecting fence/pane/wall family (which mesh from their neighbours),
+    // all render correctly straight from meta = damage.
+    let block = BlockState::new(id, dmg);
+    if block.render_shape() == RenderShape::Cube || is_fence(id) || is_pane(id) || id == 139 {
+        return Some(block);
+    }
+    None
+}
+
+/// Vanilla stairs `meta & 3` for the player's horizontal facing
+/// (`getHorizontalFacing` → E=0, W=1, S=2, N=3).
+fn stair_facing_meta(yaw: f32) -> u8 {
+    // getHorizontal index: 0=S, 1=W, 2=N, 3=E.
+    let idx = (((yaw as f64) * 4.0 / 360.0 + 0.5).floor() as i32) & 3;
+    match idx {
+        0 => 2,
+        1 => 1,
+        2 => 3,
+        _ => 0,
+    }
 }
 
 /// Voxel DDA (Amanatides–Woo) returning the first targetable block, the face
@@ -2107,6 +2933,145 @@ mod interaction_tests {
         gs
     }
 
+    fn item(id: i16, count: u8) -> SlotItem {
+        SlotItem {
+            id,
+            count,
+            damage: 0,
+        }
+    }
+
+    #[test]
+    fn left_click_picks_up_then_places_a_stack() {
+        let mut g = GameState::empty_for_server(1.0);
+        g.inventory[9] = Some(item(1, 64));
+        g.click_slot(9, 0, 0);
+        assert_eq!(g.cursor_item, Some(item(1, 64)));
+        assert_eq!(g.inventory[9], None);
+        g.click_slot(10, 0, 0);
+        assert_eq!(g.cursor_item, None);
+        assert_eq!(g.inventory[10], Some(item(1, 64)));
+    }
+
+    #[test]
+    fn right_click_takes_the_ceil_half() {
+        let mut g = GameState::empty_for_server(1.0);
+        g.inventory[9] = Some(item(1, 9));
+        g.click_slot(9, 1, 0);
+        assert_eq!(g.cursor_item, Some(item(1, 5)));
+        assert_eq!(g.inventory[9], Some(item(1, 4)));
+    }
+
+    #[test]
+    fn left_click_merges_up_to_the_max_stack() {
+        let mut g = GameState::empty_for_server(1.0);
+        g.inventory[9] = Some(item(1, 60));
+        g.cursor_item = Some(item(1, 20));
+        g.click_slot(9, 0, 0);
+        assert_eq!(g.inventory[9], Some(item(1, 64)));
+        assert_eq!(g.cursor_item, Some(item(1, 16)));
+    }
+
+    #[test]
+    fn different_items_swap_on_click() {
+        let mut g = GameState::empty_for_server(1.0);
+        g.inventory[9] = Some(item(1, 10));
+        g.cursor_item = Some(item(5, 3));
+        g.click_slot(9, 0, 0);
+        assert_eq!(g.inventory[9], Some(item(5, 3)));
+        assert_eq!(g.cursor_item, Some(item(1, 10)));
+    }
+
+    #[test]
+    fn shift_click_moves_a_hotbar_stack_into_the_main_inventory() {
+        let mut g = GameState::empty_for_server(1.0);
+        g.inventory[36] = Some(item(1, 10));
+        let packets = g.click_slot(36, 0, 1);
+        assert_eq!(g.inventory[36], None);
+        assert_eq!(g.inventory[9], Some(item(1, 10)));
+        assert!(matches!(
+            packets[0],
+            ServerboundPacket::ClickWindow { mode: 1, slot: 36, .. }
+        ));
+    }
+
+    #[test]
+    fn q_drops_one_outside_click_drops_the_cursor() {
+        let mut g = GameState::empty_for_server(1.0);
+        g.inventory[9] = Some(item(1, 3));
+        g.click_slot(9, 0, 4); // Q
+        assert_eq!(g.inventory[9], Some(item(1, 2)));
+        // Outside-window click drops the cursor stack.
+        g.cursor_item = Some(item(2, 5));
+        g.click_slot(-999, 0, 0);
+        assert_eq!(g.cursor_item, None);
+    }
+
+    #[test]
+    fn left_paint_drag_even_splits_across_painted_slots() {
+        let mut g = GameState::empty_for_server(1.0);
+        g.cursor_item = Some(item(1, 6));
+        g.drag_begin(false);
+        g.drag_add_slot(9);
+        g.drag_add_slot(10);
+        g.drag_add_slot(11);
+        let packets = g.drag_commit();
+        assert_eq!(g.inventory[9], Some(item(1, 2)));
+        assert_eq!(g.inventory[10], Some(item(1, 2)));
+        assert_eq!(g.inventory[11], Some(item(1, 2)));
+        assert_eq!(g.cursor_item, None);
+        // start + one per slot + end, all mode 5.
+        assert_eq!(packets.len(), 5);
+        assert!(packets
+            .iter()
+            .all(|p| matches!(p, ServerboundPacket::ClickWindow { mode: 5, .. })));
+    }
+
+    #[test]
+    fn mounting_follows_the_vehicle_then_detaching_clears_it() {
+        let mut g = GameState::empty_for_server(1.0);
+        // A vehicle entity (pig, id 1) at a known position.
+        g.apply_play_packet(ClientboundPlayPacket::SpawnMob {
+            entity_id: 1,
+            kind: 90,
+            x: 10.0,
+            y: 64.0,
+            z: -5.0,
+            yaw: 0.0,
+            pitch: 0.0,
+            head_pitch: 0.0,
+            metadata: Vec::new(),
+        });
+        g.apply_play_packet(ClientboundPlayPacket::AttachEntity {
+            entity_id: 0, // the local player
+            vehicle_id: 1,
+            leash: false,
+        });
+        g.tick(0.05);
+        // The rider snaps onto the vehicle (height 1.9 × 0.75 mount offset).
+        assert!((g.player.position.x - 10.0).abs() < 1.0e-6);
+        assert!((g.player.position.z + 5.0).abs() < 1.0e-6);
+        assert!((g.player.position.y - (64.0 + 1.9 * 0.75)).abs() < 1.0e-6);
+
+        // Detaching (vehicle_id -1) clears the mount so physics resumes.
+        g.apply_play_packet(ClientboundPlayPacket::AttachEntity {
+            entity_id: 0,
+            vehicle_id: -1,
+            leash: false,
+        });
+        assert!(!g.vehicles.contains_key(&EntityId(0)));
+    }
+
+    #[test]
+    fn number_key_swaps_with_the_hotbar_slot() {
+        let mut g = GameState::empty_for_server(1.0);
+        g.inventory[9] = Some(item(1, 5));
+        g.inventory[36] = Some(item(2, 1));
+        g.click_slot(9, 0, 2); // press "1" over slot 9
+        assert_eq!(g.inventory[9], Some(item(2, 1)));
+        assert_eq!(g.inventory[36], Some(item(1, 5)));
+    }
+
     #[test]
     fn raycast_block_hits_first_block_and_face() {
         let mut world = World::new();
@@ -2233,6 +3198,135 @@ mod interaction_tests {
             ),
             "got {packets:?}"
         );
+    }
+
+    #[test]
+    fn use_block_predicts_placement_and_sends_held_item() {
+        let mut gs = looking_along_x();
+        gs.world.set_block(3, 0, 0, BlockState::STONE);
+        gs.selected_slot = 0;
+        gs.inventory[36] = Some(SlotItem {
+            id: 1,
+            count: 64,
+            damage: 0,
+        }); // stone in hotbar slot 0
+        assert!(gs.world.block_at(2, 0, 0).is_air());
+
+        let packets = gs.on_use();
+
+        // The block shows immediately at the adjacent cell, without a server echo.
+        assert_eq!(gs.world.block_at(2, 0, 0), BlockState::new(1, 0));
+        // C08 now carries the held stack rather than an empty slot.
+        assert!(
+            matches!(
+                packets.first(),
+                Some(ServerboundPacket::PlayerBlockPlacement {
+                    held_item: Some(HeldItem { id: 1, .. }),
+                    ..
+                })
+            ),
+            "got {packets:?}"
+        );
+    }
+
+    #[test]
+    fn server_cancel_reverts_a_predicted_placement() {
+        let mut gs = looking_along_x();
+        gs.world.set_block(3, 0, 0, BlockState::STONE);
+        gs.selected_slot = 0;
+        gs.inventory[36] = Some(SlotItem {
+            id: 1,
+            count: 64,
+            damage: 0,
+        });
+        let _ = gs.on_use();
+        assert_eq!(
+            gs.world.block_at(2, 0, 0),
+            BlockState::new(1, 0),
+            "placement is predicted locally"
+        );
+
+        // The server rejects the placement and sends the original (air) back. The
+        // prediction never locks the cell, so this authoritative update wins.
+        let remesh = gs.apply_play_packet(ClientboundPlayPacket::BlockChange {
+            x: 2,
+            y: 0,
+            z: 0,
+            id: 0,
+            meta: 0,
+        });
+        assert!(
+            gs.world.block_at(2, 0, 0).is_air(),
+            "a server cancel must revert the phantom block"
+        );
+        assert!(remesh, "the revert should re-mesh the chunk");
+    }
+
+    #[test]
+    fn use_block_on_interactable_does_not_predict() {
+        let mut gs = looking_along_x();
+        gs.world.set_block(3, 0, 0, BlockState::new(54, 2)); // chest
+        gs.selected_slot = 0;
+        gs.inventory[36] = Some(SlotItem {
+            id: 1,
+            count: 64,
+            damage: 0,
+        });
+        let _ = gs.on_use();
+        assert!(
+            gs.world.block_at(2, 0, 0).is_air(),
+            "right-clicking a chest must not conjure a phantom block in front of it"
+        );
+    }
+
+    #[test]
+    fn placement_block_state_orients_common_blocks() {
+        let stone = SlotItem {
+            id: 1,
+            count: 1,
+            damage: 0,
+        };
+        assert_eq!(
+            placement_block_state(stone, 1, 0.0, 8),
+            Some(BlockState::new(1, 0))
+        );
+        // Slab on top of a block → bottom half; on the underside → top half.
+        let slab = SlotItem {
+            id: 44,
+            count: 1,
+            damage: 0,
+        };
+        assert_eq!(
+            placement_block_state(slab, 1, 0.0, 8),
+            Some(BlockState::new(44, 0))
+        );
+        assert_eq!(
+            placement_block_state(slab, 0, 0.0, 8),
+            Some(BlockState::new(44, 8))
+        );
+        // Log placed against an x-facing face → x axis (meta bit 4).
+        let log = SlotItem {
+            id: 17,
+            count: 1,
+            damage: 0,
+        };
+        assert_eq!(
+            placement_block_state(log, 4, 0.0, 8),
+            Some(BlockState::new(17, 4))
+        );
+        // Non-block items and oriented blocks we don't model are not predicted.
+        let pickaxe = SlotItem {
+            id: 278,
+            count: 1,
+            damage: 0,
+        };
+        assert!(placement_block_state(pickaxe, 1, 0.0, 8).is_none());
+        let torch = SlotItem {
+            id: 50,
+            count: 1,
+            damage: 0,
+        };
+        assert!(placement_block_state(torch, 1, 0.0, 8).is_none());
     }
 
     #[test]

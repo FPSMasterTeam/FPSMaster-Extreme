@@ -162,8 +162,15 @@ impl GuiScreen for GuiOptions {
         self.apply_drag(x, ctx);
     }
 
-    fn mouse_released(&mut self, _x: f64, _y: f64) {
+    fn mouse_released(
+        &mut self,
+        _x: f64,
+        _y: f64,
+        _right: bool,
+        _ctx: &mut ScreenCtx,
+    ) -> Vec<GuiAction> {
         self.dragging = None;
+        Vec::new()
     }
 
     fn key_pressed(&mut self, event: &KeyEvent, _ctx: &mut ScreenCtx) -> Vec<GuiAction> {

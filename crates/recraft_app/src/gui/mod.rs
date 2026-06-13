@@ -19,12 +19,15 @@ pub mod options;
 pub mod progress;
 pub mod widgets;
 
+use recraft_protocol::v1_8_9::packets::ServerboundPacket;
 use recraft_render::{GuiTexture, UiColor, UiFrame, UiRect};
 use winit::event::KeyEvent;
+use winit::keyboard::ModifiersState;
 
 use crate::game::GameState;
 use crate::gui::ingame::HudState;
 use crate::settings::Settings;
+use crate::text_input::TextInput;
 
 /// One open screen. Implementations hold their own widgets and produce
 /// [`GuiAction`]s; the main loop owns navigation and app side effects.
@@ -37,7 +40,23 @@ pub trait GuiScreen {
         Vec::new()
     }
 
-    fn mouse_released(&mut self, _x: f64, _y: f64) {}
+    /// A right mouse press (most screens ignore it; the inventory uses it for
+    /// half-pickup / place-one / right paint-drag).
+    fn mouse_right_clicked(&mut self, _x: f64, _y: f64, _ctx: &mut ScreenCtx) -> Vec<GuiAction> {
+        Vec::new()
+    }
+
+    /// A mouse-button release. `right` is true for the right button, so a
+    /// screen can tell which button ends an in-progress gesture (paint-drag).
+    fn mouse_released(
+        &mut self,
+        _x: f64,
+        _y: f64,
+        _right: bool,
+        _ctx: &mut ScreenCtx,
+    ) -> Vec<GuiAction> {
+        Vec::new()
+    }
 
     fn mouse_dragged(&mut self, _x: f64, _y: f64, _ctx: &mut ScreenCtx) {}
 
@@ -52,9 +71,22 @@ pub trait GuiScreen {
         Vec::new()
     }
 
-    /// The live chat input when this screen is the chat overlay; the HUD's
-    /// chat panel renders the box and backlog.
+    /// The live chat input text when this screen is the chat overlay; the
+    /// HUD's chat panel renders the box and backlog.
     fn chat_input(&self) -> Option<&str> {
+        None
+    }
+
+    /// The chat overlay's editable buffer, for the HUD to render its content,
+    /// caret and IME composition (and to record the caret area).
+    fn chat_input_mut(&mut self) -> Option<&mut TextInput> {
+        None
+    }
+
+    /// The text buffer currently accepting input on this screen, if any. The
+    /// host routes IME events here, enables IME while one is present, and reads
+    /// its caret area to place the candidate window.
+    fn focused_text_input(&mut self) -> Option<&mut TextInput> {
         None
     }
 
@@ -83,6 +115,8 @@ pub enum GuiAction {
     CopyActiveToken,
     /// Settings were edited; the renderer must apply the new vsync mode.
     SetVsync(bool),
+    /// Send a serverbound packet (inventory clicks, window close, …).
+    SendPacket(ServerboundPacket),
 }
 
 /// Immutable per-frame data screens draw from.
@@ -110,6 +144,11 @@ pub struct ScreenCtx<'a> {
     pub game: &'a mut GameState,
     pub settings: &'a mut Settings,
     pub clipboard: Option<&'a mut arboard::Clipboard>,
+    /// Modifier keys currently held (for shortcuts like Ctrl/Cmd+V).
+    pub modifiers: ModifiersState,
+    /// Current cursor position in physical pixels (for slot hit-testing on
+    /// keyboard shortcuts like number-keys and Q-drop).
+    pub mouse: (f64, f64),
 }
 
 /// A saved account row for the accounts screen.

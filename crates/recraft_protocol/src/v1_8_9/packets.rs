@@ -125,6 +125,28 @@ pub enum ServerboundPacket {
     HeldItemChange {
         slot: i16,
     },
+    /// C0E ClickWindow — a slot click in an open window. `action_number` is the
+    /// per-window transaction counter the server echoes via ConfirmTransaction;
+    /// `mode`/`button` select the click kind (normal/shift/number/drag/drop).
+    ClickWindow {
+        window_id: u8,
+        slot: i16,
+        button: i8,
+        action_number: i16,
+        mode: i8,
+        clicked_item: Option<SlotItem>,
+    },
+    /// C0D CloseWindow — the client closed the window (also sent for the
+    /// player inventory, window id 0).
+    CloseWindow {
+        window_id: u8,
+    },
+    /// C10 CreativeInventoryAction — set a slot directly (creative mode is
+    /// client-authoritative over the inventory, no transaction).
+    CreativeInventoryAction {
+        slot: i16,
+        clicked_item: Option<SlotItem>,
+    },
     /// C0A Animation — swing the main arm (no payload in 1.8).
     SwingArm,
     /// C16 ClientStatus — action 0 performs a respawn (sent after death).
@@ -261,6 +283,67 @@ pub enum TitleAction {
     Reset,
 }
 
+/// One signed property of a player's GameProfile (S38 add action). The
+/// `textures` property's base64 `value` carries the skin/cape URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlayerProperty {
+    pub name: String,
+    pub value: String,
+    pub signature: Option<String>,
+}
+
+/// S38 PlayerListItem per-entry action. The packet's single action int applies
+/// to every entry; each entry already encodes which action it carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlayerListItemAction {
+    Add {
+        name: String,
+        properties: Vec<PlayerProperty>,
+        gamemode: i32,
+        ping: i32,
+        /// Chat-JSON display name, or `None` to fall back to the plain name.
+        display_name: Option<String>,
+    },
+    UpdateGameMode {
+        gamemode: i32,
+    },
+    UpdateLatency {
+        ping: i32,
+    },
+    UpdateDisplayName {
+        display_name: Option<String>,
+    },
+    Remove,
+}
+
+/// One S38 PlayerListItem entry: the player UUID plus its action payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlayerListItemEntry {
+    pub uuid: [u8; 16],
+    pub action: PlayerListItemAction,
+}
+
+/// One decoded entry of a 1.8 EntityMetadata (S1C) array. `index` is the
+/// data-watcher slot; the meaningful indices are documented per entity type.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MetadataEntry {
+    pub index: u8,
+    pub value: MetadataValue,
+}
+
+/// A 1.8 metadata value, tagged by the type bits of the entry header.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MetadataValue {
+    Byte(i8),
+    Short(i16),
+    Int(i32),
+    Float(f32),
+    Str(String),
+    Slot(Option<SlotItem>),
+    IntVec(i32, i32, i32),
+    FloatVec(f32, f32, f32),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ClientboundPlayPacket {
     KeepAlive {
@@ -384,6 +467,9 @@ pub enum ClientboundPlayPacket {
     },
     SpawnPlayer {
         entity_id: i32,
+        /// The player's account UUID, linking this entity to its roster entry
+        /// (name, skin texture property). Vanilla used to discard it.
+        uuid: [u8; 16],
         x: f64,
         y: f64,
         z: f64,
@@ -398,6 +484,9 @@ pub enum ClientboundPlayPacket {
         z: f64,
         yaw: f32,
         pitch: f32,
+        head_pitch: f32,
+        /// Trailing data-watcher metadata (sneak/name/age flags etc.).
+        metadata: Vec<MetadataEntry>,
     },
     SpawnObject {
         entity_id: i32,
@@ -405,6 +494,12 @@ pub enum ClientboundPlayPacket {
         x: f64,
         y: f64,
         z: f64,
+        yaw: f32,
+        pitch: f32,
+        /// Object-type-specific data int (e.g. thrower id, block state).
+        data: i32,
+        /// Initial velocity in blocks/tick, present only when `data != 0`.
+        velocity: Option<(f64, f64, f64)>,
     },
     /// Relative move deltas, already converted from fixed-point to blocks.
     EntityRelativeMove {
@@ -467,6 +562,55 @@ pub enum ClientboundPlayPacket {
         window_id: i8,
         action_number: i16,
         accepted: bool,
+    },
+    /// S19 EntityHeadLook — the head yaw of an entity (separate from the body
+    /// yaw carried by movement packets), drives head-turn rendering.
+    EntityHeadLook {
+        entity_id: i32,
+        head_yaw: f32,
+    },
+    /// S1C EntityMetadata — a sparse data-watcher update (sneak/sprint flags,
+    /// custom nametag, item-entity contents, …).
+    EntityMetadata {
+        entity_id: i32,
+        metadata: Vec<MetadataEntry>,
+    },
+    /// S04 EntityEquipment — armor/held item on another entity. `slot` is
+    /// 0 = held, 1-4 = boots/leggings/chest/helmet.
+    EntityEquipment {
+        entity_id: i32,
+        slot: i16,
+        item: Option<SlotItem>,
+    },
+    /// S0D CollectItem — `collected_id` was picked up by `collector_id`
+    /// (drives the shrink-toward-collector pickup animation).
+    CollectItem {
+        collected_id: i32,
+        collector_id: i32,
+    },
+    /// S0B Animation — `animation` 0 = swing arm, 1 = take damage, 2 = leave
+    /// bed, 4 = critical effect, 5 = magic-critical effect.
+    EntityAnimation {
+        entity_id: i32,
+        animation: u8,
+    },
+    /// S1B AttachEntity — `entity_id` mounts (or leashes) onto `vehicle_id`;
+    /// `vehicle_id == -1` detaches, and `leash` distinguishes a leash from a
+    /// ride. Both ids are full ints in 1.8, not VarInts.
+    AttachEntity {
+        entity_id: i32,
+        vehicle_id: i32,
+        leash: bool,
+    },
+    /// S38 PlayerListItem — add/update/remove tab-list player profiles.
+    PlayerListItem {
+        entries: Vec<PlayerListItemEntry>,
+    },
+    /// S47 PlayerListHeaderFooter — the chat-JSON header and footer drawn above
+    /// and below the tab list.
+    PlayerListHeaderFooter {
+        header: String,
+        footer: String,
     },
     Unknown {
         id: i32,
@@ -640,6 +784,34 @@ impl ServerboundPacket {
                 let mut body = PacketWriter::new();
                 body.write_i16(slot);
                 PacketFrame::new(0x09, body.into_inner())
+            }
+            Self::ClickWindow {
+                window_id,
+                slot,
+                button,
+                action_number,
+                mode,
+                clicked_item,
+            } => {
+                let mut body = PacketWriter::new();
+                body.write_u8(window_id);
+                body.write_i16(slot);
+                body.write_i8(button);
+                body.write_i16(action_number);
+                body.write_i8(mode);
+                write_slot(&mut body, clicked_item);
+                PacketFrame::new(0x0e, body.into_inner())
+            }
+            Self::CloseWindow { window_id } => {
+                let mut body = PacketWriter::new();
+                body.write_u8(window_id);
+                PacketFrame::new(0x0d, body.into_inner())
+            }
+            Self::CreativeInventoryAction { slot, clicked_item } => {
+                let mut body = PacketWriter::new();
+                body.write_i16(slot);
+                write_slot(&mut body, clicked_item);
+                PacketFrame::new(0x10, body.into_inner())
             }
             Self::SwingArm => PacketFrame::new(0x0a, Vec::new()),
             Self::ClientStatus { action } => {
@@ -826,14 +998,17 @@ impl ClientboundPlayPacket {
             }
             0x0c => {
                 let entity_id = body.read_var_i32()?;
-                body.read_bytes(16)?; // player UUID
+                let mut uuid = [0u8; 16];
+                uuid.copy_from_slice(body.read_bytes(16)?);
                 let x = fixed_point(body.read_i32()?);
                 let y = fixed_point(body.read_i32()?);
                 let z = fixed_point(body.read_i32()?);
                 let yaw = angle(body.read_i8()?);
                 let pitch = angle(body.read_i8()?);
+                // Trailing current-item Short and metadata array are ignored.
                 Ok(Self::SpawnPlayer {
                     entity_id,
+                    uuid,
                     x,
                     y,
                     z,
@@ -847,12 +1022,28 @@ impl ClientboundPlayPacket {
                 let x = fixed_point(body.read_i32()?);
                 let y = fixed_point(body.read_i32()?);
                 let z = fixed_point(body.read_i32()?);
+                let pitch = angle(body.read_i8()?);
+                let yaw = angle(body.read_i8()?);
+                let data = body.read_i32()?;
+                let velocity = if data != 0 {
+                    Some((
+                        body.read_i16()? as f64 / 8000.0,
+                        body.read_i16()? as f64 / 8000.0,
+                        body.read_i16()? as f64 / 8000.0,
+                    ))
+                } else {
+                    None
+                };
                 Ok(Self::SpawnObject {
                     entity_id,
                     kind,
                     x,
                     y,
                     z,
+                    yaw,
+                    pitch,
+                    data,
+                    velocity,
                 })
             }
             0x0f => {
@@ -863,6 +1054,12 @@ impl ClientboundPlayPacket {
                 let z = fixed_point(body.read_i32()?);
                 let yaw = angle(body.read_i8()?);
                 let pitch = angle(body.read_i8()?);
+                let head_pitch = angle(body.read_i8()?);
+                // Velocity shorts precede the metadata array.
+                body.read_i16()?;
+                body.read_i16()?;
+                body.read_i16()?;
+                let metadata = read_metadata(&mut body)?;
                 Ok(Self::SpawnMob {
                     entity_id,
                     kind,
@@ -871,6 +1068,8 @@ impl ClientboundPlayPacket {
                     z,
                     yaw,
                     pitch,
+                    head_pitch,
+                    metadata,
                 })
             }
             0x15 => Ok(Self::EntityRelativeMove {
@@ -1082,6 +1281,51 @@ impl ClientboundPlayPacket {
             }),
             0x45 => Ok(Self::Title {
                 action: read_title_action(&mut body)?,
+            }),
+            0x04 => Ok(Self::EntityEquipment {
+                entity_id: body.read_var_i32()?,
+                slot: body.read_i16()?,
+                item: read_slot(&mut body)?,
+            }),
+            0x0b => Ok(Self::EntityAnimation {
+                entity_id: body.read_var_i32()?,
+                animation: body.read_u8()?,
+            }),
+            0x0d => Ok(Self::CollectItem {
+                collected_id: body.read_var_i32()?,
+                collector_id: body.read_var_i32()?,
+            }),
+            0x19 => Ok(Self::EntityHeadLook {
+                entity_id: body.read_var_i32()?,
+                head_yaw: angle(body.read_i8()?),
+            }),
+            0x1b => Ok(Self::AttachEntity {
+                entity_id: body.read_i32()?,
+                vehicle_id: body.read_i32()?,
+                leash: body.read_bool()?,
+            }),
+            0x1c => Ok(Self::EntityMetadata {
+                entity_id: body.read_var_i32()?,
+                metadata: read_metadata(&mut body)?,
+            }),
+            0x38 => {
+                let action = body.read_var_i32()?;
+                let count = body.read_var_i32()?;
+                if count < 0 {
+                    return Err(ProtocolError::InvalidData("negative player-list count"));
+                }
+                let mut entries = Vec::with_capacity(count.min(1024) as usize);
+                for _ in 0..count {
+                    let mut uuid = [0u8; 16];
+                    uuid.copy_from_slice(body.read_bytes(16)?);
+                    let action = read_player_list_action(&mut body, action)?;
+                    entries.push(PlayerListItemEntry { uuid, action });
+                }
+                Ok(Self::PlayerListItem { entries })
+            }
+            0x47 => Ok(Self::PlayerListHeaderFooter {
+                header: body.read_string(32767)?,
+                footer: body.read_string(32767)?,
             }),
             id => Ok(Self::Unknown {
                 id,
@@ -1314,7 +1558,10 @@ mod tests {
         body.write_i8(64); // yaw = 90 deg
         body.write_i8(0); // pitch
         body.write_i8(0); // head pitch
-                          // velocity + metadata omitted; decoder ignores trailing bytes.
+        body.write_i16(0); // velocity x
+        body.write_i16(0); // velocity y
+        body.write_i16(0); // velocity z
+        body.write_u8(0x7f); // empty metadata terminator
 
         let packet =
             ClientboundPlayPacket::from_frame(PacketFrame::new(0x0f, body.into_inner())).unwrap();
@@ -1802,6 +2049,179 @@ mod tests {
             | ((z as u64) & 0x03ff_ffff);
         value.to_be_bytes()
     }
+
+    #[test]
+    fn spawn_player_keeps_the_uuid() {
+        let mut body = PacketWriter::new();
+        body.write_var_i32(7);
+        let uuid = [9u8; 16];
+        body.write_bytes(&uuid);
+        body.write_i32(32 * 10); // x = 10.0
+        body.write_i32(32 * 64); // y = 64.0
+        body.write_i32(32 * -3); // z = -3.0
+        body.write_i8(64); // yaw 90°
+        body.write_i8(0);
+        body.write_i16(0); // current item
+        body.write_u8(0x7f); // empty metadata
+
+        let packet =
+            ClientboundPlayPacket::from_frame(PacketFrame::new(0x0c, body.into_inner())).unwrap();
+        match packet {
+            ClientboundPlayPacket::SpawnPlayer {
+                entity_id,
+                uuid: got,
+                x,
+                yaw,
+                ..
+            } => {
+                assert_eq!(entity_id, 7);
+                assert_eq!(got, uuid);
+                assert!((x - 10.0).abs() < 1e-9);
+                assert!((yaw - 90.0).abs() < 1e-3);
+            }
+            other => panic!("expected SpawnPlayer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn player_list_item_add_decodes_profile_and_textures() {
+        let mut body = PacketWriter::new();
+        body.write_var_i32(0); // action ADD
+        body.write_var_i32(1); // one entry
+        body.write_bytes(&[1u8; 16]);
+        body.write_string("Notch");
+        body.write_var_i32(1); // one property
+        body.write_string("textures");
+        body.write_string("base64data");
+        body.write_bool(true);
+        body.write_string("sig");
+        body.write_var_i32(1); // gamemode creative
+        body.write_var_i32(42); // ping
+        body.write_bool(true);
+        body.write_string("{\"text\":\"Notch\"}");
+
+        let packet =
+            ClientboundPlayPacket::from_frame(PacketFrame::new(0x38, body.into_inner())).unwrap();
+        let ClientboundPlayPacket::PlayerListItem { entries } = packet else {
+            panic!("expected PlayerListItem");
+        };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].uuid, [1u8; 16]);
+        match &entries[0].action {
+            PlayerListItemAction::Add {
+                name,
+                properties,
+                gamemode,
+                ping,
+                display_name,
+            } => {
+                assert_eq!(name, "Notch");
+                assert_eq!(properties[0].name, "textures");
+                assert_eq!(properties[0].value, "base64data");
+                assert_eq!(properties[0].signature.as_deref(), Some("sig"));
+                assert_eq!(*gamemode, 1);
+                assert_eq!(*ping, 42);
+                assert_eq!(display_name.as_deref(), Some("{\"text\":\"Notch\"}"));
+            }
+            other => panic!("expected Add, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn entity_metadata_decodes_typed_entries() {
+        let mut body = PacketWriter::new();
+        body.write_var_i32(5);
+        // index 0, type 0 (byte): entity flags
+        body.write_u8((0 << 5) | 0);
+        body.write_i8(0x02); // sneaking bit
+        // index 10, type 5 (slot): item-entity contents
+        body.write_u8((5 << 5) | 10);
+        body.write_i16(1); // stone
+        body.write_u8(3);
+        body.write_i16(0);
+        body.write_u8(0); // no NBT
+        body.write_u8(0x7f); // terminator
+
+        let packet =
+            ClientboundPlayPacket::from_frame(PacketFrame::new(0x1c, body.into_inner())).unwrap();
+        let ClientboundPlayPacket::EntityMetadata { entity_id, metadata } = packet else {
+            panic!("expected EntityMetadata");
+        };
+        assert_eq!(entity_id, 5);
+        assert_eq!(metadata.len(), 2);
+        assert_eq!(metadata[0].index, 0);
+        assert_eq!(metadata[0].value, MetadataValue::Byte(0x02));
+        assert_eq!(metadata[1].index, 10);
+        assert_eq!(
+            metadata[1].value,
+            MetadataValue::Slot(Some(SlotItem {
+                id: 1,
+                count: 3,
+                damage: 0
+            }))
+        );
+    }
+
+    #[test]
+    fn click_window_round_trips_through_write_slot() {
+        let frame = ServerboundPacket::ClickWindow {
+            window_id: 0,
+            slot: 36,
+            button: 0,
+            action_number: 1,
+            mode: 0,
+            clicked_item: Some(SlotItem {
+                id: 1,
+                count: 64,
+                damage: 0,
+            }),
+        }
+        .into_frame();
+        assert_eq!(frame.id, 0x0e);
+        let mut r = PacketReader::new(&frame.body);
+        assert_eq!(r.read_u8().unwrap(), 0);
+        assert_eq!(r.read_i16().unwrap(), 36);
+        assert_eq!(r.read_i8().unwrap(), 0);
+        assert_eq!(r.read_i16().unwrap(), 1);
+        assert_eq!(r.read_i8().unwrap(), 0);
+        assert_eq!(read_slot(&mut r).unwrap(), Some(SlotItem { id: 1, count: 64, damage: 0 }));
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn attach_entity_decodes_ints_and_leash() {
+        let mut body = PacketWriter::new();
+        body.write_i32(5);
+        body.write_i32(-1);
+        body.write_bool(false);
+        let packet =
+            ClientboundPlayPacket::from_frame(PacketFrame::new(0x1b, body.into_inner())).unwrap();
+        assert_eq!(
+            packet,
+            ClientboundPlayPacket::AttachEntity {
+                entity_id: 5,
+                vehicle_id: -1,
+                leash: false,
+            }
+        );
+    }
+
+    #[test]
+    fn creative_action_and_close_window_encode_ids() {
+        let creative = ServerboundPacket::CreativeInventoryAction {
+            slot: 36,
+            clicked_item: None,
+        }
+        .into_frame();
+        assert_eq!(creative.id, 0x10);
+        let mut r = PacketReader::new(&creative.body);
+        assert_eq!(r.read_i16().unwrap(), 36);
+        assert_eq!(r.read_i16().unwrap(), -1); // empty slot
+
+        let close = ServerboundPacket::CloseWindow { window_id: 3 }.into_frame();
+        assert_eq!(close.id, 0x0d);
+        assert_eq!(close.body, vec![3]);
+    }
 }
 
 /// 1.8 sends absolute entity coordinates as fixed-point integers (block * 32).
@@ -1826,6 +2246,105 @@ fn bulk_chunk_data_len(primary_bit_mask: u16, sky_light_sent: bool) -> usize {
         len += sections * 2048;
     }
     len + 256
+}
+
+/// Write a 1.8 Slot: Short id (-1 = empty), Byte count, Short damage, and a
+/// single 0 byte for the absent NBT tag. `recraft` never sends item NBT.
+fn write_slot(body: &mut PacketWriter, item: Option<SlotItem>) {
+    match item {
+        None => body.write_i16(-1),
+        Some(item) => {
+            body.write_i16(item.id);
+            body.write_u8(item.count);
+            body.write_i16(item.damage);
+            body.write_u8(0); // empty NBT
+        }
+    }
+}
+
+/// Read one S38 PlayerListItem entry body for the packet's shared `action`.
+fn read_player_list_action(
+    body: &mut PacketReader<'_>,
+    action: i32,
+) -> Result<PlayerListItemAction> {
+    Ok(match action {
+        0 => {
+            let name = body.read_string(16)?;
+            let prop_count = body.read_var_i32()?;
+            if prop_count < 0 {
+                return Err(ProtocolError::InvalidData("negative property count"));
+            }
+            let mut properties = Vec::with_capacity(prop_count.min(64) as usize);
+            for _ in 0..prop_count {
+                let name = body.read_string(32767)?;
+                let value = body.read_string(32767)?;
+                let signature = if body.read_bool()? {
+                    Some(body.read_string(32767)?)
+                } else {
+                    None
+                };
+                properties.push(PlayerProperty {
+                    name,
+                    value,
+                    signature,
+                });
+            }
+            let gamemode = body.read_var_i32()?;
+            let ping = body.read_var_i32()?;
+            let display_name = if body.read_bool()? {
+                Some(body.read_string(32767)?)
+            } else {
+                None
+            };
+            PlayerListItemAction::Add {
+                name,
+                properties,
+                gamemode,
+                ping,
+                display_name,
+            }
+        }
+        1 => PlayerListItemAction::UpdateGameMode {
+            gamemode: body.read_var_i32()?,
+        },
+        2 => PlayerListItemAction::UpdateLatency {
+            ping: body.read_var_i32()?,
+        },
+        3 => PlayerListItemAction::UpdateDisplayName {
+            display_name: if body.read_bool()? {
+                Some(body.read_string(32767)?)
+            } else {
+                None
+            },
+        },
+        4 => PlayerListItemAction::Remove,
+        _ => return Err(ProtocolError::InvalidData("unknown player-list action")),
+    })
+}
+
+/// Read a 1.8 EntityMetadata array: type-tagged, index-headed entries
+/// terminated by the 0x7f sentinel byte.
+fn read_metadata(body: &mut PacketReader<'_>) -> Result<Vec<MetadataEntry>> {
+    let mut entries = Vec::new();
+    loop {
+        let header = body.read_u8()?;
+        if header == 0x7f {
+            return Ok(entries);
+        }
+        let index = header & 0x1f;
+        let value = match header >> 5 {
+            0 => MetadataValue::Byte(body.read_i8()?),
+            1 => MetadataValue::Short(body.read_i16()?),
+            2 => MetadataValue::Int(body.read_i32()?),
+            3 => MetadataValue::Float(body.read_f32()?),
+            4 => MetadataValue::Str(body.read_string(32767)?),
+            5 => MetadataValue::Slot(read_slot(body)?),
+            6 => MetadataValue::IntVec(body.read_i32()?, body.read_i32()?, body.read_i32()?),
+            7 => MetadataValue::FloatVec(body.read_f32()?, body.read_f32()?, body.read_f32()?),
+            _ => return Err(ProtocolError::InvalidData("unknown metadata type")),
+        };
+        entries.push(MetadataEntry { index, value });
+    }
 }
 
 /// Read a 1.8 Slot: Short id (-1 = empty), then Byte count, Short damage and
