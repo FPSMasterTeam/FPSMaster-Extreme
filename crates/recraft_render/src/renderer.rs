@@ -471,6 +471,12 @@ pub struct Renderer<'window> {
     shaders_enabled: bool,
     shadows_enabled: bool,
     specular_enabled: bool,
+    /// Sun shadow-map target + the depth-only pipelines that fill it.
+    shadow_view: wgpu::TextureView,
+    shadow_solid_pipeline: wgpu::RenderPipeline,
+    shadow_cutout_pipeline: wgpu::RenderPipeline,
+    shadow_uniform_buffer: wgpu::Buffer,
+    shadow_uniform_bind_group: wgpu::BindGroup,
     /// Off-screen world target + upscale-blit resources, present only while
     /// render_scale < 1.0; `None` means the world draws straight to the swapchain.
     offscreen_view: Option<wgpu::TextureView>,
@@ -725,20 +731,66 @@ impl<'window> Renderer<'window> {
             bind_group_layouts: &[&camera_layout, &texture_layout],
             push_constant_ranges: &[],
         });
-        // Shader-pack lighting bind group (chunk group 2): one uniform for now;
-        // the shadow map texture/sampler join it in the shadow step.
+        // Sun shadow map: a depth target rendered from the light's view and
+        // sampled (comparison/PCF) by the chunk shader.
+        let shadow_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("shadow-map"),
+            size: wgpu::Extent3d {
+                width: SHADOW_DIM,
+                height: SHADOW_DIM,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: SHADOW_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let shadow_view = shadow_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let shadow_compare_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("shadow-compare-sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            compare: Some(wgpu::CompareFunction::LessEqual),
+            ..Default::default()
+        });
+
+        // Shader-pack lighting bind group (chunk group 2): the lighting uniform
+        // plus the shadow map + its comparison sampler.
         let lighting_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("lighting-layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+                    count: None,
+                },
+            ],
         });
         let lighting_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("lighting-uniform"),
@@ -749,10 +801,20 @@ impl<'window> Renderer<'window> {
         let lighting_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("lighting-bind-group"),
             layout: &lighting_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: lighting_buffer.as_entire_binding(),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: lighting_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&shadow_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&shadow_compare_sampler),
+                },
+            ],
         });
         // Chunk colour pipelines also bind the lighting group (group 2).
         let lit_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1471,6 +1533,96 @@ impl<'window> Renderer<'window> {
             multiview: None,
         });
 
+        // Sun shadow-map pass: render chunk depth from the light's view. Solid is
+        // depth-only (no fragment); cutout alpha-tests so leaves cast shaped
+        // shadows. Both target only a depth attachment.
+        let shadow_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("shadow-shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shader/shadow.wgsl").into()),
+        });
+        let shadow_uniform_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("shadow-uniform-layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let shadow_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("shadow-uniform"),
+            size: 64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let shadow_uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("shadow-uniform-bind-group"),
+            layout: &shadow_uniform_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: shadow_uniform_buffer.as_entire_binding(),
+            }],
+        });
+        let shadow_depth_state = wgpu::DepthStencilState {
+            format: SHADOW_FORMAT,
+            depth_write_enabled: true,
+            depth_compare: wgpu::CompareFunction::Less,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        };
+        let shadow_solid_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("shadow-solid-layout"),
+            bind_group_layouts: &[&shadow_uniform_layout],
+            push_constant_ranges: &[],
+        });
+        let shadow_solid_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("shadow-solid-pipeline"),
+            layout: Some(&shadow_solid_layout),
+            vertex: wgpu::VertexState {
+                module: &shadow_shader,
+                entry_point: "vs_main",
+                buffers: &[ChunkVertex::layout()],
+            },
+            fragment: None,
+            primitive: wgpu::PrimitiveState {
+                cull_mode: Some(wgpu::Face::Back),
+                ..Default::default()
+            },
+            depth_stencil: Some(shadow_depth_state.clone()),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+        });
+        let shadow_cutout_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("shadow-cutout-layout"),
+            bind_group_layouts: &[&shadow_uniform_layout, &texture_layout],
+            push_constant_ranges: &[],
+        });
+        let shadow_cutout_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("shadow-cutout-pipeline"),
+            layout: Some(&shadow_cutout_layout),
+            vertex: wgpu::VertexState {
+                module: &shadow_shader,
+                entry_point: "vs_main",
+                buffers: &[ChunkVertex::layout()],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shadow_shader,
+                entry_point: "fs_cutout",
+                targets: &[],
+            }),
+            primitive: wgpu::PrimitiveState {
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(shadow_depth_state),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+        });
+
         let chunk_solid = ChunkLayer::new("mega-solid");
         let chunk_cutout = ChunkLayer::new("mega-cutout");
         let chunk_transparent = ChunkLayer::new("mega-transparent");
@@ -1542,6 +1694,11 @@ impl<'window> Renderer<'window> {
             shaders_enabled: false,
             shadows_enabled: false,
             specular_enabled: false,
+            shadow_view,
+            shadow_solid_pipeline,
+            shadow_cutout_pipeline,
+            shadow_uniform_buffer,
+            shadow_uniform_bind_group,
             offscreen_view: None,
             blit_bind_group: None,
             blit_pipeline,
@@ -2226,20 +2383,45 @@ impl<'window> Renderer<'window> {
         let sb = sky.sun_brightness;
         let cam = camera.position;
         let on = |b: bool| if b { 1.0 } else { 0.0 };
+        let shadows_on = self.shaders_enabled && self.shadows_enabled;
+        // Orthographic light frustum centred just ahead of the camera, viewed
+        // from the sun direction — covers the near scene the player actually sees.
+        let light_view_proj = if shadows_on {
+            let center = camera.position + camera.direction() * (SHADOW_RADIUS * 0.5);
+            let eye = center + sun_dir * (SHADOW_RADIUS * 2.5);
+            let up = if sun_dir.y.abs() > 0.99 { Vec3::Z } else { Vec3::Y };
+            let view = Mat4::look_at_rh(eye, center, up);
+            let proj = Mat4::orthographic_rh(
+                -SHADOW_RADIUS,
+                SHADOW_RADIUS,
+                -SHADOW_RADIUS,
+                SHADOW_RADIUS,
+                0.1,
+                SHADOW_RADIUS * 5.0,
+            );
+            proj * view
+        } else {
+            Mat4::IDENTITY
+        };
+        self.queue.write_buffer(
+            &self.shadow_uniform_buffer,
+            0,
+            bytemuck::bytes_of(&light_view_proj.to_cols_array_2d()),
+        );
         self.queue.write_buffer(
             &self.lighting_buffer,
             0,
             bytemuck::bytes_of(&LightingUniform {
-                light_view_proj: Mat4::IDENTITY.to_cols_array_2d(),
+                light_view_proj: light_view_proj.to_cols_array_2d(),
                 sun_dir: [sun_dir.x, sun_dir.y, sun_dir.z, 0.0],
                 sun_color: [1.0 * sb, 0.96 * sb, 0.88 * sb, 0.0],
                 ambient: [0.45, 0.48, 0.55, 0.0],
                 camera_pos: [cam.x, cam.y, cam.z, 0.0],
                 flags: [
                     on(self.shaders_enabled),
-                    on(self.shaders_enabled && self.shadows_enabled),
+                    on(shadows_on),
                     on(self.shaders_enabled && self.specular_enabled),
-                    0.0,
+                    1.0 / SHADOW_DIM as f32,
                 ],
             }),
         );
@@ -2292,6 +2474,52 @@ impl<'window> Renderer<'window> {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("frame-encoder"),
             });
+
+        // Sun shadow pass: render every loaded chunk section's depth from the
+        // light's view (no frustum cull, so off-screen casters still shadow the
+        // visible scene). Per-section draws against the paged mega-buffers.
+        if shadows_on {
+            let mut sp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("shadow-pass"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.shadow_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                occlusion_query_set: None,
+                timestamp_writes: None,
+            });
+            sp.set_bind_group(0, &self.shadow_uniform_bind_group, &[]);
+            // Solid casters (depth only).
+            sp.set_pipeline(&self.shadow_solid_pipeline);
+            for slot in self.chunk_solid.slots.values() {
+                let page = &self.chunk_solid.pages[slot.page as usize];
+                sp.set_vertex_buffer(0, page.vertex_buf.slice(..));
+                sp.set_index_buffer(page.index_buf.slice(..), wgpu::IndexFormat::Uint16);
+                sp.draw_indexed(
+                    slot.index_offset..slot.index_offset + slot.index_count,
+                    slot.vertex_offset as i32,
+                    0..1,
+                );
+            }
+            // Cutout casters (alpha-tested) — needs the atlas at group 1.
+            sp.set_pipeline(&self.shadow_cutout_pipeline);
+            sp.set_bind_group(1, &self.texture_bind_groups[self.mipmap_levels as usize], &[]);
+            for slot in self.chunk_cutout.slots.values() {
+                let page = &self.chunk_cutout.pages[slot.page as usize];
+                sp.set_vertex_buffer(0, page.vertex_buf.slice(..));
+                sp.set_index_buffer(page.index_buf.slice(..), wgpu::IndexFormat::Uint16);
+                sp.draw_indexed(
+                    slot.index_offset..slot.index_offset + slot.index_count,
+                    slot.vertex_offset as i32,
+                    0..1,
+                );
+            }
+        }
 
         let mut visible_chunks = 0u32;
         let mut draw_calls = 0u32;
@@ -3047,6 +3275,11 @@ fn pick_present_mode(present_modes: &[wgpu::PresentMode], vsync: bool) -> wgpu::
 }
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24Plus;
+/// Sun shadow map resolution and format (quality-first; cheap on a dGPU).
+const SHADOW_DIM: u32 = 2048;
+const SHADOW_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+/// World-space half-extent of the shadow frustum centred near the camera.
+const SHADOW_RADIUS: f32 = 96.0;
 
 /// A single-binding bind-group layout holding one uniform buffer.
 fn create_uniform_layout(

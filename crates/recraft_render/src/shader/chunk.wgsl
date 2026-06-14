@@ -28,6 +28,10 @@ struct Lighting {
 
 @group(2) @binding(0)
 var<uniform> lighting: Lighting;
+@group(2) @binding(1)
+var shadow_map: texture_depth_2d;
+@group(2) @binding(2)
+var shadow_sampler: sampler_comparison;
 
 struct VertexInput {
     // xyz: world position × 64 as fixed-point i16.
@@ -68,6 +72,28 @@ fn day_night(light: vec2<f32>) -> f32 {
     return max(light.x * camera.sky_brightness, light.y);
 }
 
+// Fraction of the sun visible at this world position (1 = lit, 0 = shadowed),
+// 3×3 PCF. Outside the shadow map's range everything is lit.
+fn sun_shadow(world_pos: vec3<f32>, ndotl: f32) -> f32 {
+    let lc = lighting.light_view_proj * vec4<f32>(world_pos, 1.0);
+    let ndc = lc.xyz / lc.w;
+    if (ndc.x < -1.0 || ndc.x > 1.0 || ndc.y < -1.0 || ndc.y > 1.0 || ndc.z > 1.0) {
+        return 1.0;
+    }
+    let uv = vec2<f32>(ndc.x * 0.5 + 0.5, ndc.y * -0.5 + 0.5);
+    let bias = clamp(0.0015 * (1.0 - ndotl), 0.0004, 0.003);
+    let depth = ndc.z - bias;
+    let texel = lighting.flags.w;
+    var sum = 0.0;
+    for (var dy = -1; dy <= 1; dy = dy + 1) {
+        for (var dx = -1; dx <= 1; dx = dx + 1) {
+            let off = vec2<f32>(f32(dx), f32(dy)) * texel;
+            sum = sum + textureSampleCompare(shadow_map, shadow_sampler, uv + off, depth);
+        }
+    }
+    return sum / 9.0;
+}
+
 // Apply the shader-pack lighting model to an albedo colour. Falls back to the
 // vanilla flat day/night brightness when shaders are disabled.
 fn apply_lighting(albedo: vec3<f32>, in: VertexOutput) -> vec3<f32> {
@@ -76,7 +102,10 @@ fn apply_lighting(albedo: vec3<f32>, in: VertexOutput) -> vec3<f32> {
     }
     let n = normalize(in.normal);
     let ndotl = max(dot(n, lighting.sun_dir.xyz), 0.0);
-    let shadow = 1.0;           // real shadow map added in the next step
+    var shadow = 1.0;
+    if (lighting.flags.y > 0.5) {
+        shadow = sun_shadow(in.world_pos, ndotl);
+    }
     let sky = in.light.x;       // skylight 0..1 — gates the sun (indoors = none)
     let block = in.light.y;     // blocklight 0..1 — torches/lava
     let ambient = lighting.ambient.rgb * (0.35 + 0.65 * sky);
