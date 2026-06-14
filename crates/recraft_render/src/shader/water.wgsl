@@ -145,7 +145,8 @@ fn sky_reflection(dir: vec3<f32>) -> vec3<f32> {
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let texel = textureSample(block_atlas, block_sampler, in.uv);
-    var base = texel.rgb * in.color.rgb;
+    // Deeper, darker water body: darken and tint the texel toward a deep blue.
+    var base = texel.rgb * in.color.rgb * vec3<f32>(0.30, 0.45, 0.62);
     var alpha = texel.a * in.color.a;
 
     // Plain translucent water when the shader pack is off.
@@ -164,15 +165,17 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let diffuse = lighting.sun_color.rgb * (ndotl * sky * 0.5);
     var color = base * (ambient + diffuse);
 
-    // Fresnel: more mirror-like at grazing angles.
-    let fresnel = clamp(0.02 + 0.98 * pow(1.0 - max(dot(n, view_dir), 0.0), 5.0), 0.0, 1.0);
+    // Fresnel: more mirror-like at grazing angles. Raised floor so even a
+    // top-down view keeps a clear reflection.
+    let fresnel = clamp(0.12 + 0.88 * pow(1.0 - max(dot(n, view_dir), 0.0), 5.0), 0.0, 1.0);
     let refl_dir = reflect(-view_dir, n);
     // Screen-space reflection of the terrain, falling back to the sky where the
     // ray leaves the screen or hits nothing.
     var reflection = sky_reflection(refl_dir);
     let ssr = screen_space_reflection(in.world_pos + n * 0.05, refl_dir);
     reflection = mix(reflection, ssr.rgb, ssr.a);
-    color = mix(color, reflection, fresnel * 0.85);
+    // Stronger reflection overall.
+    color = mix(color, reflection, fresnel);
 
     // Tight sun specular highlight — the sparkle ("波光粼粼").
     let half_dir = normalize(lighting.sun_dir.xyz + view_dir);
@@ -189,7 +192,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         color = mix(color, lighting.fog_color.rgb, f);
     }
 
-    // Push alpha up where the reflection is strong so it reads as a surface.
-    alpha = clamp(alpha + fresnel * 0.3, 0.0, 1.0);
+    // Lower visibility (less see-through): a high opacity floor, rising toward
+    // opaque at grazing angles where the reflection dominates.
+    alpha = clamp(max(alpha, 0.72) + fresnel * 0.28, 0.0, 1.0);
     return vec4<f32>(color, alpha);
 }
