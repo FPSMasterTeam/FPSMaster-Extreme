@@ -15,9 +15,30 @@ struct Params {
     s: vec4<f32>,
 };
 
+struct PostCamera {
+    inv_view_proj: mat4x4<f32>,
+    prev_view_proj: mat4x4<f32>,
+    camera_pos: vec4<f32>,
+};
+
 @group(0) @binding(0) var scene_tex: texture_2d<f32>;
 @group(0) @binding(1) var scene_sampler: sampler;
 @group(0) @binding(2) var<uniform> params: Params;
+@group(0) @binding(3) var depth_tex: texture_depth_2d;
+@group(0) @binding(4) var<uniform> cam: PostCamera;
+
+// Reconstruct world position from a screen UV + non-linear depth.
+fn world_from_depth(uv: vec2<f32>, depth: f32) -> vec3<f32> {
+    let clip = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
+    let world = cam.inv_view_proj * clip;
+    return world.xyz / world.w;
+}
+
+fn load_depth(uv: vec2<f32>) -> f32 {
+    let dims = vec2<f32>(textureDimensions(depth_tex));
+    let px = vec2<i32>(clamp(uv * dims, vec2<f32>(0.0), dims - 1.0));
+    return textureLoad(depth_tex, px, 0);
+}
 
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
@@ -70,6 +91,52 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         );
     } else {
         color = textureSample(scene_tex, scene_sampler, in.uv).rgb;
+    }
+
+    // Depth of field: blur by circle-of-confusion from the distance between this
+    // pixel and the auto-focused screen centre. r.z is the strength (0 = off).
+    if (params.r.z > 0.0) {
+        let texel = params.p.zw;
+        let focus_w = world_from_depth(vec2<f32>(0.5, 0.5), load_depth(vec2<f32>(0.5, 0.5)));
+        let focus_dist = length(focus_w - cam.camera_pos.xyz);
+        let pix_w = world_from_depth(in.uv, load_depth(in.uv));
+        let pix_dist = length(pix_w - cam.camera_pos.xyz);
+        let coc = clamp(abs(pix_dist - focus_dist) / max(focus_dist, 1.0), 0.0, 1.0);
+        let radius = coc * params.r.z * 8.0;
+        if (radius > 0.5) {
+            var acc = color;
+            var n = 1.0;
+            for (var k = 0; k < 8; k = k + 1) {
+                let a = f32(k) / 8.0 * 6.2831853;
+                let o = vec2<f32>(cos(a), sin(a)) * radius * texel;
+                acc += textureSample(scene_tex, scene_sampler, in.uv + o).rgb;
+                n += 1.0;
+            }
+            color = acc / n;
+        }
+    }
+
+    // Motion blur: smear along the screen-space velocity from reprojecting this
+    // pixel into the previous frame. r.w is the strength (0 = off).
+    if (params.r.w > 0.0) {
+        let pix_w = world_from_depth(in.uv, load_depth(in.uv));
+        let prev_clip = cam.prev_view_proj * vec4<f32>(pix_w, 1.0);
+        let prev_uv = vec2<f32>(
+            prev_clip.x / prev_clip.w * 0.5 + 0.5,
+            0.5 - prev_clip.y / prev_clip.w * 0.5,
+        );
+        var vel = (in.uv - prev_uv) * params.r.w;
+        vel = clamp(vel, vec2<f32>(-0.04), vec2<f32>(0.04));
+        if (dot(vel, vel) > 1e-9) {
+            var acc = color;
+            var n = 1.0;
+            for (var k = 1; k <= 6; k = k + 1) {
+                let t = f32(k) / 6.0;
+                acc += textureSample(scene_tex, scene_sampler, in.uv - vel * t).rgb;
+                n += 1.0;
+            }
+            color = acc / n;
+        }
     }
 
     if (params.q.w > 0.5) {

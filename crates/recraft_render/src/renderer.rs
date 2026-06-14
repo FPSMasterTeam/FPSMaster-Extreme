@@ -67,6 +67,16 @@ struct LightingUniform {
     fog_params: [f32; 4],
 }
 
+/// Uniform for the post pass's depth-aware effects (DoF / motion blur):
+/// reconstruct world position from depth, and reproject into the previous frame.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct PostCamera {
+    inv_view_proj: [[f32; 4]; 4],
+    prev_view_proj: [[f32; 4]; 4],
+    camera_pos: [f32; 4],
+}
+
 /// Uniform for the fullscreen sky-gradient pass: the inverse rotation-only
 /// view-projection (to reconstruct a per-pixel view ray) plus the time-of-day
 /// gradient and sunset-glow colors.
@@ -501,7 +511,11 @@ pub struct Renderer<'window> {
     post_layout: wgpu::BindGroupLayout,
     post_sampler: wgpu::Sampler,
     post_params_buffer: wgpu::Buffer,
+    /// Camera uniform for the post pass's depth-aware effects (DoF / motion blur).
+    post_camera_buffer: wgpu::Buffer,
     post_bind_group: Option<wgpu::BindGroup>,
+    /// Previous frame's view-projection, for motion-blur reprojection.
+    prev_view_proj: Mat4,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     chunk_solid: ChunkLayer,
@@ -1487,6 +1501,28 @@ impl<'window> Renderer<'window> {
                     },
                     count: None,
                 },
+                // World depth (for DoF / motion blur).
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // Post camera uniform (inv-VP, prev-VP, camera pos).
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
         let post_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -1498,6 +1534,12 @@ impl<'window> Renderer<'window> {
         let post_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("post-params"),
             size: 64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let post_camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("post-camera"),
+            size: std::mem::size_of::<PostCamera>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -1709,7 +1751,9 @@ impl<'window> Renderer<'window> {
             post_layout,
             post_sampler,
             post_params_buffer,
+            post_camera_buffer,
             post_bind_group: None,
+            prev_view_proj: Mat4::IDENTITY,
             camera_buffer,
             camera_bind_group,
             chunk_solid,
@@ -1910,6 +1954,14 @@ impl<'window> Renderer<'window> {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: self.post_params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&self.depth_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: self.post_camera_buffer.as_entire_binding(),
                 },
             ],
         }));
@@ -2455,14 +2507,27 @@ impl<'window> Renderer<'window> {
         // chunk lightmap (sky_brightness), the sky-gradient colors and the
         // sun/moon/star geometry.
         let sky = crate::sky::sky_colors(self.world_time);
+        let view_proj = camera.view_projection();
         self.queue.write_buffer(
             &self.camera_buffer,
             0,
             bytemuck::bytes_of(&CameraUniform::new(
-                camera.view_projection().to_cols_array_2d(),
+                view_proj.to_cols_array_2d(),
                 sky.sun_brightness,
             )),
         );
+        // Post-pass camera (depth-aware DoF / motion blur): unproject depth and
+        // reproject into last frame. Updated before prev is overwritten.
+        self.queue.write_buffer(
+            &self.post_camera_buffer,
+            0,
+            bytemuck::bytes_of(&PostCamera {
+                inv_view_proj: view_proj.inverse().to_cols_array_2d(),
+                prev_view_proj: self.prev_view_proj.to_cols_array_2d(),
+                camera_pos: [camera.position.x, camera.position.y, camera.position.z, 0.0],
+            }),
+        );
+        self.prev_view_proj = view_proj;
         self.prepare_sky(camera, &sky);
 
         // Shader-pack lighting uniform: directional sun (day/night scaled) +
@@ -2670,7 +2735,9 @@ impl<'window> Renderer<'window> {
                     view: &self.depth_view,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Discard,
+                        // Stored (not discarded) so the post pass can sample world
+                        // depth for depth-of-field and motion blur.
+                        store: wgpu::StoreOp::Store,
                     }),
                     stencil_ops: None,
                 }),
@@ -3390,7 +3457,9 @@ fn pick_present_mode(present_modes: &[wgpu::PresentMode], vsync: bool) -> wgpu::
     }
 }
 
-const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24Plus;
+// Depth32Float (not Depth24Plus) so the post pass can sample the world depth for
+// depth-of-field and motion blur (Depth24Plus is not reliably loadable).
+const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 /// Linear HDR format for the off-screen world target, so the post pass can
 /// tone-map highlights (sun/specular/bloom) above 1.0 instead of clipping.
 const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
@@ -3638,7 +3707,7 @@ fn create_depth_view_sized(device: &wgpu::Device, width: u32, height: u32) -> wg
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: DEPTH_FORMAT,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     });
     texture.create_view(&wgpu::TextureViewDescriptor::default())
