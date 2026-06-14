@@ -9,3 +9,7 @@
 /local_assets/
 /main/
 CLAUDE.md
+
+# Runtime artifacts
+recraft_options.txt
+logs/
