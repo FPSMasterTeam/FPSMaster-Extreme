@@ -512,6 +512,13 @@ pub struct Renderer<'window> {
     /// here, then the post pass tone-maps it to the sRGB swapchain. Sized by the
     /// render scale.
     offscreen_view: Option<wgpu::TextureView>,
+    /// The off-screen texture itself, copied to `scene_copy` before the water
+    /// pass so water can sample the opaque scene for screen-space reflection.
+    offscreen_tex: Option<wgpu::Texture>,
+    scene_copy_tex: Option<wgpu::Texture>,
+    /// Water SSR bind group (scene copy + depth + camera); rebuilt with targets.
+    water_ssr_layout: wgpu::BindGroupLayout,
+    water_ssr_bind_group: Option<wgpu::BindGroup>,
     /// Post pass: HDR scene -> ACES tone-map + grade (+ optional bloom, + upscale).
     bloom_enabled: bool,
     post_pipeline: wgpu::RenderPipeline,
@@ -875,6 +882,54 @@ impl<'window> Renderer<'window> {
             bind_group_layouts: &[&camera_layout, &texture_layout, &lighting_layout],
             push_constant_ranges: &[],
         });
+        // Water SSR group (3): copied opaque scene colour + sampler + world depth
+        // + the post camera uniform (inv-VP / eye), for screen-space reflection.
+        let water_ssr_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("water-ssr-layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let water_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("water-pipeline-layout"),
+            bind_group_layouts: &[&camera_layout, &texture_layout, &lighting_layout, &water_ssr_layout],
+            push_constant_ranges: &[],
+        });
         let depth_view = create_depth_view(&device, &config);
         let window_depth_view = create_depth_view(&device, &config);
 
@@ -1199,7 +1254,7 @@ impl<'window> Renderer<'window> {
         // blended, depth-tested but no depth write (like the translucent layer).
         let water_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("water-pipeline"),
-            layout: Some(&lit_pipeline_layout),
+            layout: Some(&water_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &water_shader,
                 entry_point: "vs_main",
@@ -1803,6 +1858,10 @@ impl<'window> Renderer<'window> {
             shadow_uniform_buffer,
             shadow_uniform_bind_group,
             offscreen_view: None,
+            offscreen_tex: None,
+            scene_copy_tex: None,
+            water_ssr_layout,
+            water_ssr_bind_group: None,
             bloom_enabled: false,
             post_pipeline,
             post_layout,
@@ -1993,10 +2052,51 @@ impl<'window> Renderer<'window> {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: HDR_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
         let view = color.create_view(&wgpu::TextureViewDescriptor::default());
+        // Copy of the opaque scene the water pass samples for SSR.
+        let scene_copy = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("scene-copy-hdr"),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: HDR_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let scene_copy_view = scene_copy.create_view(&wgpu::TextureViewDescriptor::default());
+        self.water_ssr_bind_group = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("water-ssr-bind-group"),
+            layout: &self.water_ssr_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&scene_copy_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.post_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&self.depth_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.post_camera_buffer.as_entire_binding(),
+                },
+            ],
+        }));
+        self.scene_copy_tex = Some(scene_copy);
         self.post_bind_group = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("post-bind-group"),
             layout: &self.post_layout,
@@ -2024,6 +2124,7 @@ impl<'window> Renderer<'window> {
             ],
         }));
         self.offscreen_view = Some(view);
+        self.offscreen_tex = Some(color);
         self.update_post_params();
     }
 
@@ -2749,6 +2850,10 @@ impl<'window> Renderer<'window> {
         let mut visible_chunks = 0u32;
         let mut draw_calls = 0u32;
         let mut chunk_indices = 0u32;
+        // Water draws (page index + command) captured during collection and
+        // issued in a separate pass after the opaque scene is copied, so the
+        // water shader can sample it for screen-space reflection.
+        let mut water_draws: Vec<(usize, IndirectCmd)> = Vec::new();
 
         // Bracket the whole frame pass with timestamps when measuring this frame.
         let timestamp_writes = self
@@ -2822,7 +2927,7 @@ impl<'window> Renderer<'window> {
             // drawn after the sky so water/glass still blends over it.
             let mut cmd_offset = 0u64;
             let cmd_stride = std::mem::size_of::<IndirectCmd>() as u64;
-            let (trans_batches, water_batches) = if !self.chunk_sections.is_empty() {
+            let trans_batches = if !self.chunk_sections.is_empty() {
                 let frustum = camera.frustum();
                 let visible: Vec<SectionPos> = self
                     .chunk_sections
@@ -2839,14 +2944,21 @@ impl<'window> Renderer<'window> {
                     collect_layer_batches(&self.chunk_cutout, &visible, &mut chunk_indices);
                 let trans_batches =
                     collect_layer_batches(&self.chunk_transparent, &visible, &mut chunk_indices);
+                // Water is drawn in its own later pass (SSR), not via the shared
+                // indirect buffer — capture its draws here.
                 let water_batches =
                     collect_layer_batches(&self.chunk_water, &visible, &mut chunk_indices);
+                for b in &water_batches {
+                    for c in &b.cmds {
+                        water_draws.push((b.page, *c));
+                    }
+                }
 
                 // Pack all commands into the indirect buffer (order: solid,
-                // cutout, transparent, water — matching the draw order so the
-                // running cmd_offset lines up).
+                // cutout, transparent — matching the draw order so the running
+                // cmd_offset lines up).
                 let total_cmds: usize = solid_batches.iter().chain(&cutout_batches)
-                    .chain(&trans_batches).chain(&water_batches)
+                    .chain(&trans_batches)
                     .map(|b| b.cmds.len()).sum();
                 if total_cmds > 0 {
                     let cmd_size = std::mem::size_of::<IndirectCmd>() as u64;
@@ -2861,7 +2973,7 @@ impl<'window> Renderer<'window> {
                     }
                     let mut all_cmds = Vec::with_capacity(total_cmds);
                     for b in solid_batches.iter().chain(&cutout_batches)
-                        .chain(&trans_batches).chain(&water_batches) {
+                        .chain(&trans_batches) {
                         all_cmds.extend_from_slice(&b.cmds);
                     }
                     self.queue.write_buffer(
@@ -2945,9 +3057,9 @@ impl<'window> Renderer<'window> {
                     }
                 }
 
-                (trans_batches, water_batches)
+                trans_batches
             } else {
-                (Vec::new(), Vec::new())
+                Vec::new()
             };
 
             // Sky gradient (fullscreen view-ray) then the sun/moon/stars, drawn
@@ -2987,40 +3099,6 @@ impl<'window> Renderer<'window> {
                 });
                 for batch in &trans_batches {
                     let page = &self.chunk_transparent.pages[batch.page];
-                    pass.set_vertex_buffer(0, page.vertex_buf.slice(..));
-                    pass.set_index_buffer(page.index_buf.slice(..), wgpu::IndexFormat::Uint16);
-                    let count = batch.cmds.len() as u32;
-                    draw_calls += count;
-                    if self.multi_draw {
-                        pass.multi_draw_indexed_indirect(&self.indirect_buf, cmd_offset, count);
-                    } else {
-                        for c in &batch.cmds {
-                            pass.draw_indexed(c.first_index..c.first_index + c.index_count, c.base_vertex, 0..1);
-                        }
-                    }
-                    cmd_offset += count as u64 * cmd_stride;
-                }
-            }
-
-            // Water surfaces: dedicated shader (animated waves + Fresnel
-            // reflection) over the sky and world. Its indirect commands are
-            // packed after the transparent ones, so cmd_offset already points at
-            // them. Fast graphics falls back to the opaque water pipeline.
-            if !water_batches.is_empty() && !self.debug_skip.water {
-                pass.set_bind_group(0, &self.camera_bind_group, &[]);
-                pass.set_bind_group(
-                    1,
-                    &self.texture_bind_groups[self.mipmap_levels as usize],
-                    &[],
-                );
-                pass.set_bind_group(2, &self.lighting_bind_group, &[]);
-                pass.set_pipeline(if self.fancy_graphics {
-                    &self.water_pipeline
-                } else {
-                    &self.water_opaque_pipeline
-                });
-                for batch in &water_batches {
-                    let page = &self.chunk_water.pages[batch.page];
                     pass.set_vertex_buffer(0, page.vertex_buf.slice(..));
                     pass.set_index_buffer(page.index_buf.slice(..), wgpu::IndexFormat::Uint16);
                     let count = batch.cmds.len() as u32;
@@ -3106,6 +3184,78 @@ impl<'window> Renderer<'window> {
             }
             } // else (non-panorama sky + world content)
         }
+
+        // Water pass: reflective water over the now-rendered opaque scene. Fancy
+        // graphics copies the scene colour first so the water shader can sample
+        // it for screen-space reflection; Fast graphics draws plain water.
+        if !water_draws.is_empty() && !self.debug_skip.water {
+            let use_ssr = self.fancy_graphics
+                && self.offscreen_tex.is_some()
+                && self.scene_copy_tex.is_some()
+                && self.water_ssr_bind_group.is_some();
+            if use_ssr {
+                let (w, h) = self.scaled_dims();
+                encoder.copy_texture_to_texture(
+                    wgpu::ImageCopyTexture {
+                        texture: self.offscreen_tex.as_ref().unwrap(),
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::ImageCopyTexture {
+                        texture: self.scene_copy_tex.as_ref().unwrap(),
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::Extent3d {
+                        width: w,
+                        height: h,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
+            let mut wp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("water-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                occlusion_query_set: None,
+                timestamp_writes: None,
+            });
+            wp.set_pipeline(if use_ssr {
+                &self.water_pipeline
+            } else {
+                &self.water_opaque_pipeline
+            });
+            wp.set_bind_group(0, &self.camera_bind_group, &[]);
+            wp.set_bind_group(1, &self.texture_bind_groups[self.mipmap_levels as usize], &[]);
+            wp.set_bind_group(2, &self.lighting_bind_group, &[]);
+            if use_ssr {
+                wp.set_bind_group(3, self.water_ssr_bind_group.as_ref().unwrap(), &[]);
+            }
+            for (page, c) in &water_draws {
+                let p = &self.chunk_water.pages[*page];
+                wp.set_vertex_buffer(0, p.vertex_buf.slice(..));
+                wp.set_index_buffer(p.index_buf.slice(..), wgpu::IndexFormat::Uint16);
+                wp.draw_indexed(c.first_index..c.first_index + c.index_count, c.base_vertex, 0..1);
+                draw_calls += 1;
+            }
+        }
+
         // Post pass: HDR off-screen world → ACES tone-map + grade (+ optional
         // bloom, + upscale) into the sRGB swapchain. Always runs.
         if let Some(bind) = &self.post_bind_group {

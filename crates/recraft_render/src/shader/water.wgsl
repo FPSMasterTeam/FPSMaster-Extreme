@@ -27,6 +27,48 @@ struct Lighting {
 @group(2) @binding(1) var shadow_map: texture_depth_2d;
 @group(2) @binding(2) var shadow_sampler: sampler_comparison;
 
+// Group 3: screen-space reflection inputs (copied opaque scene + depth + camera).
+struct PostCamera {
+    inv_view_proj: mat4x4<f32>,
+    prev_view_proj: mat4x4<f32>,
+    camera_pos: vec4<f32>,
+};
+@group(3) @binding(0) var scene_tex: texture_2d<f32>;
+@group(3) @binding(1) var scene_sampler: sampler;
+@group(3) @binding(2) var depth_tex: texture_depth_2d;
+@group(3) @binding(3) var<uniform> ssr_cam: PostCamera;
+
+// March the reflected ray through the depth buffer. Returns reflected colour in
+// rgb and a hit confidence in a (0 = miss). World-space steps that grow with
+// distance, projected to screen each step and tested against stored depth.
+fn screen_space_reflection(origin: vec3<f32>, dir: vec3<f32>) -> vec4<f32> {
+    let dims = vec2<f32>(textureDimensions(depth_tex));
+    var p = origin;
+    var step = 0.4;
+    for (var i = 0; i < 28; i = i + 1) {
+        p = p + dir * step;
+        step = step * 1.16;
+        let clip = camera.view_proj * vec4<f32>(p, 1.0);
+        if (clip.w <= 0.0) {
+            break;
+        }
+        let ndc = clip.xyz / clip.w;
+        let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+        if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+            break;
+        }
+        let px = vec2<i32>(clamp(uv * dims, vec2<f32>(0.0), dims - 1.0));
+        let scene_depth = textureLoad(depth_tex, px, 0);
+        let delta = ndc.z - scene_depth;
+        // Ray went just behind the stored surface → intersection (thickness-bounded).
+        if (delta > 0.00002 && delta < 0.0025) {
+            let edge = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
+            return vec4<f32>(textureSample(scene_tex, scene_sampler, uv).rgb, smoothstep(0.0, 0.12, edge));
+        }
+    }
+    return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+}
+
 struct VertexInput {
     @location(0) pos_light: vec4<i32>,
     @location(1) color: vec4<f32>,
@@ -125,7 +167,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Fresnel: more mirror-like at grazing angles.
     let fresnel = clamp(0.02 + 0.98 * pow(1.0 - max(dot(n, view_dir), 0.0), 5.0), 0.0, 1.0);
     let refl_dir = reflect(-view_dir, n);
-    let reflection = sky_reflection(refl_dir);
+    // Screen-space reflection of the terrain, falling back to the sky where the
+    // ray leaves the screen or hits nothing.
+    var reflection = sky_reflection(refl_dir);
+    let ssr = screen_space_reflection(in.world_pos + n * 0.05, refl_dir);
+    reflection = mix(reflection, ssr.rgb, ssr.a);
     color = mix(color, reflection, fresnel * 0.85);
 
     // Tight sun specular highlight — the sparkle ("波光粼粼").
