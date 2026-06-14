@@ -484,19 +484,17 @@ pub struct Renderer<'window> {
     shadow_cutout_pipeline: wgpu::RenderPipeline,
     shadow_uniform_buffer: wgpu::Buffer,
     shadow_uniform_bind_group: wgpu::BindGroup,
-    /// Off-screen world target + upscale-blit resources, present only while
-    /// render_scale < 1.0; `None` means the world draws straight to the swapchain.
+    /// Linear HDR off-screen world target (always present): the world renders
+    /// here, then the post pass tone-maps it to the sRGB swapchain. Sized by the
+    /// render scale.
     offscreen_view: Option<wgpu::TextureView>,
-    blit_bind_group: Option<wgpu::BindGroup>,
-    blit_pipeline: wgpu::RenderPipeline,
-    blit_sampler: wgpu::Sampler,
-    blit_layout: wgpu::BindGroupLayout,
-    /// Single-pass bloom composite (replaces the blit when bloom is on).
+    /// Post pass: HDR scene -> ACES tone-map + grade (+ optional bloom, + upscale).
     bloom_enabled: bool,
-    bloom_pipeline: wgpu::RenderPipeline,
-    bloom_layout: wgpu::BindGroupLayout,
-    bloom_params_buffer: wgpu::Buffer,
-    bloom_bind_group: Option<wgpu::BindGroup>,
+    post_pipeline: wgpu::RenderPipeline,
+    post_layout: wgpu::BindGroupLayout,
+    post_sampler: wgpu::Sampler,
+    post_params_buffer: wgpu::Buffer,
+    post_bind_group: Option<wgpu::BindGroup>,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     chunk_solid: ChunkLayer,
@@ -581,13 +579,18 @@ impl<'window> Renderer<'window> {
         log::info!("multi-draw-indirect: {multi_draw}");
 
         let caps = surface.get_capabilities(&adapter);
-        let format = caps
+        let surface_format = caps
             .formats
             .iter()
             .copied()
             .find(|format| format.is_srgb())
             .or_else(|| caps.formats.first().copied())
             .ok_or(RendererError::NoSurfaceFormat)?;
+        // World geometry renders into a linear HDR off-screen target so the post
+        // pass can tone-map (ACES) instead of clipping at 1.0; only the final
+        // composite + UI pipelines write the sRGB swapchain. Every world-pass
+        // pipeline below uses `format` (HDR); UI/post use `surface_format`.
+        let format = HDR_FORMAT;
         let present_modes = caps.present_modes.clone();
         log::info!("surface present modes available: {present_modes:?}");
         let present_mode = pick_present_mode(&present_modes, false);
@@ -598,7 +601,7 @@ impl<'window> Renderer<'window> {
             .unwrap_or(wgpu::CompositeAlphaMode::Auto);
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format,
+            format: surface_format,
             width: size.width.max(1),
             height: size.height.max(1),
             present_mode,
@@ -1012,7 +1015,7 @@ impl<'window> Renderer<'window> {
                 module: &overlay_shader,
                 entry_point: "fs_cutout",
                 targets: &[Some(wgpu::ColorTargetState {
-                    format,
+                    format: surface_format,
                     blend: Some(wgpu::BlendState::REPLACE),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -1357,8 +1360,7 @@ impl<'window> Renderer<'window> {
             bind_group_layouts: &[&ui_bind_group_layout],
             push_constant_ranges: &[],
         });
-        // The UI layers draw inside the main pass (which has a depth
-        // attachment), so the pipeline declares a no-op depth state.
+        // The UI draws in its own pass to the sRGB swapchain after the post pass.
         let ui_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("ui-pipeline"),
             layout: Some(&ui_pipeline_layout),
@@ -1371,7 +1373,7 @@ impl<'window> Renderer<'window> {
                 module: &ui_shader,
                 entry_point: "fs_main",
                 targets: &[Some(wgpu::ColorTargetState {
-                    format,
+                    format: surface_format,
                     blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -1442,75 +1444,15 @@ impl<'window> Renderer<'window> {
             }
         });
 
-        // Upscale-blit resources for render scale < 1.0: sample a scaled
-        // off-screen world texture across a fullscreen triangle into the swapchain.
-        let blit_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("blit-shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shader/blit.wgsl").into()),
+        // Post pass: HDR off-screen scene -> ACES tone-map + grade (+ optional
+        // bloom, + upscale) into the sRGB swapchain. Always runs (the world only
+        // ever renders to the HDR off-screen target now).
+        let post_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("post-shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shader/post.wgsl").into()),
         });
-        let blit_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("blit-layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
-        let blit_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("blit-sampler"),
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
-        let blit_pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("blit-pipeline-layout"),
-                bind_group_layouts: &[&blit_layout],
-                push_constant_ranges: &[],
-            });
-        let blit_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("blit-pipeline"),
-            layout: Some(&blit_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &blit_shader,
-                entry_point: "vs_main",
-                buffers: &[],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &blit_shader,
-                entry_point: "fs_main",
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-        });
-
-        // Bloom composite (single pass over the off-screen scene → swapchain).
-        let bloom_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("bloom-shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shader/bloom.wgsl").into()),
-        });
-        let bloom_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("bloom-layout"),
+        let post_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("post-layout"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -1540,30 +1482,36 @@ impl<'window> Renderer<'window> {
                 },
             ],
         });
-        let bloom_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("bloom-params"),
-            size: 16,
+        let post_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("post-sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let post_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("post-params"),
+            size: 32,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let bloom_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("bloom-pipeline-layout"),
-            bind_group_layouts: &[&bloom_layout],
+        let post_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("post-pipeline-layout"),
+            bind_group_layouts: &[&post_layout],
             push_constant_ranges: &[],
         });
-        let bloom_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("bloom-pipeline"),
-            layout: Some(&bloom_pipeline_layout),
+        let post_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("post-pipeline"),
+            layout: Some(&post_pipeline_layout),
             vertex: wgpu::VertexState {
-                module: &bloom_shader,
+                module: &post_shader,
                 entry_point: "vs_main",
                 buffers: &[],
             },
             fragment: Some(wgpu::FragmentState {
-                module: &bloom_shader,
-                entry_point: "fs_composite",
+                module: &post_shader,
+                entry_point: "fs_main",
                 targets: &[Some(wgpu::ColorTargetState {
-                    format,
+                    format: surface_format,
                     blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -1674,7 +1622,7 @@ impl<'window> Renderer<'window> {
             mapped_at_creation: false,
         });
 
-        Ok(Self {
+        let mut renderer = Self {
             surface,
             device,
             queue,
@@ -1743,15 +1691,12 @@ impl<'window> Renderer<'window> {
             shadow_uniform_buffer,
             shadow_uniform_bind_group,
             offscreen_view: None,
-            blit_bind_group: None,
-            blit_pipeline,
-            blit_sampler,
-            blit_layout,
             bloom_enabled: false,
-            bloom_pipeline,
-            bloom_layout,
-            bloom_params_buffer,
-            bloom_bind_group: None,
+            post_pipeline,
+            post_layout,
+            post_sampler,
+            post_params_buffer,
+            post_bind_group: None,
             camera_buffer,
             camera_bind_group,
             chunk_solid,
@@ -1769,7 +1714,10 @@ impl<'window> Renderer<'window> {
             gpu_timing_enabled: false,
             last_stats: RenderStats::default(),
             debug_skip: DebugSkip::default(),
-        })
+        };
+        // The world always renders to the HDR off-screen target; build it now.
+        renderer.rebuild_scaled_targets();
+        Ok(renderer)
     }
 
     /// Timing/draw-scale counters for the most recently rendered frame. Used by
@@ -1818,12 +1766,12 @@ impl<'window> Renderer<'window> {
         self.brightness = value;
     }
 
-    /// Bloom (glow around bright pixels). Forces the off-screen path so the scene
-    /// can be post-composited, so it recreates the scaled targets.
+    /// Bloom (HDR glow around over-bright pixels). The world already renders to
+    /// the HDR off-screen target, so this just toggles the post-pass param.
     pub fn set_bloom_enabled(&mut self, on: bool) {
         if on != self.bloom_enabled {
             self.bloom_enabled = on;
-            self.rebuild_scaled_targets();
+            self.update_post_params();
         }
     }
 
@@ -1876,13 +1824,13 @@ impl<'window> Renderer<'window> {
         (w, h)
     }
 
-    /// Recreate the depth buffer (sized to the world target) and, when render
-    /// scale < 1.0, the off-screen colour target + its blit bind group. At scale
-    /// 1.0 the world draws straight to the swapchain (no off-screen, no blit).
+    /// Recreate the world depth buffer and the HDR off-screen colour target (both
+    /// sized by the render scale) plus the post-pass bind group. The world always
+    /// renders off-screen now; the post pass tone-maps it to the swapchain.
     fn rebuild_scaled_targets(&mut self) {
         let (w, h) = self.scaled_dims();
         log::info!(
-            "render scale {:.2}: swapchain {}x{} -> world target {}x{}",
+            "render scale {:.2}: swapchain {}x{} -> world target {}x{} (HDR)",
             self.render_scale,
             self.config.width,
             self.config.height,
@@ -1890,74 +1838,62 @@ impl<'window> Renderer<'window> {
             h
         );
         self.depth_view = create_depth_view_sized(&self.device, w, h);
-        // The world renders off-screen whenever it must be post-processed: render
-        // scale < 1 (upscale blit) or bloom (composite).
-        if self.render_scale < 0.999 || self.bloom_enabled {
-            let color = self.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("offscreen-world-color"),
-                size: wgpu::Extent3d {
-                    width: w,
-                    height: h,
-                    depth_or_array_layers: 1,
+        let color = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("offscreen-world-hdr"),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: HDR_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = color.create_view(&wgpu::TextureViewDescriptor::default());
+        self.post_bind_group = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("post-bind-group"),
+            layout: &self.post_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
                 },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: self.config.format,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                    | wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
-            });
-            let view = color.create_view(&wgpu::TextureViewDescriptor::default());
-            let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("blit-bind-group"),
-                layout: &self.blit_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.blit_sampler),
-                    },
-                ],
-            });
-            self.bloom_bind_group = if self.bloom_enabled {
-                // params: threshold, intensity, texel.x, texel.y
-                self.queue.write_buffer(
-                    &self.bloom_params_buffer,
-                    0,
-                    bytemuck::cast_slice(&[0.65f32, 1.1, 1.0 / w as f32, 1.0 / h as f32]),
-                );
-                Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("bloom-bind-group"),
-                    layout: &self.bloom_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::TextureView(&view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::Sampler(&self.blit_sampler),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: self.bloom_params_buffer.as_entire_binding(),
-                        },
-                    ],
-                }))
-            } else {
-                None
-            };
-            self.offscreen_view = Some(view);
-            self.blit_bind_group = Some(bind);
-        } else {
-            self.offscreen_view = None;
-            self.blit_bind_group = None;
-            self.bloom_bind_group = None;
-        }
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.post_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.post_params_buffer.as_entire_binding(),
+                },
+            ],
+        }));
+        self.offscreen_view = Some(view);
+        self.update_post_params();
+    }
+
+    /// Write the post-pass parameters (bloom + grade) for the current off-screen
+    /// size and bloom toggle.
+    fn update_post_params(&self) {
+        let (w, h) = self.scaled_dims();
+        let bloom = if self.bloom_enabled { 1.0f32 } else { 0.0 };
+        // p: bloom threshold, bloom intensity, texel.x, texel.y
+        // q: exposure, saturation, contrast, bloom-enabled
+        let params = [
+            1.0f32,
+            0.8,
+            1.0 / w as f32,
+            1.0 / h as f32,
+            1.1,
+            1.15,
+            1.06,
+            bloom,
+        ];
+        self.queue
+            .write_buffer(&self.post_params_buffer, 0, bytemuck::cast_slice(&params));
     }
 
     pub fn aspect(&self) -> f32 {
@@ -2946,15 +2882,10 @@ impl<'window> Renderer<'window> {
             }
             } // else (non-panorama sky + world content)
         }
-        // Off-screen → swapchain: bloom composite when enabled, else a plain
-        // upscale blit (render scale < 1.0). Either way one fullscreen pass.
-        let post = self
-            .bloom_bind_group
-            .as_ref()
-            .map(|b| (&self.bloom_pipeline, b))
-            .or_else(|| self.blit_bind_group.as_ref().map(|b| (&self.blit_pipeline, b)));
-        if let Some((pipeline, bind)) = post {
-            let mut blit = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        // Post pass: HDR off-screen world → ACES tone-map + grade (+ optional
+        // bloom, + upscale) into the sRGB swapchain. Always runs.
+        if let Some(bind) = &self.post_bind_group {
+            let mut post = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("post-composite"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &swapchain_view,
@@ -2968,9 +2899,9 @@ impl<'window> Renderer<'window> {
                 occlusion_query_set: None,
                 timestamp_writes: None,
             });
-            blit.set_pipeline(pipeline);
-            blit.set_bind_group(0, bind, &[]);
-            blit.draw(0..3, 0..1);
+            post.set_pipeline(&self.post_pipeline);
+            post.set_bind_group(0, bind, &[]);
+            post.draw(0..3, 0..1);
         }
 
         // UI pass: drawn to the swapchain AFTER the world composite, so the HUD
@@ -3406,6 +3337,9 @@ fn pick_present_mode(present_modes: &[wgpu::PresentMode], vsync: bool) -> wgpu::
 }
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24Plus;
+/// Linear HDR format for the off-screen world target, so the post pass can
+/// tone-map highlights (sun/specular/bloom) above 1.0 instead of clipping.
+const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 /// Sun shadow map resolution and format (quality-first; cheap on a dGPU).
 const SHADOW_DIM: u32 = 2048;
 const SHADOW_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
