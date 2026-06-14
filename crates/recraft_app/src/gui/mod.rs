@@ -127,6 +127,19 @@ pub enum GuiAction {
     CopyActiveToken,
     /// Settings were edited; the renderer must apply the new vsync mode.
     SetVsync(bool),
+    /// Apply the 3D-world render-resolution scale (recreates off-screen targets).
+    SetRenderScale(f32),
+    /// Toggle fancy graphics (sky gradient + transparent water).
+    SetFancyGraphics(bool),
+    /// Set the block-atlas mipmap level (0 = off .. MIPMAP_MAX).
+    SetMipmapLevels(u32),
+    /// Apply the target physical resolution (None = native), resizing the
+    /// window/swapchain — the real present-cost lever on high-DPI screens.
+    SetResolution(Option<(u32, u32)>),
+    /// Toggle exclusive fullscreen at the chosen resolution.
+    SetFullscreen(bool),
+    /// Persist the current settings to disk (emitted when options close).
+    SaveSettings,
     /// Send a serverbound packet (inventory clicks, window close, …).
     SendPacket(ServerboundPacket),
 }

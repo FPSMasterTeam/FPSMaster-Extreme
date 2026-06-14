@@ -63,6 +63,8 @@ struct LaunchConfig {
     /// frame (fps cap off) and print an A/B table on exit. Defeats the
     /// cross-process thermal/clock drift that makes separate runs incomparable.
     bench_passes_seconds: Option<f32>,
+    /// Force the window's physical-pixel inner size (`--window WxH`).
+    window_size: Option<(u32, u32)>,
     demo_kind: game::DemoKind,
 }
 
@@ -169,9 +171,16 @@ fn main() -> anyhow::Result<()> {
     }
 
     let event_loop = EventLoop::new().context("create event loop")?;
+    // `--window WxH` forces a physical-pixel window size (bypasses the OS
+    // high-DPI scaling that otherwise doubles the swapchain on 200% displays);
+    // used to isolate present/composite cost from world-render cost.
+    let initial_size: winit::dpi::Size = match config.window_size {
+        Some((w, h)) => winit::dpi::PhysicalSize::new(w, h).into(),
+        None => LogicalSize::new(1280.0, 720.0).into(),
+    };
     let window = WindowBuilder::new()
         .with_title("ReCraft - Rust Minecraft Client")
-        .with_inner_size(LogicalSize::new(1280.0, 720.0))
+        .with_inner_size(initial_size)
         // Start hidden so the OS never shows an empty white window while the
         // renderer loads textures; revealed after the first frame is drawn.
         .with_visible(false)
@@ -181,7 +190,7 @@ fn main() -> anyhow::Result<()> {
     release_cursor(window);
 
     let mut renderer = pollster::block_on(Renderer::new(window)).context("create renderer")?;
-    let mut settings = Settings::default();
+    let mut settings = Settings::load();
     // Both scripted-smoke and the pass benchmark auto-load the demo world and run
     // unthrottled.
     let auto_play = config
@@ -193,6 +202,10 @@ fn main() -> anyhow::Result<()> {
         settings.fps_cap = u32::MAX;
     }
     renderer.set_vsync(settings.vsync);
+    renderer.set_fancy_graphics(settings.fancy_graphics);
+    renderer.set_mipmap_levels(settings.mipmap_levels);
+    renderer.set_render_scale(settings.render_scale);
+    apply_display(window, &settings);
     // Atlas UV table snapshot for first-person item geometry (cheap clone of
     // the name→tile map, taken once).
     let atlas_uv = renderer.atlas_uv().clone();
@@ -350,7 +363,7 @@ fn main() -> anyhow::Result<()> {
                             Vec::new()
                         };
                         app.screen = taken;
-                        handle_actions(&mut app, &mut renderer, actions);
+                        handle_actions(&mut app, &mut renderer, window, actions);
                     } else if app.in_world {
                         // Gameplay input.
                         let pressed = event.state == ElementState::Pressed;
@@ -448,7 +461,7 @@ fn main() -> anyhow::Result<()> {
                                 Vec::new()
                             };
                             app.screen = taken;
-                            handle_actions(&mut app, &mut renderer, actions);
+                            handle_actions(&mut app, &mut renderer, window, actions);
                         }
                     } else if app.screen.is_some() {
                         if is_left || is_right || is_middle {
@@ -478,7 +491,7 @@ fn main() -> anyhow::Result<()> {
                                 Vec::new()
                             };
                             app.screen = taken;
-                            handle_actions(&mut app, &mut renderer, actions);
+                            handle_actions(&mut app, &mut renderer, window, actions);
                             sync_cursor(window, &mut cursor_captured, &app);
                         }
                     } else if app.in_world {
@@ -541,7 +554,7 @@ fn main() -> anyhow::Result<()> {
                     Vec::new()
                 };
                 app.screen = taken;
-                handle_actions(&mut app, &mut renderer, actions);
+                handle_actions(&mut app, &mut renderer, window, actions);
 
                 // Scripted runs auto-respawn so the smoke driver keeps moving.
                 if scripted_smoke_seconds.is_some() && app.game.is_dead() {
@@ -728,7 +741,50 @@ fn main() -> anyhow::Result<()> {
 }
 
 /// Apply screen actions to the application (navigation, connects, auth, …).
-fn handle_actions(app: &mut App, renderer: &mut Renderer, actions: Vec<GuiAction>) {
+/// Apply the windowed/fullscreen + resolution settings to the OS window. In
+/// windowed mode a chosen resolution resizes the window (and thus the swapchain);
+/// fullscreen picks the exclusive video mode closest to it (display hardware
+/// scales, bypassing the desktop compositor). Either way the surface follows via
+/// the resulting Resized event.
+fn apply_display(window: &winit::window::Window, settings: &Settings) {
+    use winit::window::Fullscreen;
+    if settings.fullscreen {
+        let target = settings.resolution;
+        let mode = window.current_monitor().and_then(|m| {
+            let modes = m.video_modes();
+            match target {
+                Some((w, h)) => {
+                    let area = (w as u64) * (h as u64);
+                    modes.min_by_key(|vm| {
+                        let s = vm.size();
+                        let a = (s.width as u64) * (s.height as u64);
+                        (a.abs_diff(area), u32::MAX - vm.refresh_rate_millihertz())
+                    })
+                }
+                None => modes.max_by_key(|vm| {
+                    let s = vm.size();
+                    (s.width as u64 * s.height as u64, vm.refresh_rate_millihertz())
+                }),
+            }
+        });
+        match mode {
+            Some(vm) => window.set_fullscreen(Some(Fullscreen::Exclusive(vm))),
+            None => window.set_fullscreen(Some(Fullscreen::Borderless(None))),
+        }
+    } else {
+        window.set_fullscreen(None);
+        if let Some((w, h)) = settings.resolution {
+            let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(w, h));
+        }
+    }
+}
+
+fn handle_actions(
+    app: &mut App,
+    renderer: &mut Renderer,
+    window: &winit::window::Window,
+    actions: Vec<GuiAction>,
+) {
     for action in actions {
         match action {
             GuiAction::SetScreen(screen) => app.screen = Some(screen),
@@ -822,6 +878,12 @@ fn handle_actions(app: &mut App, renderer: &mut Renderer, actions: Vec<GuiAction
                 }
             }
             GuiAction::SetVsync(on) => renderer.set_vsync(on),
+            GuiAction::SetRenderScale(scale) => renderer.set_render_scale(scale),
+            GuiAction::SetFancyGraphics(on) => renderer.set_fancy_graphics(on),
+            GuiAction::SetMipmapLevels(levels) => renderer.set_mipmap_levels(levels),
+            GuiAction::SetResolution(_) => apply_display(window, &app.settings),
+            GuiAction::SetFullscreen(_) => apply_display(window, &app.settings),
+            GuiAction::SaveSettings => app.settings.save(),
             GuiAction::SendPacket(packet) => {
                 if let Some(network) = &app.network {
                     network.send_packet(packet);
@@ -1322,6 +1384,7 @@ impl LaunchConfig {
         let mut headless_smoke_seconds = None;
         let mut headless_interact_seconds = None;
         let mut bench_passes_seconds = None;
+        let mut window_size = None;
         let mut demo_kind = game::DemoKind::Landscape;
         let mut args = env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -1357,6 +1420,12 @@ impl LaunchConfig {
                     bench_passes_seconds =
                         args.next().and_then(|value| value.parse::<f32>().ok());
                 }
+                "--window" => {
+                    window_size = args.next().and_then(|value| {
+                        let (w, h) = value.split_once('x')?;
+                        Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
+                    });
+                }
                 "--demo" => {
                     if let Some(value) = args.next() {
                         demo_kind = match value.as_str() {
@@ -1379,6 +1448,7 @@ impl LaunchConfig {
             headless_smoke_seconds,
             headless_interact_seconds,
             bench_passes_seconds,
+            window_size,
             demo_kind,
         }
     }

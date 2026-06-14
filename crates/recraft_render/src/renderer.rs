@@ -440,7 +440,23 @@ pub struct Renderer<'window> {
     model_texture_layout: wgpu::BindGroupLayout,
     gui_atlas: GuiAtlas,
     depth_view: wgpu::TextureView,
-    texture_bind_group: wgpu::BindGroup,
+    /// Block atlas bound once per mipmap level (index = active level); the
+    /// "Mipmaps" option selects which to bind.
+    texture_bind_groups: Vec<wgpu::BindGroup>,
+    /// Opaque (REPLACE-blend) water/glass pipeline for Graphics: Fast — skips
+    /// the alpha-blend destination read.
+    water_opaque_pipeline: wgpu::RenderPipeline,
+    /// Settings: 3D render-resolution scale, fancy graphics, mipmap level.
+    render_scale: f32,
+    fancy_graphics: bool,
+    mipmap_levels: u32,
+    /// Off-screen world target + upscale-blit resources, present only while
+    /// render_scale < 1.0; `None` means the world draws straight to the swapchain.
+    offscreen_view: Option<wgpu::TextureView>,
+    blit_bind_group: Option<wgpu::BindGroup>,
+    blit_pipeline: wgpu::RenderPipeline,
+    blit_sampler: wgpu::Sampler,
+    blit_layout: wgpu::BindGroupLayout,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     chunk_solid: ChunkLayer,
@@ -600,7 +616,7 @@ impl<'window> Renderer<'window> {
                 resource: gui_camera_buffer.as_entire_binding(),
             }],
         });
-        let (texture_layout, texture_bind_group, biome_colors, atlas_uv, block_image) =
+        let (texture_layout, texture_bind_groups, biome_colors, atlas_uv, block_image) =
             create_texture_bind_group(&device, &queue);
         let (entity_texture_layout, entity_bind_group, entity_texture) =
             create_entity_texture_bind_group(&device, &queue);
@@ -969,6 +985,44 @@ impl<'window> Renderer<'window> {
             multisample: wgpu::MultisampleState::default(),
             multiview: None,
         });
+        // Graphics: Fast water/glass — opaque (REPLACE, no blend dst read) and
+        // writes depth so it occludes properly. Saves the alpha-blend bandwidth.
+        let water_opaque_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("chunk-water-opaque-pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_main",
+                buffers: &[ChunkVertex::layout()],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: Some(wgpu::Face::Back),
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+        });
         let overlay_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("overlay-pipeline"),
             layout: Some(&pipeline_layout),
@@ -1299,6 +1353,68 @@ impl<'window> Renderer<'window> {
             }
         });
 
+        // Upscale-blit resources for render scale < 1.0: sample a scaled
+        // off-screen world texture across a fullscreen triangle into the swapchain.
+        let blit_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("blit-shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shader/blit.wgsl").into()),
+        });
+        let blit_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("blit-layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let blit_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("blit-sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let blit_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("blit-pipeline-layout"),
+                bind_group_layouts: &[&blit_layout],
+                push_constant_ranges: &[],
+            });
+        let blit_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("blit-pipeline"),
+            layout: Some(&blit_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &blit_shader,
+                entry_point: "vs_main",
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &blit_shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+        });
+
         let chunk_solid = ChunkLayer::new("mega-solid");
         let chunk_cutout = ChunkLayer::new("mega-cutout");
         let chunk_transparent = ChunkLayer::new("mega-transparent");
@@ -1360,7 +1476,16 @@ impl<'window> Renderer<'window> {
             model_texture_layout: entity_texture_layout,
             gui_atlas,
             depth_view,
-            texture_bind_group,
+            texture_bind_groups,
+            water_opaque_pipeline,
+            render_scale: 1.0,
+            fancy_graphics: true,
+            mipmap_levels: crate::texture::ATLAS_MIP_LEVELS - 1,
+            offscreen_view: None,
+            blit_bind_group: None,
+            blit_pipeline,
+            blit_sampler,
+            blit_layout,
             camera_buffer,
             camera_bind_group,
             chunk_solid,
@@ -1391,6 +1516,28 @@ impl<'window> Renderer<'window> {
     /// Override the per-pass skip flags at runtime. Used by the in-process pass
     /// benchmark (`--bench-passes`) to A/B individual passes within a single,
     /// thermally-consistent run rather than across separate processes.
+    /// Fancy graphics: sky gradient + transparent water. Off → flat sky + opaque
+    /// water (cheaper per pixel).
+    pub fn set_fancy_graphics(&mut self, on: bool) {
+        self.fancy_graphics = on;
+    }
+
+    /// Select the block-atlas mipmap level (0 = off; clamped to the built chain).
+    /// Swaps which per-level sampler bind group is bound at draw time.
+    pub fn set_mipmap_levels(&mut self, levels: u32) {
+        self.mipmap_levels = levels.min(crate::texture::ATLAS_MIP_LEVELS - 1);
+    }
+
+    /// Set the 3D-world render-resolution scale (0.5..=1.0). Below 1.0 the world
+    /// renders to a smaller off-screen target and is upscaled to the window.
+    pub fn set_render_scale(&mut self, scale: f32) {
+        let scale = scale.clamp(0.25, 1.0);
+        if (scale - self.render_scale).abs() > f32::EPSILON {
+            self.render_scale = scale;
+            self.rebuild_scaled_targets();
+        }
+    }
+
     pub fn set_pass_skip(&mut self, sky: bool, water: bool, ui: bool, flat: bool) {
         self.debug_skip = DebugSkip {
             sky,
@@ -1419,7 +1566,67 @@ impl<'window> Renderer<'window> {
         self.config.width = size.width;
         self.config.height = size.height;
         self.surface.configure(&self.device, &self.config);
-        self.depth_view = create_depth_view(&self.device, &self.config);
+        self.rebuild_scaled_targets();
+    }
+
+    /// The world render-target size after applying `render_scale`.
+    fn scaled_dims(&self) -> (u32, u32) {
+        let w = ((self.config.width as f32 * self.render_scale).round() as u32).max(1);
+        let h = ((self.config.height as f32 * self.render_scale).round() as u32).max(1);
+        (w, h)
+    }
+
+    /// Recreate the depth buffer (sized to the world target) and, when render
+    /// scale < 1.0, the off-screen colour target + its blit bind group. At scale
+    /// 1.0 the world draws straight to the swapchain (no off-screen, no blit).
+    fn rebuild_scaled_targets(&mut self) {
+        let (w, h) = self.scaled_dims();
+        log::info!(
+            "render scale {:.2}: swapchain {}x{} -> world target {}x{}",
+            self.render_scale,
+            self.config.width,
+            self.config.height,
+            w,
+            h
+        );
+        self.depth_view = create_depth_view_sized(&self.device, w, h);
+        if self.render_scale < 0.999 {
+            let color = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("offscreen-world-color"),
+                size: wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: self.config.format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            let view = color.create_view(&wgpu::TextureViewDescriptor::default());
+            let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("blit-bind-group"),
+                layout: &self.blit_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.blit_sampler),
+                    },
+                ],
+            });
+            self.offscreen_view = Some(view);
+            self.blit_bind_group = Some(bind);
+        } else {
+            self.offscreen_view = None;
+            self.blit_bind_group = None;
+        }
     }
 
     pub fn aspect(&self) -> f32 {
@@ -1974,9 +2181,12 @@ impl<'window> Renderer<'window> {
         let acquire_us = t_acquire.elapsed().as_micros() as u32;
 
         let t_encode = Instant::now();
-        let view = frame
+        let swapchain_view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
+        // Render the world into the scaled off-screen target when render_scale
+        // < 1.0 (then upscale-blit below); otherwise straight to the swapchain.
+        let view: &wgpu::TextureView = self.offscreen_view.as_ref().unwrap_or(&swapchain_view);
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -2016,7 +2226,7 @@ impl<'window> Renderer<'window> {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main-render-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
+                    view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         // The fullscreen sky gradient overwrites every pixel, so
@@ -2101,7 +2311,11 @@ impl<'window> Renderer<'window> {
                 }
 
                 pass.set_bind_group(0, &self.camera_bind_group, &[]);
-                pass.set_bind_group(1, &self.texture_bind_group, &[]);
+                pass.set_bind_group(
+                    1,
+                    &self.texture_bind_groups[self.mipmap_levels as usize],
+                    &[],
+                );
 
                 // Depth pre-pass: fill the solid layer's depth first (colour
                 // masked off) so the solid colour pass below shades each visible
@@ -2176,8 +2390,9 @@ impl<'window> Renderer<'window> {
 
             // Sky gradient (fullscreen view-ray) then the sun/moon/stars, drawn
             // AFTER the opaque world and depth-tested (LessEqual at the far plane)
-            // so the shader runs only on pixels no block covers.
-            if !self.debug_skip.sky {
+            // so the shader runs only on pixels no block covers. Graphics: Fast
+            // skips it entirely — the clear already holds the flat horizon colour.
+            if !self.debug_skip.sky && self.fancy_graphics {
             pass.set_pipeline(&self.sky_pipeline);
             pass.set_bind_group(0, &self.sky_bind_group, &[]);
             pass.draw(0..3, 0..1);
@@ -2196,8 +2411,17 @@ impl<'window> Renderer<'window> {
             // The sky/celestial draws rebound groups 0/1, so restore them first.
             if !trans_batches.is_empty() && !self.debug_skip.water {
                 pass.set_bind_group(0, &self.camera_bind_group, &[]);
-                pass.set_bind_group(1, &self.texture_bind_group, &[]);
-                pass.set_pipeline(&self.transparent_pipeline);
+                pass.set_bind_group(
+                    1,
+                    &self.texture_bind_groups[self.mipmap_levels as usize],
+                    &[],
+                );
+                // Graphics: Fast renders water/glass opaque (no blend dst read).
+                pass.set_pipeline(if self.fancy_graphics {
+                    &self.transparent_pipeline
+                } else {
+                    &self.water_opaque_pipeline
+                });
                 for batch in &trans_batches {
                     let page = &self.chunk_transparent.pages[batch.page];
                     pass.set_vertex_buffer(0, page.vertex_buf.slice(..));
@@ -2221,7 +2445,11 @@ impl<'window> Renderer<'window> {
             if let Some(overlay) = self.break_overlay.as_ref().filter(|m| m.index_count > 0) {
                 pass.set_pipeline(&self.overlay_pipeline);
                 pass.set_bind_group(0, &self.camera_bind_group, &[]);
-                pass.set_bind_group(1, &self.texture_bind_group, &[]);
+                pass.set_bind_group(
+                    1,
+                    &self.texture_bind_groups[self.mipmap_levels as usize],
+                    &[],
+                );
                 pass.set_vertex_buffer(0, overlay.vertex_buffer.slice(..));
                 pass.set_index_buffer(overlay.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..overlay.index_count, 0, 0..1);
@@ -2254,7 +2482,11 @@ impl<'window> Renderer<'window> {
             if let Some(items) = self.world_items.as_ref().filter(|m| m.index_count > 0) {
                 pass.set_pipeline(&self.item_pipeline);
                 pass.set_bind_group(0, &self.camera_bind_group, &[]);
-                pass.set_bind_group(1, &self.texture_bind_group, &[]);
+                pass.set_bind_group(
+                    1,
+                    &self.texture_bind_groups[self.mipmap_levels as usize],
+                    &[],
+                );
                 pass.set_vertex_buffer(0, items.vertex_buffer.slice(..));
                 pass.set_index_buffer(items.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..items.index_count, 0, 0..1);
@@ -2265,7 +2497,11 @@ impl<'window> Renderer<'window> {
             if let Some(item) = self.first_person_item.as_ref().filter(|m| m.index_count > 0) {
                 pass.set_pipeline(&self.item_pipeline);
                 pass.set_bind_group(0, &self.camera_bind_group, &[]);
-                pass.set_bind_group(1, &self.texture_bind_group, &[]);
+                pass.set_bind_group(
+                    1,
+                    &self.texture_bind_groups[self.mipmap_levels as usize],
+                    &[],
+                );
                 pass.set_vertex_buffer(0, item.vertex_buffer.slice(..));
                 pass.set_index_buffer(item.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..item.index_count, 0, 0..1);
@@ -2290,7 +2526,11 @@ impl<'window> Renderer<'window> {
                     pass.draw(0..3, 0..1);
                     pass.set_pipeline(&self.gui_cube_pipeline);
                     pass.set_bind_group(0, &self.gui_camera_bind_group, &[]);
-                    pass.set_bind_group(1, &self.texture_bind_group, &[]);
+                    pass.set_bind_group(
+                    1,
+                    &self.texture_bind_groups[self.mipmap_levels as usize],
+                    &[],
+                );
                     pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                     pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                     pass.draw_indexed(0..mesh.index_count, 0, 0..1);
@@ -2304,6 +2544,26 @@ impl<'window> Renderer<'window> {
                     draw_calls += 1;
                 }
             }
+        }
+        // Render scale < 1.0: upscale the off-screen world into the swapchain.
+        if let Some(blit_bind) = &self.blit_bind_group {
+            let mut blit = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("upscale-blit"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &swapchain_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+            });
+            blit.set_pipeline(&self.blit_pipeline);
+            blit.set_bind_group(0, blit_bind, &[]);
+            blit.draw(0..3, 0..1);
         }
         // Resolve this frame's timestamps into the readback buffer (still in the
         // same command buffer, after the pass that wrote them).
@@ -2909,11 +3169,15 @@ fn create_depth_view(
     device: &wgpu::Device,
     config: &wgpu::SurfaceConfiguration,
 ) -> wgpu::TextureView {
+    create_depth_view_sized(device, config.width, config.height)
+}
+
+fn create_depth_view_sized(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("depth-texture"),
         size: wgpu::Extent3d {
-            width: config.width.max(1),
-            height: config.height.max(1),
+            width: width.max(1),
+            height: height.max(1),
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
@@ -3121,7 +3385,7 @@ fn create_texture_bind_group(
     queue: &wgpu::Queue,
 ) -> (
     wgpu::BindGroupLayout,
-    wgpu::BindGroup,
+    Vec<wgpu::BindGroup>,
     BiomeColors,
     AtlasUv,
     Option<image::RgbaImage>,
@@ -3191,20 +3455,6 @@ fn create_texture_bind_group(
         );
     }
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-        label: Some("block-atlas-sampler"),
-        address_mode_u: wgpu::AddressMode::ClampToEdge,
-        address_mode_v: wgpu::AddressMode::ClampToEdge,
-        address_mode_w: wgpu::AddressMode::ClampToEdge,
-        // Nearest within a level keeps the blocky look up close AND avoids
-        // bilinear bleed across packed tiles; Linear between levels (trilinear)
-        // smooths the distance transition. The win is sampling small mips far
-        // away, which is cache-friendly regardless of the in-level filter.
-        mag_filter: wgpu::FilterMode::Nearest,
-        min_filter: wgpu::FilterMode::Nearest,
-        mipmap_filter: wgpu::FilterMode::Linear,
-        ..Default::default()
-    });
     let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("texture-layout"),
         entries: &[
@@ -3226,25 +3476,45 @@ fn create_texture_bind_group(
             },
         ],
     });
-    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("texture-bind-group"),
-        layout: &layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(&view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::Sampler(&sampler),
-            },
-        ],
-    });
+    // One bind group per selectable mipmap level (vanilla "Mipmap Levels"):
+    // index L caps the sampler to mips 0..=L via lod_max_clamp. L=0 reads only
+    // the full-resolution mip 0 (nearest); higher L uses the trilinear chain,
+    // sampling progressively smaller (cache-friendlier) mips at distance. In all
+    // cases min_filter is Nearest so packed tiles never bleed within a level.
+    let bind_groups: Vec<wgpu::BindGroup> = (0..crate::texture::ATLAS_MIP_LEVELS)
+        .map(|level| {
+            let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+                label: Some("block-atlas-sampler"),
+                address_mode_u: wgpu::AddressMode::ClampToEdge,
+                address_mode_v: wgpu::AddressMode::ClampToEdge,
+                address_mode_w: wgpu::AddressMode::ClampToEdge,
+                mag_filter: wgpu::FilterMode::Nearest,
+                min_filter: wgpu::FilterMode::Nearest,
+                mipmap_filter: wgpu::FilterMode::Linear,
+                lod_max_clamp: level as f32,
+                ..Default::default()
+            });
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("block-atlas-bind-group"),
+                layout: &layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&sampler),
+                    },
+                ],
+            })
+        })
+        .collect();
 
     // Hand the CPU atlas image to the UI for block item thumbnails (reuses this
     // build instead of loading the atlas a second time).
     let block_image = image::RgbaImage::from_raw(atlas.width, atlas.height, atlas.pixels);
-    (layout, bind_group, biome_colors, atlas_uv, block_image)
+    (layout, bind_groups, biome_colors, atlas_uv, block_image)
 }
 
 fn create_panorama_resources(

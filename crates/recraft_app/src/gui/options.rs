@@ -15,13 +15,19 @@ use super::{draw_centered_text, draw_default_background, DrawCtx, GuiAction, Gui
 enum Slider {
     Sensitivity,
     FpsCap,
+    RenderScale,
 }
 
 #[derive(Default)]
 pub struct GuiOptions {
     sensitivity_rect: UiRect,
     fps_rect: UiRect,
+    render_scale_rect: UiRect,
     vsync: Option<GuiButton>,
+    graphics: Option<GuiButton>,
+    mipmaps: Option<GuiButton>,
+    resolution: Option<GuiButton>,
+    fullscreen: Option<GuiButton>,
     done: Option<GuiButton>,
     dragging: Option<Slider>,
     /// Whether this was opened from the title screen (Done returns there) vs.
@@ -54,11 +60,16 @@ impl GuiOptions {
     fn layout(&mut self, ctx: &DrawCtx) {
         let s = ctx.scale;
         let x = (ctx.width - 200 * s) / 2;
-        let top = ctx.height / 4;
+        let top = ctx.height / 4 - 24 * s;
         self.sensitivity_rect = UiRect::new(x, top, 200 * s, BUTTON_HEIGHT * s);
         self.vsync = Some(GuiButton::at_px(x, top + 24 * s, 200 * s, s, ""));
         self.fps_rect = UiRect::new(x, top + 48 * s, 200 * s, BUTTON_HEIGHT * s);
-        self.done = Some(GuiButton::at_px(x, top + 84 * s, 200 * s, s, "Done"));
+        self.render_scale_rect = UiRect::new(x, top + 72 * s, 200 * s, BUTTON_HEIGHT * s);
+        self.graphics = Some(GuiButton::at_px(x, top + 96 * s, 98 * s, s, ""));
+        self.mipmaps = Some(GuiButton::at_px(x + 102 * s, top + 96 * s, 98 * s, s, ""));
+        self.resolution = Some(GuiButton::at_px(x, top + 120 * s, 98 * s, s, ""));
+        self.fullscreen = Some(GuiButton::at_px(x + 102 * s, top + 120 * s, 98 * s, s, ""));
+        self.done = Some(GuiButton::at_px(x, top + 156 * s, 200 * s, s, "Done"));
     }
 
     fn slider_fraction(rect: UiRect, x: f64) -> f32 {
@@ -76,6 +87,9 @@ impl GuiOptions {
             Some(Slider::FpsCap) => ctx
                 .settings
                 .set_fps_from01(Self::slider_fraction(self.fps_rect, x)),
+            Some(Slider::RenderScale) => ctx
+                .settings
+                .set_render_scale_from01(Self::slider_fraction(self.render_scale_rect, x)),
             None => {}
         }
     }
@@ -153,6 +167,35 @@ impl GuiScreen for GuiOptions {
             ctx.settings.fps_fraction(),
             &format!("Max Framerate: {}", ctx.settings.fps_label()),
         );
+        draw_slider(
+            ui,
+            self.render_scale_rect,
+            s,
+            ctx.settings.render_scale_fraction(),
+            &format!("Render Scale: {}%", ctx.settings.render_scale_percent()),
+        );
+        if let Some(graphics) = &mut self.graphics {
+            graphics.label = format!(
+                "Graphics: {}",
+                if ctx.settings.fancy_graphics { "Fancy" } else { "Fast" }
+            );
+            graphics.draw(ui, s, ctx.mouse, ctx.mouse_down);
+        }
+        if let Some(mipmaps) = &mut self.mipmaps {
+            mipmaps.label = format!("Mipmaps: {}", ctx.settings.mipmap_label());
+            mipmaps.draw(ui, s, ctx.mouse, ctx.mouse_down);
+        }
+        if let Some(resolution) = &mut self.resolution {
+            resolution.label = format!("Res: {}", ctx.settings.resolution_label());
+            resolution.draw(ui, s, ctx.mouse, ctx.mouse_down);
+        }
+        if let Some(fullscreen) = &mut self.fullscreen {
+            fullscreen.label = format!(
+                "Fullscreen: {}",
+                if ctx.settings.fullscreen { "ON" } else { "OFF" }
+            );
+            fullscreen.draw(ui, s, ctx.mouse, ctx.mouse_down);
+        }
         if let Some(done) = &self.done {
             done.draw(ui, s, ctx.mouse, ctx.mouse_down);
         }
@@ -169,12 +212,33 @@ impl GuiScreen for GuiOptions {
             self.apply_drag(x, ctx);
             return Vec::new();
         }
+        if self.render_scale_rect.contains(x, y) {
+            self.dragging = Some(Slider::RenderScale);
+            self.apply_drag(x, ctx);
+            return Vec::new();
+        }
         if self.vsync.as_ref().is_some_and(|b| b.clicked(x, y)) {
             ctx.settings.vsync = !ctx.settings.vsync;
             return vec![GuiAction::SetVsync(ctx.settings.vsync)];
         }
+        if self.graphics.as_ref().is_some_and(|b| b.clicked(x, y)) {
+            ctx.settings.fancy_graphics = !ctx.settings.fancy_graphics;
+            return vec![GuiAction::SetFancyGraphics(ctx.settings.fancy_graphics)];
+        }
+        if self.mipmaps.as_ref().is_some_and(|b| b.clicked(x, y)) {
+            ctx.settings.cycle_mipmap_levels();
+            return vec![GuiAction::SetMipmapLevels(ctx.settings.mipmap_levels)];
+        }
+        if self.resolution.as_ref().is_some_and(|b| b.clicked(x, y)) {
+            ctx.settings.cycle_resolution();
+            return vec![GuiAction::SetResolution(ctx.settings.resolution)];
+        }
+        if self.fullscreen.as_ref().is_some_and(|b| b.clicked(x, y)) {
+            ctx.settings.fullscreen = !ctx.settings.fullscreen;
+            return vec![GuiAction::SetFullscreen(ctx.settings.fullscreen)];
+        }
         if self.done.as_ref().is_some_and(|b| b.clicked(x, y)) {
-            return vec![GuiAction::SetScreen(self.back_screen())];
+            return vec![GuiAction::SaveSettings, GuiAction::SetScreen(self.back_screen())];
         }
         Vec::new()
     }
@@ -188,17 +252,24 @@ impl GuiScreen for GuiOptions {
         _x: f64,
         _y: f64,
         _right: bool,
-        _ctx: &mut ScreenCtx,
+        ctx: &mut ScreenCtx,
     ) -> Vec<GuiAction> {
+        // Render scale recreates off-screen targets, so apply it once on release
+        // rather than on every drag tick.
+        let action = if self.dragging == Some(Slider::RenderScale) {
+            vec![GuiAction::SetRenderScale(ctx.settings.render_scale)]
+        } else {
+            Vec::new()
+        };
         self.dragging = None;
-        Vec::new()
+        action
     }
 
     fn key_pressed(&mut self, event: &KeyEvent, _ctx: &mut ScreenCtx) -> Vec<GuiAction> {
         if event.state == ElementState::Pressed
             && matches!(event.physical_key, PhysicalKey::Code(KeyCode::Escape))
         {
-            return vec![GuiAction::SetScreen(self.back_screen())];
+            return vec![GuiAction::SaveSettings, GuiAction::SetScreen(self.back_screen())];
         }
         Vec::new()
     }

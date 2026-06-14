@@ -2,6 +2,10 @@
 
 use std::time::Instant;
 
+/// Where persisted options live (key=value text, next to the working directory,
+/// like vanilla's options.txt).
+const SETTINGS_FILE: &str = "recraft_options.txt";
+
 /// User-adjustable options edited from the options screen.
 #[derive(Debug, Clone, Copy)]
 pub struct Settings {
@@ -11,11 +15,43 @@ pub struct Settings {
     pub vsync: bool,
     /// Frame-rate cap; `FPS_MAX` means unlimited.
     pub fps_cap: u32,
+    /// 3D-world render resolution scale in `RENDER_SCALE_MIN..=1.0`. Below 1.0
+    /// the world renders to a smaller off-screen target and is upscaled, cutting
+    /// per-pixel fill/bandwidth (the main lever on weak iGPUs).
+    pub render_scale: f32,
+    /// Fancy graphics: sky gradient + see-through (alpha-blended) water. Off =
+    /// flat horizon sky + opaque water, skipping the heaviest per-pixel work.
+    pub fancy_graphics: bool,
+    /// Block-atlas mipmap levels `0..=MIPMAP_MAX` (vanilla "Mipmap Levels"):
+    /// 0 = off (full-res mip 0 only), 4 = full trilinear chain down to 1px.
+    pub mipmap_levels: u32,
+    /// Target physical render/present resolution, or `None` for the native
+    /// window/display size. The swapchain present + desktop composite cost scales
+    /// with this — the real lever on high-DPI screens where a "small" window is
+    /// secretly huge in physical pixels.
+    pub resolution: Option<(u32, u32)>,
+    /// Exclusive fullscreen at the chosen resolution (bypasses the desktop
+    /// compositor and lets the display hardware scale a lower mode — cheap present
+    /// at a full-screen image). Off = windowed.
+    pub fullscreen: bool,
 }
+
+/// Selectable resolutions (None = native). Common 16:9 modes most panels scale.
+pub const RESOLUTION_PRESETS: [Option<(u32, u32)>; 6] = [
+    None,
+    Some((1920, 1080)),
+    Some((1600, 900)),
+    Some((1366, 768)),
+    Some((1280, 720)),
+    Some((960, 540)),
+];
 
 const FPS_MIN: u32 = 30;
 const FPS_MAX: u32 = 260;
 const FPS_STEP: u32 = 10;
+const RENDER_SCALE_MIN: f32 = 0.5;
+/// Highest selectable mipmap level (16px tiles → mips 0..4).
+pub const MIPMAP_MAX: u32 = 4;
 
 impl Default for Settings {
     fn default() -> Self {
@@ -23,11 +59,120 @@ impl Default for Settings {
             sensitivity: 0.5,
             vsync: true,
             fps_cap: 120,
+            render_scale: 1.0,
+            fancy_graphics: true,
+            mipmap_levels: MIPMAP_MAX,
+            resolution: None,
+            fullscreen: false,
         }
     }
 }
 
 impl Settings {
+    /// Load persisted options from [`SETTINGS_FILE`], falling back to defaults
+    /// for a missing file or any missing/invalid key. Values are clamped to
+    /// their valid ranges so a hand-edited file can't put the game in a bad state.
+    pub fn load() -> Self {
+        Self::load_from(std::path::Path::new(SETTINGS_FILE))
+    }
+
+    fn load_from(path: &std::path::Path) -> Self {
+        let mut s = Self::default();
+        let (mut res_w, mut res_h) = (0u32, 0u32);
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return s;
+        };
+        for line in text.lines() {
+            let Some((key, val)) = line.split_once('=') else {
+                continue;
+            };
+            let val = val.trim();
+            match key.trim() {
+                "sensitivity" => {
+                    if let Ok(v) = val.parse() {
+                        s.sensitivity = v;
+                    }
+                }
+                "vsync" => {
+                    if let Ok(v) = val.parse() {
+                        s.vsync = v;
+                    }
+                }
+                "fps_cap" => {
+                    if let Ok(v) = val.parse() {
+                        s.fps_cap = v;
+                    }
+                }
+                "render_scale" => {
+                    if let Ok(v) = val.parse() {
+                        s.render_scale = v;
+                    }
+                }
+                "fancy_graphics" => {
+                    if let Ok(v) = val.parse() {
+                        s.fancy_graphics = v;
+                    }
+                }
+                "mipmap_levels" => {
+                    if let Ok(v) = val.parse() {
+                        s.mipmap_levels = v;
+                    }
+                }
+                "resolution_w" => {
+                    if let Ok(v) = val.parse() {
+                        res_w = v;
+                    }
+                }
+                "resolution_h" => {
+                    if let Ok(v) = val.parse() {
+                        res_h = v;
+                    }
+                }
+                "fullscreen" => {
+                    if let Ok(v) = val.parse() {
+                        s.fullscreen = v;
+                    }
+                }
+                _ => {}
+            }
+        }
+        s.sensitivity = s.sensitivity.clamp(0.0, 1.0);
+        s.fps_cap = s.fps_cap.clamp(FPS_MIN, FPS_MAX);
+        s.render_scale = s.render_scale.clamp(RENDER_SCALE_MIN, 1.0);
+        s.mipmap_levels = s.mipmap_levels.min(MIPMAP_MAX);
+        s.resolution = if res_w > 0 && res_h > 0 {
+            Some((res_w, res_h))
+        } else {
+            None
+        };
+        s
+    }
+
+    /// Write the current options to [`SETTINGS_FILE`]. Best-effort: a failure
+    /// (e.g. read-only directory) is logged, not fatal.
+    pub fn save(&self) {
+        self.save_to(std::path::Path::new(SETTINGS_FILE));
+    }
+
+    fn save_to(&self, path: &std::path::Path) {
+        let (res_w, res_h) = self.resolution.unwrap_or((0, 0));
+        let text = format!(
+            "sensitivity={}\nvsync={}\nfps_cap={}\nrender_scale={}\nfancy_graphics={}\nmipmap_levels={}\nresolution_w={}\nresolution_h={}\nfullscreen={}\n",
+            self.sensitivity,
+            self.vsync,
+            self.fps_cap,
+            self.render_scale,
+            self.fancy_graphics,
+            self.mipmap_levels,
+            res_w,
+            res_h,
+            self.fullscreen,
+        );
+        if let Err(err) = std::fs::write(path, text) {
+            log::warn!("failed to save settings to {}: {err}", path.display());
+        }
+    }
+
     /// Degrees of view rotation per pixel of mouse motion. Reproduces the
     /// vanilla curve so 0.5 maps to the long-standing 0.15 default.
     pub fn mouse_factor(self) -> f32 {
@@ -71,6 +216,54 @@ impl Settings {
         let stepped = (raw / FPS_STEP as f32).round() as u32 * FPS_STEP;
         self.fps_cap = stepped.clamp(FPS_MIN, FPS_MAX);
     }
+
+    /// Render-scale slider fill fraction in 0..=1.
+    pub fn render_scale_fraction(self) -> f32 {
+        (self.render_scale - RENDER_SCALE_MIN) / (1.0 - RENDER_SCALE_MIN)
+    }
+
+    pub fn render_scale_percent(self) -> u32 {
+        (self.render_scale * 100.0).round() as u32
+    }
+
+    pub fn set_render_scale_from01(&mut self, value: f32) {
+        let raw = RENDER_SCALE_MIN + value.clamp(0.0, 1.0) * (1.0 - RENDER_SCALE_MIN);
+        // Snap to 5% steps for clean labels (50%, 55%, … 100%).
+        self.render_scale = ((raw * 20.0).round() / 20.0).clamp(RENDER_SCALE_MIN, 1.0);
+    }
+
+    /// Advance the mipmap level, wrapping `0 → 1 → … → MIPMAP_MAX → 0`.
+    pub fn cycle_mipmap_levels(&mut self) {
+        self.mipmap_levels = if self.mipmap_levels >= MIPMAP_MAX {
+            0
+        } else {
+            self.mipmap_levels + 1
+        };
+    }
+
+    pub fn mipmap_label(self) -> String {
+        if self.mipmap_levels == 0 {
+            "OFF".to_owned()
+        } else {
+            self.mipmap_levels.to_string()
+        }
+    }
+
+    /// Cycle through [`RESOLUTION_PRESETS`] (Native → 1080p → … → 540p → Native).
+    pub fn cycle_resolution(&mut self) {
+        let idx = RESOLUTION_PRESETS
+            .iter()
+            .position(|&r| r == self.resolution)
+            .unwrap_or(0);
+        self.resolution = RESOLUTION_PRESETS[(idx + 1) % RESOLUTION_PRESETS.len()];
+    }
+
+    pub fn resolution_label(self) -> String {
+        match self.resolution {
+            None => "Native".to_owned(),
+            Some((w, h)) => format!("{w}x{h}"),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -101,5 +294,57 @@ impl FpsCounter {
 
     pub fn fps(&self) -> f32 {
         self.fps
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settings_round_trip_through_disk() {
+        let path = std::env::temp_dir().join("recraft_settings_round_trip.txt");
+        let _ = std::fs::remove_file(&path);
+
+        let mut original = Settings::default();
+        original.sensitivity = 0.73;
+        original.vsync = false;
+        original.fps_cap = 60;
+        original.render_scale = 0.7;
+        original.fancy_graphics = false;
+        original.mipmap_levels = 2;
+        original.save_to(&path);
+
+        let loaded = Settings::load_from(&path);
+        assert!((loaded.sensitivity - 0.73).abs() < 1e-6);
+        assert!(!loaded.vsync);
+        assert_eq!(loaded.fps_cap, 60);
+        assert!((loaded.render_scale - 0.7).abs() < 1e-6);
+        assert!(!loaded.fancy_graphics);
+        assert_eq!(loaded.mipmap_levels, 2);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn missing_file_yields_defaults() {
+        let path = std::env::temp_dir().join("recraft_settings_does_not_exist.txt");
+        let _ = std::fs::remove_file(&path);
+        let loaded = Settings::load_from(&path);
+        let default = Settings::default();
+        assert_eq!(loaded.fps_cap, default.fps_cap);
+        assert_eq!(loaded.mipmap_levels, default.mipmap_levels);
+        assert!((loaded.render_scale - default.render_scale).abs() < 1e-6);
+    }
+
+    #[test]
+    fn out_of_range_values_are_clamped() {
+        let path = std::env::temp_dir().join("recraft_settings_clamp.txt");
+        std::fs::write(&path, "render_scale=5.0\nmipmap_levels=99\nfps_cap=1\n").unwrap();
+        let loaded = Settings::load_from(&path);
+        assert!(loaded.render_scale <= 1.0);
+        assert!(loaded.mipmap_levels <= MIPMAP_MAX);
+        assert!(loaded.fps_cap >= FPS_MIN);
+        let _ = std::fs::remove_file(&path);
     }
 }
