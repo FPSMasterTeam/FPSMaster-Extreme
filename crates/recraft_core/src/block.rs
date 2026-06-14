@@ -12,12 +12,24 @@ impl BlockState {
     pub const GRASS: Self = Self { id: 2, meta: 0 };
     pub const DIRT: Self = Self { id: 3, meta: 0 };
 
+    /// Highest block id that exists in 1.8.9 (dark oak door, 197). Over protocol
+    /// 47 the server can only legitimately send ids in `0..=MAX_BLOCK_ID`; a
+    /// higher id is an unregistered block (e.g. a 1.9+/1.12 block leaking
+    /// through without a ViaVersion block-remap), which vanilla resolves to air.
+    pub const MAX_BLOCK_ID: u16 = 197;
+
     pub const fn new(id: u16, meta: u8) -> Self {
         Self { id, meta }
     }
 
+    /// True for air and for any out-of-range (unregistered) id. Vanilla's
+    /// `Block.getBlockById` returns `Blocks.air` for ids it doesn't know, so an
+    /// id beyond the 1.8.9 range behaves exactly like air: invisible, no
+    /// collision, non-occluding. (An *in-range* id that's merely absent from
+    /// `blocks.json` is a client config gap, not air — it still renders the
+    /// magenta missing tile so the gap is visible.)
     pub const fn is_air(self) -> bool {
-        self.id == 0
+        self.id == 0 || self.id > Self::MAX_BLOCK_ID
     }
 
     /// Block-light this block emits (0..=15), matching vanilla 1.8 light values.
@@ -50,7 +62,8 @@ impl BlockState {
     }
 
     /// Whether this block fully occludes the neighbouring face touching it
-    /// (data-driven). Unknown non-air blocks are treated as opaque cubes.
+    /// (data-driven). In-range ids absent from `blocks.json` are treated as
+    /// opaque cubes (the magenta missing tile); out-of-range ids are air.
     pub fn is_opaque_cube(self) -> bool {
         if self.is_air() || self.id == 166 {
             return false;

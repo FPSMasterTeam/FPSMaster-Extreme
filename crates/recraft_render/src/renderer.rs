@@ -3082,9 +3082,14 @@ impl<'window> Renderer<'window> {
                     view: &self.depth_view,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(1.0),
-                        // Stored (not discarded) so the post pass can sample world
-                        // depth for depth-of-field and motion blur.
-                        store: wgpu::StoreOp::Store,
+                        // Keep depth only when a later pass needs it (DoF/motion
+                        // blur in post, or the SSR water pass) — all of which
+                        // require shaders. Otherwise discard it (cheaper).
+                        store: if self.shaders_enabled {
+                            wgpu::StoreOp::Store
+                        } else {
+                            wgpu::StoreOp::Discard
+                        },
                     }),
                     stencil_ops: None,
                 }),
@@ -3293,6 +3298,30 @@ impl<'window> Renderer<'window> {
                 }
             }
 
+            // Water in the main pass when SSR isn't used (shaders off, or Fast
+            // graphics) — avoids a separate pass and keeping the depth buffer.
+            // Fancy = translucent (alpha blend), Fast = opaque.
+            if !water_draws.is_empty()
+                && !self.debug_skip.water
+                && !(self.shaders_enabled && self.fancy_graphics)
+            {
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                pass.set_bind_group(1, &self.texture_bind_groups[self.mipmap_levels as usize], &[]);
+                pass.set_bind_group(2, &self.lighting_bind_group, &[]);
+                pass.set_pipeline(if self.fancy_graphics {
+                    &self.transparent_pipeline
+                } else {
+                    &self.water_opaque_pipeline
+                });
+                for (page, c) in &water_draws {
+                    let p = &self.chunk_water.pages[*page];
+                    pass.set_vertex_buffer(0, p.vertex_buf.slice(..));
+                    pass.set_index_buffer(p.index_buf.slice(..), wgpu::IndexFormat::Uint16);
+                    pass.draw_indexed(c.first_index..c.first_index + c.index_count, c.base_vertex, 0..1);
+                    draw_calls += 1;
+                }
+            }
+
             // Mining crack overlay: drawn with the translucent pipeline (alpha
             // blended, depth-tested, no depth write) so the crack texels darken
             // the mined block in place.
@@ -3364,49 +3393,37 @@ impl<'window> Renderer<'window> {
             } // else (non-panorama sky + world content)
         }
 
-        // Water pass: reflective water over the now-rendered opaque scene. Fancy
-        // graphics copies the scene colour first so the water shader can sample
-        // it for screen-space reflection; Fast graphics draws plain water.
-        if !water_draws.is_empty() && !self.debug_skip.water {
-            // SSR (and its scene copy) only with shaders on; otherwise plain water.
-            let use_ssr = self.shaders_enabled
-                && self.fancy_graphics
-                && self.offscreen_tex.is_some()
-                && self.scene_copy_tex.is_some()
-                && self.water_ssr_bind_group.is_some();
-            if use_ssr {
-                let (w, h) = self.scaled_dims();
-                encoder.copy_texture_to_texture(
-                    wgpu::ImageCopyTexture {
-                        texture: self.offscreen_tex.as_ref().unwrap(),
-                        mip_level: 0,
-                        origin: wgpu::Origin3d::ZERO,
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    wgpu::ImageCopyTexture {
-                        texture: self.scene_copy_tex.as_ref().unwrap(),
-                        mip_level: 0,
-                        origin: wgpu::Origin3d::ZERO,
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    wgpu::Extent3d {
-                        width: w,
-                        height: h,
-                        depth_or_array_layers: 1,
-                    },
-                );
-            }
-            // SSR samples the depth texture, so its pass must bind depth read-only
-            // (the water shader tests but never writes depth). The Fast path
-            // writes depth and doesn't sample it, so it uses a normal attachment.
-            let depth_ops = if use_ssr {
-                None
-            } else {
-                Some(wgpu::Operations {
-                    load: wgpu::LoadOp::Load,
-                    store: wgpu::StoreOp::Store,
-                })
-            };
+        // SSR water pass: only with shaders + Fancy. Copy the opaque scene so the
+        // water shader can sample it for screen-space reflection, then draw water
+        // with depth bound read-only (it tests but never writes depth, so the same
+        // depth texture can be sampled). Non-SSR water was already drawn in the
+        // main pass above.
+        let ssr_water = self.shaders_enabled
+            && self.fancy_graphics
+            && self.offscreen_tex.is_some()
+            && self.scene_copy_tex.is_some()
+            && self.water_ssr_bind_group.is_some();
+        if ssr_water && !water_draws.is_empty() && !self.debug_skip.water {
+            let (w, h) = self.scaled_dims();
+            encoder.copy_texture_to_texture(
+                wgpu::ImageCopyTexture {
+                    texture: self.offscreen_tex.as_ref().unwrap(),
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::ImageCopyTexture {
+                    texture: self.scene_copy_tex.as_ref().unwrap(),
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+            );
             let mut wp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("water-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -3419,28 +3436,17 @@ impl<'window> Renderer<'window> {
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &self.depth_view,
-                    depth_ops,
+                    depth_ops: None, // read-only: sampled for SSR in this pass
                     stencil_ops: None,
                 }),
                 occlusion_query_set: None,
                 timestamp_writes: None,
             });
-            // Three water looks: the full SSR water shader (shaders + Fancy);
-            // plain alpha-blended translucent water (Fancy, shaders off — the
-            // vanilla Fancy look); opaque water (Fast graphics).
-            wp.set_pipeline(if use_ssr {
-                &self.water_pipeline
-            } else if self.fancy_graphics {
-                &self.transparent_pipeline
-            } else {
-                &self.water_opaque_pipeline
-            });
+            wp.set_pipeline(&self.water_pipeline);
             wp.set_bind_group(0, &self.camera_bind_group, &[]);
             wp.set_bind_group(1, &self.texture_bind_groups[self.mipmap_levels as usize], &[]);
             wp.set_bind_group(2, &self.lighting_bind_group, &[]);
-            if use_ssr {
-                wp.set_bind_group(3, self.water_ssr_bind_group.as_ref().unwrap(), &[]);
-            }
+            wp.set_bind_group(3, self.water_ssr_bind_group.as_ref().unwrap(), &[]);
             for (page, c) in &water_draws {
                 let p = &self.chunk_water.pages[*page];
                 wp.set_vertex_buffer(0, p.vertex_buf.slice(..));
