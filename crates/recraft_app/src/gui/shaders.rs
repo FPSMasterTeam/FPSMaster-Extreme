@@ -51,17 +51,19 @@ impl GuiShaders {
         let cw = 98 * s;
         let top = ctx.height / 4 - 8 * s;
         let row = |i: i32| top + i * 24 * s;
+        // Sub-effects are unavailable while the master shader toggle is off.
+        let off = !ctx.settings.shaders;
         self.shaders = Some(GuiButton::at_px(x, row(0), cw, s, ""));
-        self.shadows = Some(GuiButton::at_px(x, row(1), cw, s, ""));
-        self.specular = Some(GuiButton::at_px(x, row(2), cw, s, ""));
-        self.fog = Some(GuiButton::at_px(x, row(3), cw, s, ""));
-        self.bloom = Some(GuiButton::at_px(x, row(4), cw, s, ""));
-        self.vignette = Some(GuiButton::at_px(xr, row(0), cw, s, ""));
-        self.chromatic = Some(GuiButton::at_px(xr, row(1), cw, s, ""));
-        self.dof = Some(GuiButton::at_px(xr, row(2), cw, s, ""));
-        self.motion_blur = Some(GuiButton::at_px(xr, row(3), cw, s, ""));
-        self.auto_exposure = Some(GuiButton::at_px(xr, row(4), cw, s, ""));
-        self.clouds = Some(GuiButton::at_px(xr, row(5), cw, s, ""));
+        self.shadows = Some(GuiButton::at_px(x, row(1), cw, s, "").disabled(off));
+        self.specular = Some(GuiButton::at_px(x, row(2), cw, s, "").disabled(off));
+        self.fog = Some(GuiButton::at_px(x, row(3), cw, s, "").disabled(off));
+        self.bloom = Some(GuiButton::at_px(x, row(4), cw, s, "").disabled(off));
+        self.vignette = Some(GuiButton::at_px(xr, row(0), cw, s, "").disabled(off));
+        self.chromatic = Some(GuiButton::at_px(xr, row(1), cw, s, "").disabled(off));
+        self.dof = Some(GuiButton::at_px(xr, row(2), cw, s, "").disabled(off));
+        self.motion_blur = Some(GuiButton::at_px(xr, row(3), cw, s, "").disabled(off));
+        self.auto_exposure = Some(GuiButton::at_px(xr, row(4), cw, s, "").disabled(off));
+        self.clouds = Some(GuiButton::at_px(xr, row(5), cw, s, "").disabled(off));
         self.done = Some(GuiButton::at_px(x, row(6) + 12 * s, 200 * s, s, "Done"));
     }
 }

@@ -2040,8 +2040,10 @@ impl<'window> Renderer<'window> {
     }
 
     /// Master toggle for the shader-pack lighting (directional sun + ambient).
+    /// Also gates every post effect (refresh their params).
     pub fn set_shaders_enabled(&mut self, on: bool) {
         self.shaders_enabled = on;
+        self.update_post_params();
     }
 
     pub fn set_shadows_enabled(&mut self, on: bool) {
@@ -2278,7 +2280,9 @@ impl<'window> Renderer<'window> {
     /// size and bloom toggle.
     fn update_post_params(&self) {
         let (w, h) = self.scaled_dims();
-        let on = |b: bool, v: f32| if b { v } else { 0.0 };
+        // All post effects are gated by the master shader toggle.
+        let sh = self.shaders_enabled;
+        let on = |b: bool, v: f32| if sh && b { v } else { 0.0 };
         // p: bloom threshold, bloom intensity, texel.x, texel.y
         // q: exposure, saturation, contrast, bloom-enabled
         // r: vignette amount, chromatic amount, dof strength, motion-blur strength
@@ -2544,7 +2548,12 @@ impl<'window> Renderer<'window> {
                     camera.position.z,
                     self.start_time.elapsed().as_secs_f32(),
                 ],
-                cloud_params: [if self.clouds_enabled { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
+                cloud_params: [
+                    if self.shaders_enabled && self.clouds_enabled { 1.0 } else { 0.0 },
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
             }),
         );
         self.queue.write_buffer(
@@ -2909,7 +2918,7 @@ impl<'window> Renderer<'window> {
                 fog_params: [
                     camera.z_far * 0.45,
                     camera.z_far * 0.92,
-                    on(self.fog_enabled),
+                    on(self.shaders_enabled && self.fog_enabled),
                     self.brightness,
                 ],
             }),
@@ -3352,7 +3361,9 @@ impl<'window> Renderer<'window> {
         // graphics copies the scene colour first so the water shader can sample
         // it for screen-space reflection; Fast graphics draws plain water.
         if !water_draws.is_empty() && !self.debug_skip.water {
-            let use_ssr = self.fancy_graphics
+            // SSR (and its scene copy) only with shaders on; otherwise plain water.
+            let use_ssr = self.shaders_enabled
+                && self.fancy_graphics
                 && self.offscreen_tex.is_some()
                 && self.scene_copy_tex.is_some()
                 && self.water_ssr_bind_group.is_some();
@@ -3428,8 +3439,9 @@ impl<'window> Renderer<'window> {
         }
 
         // Auto-exposure: reduce the HDR scene to a 1x1 average luminance the post
-        // pass reads. Only when enabled (the post pass ignores it otherwise).
-        if self.auto_exposure_enabled {
+        // pass reads. Gated by the master toggle (the post pass ignores it
+        // otherwise) so it costs nothing with shaders off.
+        if self.shaders_enabled && self.auto_exposure_enabled {
             if let Some(lb) = &self.lum_bind_group {
                 let mut lp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("luminance-pass"),
