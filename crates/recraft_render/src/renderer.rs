@@ -36,15 +36,18 @@ struct CameraUniform {
     view_proj: [[f32; 4]; 4],
     /// Day/night sky-light scale fed to the chunk shader's lightmap.
     sky_brightness: f32,
-    _pad: [f32; 3],
+    /// Seconds since startup, for animated effects (water waves).
+    time: f32,
+    _pad: [f32; 2],
 }
 
 impl CameraUniform {
-    fn new(view_proj: [[f32; 4]; 4], sky_brightness: f32) -> Self {
+    fn new(view_proj: [[f32; 4]; 4], sky_brightness: f32, time: f32) -> Self {
         Self {
             view_proj,
             sky_brightness,
-            _pad: [0.0; 3],
+            time,
+            _pad: [0.0; 2],
         }
     }
 }
@@ -474,6 +477,10 @@ pub struct Renderer<'window> {
     /// Opaque (REPLACE-blend) water/glass pipeline for Graphics: Fast — skips
     /// the alpha-blend destination read.
     water_opaque_pipeline: wgpu::RenderPipeline,
+    /// Dedicated water-surface pipeline: animated waves + fresnel reflection.
+    water_pipeline: wgpu::RenderPipeline,
+    /// Startup instant, for animated effects (water).
+    start_time: Instant,
     /// Settings: 3D render-resolution scale, fancy graphics, mipmap level.
     render_scale: f32,
     fancy_graphics: bool,
@@ -521,6 +528,8 @@ pub struct Renderer<'window> {
     chunk_solid: ChunkLayer,
     chunk_cutout: ChunkLayer,
     chunk_transparent: ChunkLayer,
+    /// Water surfaces, drawn with the dedicated water pipeline (waves/reflection).
+    chunk_water: ChunkLayer,
     chunk_sections: HashSet<SectionPos>,
     indirect_buf: wgpu::Buffer,
     multi_draw: bool,
@@ -632,7 +641,7 @@ impl<'window> Renderer<'window> {
         };
         surface.configure(&device, &config);
 
-        let camera_uniform = CameraUniform::new(Mat4::IDENTITY.to_cols_array_2d(), 1.0);
+        let camera_uniform = CameraUniform::new(Mat4::IDENTITY.to_cols_array_2d(), 1.0, 0.0);
         let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("camera-buffer"),
             contents: bytemuck::bytes_of(&camera_uniform),
@@ -669,6 +678,7 @@ impl<'window> Renderer<'window> {
             contents: bytemuck::bytes_of(&CameraUniform::new(
                 Mat4::IDENTITY.to_cols_array_2d(),
                 1.0,
+                0.0,
             )),
             usage: wgpu::BufferUsages::UNIFORM,
         });
@@ -696,6 +706,10 @@ impl<'window> Renderer<'window> {
         let overlay_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("overlay-shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader/overlay.wgsl").into()),
+        });
+        let water_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("water-shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shader/water.wgsl").into()),
         });
         let sky_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("sky-shader"),
@@ -803,7 +817,9 @@ impl<'window> Renderer<'window> {
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    // Vertex too: the water shader reads the enable flag + time
+                    // to displace the surface.
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -1172,6 +1188,44 @@ impl<'window> Renderer<'window> {
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: DEPTH_FORMAT,
                 depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+        });
+        // Dedicated water surface: animated waves + Fresnel reflection. Alpha
+        // blended, depth-tested but no depth write (like the translucent layer).
+        let water_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("water-pipeline"),
+            layout: Some(&lit_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &water_shader,
+                entry_point: "vs_main",
+                buffers: &[ChunkVertex::layout()],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &water_shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: Some(wgpu::Face::Back),
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: false,
                 depth_compare: wgpu::CompareFunction::Less,
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
@@ -1664,6 +1718,7 @@ impl<'window> Renderer<'window> {
         let chunk_solid = ChunkLayer::new("mega-solid");
         let chunk_cutout = ChunkLayer::new("mega-cutout");
         let chunk_transparent = ChunkLayer::new("mega-transparent");
+        let chunk_water = ChunkLayer::new("mega-water");
         let indirect_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("indirect-cmds"),
             size: 4096 * std::mem::size_of::<IndirectCmd>() as u64 * 3,
@@ -1724,6 +1779,8 @@ impl<'window> Renderer<'window> {
             window_depth_view,
             texture_bind_groups,
             water_opaque_pipeline,
+            water_pipeline,
+            start_time: Instant::now(),
             render_scale: 1.0,
             fancy_graphics: true,
             mipmap_levels: crate::texture::ATLAS_MIP_LEVELS - 1,
@@ -1759,6 +1816,7 @@ impl<'window> Renderer<'window> {
             chunk_solid,
             chunk_cutout,
             chunk_transparent,
+            chunk_water,
             chunk_sections: HashSet::new(),
             indirect_buf,
             multi_draw,
@@ -2031,6 +2089,7 @@ impl<'window> Renderer<'window> {
         self.chunk_solid.clear();
         self.chunk_cutout.clear();
         self.chunk_transparent.clear();
+        self.chunk_water.clear();
         self.chunk_sections.clear();
         self.chunk_mesh_generations.clear();
         let sections: Vec<SectionPos> = world
@@ -2133,6 +2192,7 @@ impl<'window> Renderer<'window> {
         self.chunk_cutout.insert(device, queue, pos, &mesh.cutout);
         self.chunk_transparent
             .insert(device, queue, pos, &mesh.transparent);
+        self.chunk_water.insert(device, queue, pos, &mesh.water);
         self.chunk_sections.insert(pos);
     }
 
@@ -2140,6 +2200,7 @@ impl<'window> Renderer<'window> {
         self.chunk_solid.remove(pos);
         self.chunk_cutout.remove(pos);
         self.chunk_transparent.remove(pos);
+        self.chunk_water.remove(pos);
         self.chunk_sections.remove(&pos);
     }
 
@@ -2508,12 +2569,14 @@ impl<'window> Renderer<'window> {
         // sun/moon/star geometry.
         let sky = crate::sky::sky_colors(self.world_time);
         let view_proj = camera.view_projection();
+        let time = self.start_time.elapsed().as_secs_f32();
         self.queue.write_buffer(
             &self.camera_buffer,
             0,
             bytemuck::bytes_of(&CameraUniform::new(
                 view_proj.to_cols_array_2d(),
                 sky.sun_brightness,
+                time,
             )),
         );
         // Post-pass camera (depth-aware DoF / motion blur): unproject depth and
@@ -2759,7 +2822,7 @@ impl<'window> Renderer<'window> {
             // drawn after the sky so water/glass still blends over it.
             let mut cmd_offset = 0u64;
             let cmd_stride = std::mem::size_of::<IndirectCmd>() as u64;
-            let trans_batches = if !self.chunk_sections.is_empty() {
+            let (trans_batches, water_batches) = if !self.chunk_sections.is_empty() {
                 let frustum = camera.frustum();
                 let visible: Vec<SectionPos> = self
                     .chunk_sections
@@ -2776,9 +2839,14 @@ impl<'window> Renderer<'window> {
                     collect_layer_batches(&self.chunk_cutout, &visible, &mut chunk_indices);
                 let trans_batches =
                     collect_layer_batches(&self.chunk_transparent, &visible, &mut chunk_indices);
+                let water_batches =
+                    collect_layer_batches(&self.chunk_water, &visible, &mut chunk_indices);
 
-                // Pack all commands into the indirect buffer.
-                let total_cmds: usize = solid_batches.iter().chain(&cutout_batches).chain(&trans_batches)
+                // Pack all commands into the indirect buffer (order: solid,
+                // cutout, transparent, water — matching the draw order so the
+                // running cmd_offset lines up).
+                let total_cmds: usize = solid_batches.iter().chain(&cutout_batches)
+                    .chain(&trans_batches).chain(&water_batches)
                     .map(|b| b.cmds.len()).sum();
                 if total_cmds > 0 {
                     let cmd_size = std::mem::size_of::<IndirectCmd>() as u64;
@@ -2792,7 +2860,8 @@ impl<'window> Renderer<'window> {
                         });
                     }
                     let mut all_cmds = Vec::with_capacity(total_cmds);
-                    for b in solid_batches.iter().chain(&cutout_batches).chain(&trans_batches) {
+                    for b in solid_batches.iter().chain(&cutout_batches)
+                        .chain(&trans_batches).chain(&water_batches) {
                         all_cmds.extend_from_slice(&b.cmds);
                     }
                     self.queue.write_buffer(
@@ -2876,9 +2945,9 @@ impl<'window> Renderer<'window> {
                     }
                 }
 
-                trans_batches
+                (trans_batches, water_batches)
             } else {
-                Vec::new()
+                (Vec::new(), Vec::new())
             };
 
             // Sky gradient (fullscreen view-ray) then the sun/moon/stars, drawn
@@ -2918,6 +2987,40 @@ impl<'window> Renderer<'window> {
                 });
                 for batch in &trans_batches {
                     let page = &self.chunk_transparent.pages[batch.page];
+                    pass.set_vertex_buffer(0, page.vertex_buf.slice(..));
+                    pass.set_index_buffer(page.index_buf.slice(..), wgpu::IndexFormat::Uint16);
+                    let count = batch.cmds.len() as u32;
+                    draw_calls += count;
+                    if self.multi_draw {
+                        pass.multi_draw_indexed_indirect(&self.indirect_buf, cmd_offset, count);
+                    } else {
+                        for c in &batch.cmds {
+                            pass.draw_indexed(c.first_index..c.first_index + c.index_count, c.base_vertex, 0..1);
+                        }
+                    }
+                    cmd_offset += count as u64 * cmd_stride;
+                }
+            }
+
+            // Water surfaces: dedicated shader (animated waves + Fresnel
+            // reflection) over the sky and world. Its indirect commands are
+            // packed after the transparent ones, so cmd_offset already points at
+            // them. Fast graphics falls back to the opaque water pipeline.
+            if !water_batches.is_empty() && !self.debug_skip.water {
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                pass.set_bind_group(
+                    1,
+                    &self.texture_bind_groups[self.mipmap_levels as usize],
+                    &[],
+                );
+                pass.set_bind_group(2, &self.lighting_bind_group, &[]);
+                pass.set_pipeline(if self.fancy_graphics {
+                    &self.water_pipeline
+                } else {
+                    &self.water_opaque_pipeline
+                });
+                for batch in &water_batches {
+                    let page = &self.chunk_water.pages[batch.page];
                     pass.set_vertex_buffer(0, page.vertex_buf.slice(..));
                     pass.set_index_buffer(page.index_buf.slice(..), wgpu::IndexFormat::Uint16);
                     let count = batch.cmds.len() as u32;

@@ -303,11 +303,17 @@ pub struct ChunkMesh {
     pub solid: ChunkMeshBuffers,
     pub cutout: ChunkMeshBuffers,
     pub transparent: ChunkMeshBuffers,
+    /// Water surfaces, split out from `transparent` so they can be drawn with a
+    /// dedicated water shader (waves + reflection).
+    pub water: ChunkMeshBuffers,
 }
 
 impl ChunkMesh {
     pub fn is_empty(&self) -> bool {
-        self.solid.is_empty() && self.cutout.is_empty() && self.transparent.is_empty()
+        self.solid.is_empty()
+            && self.cutout.is_empty()
+            && self.transparent.is_empty()
+            && self.water.is_empty()
     }
 }
 
@@ -533,6 +539,9 @@ const FACING_NORMAL: [[i32; 3]; 6] = [
 ];
 
 fn buffer_for(mesh: &mut ChunkMesh, block: BlockState) -> &mut ChunkMeshBuffers {
+    if block.is_water() {
+        return &mut mesh.water;
+    }
     match block.render_layer() {
         RenderLayer::Solid => &mut mesh.solid,
         RenderLayer::Cutout => &mut mesh.cutout,
