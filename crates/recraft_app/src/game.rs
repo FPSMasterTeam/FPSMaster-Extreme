@@ -1445,9 +1445,19 @@ impl GameState {
                 continue;
             };
             let pos = to_render_vec3(entity.render_position(tick_alpha as f64));
-            // A per-entity offset desynchronises the bob/spin of nearby items.
             let phase = entity.age as f32 + tick_alpha + (entity.id.0 as f32) * 0.5;
-            items.push(DroppedItem { item, pos, phase });
+            let (block_l, sky_l) = self.world.light_at(
+                pos.x.floor() as i32,
+                pos.y.floor() as i32,
+                pos.z.floor() as i32,
+            );
+            let light = [sky_l as f32 / 15.0, block_l as f32 / 15.0];
+            items.push(DroppedItem {
+                item,
+                pos,
+                phase,
+                light,
+            });
         }
         items
     }

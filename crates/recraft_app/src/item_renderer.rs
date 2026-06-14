@@ -29,6 +29,8 @@ pub struct DroppedItem {
     pub item: SlotItem,
     pub pos: Vec3,
     pub phase: f32,
+    /// `[sky_light, block_light]` in 0..1, sampled at the entity position.
+    pub light: [f32; 2],
 }
 
 pub struct ItemRenderer;
@@ -88,7 +90,7 @@ impl ItemRenderer {
                     let name = block.texture_name(BlockFace::Side).map(str::to_owned);
                     let tint = tint3(block.tint(BlockFace::Side));
                     let to_world = |c: Vec3| view_to_world(camera, m.transform_point3(c));
-                    push_sprite(&mut vertices, &mut indices, &to_world, name.as_deref(), atlas, tint);
+                    push_sprite(&mut vertices, &mut indices, &to_world, name.as_deref(), atlas, tint, recraft_render::FULLBRIGHT);
                 }
                 _ => {
                     // 1.8 block models have NO firstperson display entry —
@@ -98,7 +100,7 @@ impl ItemRenderer {
                     gl_scale(&mut m, 2.0, 2.0, 2.0);
                     finish_item_model(&mut m);
                     let to_world = |c: Vec3| view_to_world(camera, m.transform_point3(c));
-                    push_block_cube(&mut vertices, &mut indices, &to_world, block, atlas);
+                    push_block_cube(&mut vertices, &mut indices, &to_world, block, atlas, recraft_render::FULLBRIGHT);
                 }
             }
         } else if let Some(name) = item_texture_name(item.id) {
@@ -114,6 +116,7 @@ impl ItemRenderer {
                 Some(&name),
                 atlas,
                 [1.0, 1.0, 1.0],
+                recraft_render::FULLBRIGHT,
             );
         }
         (vertices, indices)
@@ -165,6 +168,7 @@ impl ItemRenderer {
                             name.as_deref(),
                             atlas,
                             tint,
+                            d.light,
                         );
                     }
                     _ => {
@@ -175,7 +179,7 @@ impl ItemRenderer {
                             let p = (v - Vec3::splat(0.5)) * size;
                             base + Vec3::new(p.x * c - p.z * s, p.y, p.x * s + p.z * c)
                         };
-                        push_block_cube(&mut vertices, &mut indices, &spin_to_world, block, atlas);
+                        push_block_cube(&mut vertices, &mut indices, &spin_to_world, block, atlas, d.light);
                     }
                 }
             } else if let Some(name) = item_texture_name(item.id) {
@@ -187,6 +191,7 @@ impl ItemRenderer {
                     Some(&name),
                     atlas,
                     [1.0, 1.0, 1.0],
+                    d.light,
                 );
             }
         }
@@ -313,6 +318,7 @@ fn push_quad(
     corners: [Vec3; 4],
     uvs: [[f32; 2]; 4],
     color: [f32; 4],
+    light: [f32; 2],
 ) {
     let base = vertices.len() as u32;
     for (corner, uv) in corners.iter().zip(uvs) {
@@ -320,7 +326,7 @@ fn push_quad(
             position: (*corner).into(),
             color,
             uv,
-            light: recraft_render::FULLBRIGHT,
+            light,
         });
     }
     indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
@@ -347,6 +353,7 @@ fn push_block_cube(
     to_world: &dyn Fn(Vec3) -> Vec3,
     block: BlockState,
     atlas: &AtlasUv,
+    light: [f32; 2],
 ) {
     // Per face: vanilla FaceBakery vertex order (outward CCW), the texture
     // face, and the diffuse shade. Outward winding matters because first-person
@@ -395,7 +402,7 @@ fn push_block_cube(
         let tint = tint3(block.tint(face));
         let color = [tint[0] * shade, tint[1] * shade, tint[2] * shade, 1.0];
         let world = corners.map(to_world);
-        push_quad(vertices, indices, world, uvs, color);
+        push_quad(vertices, indices, world, uvs, color, light);
     }
 }
 
@@ -411,6 +418,7 @@ fn push_sprite(
     name: Option<&str>,
     atlas: &AtlasUv,
     tint: [f32; 3],
+    light: [f32; 2],
 ) {
     let rect = atlas.tile_rect(name);
     let uv = |u: f32, v: f32| [rect[0] + u * rect[2], rect[1] + v * rect[3]];
@@ -430,6 +438,7 @@ fn push_sprite(
         [w(0.0, 1.0, ZF), w(0.0, 0.0, ZF), w(1.0, 0.0, ZF), w(1.0, 1.0, ZF)],
         [uv(0.0, 0.0), uv(0.0, 1.0), uv(1.0, 1.0), uv(1.0, 0.0)],
         color,
+        light,
     );
     push_quad(
         vertices,
@@ -437,6 +446,7 @@ fn push_sprite(
         [w(1.0, 1.0, ZB), w(1.0, 0.0, ZB), w(0.0, 0.0, ZB), w(0.0, 1.0, ZB)],
         [uv(1.0, 0.0), uv(1.0, 1.0), uv(0.0, 1.0), uv(0.0, 0.0)],
         color,
+        light,
     );
 
     // Per-pixel silhouette extrusion: a side face wherever an opaque texel
@@ -462,19 +472,19 @@ fn push_sprite(
             let suvs = [suv; 4];
             if !opaque(tx - 1, ty) {
                 push_quad(vertices, indices,
-                    [w(x0, y0, ZF), w(x0, y1, ZF), w(x0, y1, ZB), w(x0, y0, ZB)], suvs, edge);
+                    [w(x0, y0, ZF), w(x0, y1, ZF), w(x0, y1, ZB), w(x0, y0, ZB)], suvs, edge, light);
             }
             if !opaque(tx + 1, ty) {
                 push_quad(vertices, indices,
-                    [w(x1, y0, ZB), w(x1, y1, ZB), w(x1, y1, ZF), w(x1, y0, ZF)], suvs, edge);
+                    [w(x1, y0, ZB), w(x1, y1, ZB), w(x1, y1, ZF), w(x1, y0, ZF)], suvs, edge, light);
             }
             if !opaque(tx, ty - 1) {
                 push_quad(vertices, indices,
-                    [w(x0, y1, ZB), w(x0, y1, ZF), w(x1, y1, ZF), w(x1, y1, ZB)], suvs, edge);
+                    [w(x0, y1, ZB), w(x0, y1, ZF), w(x1, y1, ZF), w(x1, y1, ZB)], suvs, edge, light);
             }
             if !opaque(tx, ty + 1) {
                 push_quad(vertices, indices,
-                    [w(x0, y0, ZF), w(x0, y0, ZB), w(x1, y0, ZB), w(x1, y0, ZF)], suvs, edge);
+                    [w(x0, y0, ZF), w(x0, y0, ZB), w(x1, y0, ZB), w(x1, y0, ZF)], suvs, edge, light);
             }
         }
     }
