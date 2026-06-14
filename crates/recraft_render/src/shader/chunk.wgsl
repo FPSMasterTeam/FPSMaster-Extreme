@@ -125,8 +125,10 @@ fn apply_lighting(albedo: vec3<f32>, in: VertexOutput) -> vec3<f32> {
     // Ambient must track day/night: the skylight channel stays high at night
     // (only the directional sun sets), so gate the sky-driven ambient by the
     // day/night brightness, leaving a small floor so it's never pure black.
+    // Only the skylight-driven part tracks day/night; the small floor is constant
+    // so an enclosed/sky-less space stays the same brightness day or night.
     let day = max(camera.sky_brightness, 0.04);
-    let ambient = lighting.ambient.rgb * (0.08 + 0.92 * sky) * day;
+    let ambient = lighting.ambient.rgb * (0.08 + 0.92 * sky * day);
     let sun = lighting.sun_color.rgb * (ndotl * shadow * sky);
     let torch = vec3<f32>(1.0, 0.82, 0.55) * block;
     var lit = albedo * light_curve(ambient + sun + torch, gamma);

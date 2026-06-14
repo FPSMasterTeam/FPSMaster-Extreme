@@ -1909,9 +1909,14 @@ impl GameState {
         if !self.local_lighting {
             return;
         }
-        let sections = self.world.update_block_light(x, y, z, old);
-        self.dirty_chunks.extend(sections.iter().copied());
-        self.urgent_remesh.extend(sections);
+        let block_light = self.world.update_block_light(x, y, z, old);
+        // Also recompute the column's sky-light so roofing over darkens the space
+        // below (and digging a shaft lets daylight back in).
+        let sky_light = self.world.update_column_skylight(x, z);
+        self.dirty_chunks.extend(block_light.iter().copied());
+        self.dirty_chunks.extend(sky_light.iter().copied());
+        self.urgent_remesh.extend(block_light);
+        self.urgent_remesh.extend(sky_light);
     }
 
     /// Mirror vanilla's client-side placement: the instant we send a block

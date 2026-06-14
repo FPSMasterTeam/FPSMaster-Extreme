@@ -161,7 +161,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let sky = in.light.x;
     let ndotl = max(dot(n, lighting.sun_dir.xyz), 0.0);
     let day = max(camera.sky_brightness, 0.04);
-    let ambient = lighting.ambient.rgb * (0.2 + 0.8 * sky) * day;
+    let ambient = lighting.ambient.rgb * (0.2 + 0.8 * sky * day);
     let diffuse = lighting.sun_color.rgb * (ndotl * sky * 0.5);
     var color = base * (ambient + diffuse);
 

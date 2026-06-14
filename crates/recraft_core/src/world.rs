@@ -180,8 +180,7 @@ impl World {
     }
 
     /// Set only the block-light nibble (preserving sky-light) and record the
-    /// affected section plus any neighbour section across a touched border (so
-    /// cross-section smooth lighting re-meshes too).
+    /// affected section plus border neighbours.
     fn set_block_light_tracked(
         &mut self,
         x: i32,
@@ -192,26 +191,39 @@ impl World {
     ) {
         let sky = self.light_at(x, y, z).1;
         self.set_light(x, y, z, value, sky);
-        let sx = div_floor(x, 16);
-        let sz = div_floor(z, 16);
-        let sy = y.div_euclid(16);
-        changed.insert(SectionPos::new(sx, sy, sz));
-        let (lx, ly, lz) = (mod_floor(x, 16), y.rem_euclid(16), mod_floor(z, 16));
-        if lx == 0 {
-            changed.insert(SectionPos::new(sx - 1, sy, sz));
-        } else if lx == 15 {
-            changed.insert(SectionPos::new(sx + 1, sy, sz));
+        insert_section_borders(x, y, z, changed);
+    }
+
+    /// Recompute sky-light for one column by the vertical cast (used after a block
+    /// edit so e.g. building a roof darkens the space below, and digging a shaft
+    /// lets daylight back in). Returns the sections whose sky-light changed.
+    pub fn update_column_skylight(&mut self, x: i32, z: i32) -> Vec<SectionPos> {
+        let cpos = ChunkPos::new(div_floor(x, 16), div_floor(z, 16));
+        let section_ys: Vec<i32> = match self.chunks.get(&cpos) {
+            Some(chunk) => chunk.sections().map(|s| s.y()).collect(),
+            None => return Vec::new(),
+        };
+        let Some(&top) = section_ys.iter().max() else {
+            return Vec::new();
+        };
+        let mut changed: HashSet<SectionPos> = HashSet::new();
+        let mut blocked = false;
+        let mut y = top * 16 + 15;
+        while y >= 0 {
+            if section_ys.contains(&y.div_euclid(16)) {
+                if !blocked && self.block_at(x, y, z).is_opaque_cube() {
+                    blocked = true;
+                }
+                let want = if blocked { 0 } else { 15 };
+                let (block_l, sky_l) = self.light_at(x, y, z);
+                if sky_l != want {
+                    self.set_light(x, y, z, block_l, want);
+                    insert_section_borders(x, y, z, &mut changed);
+                }
+            }
+            y -= 1;
         }
-        if lz == 0 {
-            changed.insert(SectionPos::new(sx, sy, sz - 1));
-        } else if lz == 15 {
-            changed.insert(SectionPos::new(sx, sy, sz + 1));
-        }
-        if ly == 0 && sy > 0 {
-            changed.insert(SectionPos::new(sx, sy - 1, sz));
-        } else if ly == 15 && sy < 15 {
-            changed.insert(SectionPos::new(sx, sy + 1, sz));
-        }
+        changed.into_iter().collect()
     }
 
     pub fn upsert_entity(&mut self, entity: EntityState) {
@@ -236,6 +248,31 @@ impl World {
 
     pub fn entities(&self) -> impl Iterator<Item = &EntityState> {
         self.entities.values()
+    }
+}
+
+/// Record the section containing (x,y,z) plus any neighbour section across a
+/// touched border, so cross-section smooth lighting re-meshes too.
+fn insert_section_borders(x: i32, y: i32, z: i32, changed: &mut HashSet<SectionPos>) {
+    let sx = div_floor(x, 16);
+    let sz = div_floor(z, 16);
+    let sy = y.div_euclid(16);
+    changed.insert(SectionPos::new(sx, sy, sz));
+    let (lx, ly, lz) = (mod_floor(x, 16), y.rem_euclid(16), mod_floor(z, 16));
+    if lx == 0 {
+        changed.insert(SectionPos::new(sx - 1, sy, sz));
+    } else if lx == 15 {
+        changed.insert(SectionPos::new(sx + 1, sy, sz));
+    }
+    if lz == 0 {
+        changed.insert(SectionPos::new(sx, sy, sz - 1));
+    } else if lz == 15 {
+        changed.insert(SectionPos::new(sx, sy, sz + 1));
+    }
+    if ly == 0 && sy > 0 {
+        changed.insert(SectionPos::new(sx, sy - 1, sz));
+    } else if ly == 15 && sy < 15 {
+        changed.insert(SectionPos::new(sx, sy + 1, sz));
     }
 }
 
@@ -293,6 +330,24 @@ mod tests {
         assert_eq!(world.light_at(8, 8, 8).0, 0);
         assert_eq!(world.light_at(9, 8, 8).0, 0);
         assert_eq!(world.light_at(13, 8, 8).0, 0);
+    }
+
+    #[test]
+    fn roofing_a_column_darkens_skylight_below() {
+        let mut world = World::new();
+        world.set_block(2, 64, 2, BlockState::STONE); // floor (creates the chunk)
+        world.recompute_vertical_skylight();
+        assert_eq!(world.light_at(2, 70, 2).1, 15, "open air above the floor is sky-lit");
+
+        // Roof the column: everything below the roof loses sky-light.
+        world.set_block(2, 72, 2, BlockState::STONE);
+        world.update_column_skylight(2, 2);
+        assert_eq!(world.light_at(2, 70, 2).1, 0, "roofing darkens the space below");
+
+        // Removing the roof lets daylight back in.
+        world.set_block(2, 72, 2, BlockState::AIR);
+        world.update_column_skylight(2, 2);
+        assert_eq!(world.light_at(2, 70, 2).1, 15, "removing the roof relights it");
     }
 
     #[test]
