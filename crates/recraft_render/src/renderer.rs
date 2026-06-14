@@ -414,6 +414,8 @@ pub struct Renderer<'window> {
     /// No-cull cutout variant for the isometric GUI block-icon cubes.
     gui_cube_pipeline: wgpu::RenderPipeline,
     item_pipeline: wgpu::RenderPipeline,
+    /// First-person held item: drawn on top (depth test always passes).
+    first_person_item_pipeline: wgpu::RenderPipeline,
     transparent_pipeline: wgpu::RenderPipeline,
     overlay_pipeline: wgpu::RenderPipeline,
     model_pipeline: wgpu::RenderPipeline,
@@ -1184,6 +1186,46 @@ impl<'window> Renderer<'window> {
             multisample: wgpu::MultisampleState::default(),
             multiview: None,
         });
+        // First-person held item: same as the item pipeline but the depth test
+        // always passes and writes no depth, so the hand item is never occluded
+        // by world blocks/entities (back-face culling keeps a convex item correct
+        // without self-occlusion). Drawn last in the world pass.
+        let first_person_item_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("first-person-item-pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &overlay_shader,
+                entry_point: "vs_main",
+                buffers: &[Vertex::layout()],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &overlay_shader,
+                entry_point: "fs_cutout",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: Some(wgpu::Face::Back),
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::Always,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+        });
         // Translucent (water/ice/stained glass): alpha-blended, tested against the
         // opaque depth buffer but not writing depth (so overlapping translucent
         // faces blend). Back-face culled like vanilla so a glass/ice cube shows
@@ -1910,6 +1952,7 @@ impl<'window> Renderer<'window> {
             cutout_pipeline,
             gui_cube_pipeline,
             item_pipeline,
+            first_person_item_pipeline,
             transparent_pipeline,
             overlay_pipeline,
             model_pipeline,
@@ -3378,9 +3421,10 @@ impl<'window> Renderer<'window> {
                 draw_calls += 1;
             }
 
-            // First-person held item, textured from the block/item atlas.
+            // First-person held item, textured from the block/item atlas. Drawn
+            // with the always-on-top pipeline so it isn't occluded by the world.
             if let Some(item) = self.first_person_item.as_ref().filter(|m| m.index_count > 0) {
-                pass.set_pipeline(&self.item_pipeline);
+                pass.set_pipeline(&self.first_person_item_pipeline);
                 pass.set_bind_group(0, &self.camera_bind_group, &[]);
                 pass.set_bind_group(
                     1,
