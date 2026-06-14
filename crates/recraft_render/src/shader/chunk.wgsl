@@ -74,6 +74,25 @@ fn day_night(light: vec2<f32>) -> f32 {
     return max(light.x * camera.sky_brightness, light.y);
 }
 
+// Vanilla per-level brightness curve: light falls off steeply toward the dark
+// end (l=1 -> 1, l=0.5 -> 0.2), giving the moody gradient around light sources.
+fn light_level(l: f32) -> f32 {
+    return l / (4.0 - 3.0 * clamp(l, 0.0, 1.0));
+}
+
+// Vanilla-style coloured light map: day/night-scaled sky light (cool at night,
+// white by day) combined with a warm torch/block-light glow, with the steep
+// per-level falloff and a small moody floor so nothing is pure black.
+fn vanilla_lightmap(light: vec2<f32>) -> vec3<f32> {
+    let day = camera.sky_brightness;
+    let sky = light_level(light.x);
+    let block = light_level(light.y);
+    let sky_tint = mix(vec3<f32>(0.18, 0.22, 0.34), vec3<f32>(1.0, 1.0, 0.99), day);
+    let sky_term = sky_tint * (sky * day);
+    let block_term = vec3<f32>(1.0, 0.60, 0.30) * block; // warm torch glow
+    return max(max(sky_term, block_term), vec3<f32>(0.035, 0.04, 0.05));
+}
+
 // Fraction of the sun visible at this world position (1 = lit, 0 = shadowed),
 // 3×3 PCF. Outside the shadow map's range everything is lit.
 fn sun_shadow(world_pos: vec3<f32>, ndotl: f32) -> f32 {
@@ -112,7 +131,9 @@ fn apply_lighting(albedo: vec3<f32>, in: VertexOutput) -> vec3<f32> {
     // Brightness option (fog_params.w in 0..1) → gamma: 1.0 neutral, lower darker.
     let gamma = 1.0 + (1.0 - lighting.fog_params.w) * 1.5;
     if (lighting.flags.x < 0.5) {
-        return albedo * light_curve(vec3<f32>(day_night(in.light)), gamma);
+        // Vanilla path: coloured light map (warm block light + day/night sky) with
+        // the steep per-level falloff, then the brightness gamma.
+        return albedo * light_curve(vanilla_lightmap(in.light), gamma);
     }
     let n = normalize(in.normal);
     let ndotl = max(dot(n, lighting.sun_dir.xyz), 0.0);
