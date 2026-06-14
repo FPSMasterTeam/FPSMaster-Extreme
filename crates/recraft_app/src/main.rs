@@ -208,6 +208,7 @@ fn main() -> anyhow::Result<()> {
     renderer.set_shaders_enabled(settings.shaders);
     renderer.set_shadows_enabled(settings.shader_shadows);
     renderer.set_specular_enabled(settings.shader_specular);
+    renderer.set_fog_enabled(settings.shader_fog);
     apply_display(window, &settings);
     // Atlas UV table snapshot for first-person item geometry (cheap clone of
     // the name→tile map, taken once).
@@ -889,6 +890,7 @@ fn handle_actions(
             GuiAction::SetShaders(on) => renderer.set_shaders_enabled(on),
             GuiAction::SetShaderShadows(on) => renderer.set_shadows_enabled(on),
             GuiAction::SetShaderSpecular(on) => renderer.set_specular_enabled(on),
+            GuiAction::SetShaderFog(on) => renderer.set_fog_enabled(on),
             GuiAction::SaveSettings => app.settings.save(),
             GuiAction::SendPacket(packet) => {
                 if let Some(network) = &app.network {

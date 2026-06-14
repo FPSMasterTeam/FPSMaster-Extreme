@@ -61,6 +61,10 @@ struct LightingUniform {
     camera_pos: [f32; 4],
     /// x = master enable, y = shadows, z = specular, w = shadow texel size.
     flags: [f32; 4],
+    /// rgb = fog colour (sky horizon), w unused.
+    fog_color: [f32; 4],
+    /// x = fog start dist, y = fog end dist, z = fog enabled, w unused.
+    fog_params: [f32; 4],
 }
 
 /// Uniform for the fullscreen sky-gradient pass: the inverse rotation-only
@@ -471,6 +475,7 @@ pub struct Renderer<'window> {
     shaders_enabled: bool,
     shadows_enabled: bool,
     specular_enabled: bool,
+    fog_enabled: bool,
     /// Sun shadow-map target + the depth-only pipelines that fill it.
     shadow_view: wgpu::TextureView,
     shadow_solid_pipeline: wgpu::RenderPipeline,
@@ -1694,6 +1699,7 @@ impl<'window> Renderer<'window> {
             shaders_enabled: false,
             shadows_enabled: false,
             specular_enabled: false,
+            fog_enabled: false,
             shadow_view,
             shadow_solid_pipeline,
             shadow_cutout_pipeline,
@@ -1757,6 +1763,12 @@ impl<'window> Renderer<'window> {
 
     pub fn set_specular_enabled(&mut self, on: bool) {
         self.specular_enabled = on;
+    }
+
+    /// Distance fog toward the sky horizon colour (independent of the master
+    /// shader toggle).
+    pub fn set_fog_enabled(&mut self, on: bool) {
+        self.fog_enabled = on;
     }
 
     /// Set the 3D-world render-resolution scale (0.5..=1.0). Below 1.0 the world
@@ -2422,6 +2434,13 @@ impl<'window> Renderer<'window> {
                     on(shadows_on),
                     on(self.shaders_enabled && self.specular_enabled),
                     1.0 / SHADOW_DIM as f32,
+                ],
+                fog_color: [sky.horizon[0], sky.horizon[1], sky.horizon[2], 0.0],
+                fog_params: [
+                    camera.z_far * 0.45,
+                    camera.z_far * 0.92,
+                    on(self.fog_enabled),
+                    0.0,
                 ],
             }),
         );

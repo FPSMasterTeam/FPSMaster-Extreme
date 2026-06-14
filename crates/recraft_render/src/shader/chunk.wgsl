@@ -24,6 +24,8 @@ struct Lighting {
     camera_pos: vec4<f32>, // xyz: world-space eye (for specular)
     // x = master enable, y = shadows, z = specular, w = shadow map texel size.
     flags: vec4<f32>,
+    fog_color: vec4<f32>,  // rgb: fog (horizon) colour
+    fog_params: vec4<f32>, // x: start dist, y: end dist, z: enabled
 };
 
 @group(2) @binding(0)
@@ -123,10 +125,25 @@ fn apply_lighting(albedo: vec3<f32>, in: VertexOutput) -> vec3<f32> {
     return lit;
 }
 
+// Distance fog toward the sky horizon colour. Independent of the master shader
+// toggle so it can be used on its own.
+fn apply_fog(color: vec3<f32>, world_pos: vec3<f32>) -> vec3<f32> {
+    if (lighting.fog_params.z < 0.5) {
+        return color;
+    }
+    let dist = length(world_pos - lighting.camera_pos.xyz);
+    let f = clamp(
+        (dist - lighting.fog_params.x) / max(lighting.fog_params.y - lighting.fog_params.x, 0.001),
+        0.0,
+        1.0,
+    );
+    return mix(color, lighting.fog_color.rgb, f);
+}
+
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let texel = textureSample(block_atlas, block_sampler, input.uv);
-    let rgb = apply_lighting(texel.rgb * input.color.rgb, input);
+    let rgb = apply_fog(apply_lighting(texel.rgb * input.color.rgb, input), input.world_pos);
     return vec4<f32>(rgb, texel.a * input.color.a);
 }
 
@@ -153,6 +170,6 @@ fn fs_cutout(input: VertexOutput) -> @location(0) vec4<f32> {
     if (texel.a * input.color.a < 0.5) {
         discard;
     }
-    let rgb = apply_lighting(texel.rgb * input.color.rgb, input);
+    let rgb = apply_fog(apply_lighting(texel.rgb * input.color.rgb, input), input.world_pos);
     return vec4<f32>(rgb, 1.0);
 }

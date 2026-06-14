@@ -13,6 +13,7 @@ pub struct GuiShaders {
     shaders: Option<GuiButton>,
     shadows: Option<GuiButton>,
     specular: Option<GuiButton>,
+    fog: Option<GuiButton>,
     done: Option<GuiButton>,
     from_main_menu: bool,
 }
@@ -40,7 +41,8 @@ impl GuiShaders {
         self.shaders = Some(GuiButton::at_px(x, top, 200 * s, s, ""));
         self.shadows = Some(GuiButton::at_px(x, top + 24 * s, 200 * s, s, ""));
         self.specular = Some(GuiButton::at_px(x, top + 48 * s, 200 * s, s, ""));
-        self.done = Some(GuiButton::at_px(x, top + 84 * s, 200 * s, s, "Done"));
+        self.fog = Some(GuiButton::at_px(x, top + 72 * s, 200 * s, s, ""));
+        self.done = Some(GuiButton::at_px(x, top + 108 * s, 200 * s, s, "Done"));
     }
 }
 
@@ -71,6 +73,10 @@ impl GuiScreen for GuiShaders {
             b.label = format!("Specular: {}", on_off(ctx.settings.shader_specular));
             b.draw(ui, s, ctx.mouse, ctx.mouse_down);
         }
+        if let Some(b) = &mut self.fog {
+            b.label = format!("Fog: {}", on_off(ctx.settings.shader_fog));
+            b.draw(ui, s, ctx.mouse, ctx.mouse_down);
+        }
         if let Some(b) = &self.done {
             b.draw(ui, s, ctx.mouse, ctx.mouse_down);
         }
@@ -88,6 +94,10 @@ impl GuiScreen for GuiShaders {
         if self.specular.as_ref().is_some_and(|b| b.clicked(x, y)) {
             ctx.settings.shader_specular = !ctx.settings.shader_specular;
             return vec![GuiAction::SetShaderSpecular(ctx.settings.shader_specular)];
+        }
+        if self.fog.as_ref().is_some_and(|b| b.clicked(x, y)) {
+            ctx.settings.shader_fog = !ctx.settings.shader_fog;
+            return vec![GuiAction::SetShaderFog(ctx.settings.shader_fog)];
         }
         if self.done.as_ref().is_some_and(|b| b.clicked(x, y)) {
             return vec![GuiAction::SaveSettings, GuiAction::SetScreen(self.back_screen())];

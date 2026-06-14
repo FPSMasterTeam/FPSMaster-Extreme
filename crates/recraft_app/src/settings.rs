@@ -40,6 +40,8 @@ pub struct Settings {
     pub shader_shadows: bool,
     /// Specular highlights (only active while `shaders` is on).
     pub shader_specular: bool,
+    /// Distance fog toward the sky horizon (independent of the master toggle).
+    pub shader_fog: bool,
 }
 
 /// Selectable resolutions (None = native). Common 16:9 modes most panels scale.
@@ -73,6 +75,7 @@ impl Default for Settings {
             shaders: false,
             shader_shadows: true,
             shader_specular: true,
+            shader_fog: false,
         }
     }
 }
@@ -157,6 +160,11 @@ impl Settings {
                         s.shader_specular = v;
                     }
                 }
+                "shader_fog" => {
+                    if let Ok(v) = val.parse() {
+                        s.shader_fog = v;
+                    }
+                }
                 _ => {}
             }
         }
@@ -181,7 +189,7 @@ impl Settings {
     fn save_to(&self, path: &std::path::Path) {
         let (res_w, res_h) = self.resolution.unwrap_or((0, 0));
         let text = format!(
-            "sensitivity={}\nvsync={}\nfps_cap={}\nrender_scale={}\nfancy_graphics={}\nmipmap_levels={}\nresolution_w={}\nresolution_h={}\nfullscreen={}\nshaders={}\nshader_shadows={}\nshader_specular={}\n",
+            "sensitivity={}\nvsync={}\nfps_cap={}\nrender_scale={}\nfancy_graphics={}\nmipmap_levels={}\nresolution_w={}\nresolution_h={}\nfullscreen={}\nshaders={}\nshader_shadows={}\nshader_specular={}\nshader_fog={}\n",
             self.sensitivity,
             self.vsync,
             self.fps_cap,
@@ -194,6 +202,7 @@ impl Settings {
             self.shaders,
             self.shader_shadows,
             self.shader_specular,
+            self.shader_fog,
         );
         if let Err(err) = std::fs::write(path, text) {
             log::warn!("failed to save settings to {}: {err}", path.display());
