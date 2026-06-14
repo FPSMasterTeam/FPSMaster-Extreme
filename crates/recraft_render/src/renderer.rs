@@ -534,6 +534,13 @@ pub struct Renderer<'window> {
     post_bind_group: Option<wgpu::BindGroup>,
     /// Previous frame's view-projection, for motion-blur reprojection.
     prev_view_proj: Mat4,
+    /// Auto-exposure: a 1x1 average-luminance target written by a reduction pass
+    /// and read by the post pass to scale exposure.
+    lum_tex: wgpu::Texture,
+    lum_view: wgpu::TextureView,
+    lum_pipeline: wgpu::RenderPipeline,
+    lum_layout: wgpu::BindGroupLayout,
+    lum_bind_group: Option<wgpu::BindGroup>,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     chunk_solid: ChunkLayer,
@@ -1636,6 +1643,17 @@ impl<'window> Renderer<'window> {
                     },
                     count: None,
                 },
+                // Auto-exposure 1x1 average-luminance (read via textureLoad).
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
         let post_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -1674,6 +1692,75 @@ impl<'window> Renderer<'window> {
                 entry_point: "fs_main",
                 targets: &[Some(wgpu::ColorTargetState {
                     format: surface_format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+        });
+
+        // Auto-exposure: a 1x1 average-luminance target + reduction pipeline.
+        let lum_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("luminance-1x1"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let lum_view = lum_tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let lum_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("luminance-shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shader/luminance.wgsl").into()),
+        });
+        let lum_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("luminance-layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let lum_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("luminance-pipeline-layout"),
+            bind_group_layouts: &[&lum_layout],
+            push_constant_ranges: &[],
+        });
+        let lum_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("luminance-pipeline"),
+            layout: Some(&lum_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &lum_shader,
+                entry_point: "vs_main",
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &lum_shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::R32Float,
                     blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -1874,6 +1961,11 @@ impl<'window> Renderer<'window> {
             post_camera_buffer,
             post_bind_group: None,
             prev_view_proj: Mat4::IDENTITY,
+            lum_tex,
+            lum_view,
+            lum_pipeline,
+            lum_layout,
+            lum_bind_group: None,
             camera_buffer,
             camera_bind_group,
             chunk_solid,
@@ -2124,6 +2216,25 @@ impl<'window> Renderer<'window> {
                 wgpu::BindGroupEntry {
                     binding: 4,
                     resource: self.post_camera_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(&self.lum_view),
+                },
+            ],
+        }));
+        // Auto-exposure reduction reads the (full) off-screen scene.
+        self.lum_bind_group = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("luminance-bind-group"),
+            layout: &self.lum_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.post_sampler),
                 },
             ],
         }));
@@ -3264,6 +3375,30 @@ impl<'window> Renderer<'window> {
                 wp.set_index_buffer(p.index_buf.slice(..), wgpu::IndexFormat::Uint16);
                 wp.draw_indexed(c.first_index..c.first_index + c.index_count, c.base_vertex, 0..1);
                 draw_calls += 1;
+            }
+        }
+
+        // Auto-exposure: reduce the HDR scene to a 1x1 average luminance the post
+        // pass reads. Only when enabled (the post pass ignores it otherwise).
+        if self.auto_exposure_enabled {
+            if let Some(lb) = &self.lum_bind_group {
+                let mut lp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("luminance-pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &self.lum_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    occlusion_query_set: None,
+                    timestamp_writes: None,
+                });
+                lp.set_pipeline(&self.lum_pipeline);
+                lp.set_bind_group(0, lb, &[]);
+                lp.draw(0..3, 0..1);
             }
         }
 

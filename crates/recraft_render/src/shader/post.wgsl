@@ -26,6 +26,7 @@ struct PostCamera {
 @group(0) @binding(2) var<uniform> params: Params;
 @group(0) @binding(3) var depth_tex: texture_depth_2d;
 @group(0) @binding(4) var<uniform> cam: PostCamera;
+@group(0) @binding(5) var lum_tex: texture_2d<f32>;
 
 // Reconstruct world position from a screen UV + non-linear depth.
 fn world_from_depth(uv: vec2<f32>, depth: f32) -> vec3<f32> {
@@ -163,7 +164,15 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         color += bloom / wsum * params.p.y;
     }
 
-    color = color * params.q.x;        // exposure
+    // Exposure: the manual base, optionally scaled by auto-exposure so the scene
+    // average maps toward a mid-grey key (clamped so caves/bright scenes don't
+    // over-correct). s.x enables it.
+    var exposure = params.q.x;
+    if (params.s.x > 0.5) {
+        let avg = textureLoad(lum_tex, vec2<i32>(0, 0), 0).r;
+        exposure = exposure * clamp(0.35 / max(avg, 1e-4), 0.5, 1.8);
+    }
+    color = color * exposure;
     color = tonemap(color);            // filmic tone map (HDR -> linear [0,1])
 
     // Saturation around luma.
