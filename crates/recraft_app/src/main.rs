@@ -211,6 +211,12 @@ fn main() -> anyhow::Result<()> {
     renderer.set_fog_enabled(settings.shader_fog);
     renderer.set_bloom_enabled(settings.shader_bloom);
     renderer.set_brightness(settings.brightness);
+    renderer.set_vignette_enabled(settings.post_vignette);
+    renderer.set_chromatic_enabled(settings.post_chromatic);
+    renderer.set_dof_enabled(settings.post_dof);
+    renderer.set_motion_blur_enabled(settings.post_motion_blur);
+    renderer.set_auto_exposure_enabled(settings.post_auto_exposure);
+    renderer.set_clouds_enabled(settings.volumetric_clouds);
     apply_display(window, &settings);
     // Atlas UV table snapshot for first-person item geometry (cheap clone of
     // the name→tile map, taken once).
@@ -900,6 +906,12 @@ fn handle_actions(
             GuiAction::SetShaderFog(on) => renderer.set_fog_enabled(on),
             GuiAction::SetShaderBloom(on) => renderer.set_bloom_enabled(on),
             GuiAction::SetBrightness(v) => renderer.set_brightness(v),
+            GuiAction::SetVignette(on) => renderer.set_vignette_enabled(on),
+            GuiAction::SetChromatic(on) => renderer.set_chromatic_enabled(on),
+            GuiAction::SetDof(on) => renderer.set_dof_enabled(on),
+            GuiAction::SetMotionBlur(on) => renderer.set_motion_blur_enabled(on),
+            GuiAction::SetAutoExposure(on) => renderer.set_auto_exposure_enabled(on),
+            GuiAction::SetClouds(on) => renderer.set_clouds_enabled(on),
             GuiAction::SaveSettings => app.settings.save(),
             GuiAction::SendPacket(packet) => {
                 if let Some(network) = &app.network {

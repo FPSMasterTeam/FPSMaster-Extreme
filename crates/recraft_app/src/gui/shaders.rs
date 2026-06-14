@@ -1,5 +1,6 @@
 //! The Shaders settings screen: a dedicated entry (opened from Options) toggling
-//! the shader-pack lighting and its sub-effects.
+//! the shader-pack lighting and the post-process effects. Two columns: lighting
+//! on the left, post / world effects on the right.
 
 use winit::event::{ElementState, KeyEvent};
 use winit::keyboard::{KeyCode, PhysicalKey};
@@ -10,11 +11,19 @@ use super::{draw_centered_text, draw_default_background, DrawCtx, GuiAction, Gui
 
 #[derive(Default)]
 pub struct GuiShaders {
+    // Left column: lighting.
     shaders: Option<GuiButton>,
     shadows: Option<GuiButton>,
     specular: Option<GuiButton>,
     fog: Option<GuiButton>,
     bloom: Option<GuiButton>,
+    // Right column: post / world.
+    vignette: Option<GuiButton>,
+    chromatic: Option<GuiButton>,
+    dof: Option<GuiButton>,
+    motion_blur: Option<GuiButton>,
+    auto_exposure: Option<GuiButton>,
+    clouds: Option<GuiButton>,
     done: Option<GuiButton>,
     from_main_menu: bool,
 }
@@ -38,13 +47,22 @@ impl GuiShaders {
     fn layout(&mut self, ctx: &DrawCtx) {
         let s = ctx.scale;
         let x = (ctx.width - 200 * s) / 2;
-        let top = ctx.height / 4;
-        self.shaders = Some(GuiButton::at_px(x, top, 200 * s, s, ""));
-        self.shadows = Some(GuiButton::at_px(x, top + 24 * s, 200 * s, s, ""));
-        self.specular = Some(GuiButton::at_px(x, top + 48 * s, 200 * s, s, ""));
-        self.fog = Some(GuiButton::at_px(x, top + 72 * s, 200 * s, s, ""));
-        self.bloom = Some(GuiButton::at_px(x, top + 96 * s, 200 * s, s, ""));
-        self.done = Some(GuiButton::at_px(x, top + 132 * s, 200 * s, s, "Done"));
+        let xr = x + 102 * s;
+        let cw = 98 * s;
+        let top = ctx.height / 4 - 8 * s;
+        let row = |i: i32| top + i * 24 * s;
+        self.shaders = Some(GuiButton::at_px(x, row(0), cw, s, ""));
+        self.shadows = Some(GuiButton::at_px(x, row(1), cw, s, ""));
+        self.specular = Some(GuiButton::at_px(x, row(2), cw, s, ""));
+        self.fog = Some(GuiButton::at_px(x, row(3), cw, s, ""));
+        self.bloom = Some(GuiButton::at_px(x, row(4), cw, s, ""));
+        self.vignette = Some(GuiButton::at_px(xr, row(0), cw, s, ""));
+        self.chromatic = Some(GuiButton::at_px(xr, row(1), cw, s, ""));
+        self.dof = Some(GuiButton::at_px(xr, row(2), cw, s, ""));
+        self.motion_blur = Some(GuiButton::at_px(xr, row(3), cw, s, ""));
+        self.auto_exposure = Some(GuiButton::at_px(xr, row(4), cw, s, ""));
+        self.clouds = Some(GuiButton::at_px(xr, row(5), cw, s, ""));
+        self.done = Some(GuiButton::at_px(x, row(6) + 12 * s, 200 * s, s, "Done"));
     }
 }
 
@@ -62,27 +80,25 @@ impl GuiScreen for GuiShaders {
         draw_default_background(ui, ctx);
         let s = ctx.scale;
         draw_centered_text(ui, ctx.width, 15 * s, s, super::TEXT_WHITE, "Shaders");
+        let st = ctx.settings;
 
-        if let Some(b) = &mut self.shaders {
-            b.label = format!("Shaders: {}", on_off(ctx.settings.shaders));
-            b.draw(ui, s, ctx.mouse, ctx.mouse_down);
-        }
-        if let Some(b) = &mut self.shadows {
-            b.label = format!("Sun Shadows: {}", on_off(ctx.settings.shader_shadows));
-            b.draw(ui, s, ctx.mouse, ctx.mouse_down);
-        }
-        if let Some(b) = &mut self.specular {
-            b.label = format!("Specular: {}", on_off(ctx.settings.shader_specular));
-            b.draw(ui, s, ctx.mouse, ctx.mouse_down);
-        }
-        if let Some(b) = &mut self.fog {
-            b.label = format!("Fog: {}", on_off(ctx.settings.shader_fog));
-            b.draw(ui, s, ctx.mouse, ctx.mouse_down);
-        }
-        if let Some(b) = &mut self.bloom {
-            b.label = format!("Bloom: {}", on_off(ctx.settings.shader_bloom));
-            b.draw(ui, s, ctx.mouse, ctx.mouse_down);
-        }
+        let mut draw = |btn: &mut Option<GuiButton>, label: String| {
+            if let Some(b) = btn {
+                b.label = label;
+                b.draw(ui, s, ctx.mouse, ctx.mouse_down);
+            }
+        };
+        draw(&mut self.shaders, format!("Shaders: {}", on_off(st.shaders)));
+        draw(&mut self.shadows, format!("Shadows: {}", on_off(st.shader_shadows)));
+        draw(&mut self.specular, format!("Specular: {}", on_off(st.shader_specular)));
+        draw(&mut self.fog, format!("Fog: {}", on_off(st.shader_fog)));
+        draw(&mut self.bloom, format!("Bloom: {}", on_off(st.shader_bloom)));
+        draw(&mut self.vignette, format!("Vignette: {}", on_off(st.post_vignette)));
+        draw(&mut self.chromatic, format!("Chroma: {}", on_off(st.post_chromatic)));
+        draw(&mut self.dof, format!("DoF: {}", on_off(st.post_dof)));
+        draw(&mut self.motion_blur, format!("Motion: {}", on_off(st.post_motion_blur)));
+        draw(&mut self.auto_exposure, format!("AutoExp: {}", on_off(st.post_auto_exposure)));
+        draw(&mut self.clouds, format!("Clouds: {}", on_off(st.volumetric_clouds)));
         if let Some(b) = &self.done {
             b.draw(ui, s, ctx.mouse, ctx.mouse_down);
         }
@@ -108,6 +124,30 @@ impl GuiScreen for GuiShaders {
         if self.bloom.as_ref().is_some_and(|b| b.clicked(x, y)) {
             ctx.settings.shader_bloom = !ctx.settings.shader_bloom;
             return vec![GuiAction::SetShaderBloom(ctx.settings.shader_bloom)];
+        }
+        if self.vignette.as_ref().is_some_and(|b| b.clicked(x, y)) {
+            ctx.settings.post_vignette = !ctx.settings.post_vignette;
+            return vec![GuiAction::SetVignette(ctx.settings.post_vignette)];
+        }
+        if self.chromatic.as_ref().is_some_and(|b| b.clicked(x, y)) {
+            ctx.settings.post_chromatic = !ctx.settings.post_chromatic;
+            return vec![GuiAction::SetChromatic(ctx.settings.post_chromatic)];
+        }
+        if self.dof.as_ref().is_some_and(|b| b.clicked(x, y)) {
+            ctx.settings.post_dof = !ctx.settings.post_dof;
+            return vec![GuiAction::SetDof(ctx.settings.post_dof)];
+        }
+        if self.motion_blur.as_ref().is_some_and(|b| b.clicked(x, y)) {
+            ctx.settings.post_motion_blur = !ctx.settings.post_motion_blur;
+            return vec![GuiAction::SetMotionBlur(ctx.settings.post_motion_blur)];
+        }
+        if self.auto_exposure.as_ref().is_some_and(|b| b.clicked(x, y)) {
+            ctx.settings.post_auto_exposure = !ctx.settings.post_auto_exposure;
+            return vec![GuiAction::SetAutoExposure(ctx.settings.post_auto_exposure)];
+        }
+        if self.clouds.as_ref().is_some_and(|b| b.clicked(x, y)) {
+            ctx.settings.volumetric_clouds = !ctx.settings.volumetric_clouds;
+            return vec![GuiAction::SetClouds(ctx.settings.volumetric_clouds)];
         }
         if self.done.as_ref().is_some_and(|b| b.clicked(x, y)) {
             return vec![GuiAction::SaveSettings, GuiAction::SetScreen(self.back_screen())];

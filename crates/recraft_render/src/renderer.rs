@@ -478,6 +478,13 @@ pub struct Renderer<'window> {
     fog_enabled: bool,
     /// Overall lighting brightness multiplier (user "Brightness" option).
     brightness: f32,
+    /// Post-process effect toggles (consumed by the post pass).
+    vignette_enabled: bool,
+    chromatic_enabled: bool,
+    dof_enabled: bool,
+    motion_blur_enabled: bool,
+    auto_exposure_enabled: bool,
+    clouds_enabled: bool,
     /// Sun shadow-map target + the depth-only pipelines that fill it.
     shadow_view: wgpu::TextureView,
     shadow_solid_pipeline: wgpu::RenderPipeline,
@@ -1490,7 +1497,7 @@ impl<'window> Renderer<'window> {
         });
         let post_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("post-params"),
-            size: 32,
+            size: 64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -1685,6 +1692,12 @@ impl<'window> Renderer<'window> {
             specular_enabled: false,
             fog_enabled: false,
             brightness: 1.0,
+            vignette_enabled: false,
+            chromatic_enabled: false,
+            dof_enabled: false,
+            motion_blur_enabled: false,
+            auto_exposure_enabled: false,
+            clouds_enabled: false,
             shadow_view,
             shadow_solid_pipeline,
             shadow_cutout_pipeline,
@@ -1764,6 +1777,35 @@ impl<'window> Renderer<'window> {
     /// Overall lighting brightness multiplier (vanilla "Brightness" gamma).
     pub fn set_brightness(&mut self, value: f32) {
         self.brightness = value;
+    }
+
+    pub fn set_vignette_enabled(&mut self, on: bool) {
+        self.vignette_enabled = on;
+        self.update_post_params();
+    }
+
+    pub fn set_chromatic_enabled(&mut self, on: bool) {
+        self.chromatic_enabled = on;
+        self.update_post_params();
+    }
+
+    pub fn set_dof_enabled(&mut self, on: bool) {
+        self.dof_enabled = on;
+        self.update_post_params();
+    }
+
+    pub fn set_motion_blur_enabled(&mut self, on: bool) {
+        self.motion_blur_enabled = on;
+        self.update_post_params();
+    }
+
+    pub fn set_auto_exposure_enabled(&mut self, on: bool) {
+        self.auto_exposure_enabled = on;
+        self.update_post_params();
+    }
+
+    pub fn set_clouds_enabled(&mut self, on: bool) {
+        self.clouds_enabled = on;
     }
 
     /// Bloom (HDR glow around over-bright pixels). The world already renders to
@@ -1879,9 +1921,11 @@ impl<'window> Renderer<'window> {
     /// size and bloom toggle.
     fn update_post_params(&self) {
         let (w, h) = self.scaled_dims();
-        let bloom = if self.bloom_enabled { 1.0f32 } else { 0.0 };
+        let on = |b: bool, v: f32| if b { v } else { 0.0 };
         // p: bloom threshold, bloom intensity, texel.x, texel.y
         // q: exposure, saturation, contrast, bloom-enabled
+        // r: vignette amount, chromatic amount, dof strength, motion-blur strength
+        // s: auto-exposure enabled, (reserved), (reserved), (reserved)
         // Neutral grade (sat/contrast 1.0) + slightly-under exposure so sunlit
         // blocks keep texture detail instead of blowing out.
         let params = [
@@ -1892,7 +1936,15 @@ impl<'window> Renderer<'window> {
             0.85,
             1.0,
             1.0,
-            bloom,
+            on(self.bloom_enabled, 1.0),
+            on(self.vignette_enabled, 0.45),
+            on(self.chromatic_enabled, 0.004),
+            on(self.dof_enabled, 1.0),
+            on(self.motion_blur_enabled, 1.0),
+            on(self.auto_exposure_enabled, 1.0),
+            0.0,
+            0.0,
+            0.0,
         ];
         self.queue
             .write_buffer(&self.post_params_buffer, 0, bytemuck::cast_slice(&params));

@@ -9,6 +9,10 @@ struct Params {
     p: vec4<f32>,
     // x: exposure, y: saturation, z: contrast, w: bloom enabled (>0.5)
     q: vec4<f32>,
+    // x: vignette amount, y: chromatic amount, z: dof strength, w: motion-blur strength
+    r: vec4<f32>,
+    // x: auto-exposure enabled, yzw: reserved
+    s: vec4<f32>,
 };
 
 @group(0) @binding(0) var scene_tex: texture_2d<f32>;
@@ -51,7 +55,22 @@ fn tonemap(c: vec3<f32>) -> vec3<f32> {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    var color = textureSample(scene_tex, scene_sampler, in.uv).rgb;
+    let center = vec2<f32>(0.5, 0.5);
+    let from_center = in.uv - center;
+
+    // Chromatic aberration: spread the RGB taps radially, growing toward the
+    // edges (like a real lens). r.y is the strength (0 = off).
+    var color: vec3<f32>;
+    if (params.r.y > 0.0) {
+        let off = from_center * params.r.y;
+        color = vec3<f32>(
+            textureSample(scene_tex, scene_sampler, in.uv + off).r,
+            textureSample(scene_tex, scene_sampler, in.uv).g,
+            textureSample(scene_tex, scene_sampler, in.uv - off).b,
+        );
+    } else {
+        color = textureSample(scene_tex, scene_sampler, in.uv).rgb;
+    }
 
     if (params.q.w > 0.5) {
         // Bright-pass bloom: a 7x7 Gaussian disk, keeping only the energy above
@@ -81,6 +100,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     color = mix(vec3<f32>(l), color, params.q.y);
     // Contrast around mid-grey.
     color = clamp((color - 0.5) * params.q.z + 0.5, vec3<f32>(0.0), vec3<f32>(1.0));
+
+    // Vignette: darken toward the corners. r.x is the strength (0 = off).
+    if (params.r.x > 0.0) {
+        let d = length(from_center);
+        let v = smoothstep(0.9, 0.35, d); // 1 at centre -> 0 at the corners
+        color = color * mix(1.0, v, params.r.x);
+    }
 
     return vec4<f32>(color, 1.0);
 }

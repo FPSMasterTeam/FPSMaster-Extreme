@@ -48,6 +48,13 @@ pub struct Settings {
     /// untouched, lower values darken the shadow/low-light end (not a flat
     /// multiply). Default sits below neutral so nights and caves read dark.
     pub brightness: f32,
+    /// Post-process effects (applied in the tone-map pass / sky pass).
+    pub post_vignette: bool,
+    pub post_chromatic: bool,
+    pub post_dof: bool,
+    pub post_motion_blur: bool,
+    pub post_auto_exposure: bool,
+    pub volumetric_clouds: bool,
 }
 
 /// Selectable resolutions (None = native). Common 16:9 modes most panels scale.
@@ -89,6 +96,12 @@ impl Default for Settings {
             shader_fog: false,
             shader_bloom: false,
             brightness: 0.5,
+            post_vignette: true,
+            post_chromatic: true,
+            post_dof: false,
+            post_motion_blur: false,
+            post_auto_exposure: true,
+            volumetric_clouds: true,
         }
     }
 }
@@ -188,6 +201,36 @@ impl Settings {
                         s.brightness = v;
                     }
                 }
+                "post_vignette" => {
+                    if let Ok(v) = val.parse() {
+                        s.post_vignette = v;
+                    }
+                }
+                "post_chromatic" => {
+                    if let Ok(v) = val.parse() {
+                        s.post_chromatic = v;
+                    }
+                }
+                "post_dof" => {
+                    if let Ok(v) = val.parse() {
+                        s.post_dof = v;
+                    }
+                }
+                "post_motion_blur" => {
+                    if let Ok(v) = val.parse() {
+                        s.post_motion_blur = v;
+                    }
+                }
+                "post_auto_exposure" => {
+                    if let Ok(v) = val.parse() {
+                        s.post_auto_exposure = v;
+                    }
+                }
+                "volumetric_clouds" => {
+                    if let Ok(v) = val.parse() {
+                        s.volumetric_clouds = v;
+                    }
+                }
                 _ => {}
             }
         }
@@ -213,7 +256,7 @@ impl Settings {
     fn save_to(&self, path: &std::path::Path) {
         let (res_w, res_h) = self.resolution.unwrap_or((0, 0));
         let text = format!(
-            "sensitivity={}\nvsync={}\nfps_cap={}\nrender_scale={}\nfancy_graphics={}\nmipmap_levels={}\nresolution_w={}\nresolution_h={}\nfullscreen={}\nshaders={}\nshader_shadows={}\nshader_specular={}\nshader_fog={}\nshader_bloom={}\nbrightness={}\n",
+            "sensitivity={}\nvsync={}\nfps_cap={}\nrender_scale={}\nfancy_graphics={}\nmipmap_levels={}\nresolution_w={}\nresolution_h={}\nfullscreen={}\nshaders={}\nshader_shadows={}\nshader_specular={}\nshader_fog={}\nshader_bloom={}\nbrightness={}\npost_vignette={}\npost_chromatic={}\npost_dof={}\npost_motion_blur={}\npost_auto_exposure={}\nvolumetric_clouds={}\n",
             self.sensitivity,
             self.vsync,
             self.fps_cap,
@@ -229,6 +272,12 @@ impl Settings {
             self.shader_fog,
             self.shader_bloom,
             self.brightness,
+            self.post_vignette,
+            self.post_chromatic,
+            self.post_dof,
+            self.post_motion_blur,
+            self.post_auto_exposure,
+            self.volumetric_clouds,
         );
         if let Err(err) = std::fs::write(path, text) {
             log::warn!("failed to save settings to {}: {err}", path.display());
