@@ -93,6 +93,10 @@ struct SkyUniform {
     sun_dir: [f32; 4],
     /// rgb = sunset glow color (w unused).
     sunset: [f32; 4],
+    /// xyz = camera world position, w = time (seconds) — for volumetric clouds.
+    camera_pos: [f32; 4],
+    /// x = clouds enabled, yzw reserved.
+    cloud_params: [f32; 4],
 }
 
 /// Uniform for the celestial pass (sun/moon/stars): the rotation-only
@@ -2392,6 +2396,13 @@ impl<'window> Renderer<'window> {
                 zenith: [sky.zenith[0], sky.zenith[1], sky.zenith[2], 1.0],
                 sun_dir: [sun_dir.x, sun_dir.y, sun_dir.z, sky.sunset[3]],
                 sunset: sky.sunset,
+                camera_pos: [
+                    camera.position.x,
+                    camera.position.y,
+                    camera.position.z,
+                    self.start_time.elapsed().as_secs_f32(),
+                ],
+                cloud_params: [if self.clouds_enabled { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
             }),
         );
         self.queue.write_buffer(
