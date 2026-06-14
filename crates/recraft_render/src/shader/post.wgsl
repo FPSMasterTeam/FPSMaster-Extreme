@@ -93,16 +93,20 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         color = textureSample(scene_tex, scene_sampler, in.uv).rgb;
     }
 
-    // Depth of field: blur by circle-of-confusion from the distance between this
-    // pixel and the auto-focused screen centre. r.z is the strength (0 = off).
+    // Depth of field: keep a wide sharp band around the auto-focused screen
+    // centre and gently blur only the distant background (never the focus plane
+    // or anything nearer, so blocks you look at / your hand stay crisp). r.z is
+    // the strength (0 = off).
     if (params.r.z > 0.0) {
         let texel = params.p.zw;
-        let focus_w = world_from_depth(vec2<f32>(0.5, 0.5), load_depth(vec2<f32>(0.5, 0.5)));
-        let focus_dist = length(focus_w - cam.camera_pos.xyz);
-        let pix_w = world_from_depth(in.uv, load_depth(in.uv));
-        let pix_dist = length(pix_w - cam.camera_pos.xyz);
-        let coc = clamp(abs(pix_dist - focus_dist) / max(focus_dist, 1.0), 0.0, 1.0);
-        let radius = coc * params.r.z * 8.0;
+        let focus_dist = length(
+            world_from_depth(vec2<f32>(0.5, 0.5), load_depth(vec2<f32>(0.5, 0.5))) - cam.camera_pos.xyz
+        );
+        let pix_dist = length(world_from_depth(in.uv, load_depth(in.uv)) - cam.camera_pos.xyz);
+        // Sharp until 1.5x the focus distance (+8 block margin), ramping to full
+        // blur only by ~5.5x (+24). Far-field only — nearer pixels stay sharp.
+        let coc = smoothstep(focus_dist * 1.5 + 8.0, focus_dist * 5.5 + 24.0, pix_dist);
+        let radius = coc * params.r.z * 4.0;
         if (radius > 0.5) {
             var acc = color;
             var n = 1.0;
