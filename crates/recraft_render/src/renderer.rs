@@ -178,7 +178,7 @@ struct LayerSlot {
 }
 
 const CHUNK_VERTEX_SIZE: u64 = std::mem::size_of::<ChunkVertex>() as u64;
-const PAGE_VERTEX_CAP: u32 = 1 << 22; // 4M vertices = 64 MB
+const PAGE_VERTEX_CAP: u32 = 1 << 22; // 4M vertices
 const PAGE_INDEX_CAP: u32 = 1 << 23; // 8M indices = 16 MB
 
 struct ChunkPage {
@@ -186,14 +186,20 @@ struct ChunkPage {
     index_buf: wgpu::Buffer,
     vertex_cursor: u32,
     index_cursor: u32,
+    active_slots: u32,
 }
 
 /// One render layer's paged mega-buffer. Sections are distributed across
 /// fixed-size pages (64 MB vertex, 16 MB index each) to stay within GPU
 /// buffer-size limits while still batching draws.
+///
+/// Freed slot regions are tracked in a free list so new allocations can reuse
+/// them instead of always advancing the page cursor. When a page has zero
+/// active slots its cursors reset, reclaiming the entire page.
 struct ChunkLayer {
     pages: Vec<ChunkPage>,
     slots: HashMap<SectionPos, LayerSlot>,
+    free_list: Vec<LayerSlot>,
     label: &'static str,
 }
 
@@ -202,6 +208,7 @@ impl ChunkLayer {
         Self {
             pages: Vec::new(),
             slots: HashMap::new(),
+            free_list: Vec::new(),
             label,
         }
     }
@@ -222,6 +229,7 @@ impl ChunkLayer {
             }),
             vertex_cursor: 0,
             index_cursor: 0,
+            active_slots: 0,
         }
     }
 
@@ -233,7 +241,7 @@ impl ChunkLayer {
         buf: &ChunkMeshBuffers,
     ) {
         if buf.is_empty() {
-            self.slots.remove(&pos);
+            self.remove(pos);
             return;
         }
         let vc = buf.vertices.len() as u32;
@@ -256,7 +264,47 @@ impl ChunkLayer {
                 slot.index_count = ic;
                 return;
             }
-            self.slots.remove(&pos);
+        }
+
+        // Existing slot can't be reused in-place — free it.
+        if let Some(old) = self.slots.remove(&pos) {
+            self.free_slot(old);
+        }
+
+        // Try the free list (best-fit: smallest region that fits both dimensions).
+        let fit = self
+            .free_list
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.vertex_alloc >= vc && f.index_alloc >= ic)
+            .min_by_key(|(_, f)| (f.vertex_alloc, f.index_alloc))
+            .map(|(i, _)| i);
+        if let Some(fi) = fit {
+            let free = self.free_list.swap_remove(fi);
+            let page = &self.pages[free.page as usize];
+            queue.write_buffer(
+                &page.vertex_buf,
+                free.vertex_offset as u64 * CHUNK_VERTEX_SIZE,
+                bytemuck::cast_slice(&buf.vertices),
+            );
+            queue.write_buffer(
+                &page.index_buf,
+                free.index_offset as u64 * 2,
+                bytemuck::cast_slice(&buf.indices),
+            );
+            self.pages[free.page as usize].active_slots += 1;
+            self.slots.insert(
+                pos,
+                LayerSlot {
+                    page: free.page,
+                    vertex_offset: free.vertex_offset,
+                    vertex_alloc: free.vertex_alloc,
+                    index_offset: free.index_offset,
+                    index_alloc: free.index_alloc,
+                    index_count: ic,
+                },
+            );
+            return;
         }
 
         // Find a page with enough space, or create one.
@@ -285,6 +333,7 @@ impl ChunkLayer {
             io as u64 * 2,
             bytemuck::cast_slice(&buf.indices),
         );
+        page.active_slots += 1;
         self.slots.insert(
             pos,
             LayerSlot {
@@ -300,15 +349,30 @@ impl ChunkLayer {
         page.index_cursor += ic;
     }
 
+    fn free_slot(&mut self, slot: LayerSlot) {
+        self.pages[slot.page as usize].active_slots -= 1;
+        if self.pages[slot.page as usize].active_slots == 0 {
+            self.pages[slot.page as usize].vertex_cursor = 0;
+            self.pages[slot.page as usize].index_cursor = 0;
+            self.free_list.retain(|f| f.page != slot.page);
+        } else {
+            self.free_list.push(slot);
+        }
+    }
+
     fn remove(&mut self, pos: SectionPos) {
-        self.slots.remove(&pos);
+        if let Some(slot) = self.slots.remove(&pos) {
+            self.free_slot(slot);
+        }
     }
 
     fn clear(&mut self) {
         self.slots.clear();
+        self.free_list.clear();
         for page in &mut self.pages {
             page.vertex_cursor = 0;
             page.index_cursor = 0;
+            page.active_slots = 0;
         }
     }
 }
@@ -472,6 +536,7 @@ pub struct Renderer<'window> {
     /// nametag bind group can be rebuilt when its texture grows.
     model_texture_layout: wgpu::BindGroupLayout,
     gui_atlas: GuiAtlas,
+    depth_tex: wgpu::Texture,
     depth_view: wgpu::TextureView,
     /// Full-window depth target for the final UI pass (which draws to the
     /// swapchain after the off-screen world composite, so bloom never blooms the
@@ -522,7 +587,11 @@ pub struct Renderer<'window> {
     /// pass so water can sample the opaque scene for screen-space reflection.
     offscreen_tex: Option<wgpu::Texture>,
     scene_copy_tex: Option<wgpu::Texture>,
-    /// Water SSR bind group (scene copy + depth + camera); rebuilt with targets.
+    /// Copy of the world depth buffer for the water SSR pass to sample. Avoids a
+    /// Metal feedback loop (depth as both attachment and shader resource).
+    depth_copy_view: Option<wgpu::TextureView>,
+    depth_copy_tex: Option<wgpu::Texture>,
+    /// Water SSR bind group (scene copy + depth copy + camera); rebuilt with targets.
     water_ssr_layout: wgpu::BindGroupLayout,
     water_ssr_bind_group: Option<wgpu::BindGroup>,
     /// Post pass: HDR scene -> ACES tone-map + grade (+ optional bloom, + upscale).
@@ -946,7 +1015,7 @@ impl<'window> Renderer<'window> {
             bind_group_layouts: &[&camera_layout, &texture_layout, &lighting_layout, &water_ssr_layout],
             push_constant_ranges: &[],
         });
-        let depth_view = create_depth_view(&device, &config);
+        let (depth_tex, depth_view) = create_depth_view_sized(&device, config.width, config.height);
         let window_depth_view = create_depth_view(&device, &config);
 
         // Solid colour pass. Depth is already filled by the pre-pass below, so it
@@ -1989,6 +2058,7 @@ impl<'window> Renderer<'window> {
             nametag_last_names: Vec::new(),
             model_texture_layout: entity_texture_layout,
             gui_atlas,
+            depth_tex,
             depth_view,
             window_depth_view,
             texture_bind_groups,
@@ -2019,6 +2089,8 @@ impl<'window> Renderer<'window> {
             offscreen_view: None,
             offscreen_tex: None,
             scene_copy_tex: None,
+            depth_copy_view: None,
+            depth_copy_tex: None,
             water_ssr_layout,
             water_ssr_bind_group: None,
             bloom_enabled: false,
@@ -2208,7 +2280,9 @@ impl<'window> Renderer<'window> {
             w,
             h
         );
-        self.depth_view = create_depth_view_sized(&self.device, w, h);
+        let (depth_tex, depth_view) = create_depth_view_sized(&self.device, w, h);
+        self.depth_tex = depth_tex;
+        self.depth_view = depth_view;
         let color = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("offscreen-world-hdr"),
             size: wgpu::Extent3d {
@@ -2242,6 +2316,23 @@ impl<'window> Renderer<'window> {
             view_formats: &[],
         });
         let scene_copy_view = scene_copy.create_view(&wgpu::TextureViewDescriptor::default());
+        // Copy of the depth buffer for the water SSR pass to sample, breaking the
+        // Metal feedback loop (depth texture as both attachment and shader resource).
+        let depth_copy = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("depth-copy"),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: DEPTH_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let depth_copy_view = depth_copy.create_view(&wgpu::TextureViewDescriptor::default());
         self.water_ssr_bind_group = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("water-ssr-bind-group"),
             layout: &self.water_ssr_layout,
@@ -2256,7 +2347,7 @@ impl<'window> Renderer<'window> {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&self.depth_view),
+                    resource: wgpu::BindingResource::TextureView(&depth_copy_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
@@ -2265,6 +2356,8 @@ impl<'window> Renderer<'window> {
             ],
         }));
         self.scene_copy_tex = Some(scene_copy);
+        self.depth_copy_view = Some(depth_copy_view);
+        self.depth_copy_tex = Some(depth_copy);
         self.post_bind_group = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("post-bind-group"),
             layout: &self.post_layout,
@@ -3038,36 +3131,53 @@ impl<'window> Renderer<'window> {
                 timestamp_writes: None,
             });
             sp.set_bind_group(0, &self.shadow_uniform_bind_group, &[]);
-            // Solid casters (depth only).
+            // Solid casters (depth only), batched by page to minimise buffer rebinds.
             sp.set_pipeline(&self.shadow_solid_pipeline);
-            for (pos, slot) in self.chunk_solid.slots.iter() {
-                if !section_in_frustum(&light_frustum, *pos) {
-                    continue;
-                }
-                let page = &self.chunk_solid.pages[slot.page as usize];
+            let shadow_solid_visible: Vec<SectionPos> = self
+                .chunk_solid
+                .slots
+                .keys()
+                .copied()
+                .filter(|pos| section_in_frustum(&light_frustum, *pos))
+                .collect();
+            let mut shadow_dummy = 0u32;
+            let shadow_solid_batches =
+                collect_layer_batches(&self.chunk_solid, &shadow_solid_visible, &mut shadow_dummy);
+            for batch in &shadow_solid_batches {
+                let page = &self.chunk_solid.pages[batch.page];
                 sp.set_vertex_buffer(0, page.vertex_buf.slice(..));
                 sp.set_index_buffer(page.index_buf.slice(..), wgpu::IndexFormat::Uint16);
-                sp.draw_indexed(
-                    slot.index_offset..slot.index_offset + slot.index_count,
-                    slot.vertex_offset as i32,
-                    0..1,
-                );
+                for c in &batch.cmds {
+                    sp.draw_indexed(
+                        c.first_index..c.first_index + c.index_count,
+                        c.base_vertex,
+                        0..1,
+                    );
+                }
             }
             // Cutout casters (alpha-tested) — needs the atlas at group 1.
             sp.set_pipeline(&self.shadow_cutout_pipeline);
             sp.set_bind_group(1, &self.texture_bind_groups[self.mipmap_levels as usize], &[]);
-            for (pos, slot) in self.chunk_cutout.slots.iter() {
-                if !section_in_frustum(&light_frustum, *pos) {
-                    continue;
-                }
-                let page = &self.chunk_cutout.pages[slot.page as usize];
+            let shadow_cutout_visible: Vec<SectionPos> = self
+                .chunk_cutout
+                .slots
+                .keys()
+                .copied()
+                .filter(|pos| section_in_frustum(&light_frustum, *pos))
+                .collect();
+            let shadow_cutout_batches =
+                collect_layer_batches(&self.chunk_cutout, &shadow_cutout_visible, &mut shadow_dummy);
+            for batch in &shadow_cutout_batches {
+                let page = &self.chunk_cutout.pages[batch.page];
                 sp.set_vertex_buffer(0, page.vertex_buf.slice(..));
                 sp.set_index_buffer(page.index_buf.slice(..), wgpu::IndexFormat::Uint16);
-                sp.draw_indexed(
-                    slot.index_offset..slot.index_offset + slot.index_count,
-                    slot.vertex_offset as i32,
-                    0..1,
-                );
+                for c in &batch.cmds {
+                    sp.draw_indexed(
+                        c.first_index..c.first_index + c.index_count,
+                        c.base_vertex,
+                        0..1,
+                    );
+                }
             }
         }
 
@@ -3439,15 +3549,16 @@ impl<'window> Renderer<'window> {
             } // else (non-panorama sky + world content)
         }
 
-        // SSR water pass: only with shaders + Fancy. Copy the opaque scene so the
-        // water shader can sample it for screen-space reflection, then draw water
-        // with depth bound read-only (it tests but never writes depth, so the same
-        // depth texture can be sampled). Non-SSR water was already drawn in the
-        // main pass above.
+        // SSR water pass: only with shaders + Fancy. Copy the opaque scene and
+        // depth so the water shader can sample them for screen-space reflection,
+        // then draw water with depth testing (no depth write). The depth is copied
+        // to a separate texture to avoid a Metal feedback loop (same texture as
+        // both depth attachment and shader resource).
         let ssr_water = self.shaders_enabled
             && self.fancy_graphics
             && self.offscreen_tex.is_some()
             && self.scene_copy_tex.is_some()
+            && self.depth_copy_tex.is_some()
             && self.water_ssr_bind_group.is_some();
         if ssr_water && !water_draws.is_empty() && !self.debug_skip.water {
             let (w, h) = self.scaled_dims();
@@ -3470,6 +3581,25 @@ impl<'window> Renderer<'window> {
                     depth_or_array_layers: 1,
                 },
             );
+            encoder.copy_texture_to_texture(
+                wgpu::ImageCopyTexture {
+                    texture: &self.depth_tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::ImageCopyTexture {
+                    texture: self.depth_copy_tex.as_ref().unwrap(),
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+            );
             let mut wp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("water-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -3482,7 +3612,10 @@ impl<'window> Renderer<'window> {
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &self.depth_view,
-                    depth_ops: None, // read-only: sampled for SSR in this pass
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    }),
                     stencil_ops: None,
                 }),
                 occlusion_query_set: None,
@@ -4237,10 +4370,10 @@ fn create_depth_view(
     device: &wgpu::Device,
     config: &wgpu::SurfaceConfiguration,
 ) -> wgpu::TextureView {
-    create_depth_view_sized(device, config.width, config.height)
+    create_depth_view_sized(device, config.width, config.height).1
 }
 
-fn create_depth_view_sized(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {
+fn create_depth_view_sized(device: &wgpu::Device, width: u32, height: u32) -> (wgpu::Texture, wgpu::TextureView) {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("depth-texture"),
         size: wgpu::Extent3d {
@@ -4252,10 +4385,13 @@ fn create_depth_view_sized(device: &wgpu::Device, width: u32, height: u32) -> wg
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: DEPTH_FORMAT,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     });
-    texture.create_view(&wgpu::TextureViewDescriptor::default())
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    (texture, view)
 }
 
 /// Upload the entity texture atlas (player skin + white texel) and build the

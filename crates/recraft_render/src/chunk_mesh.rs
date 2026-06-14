@@ -41,16 +41,15 @@ impl Vertex {
     }
 }
 
-/// Compact 16-byte chunk vertex. World-space position is stored as fixed-point
-/// i16 at 1/64 block resolution (±512 block range per axis). Light curves are
-/// packed into the 4th position component. Color is RGBA8 unorm and atlas UVs
-/// are 16-bit unorm.
+/// Chunk vertex. World-space position is stored as fixed-point i32 at 1/64
+/// block resolution. Light curves are packed into the 4th position component.
+/// Color is RGBA8 unorm and atlas UVs are 16-bit unorm.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct ChunkVertex {
-    /// xyz: world position × 64, as fixed-point i16 (1/64 block precision).
-    /// w: packed `(sky_u8 << 8) | block_u8` reinterpreted as i16.
-    pub pos_light: [i16; 4],
+    /// xyz: world position × 64, as fixed-point i32 (1/64 block precision).
+    /// w: packed `(sky_u8 << 8) | block_u8`.
+    pub pos_light: [i32; 4],
     /// Material tint × directional face shade × AO + alpha, as RGBA8 unorm.
     pub color: [u8; 4],
     /// Normalized atlas UV as Unorm16×2.
@@ -62,7 +61,7 @@ pub struct ChunkVertex {
 
 impl ChunkVertex {
     pub const ATTRIBUTES: [wgpu::VertexAttribute; 4] =
-        wgpu::vertex_attr_array![0 => Sint16x4, 1 => Unorm8x4, 2 => Unorm16x2, 3 => Snorm8x4];
+        wgpu::vertex_attr_array![0 => Sint32x4, 1 => Unorm8x4, 2 => Unorm16x2, 3 => Snorm8x4];
 
     pub fn layout<'a>() -> wgpu::VertexBufferLayout<'a> {
         wgpu::VertexBufferLayout {
@@ -158,12 +157,12 @@ fn encode_chunk_vertex(
     normal: [f32; 3],
 ) -> ChunkVertex {
     let snorm = |x: f32| (x.clamp(-1.0, 1.0) * 127.0).round() as i8;
-    let px = (position[0] * 64.0).round() as i16;
-    let py = (position[1] * 64.0).round() as i16;
-    let pz = (position[2] * 64.0).round() as i16;
+    let px = (position[0] * 64.0).round() as i32;
+    let py = (position[1] * 64.0).round() as i32;
+    let pz = (position[2] * 64.0).round() as i32;
     let sky_u8 = (light[0] * 255.0 + 0.5) as u8;
     let block_u8 = (light[1] * 255.0 + 0.5) as u8;
-    let w = ((sky_u8 as u16) << 8 | block_u8 as u16) as i16;
+    let w = ((sky_u8 as i32) << 8) | (block_u8 as i32);
     ChunkVertex {
         pos_light: [px, py, pz, w],
         color: [
