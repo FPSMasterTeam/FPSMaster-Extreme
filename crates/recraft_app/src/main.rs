@@ -837,12 +837,17 @@ fn handle_actions(
                         network.send_packet(ServerboundPacket::ChatMessage { message })
                     }
                     None => {
-                        // Demo world: echo locally so the chat stays usable.
-                        let name = app
-                            .session_username()
-                            .unwrap_or(&app.username)
-                            .to_owned();
-                        app.game.chat.push_message(format!("<{name}> {message}"));
+                        // Demo world: handle slash commands locally, else echo.
+                        if let Some(cmd) = message.strip_prefix('/') {
+                            let reply = app.game.run_demo_command(cmd);
+                            app.game.chat.push_message(reply);
+                        } else {
+                            let name = app
+                                .session_username()
+                                .unwrap_or(&app.username)
+                                .to_owned();
+                            app.game.chat.push_message(format!("<{name}> {message}"));
+                        }
                     }
                 }
             }

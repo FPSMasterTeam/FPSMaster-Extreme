@@ -351,6 +351,9 @@ pub struct GameState {
     /// Whether time advances locally (gamerule doDaylightCycle): cleared when
     /// the server sends a negative `time_of_day`.
     daylight_cycle: bool,
+    /// World-time ticks advanced per game tick (1 = vanilla 20-min day; demos
+    /// run faster so the day/night cycle is visible without waiting).
+    time_rate: i64,
     joined_game: bool,
     /// Set once the server has sent the initial PlayerPositionLook.
     position_synced: bool,
@@ -557,6 +560,18 @@ impl GameState {
             state.camera.yaw = 30.0;
             state.capabilities.flying = true;
         }
+        // Demo worlds run the day/night cycle ~12× so it's visible in a minute or
+        // two (a full vanilla day is 20 min), and stock the hotbar with light
+        // sources so emissive lighting/shadows are easy to try at night.
+        state.time_rate = 12;
+        let lights = [89, 50, 169, 91, 124]; // glowstone, torch, sea lantern, jack-o-lantern, redstone lamp (lit)
+        for (i, id) in lights.into_iter().enumerate() {
+            state.inventory[36 + i] = Some(SlotItem {
+                id,
+                count: 64,
+                damage: 0,
+            });
+        }
         state
     }
 
@@ -589,6 +604,7 @@ impl GameState {
             has_sky_light: true,
             world_time: 6000,
             daylight_cycle: true,
+            time_rate: 1,
             joined_game: false,
             position_synced: false,
             pending_confirm: false,
@@ -759,8 +775,49 @@ impl GameState {
 
     /// World time of day in ticks, interpolated by `tick_alpha` (0..1) for a
     /// smooth sky between ticks. Drives the renderer's day/night cycle.
+    /// Handle a demo-world chat command (text after the leading `/`). Returns the
+    /// feedback line to show in chat. Currently supports `/time`.
+    pub fn run_demo_command(&mut self, cmd: &str) -> String {
+        let parts: Vec<&str> = cmd.split_whitespace().collect();
+        match parts.as_slice() {
+            ["time", "set", v] => {
+                let t = match *v {
+                    "day" => Some(1000),
+                    "noon" => Some(6000),
+                    "night" => Some(13000),
+                    "midnight" => Some(18000),
+                    n => n.parse::<i64>().ok(),
+                };
+                match t {
+                    Some(t) => {
+                        self.world_time = t.rem_euclid(24000);
+                        format!("Set the time to {}", self.world_time)
+                    }
+                    None => "Usage: /time set <day|noon|night|midnight|ticks>".to_owned(),
+                }
+            }
+            ["time", "add", n] => match n.parse::<i64>() {
+                Ok(n) => {
+                    self.world_time = (self.world_time + n).rem_euclid(24000);
+                    format!("Added {n} to the time (now {})", self.world_time)
+                }
+                Err(_) => "Usage: /time add <ticks>".to_owned(),
+            },
+            ["time", "rate", n] => match n.parse::<i64>() {
+                Ok(n) => {
+                    self.time_rate = n.max(0);
+                    format!("Day/night rate set to {}x", self.time_rate)
+                }
+                Err(_) => "Usage: /time rate <ticks-per-tick>".to_owned(),
+            },
+            ["time", ..] => "Usage: /time set|add <…> or /time rate <n>".to_owned(),
+            _ => format!("Unknown command: /{cmd}"),
+        }
+    }
+
     pub fn world_time(&self, tick_alpha: f32) -> f64 {
-        self.world_time as f64 + (self.daylight_cycle as i32 as f64) * tick_alpha as f64
+        self.world_time as f64
+            + (if self.daylight_cycle { self.time_rate } else { 0 }) as f64 * tick_alpha as f64
     }
 
     /// Experience bar fill, 0..1.
@@ -1021,7 +1078,7 @@ impl GameState {
         // Advance the day/night clock one tick (vanilla ticks world time forward
         // locally between server updates), unless daylight cycle is off.
         if self.daylight_cycle {
-            self.world_time += 1;
+            self.world_time += self.time_rate;
         }
         self.previous_player_position = self.player.position;
         let turn_speed = 110.0 * dt;
