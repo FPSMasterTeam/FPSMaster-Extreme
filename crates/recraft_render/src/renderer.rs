@@ -2973,10 +2973,11 @@ impl<'window> Renderer<'window> {
                 label: Some("frame-encoder"),
             });
 
-        // Sun shadow pass: render every loaded chunk section's depth from the
-        // light's view (no frustum cull, so off-screen casters still shadow the
-        // visible scene). Per-section draws against the paged mega-buffers.
+        // Sun shadow pass: render chunk-section depth from the light's view,
+        // culled to the light frustum — sections outside the shadow map's
+        // coverage contribute nothing, so there's no need to draw them all.
         if shadows_on {
+            let light_frustum = Frustum::from_view_projection(light_view_proj);
             let mut sp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("shadow-pass"),
                 color_attachments: &[],
@@ -2994,7 +2995,10 @@ impl<'window> Renderer<'window> {
             sp.set_bind_group(0, &self.shadow_uniform_bind_group, &[]);
             // Solid casters (depth only).
             sp.set_pipeline(&self.shadow_solid_pipeline);
-            for slot in self.chunk_solid.slots.values() {
+            for (pos, slot) in self.chunk_solid.slots.iter() {
+                if !section_in_frustum(&light_frustum, *pos) {
+                    continue;
+                }
                 let page = &self.chunk_solid.pages[slot.page as usize];
                 sp.set_vertex_buffer(0, page.vertex_buf.slice(..));
                 sp.set_index_buffer(page.index_buf.slice(..), wgpu::IndexFormat::Uint16);
@@ -3007,7 +3011,10 @@ impl<'window> Renderer<'window> {
             // Cutout casters (alpha-tested) — needs the atlas at group 1.
             sp.set_pipeline(&self.shadow_cutout_pipeline);
             sp.set_bind_group(1, &self.texture_bind_groups[self.mipmap_levels as usize], &[]);
-            for slot in self.chunk_cutout.slots.values() {
+            for (pos, slot) in self.chunk_cutout.slots.iter() {
+                if !section_in_frustum(&light_frustum, *pos) {
+                    continue;
+                }
                 let page = &self.chunk_cutout.pages[slot.page as usize];
                 sp.set_vertex_buffer(0, page.vertex_buf.slice(..));
                 sp.set_index_buffer(page.index_buf.slice(..), wgpu::IndexFormat::Uint16);
