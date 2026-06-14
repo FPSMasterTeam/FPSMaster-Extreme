@@ -5,6 +5,7 @@
 
 @group(0) @binding(0) var scene_tex: texture_2d<f32>;
 @group(0) @binding(1) var scene_sampler: sampler;
+@group(0) @binding(2) var prev_tex: texture_2d<f32>;
 
 @vertex
 fn vs_main(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
@@ -26,5 +27,11 @@ fn fs_main() -> @location(0) vec4<f32> {
         }
     }
     let avg = exp(sum / f32(n * n));
-    return vec4<f32>(avg, 0.0, 0.0, 1.0);
+    // Eye adaptation: ease the stored luminance toward this frame's average so
+    // exposure changes smoothly instead of flickering. Seed from `avg` when the
+    // history is uninitialised.
+    let prev = textureLoad(prev_tex, vec2<i32>(0, 0), 0).r;
+    let base = select(avg, prev, prev > 0.0001);
+    let adapted = mix(base, avg, 0.03);
+    return vec4<f32>(adapted, 0.0, 0.0, 1.0);
 }

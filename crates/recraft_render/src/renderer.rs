@@ -538,6 +538,9 @@ pub struct Renderer<'window> {
     /// and read by the post pass to scale exposure.
     lum_tex: wgpu::Texture,
     lum_view: wgpu::TextureView,
+    /// Previous adapted luminance, for smooth eye adaptation.
+    lum_history: wgpu::Texture,
+    lum_history_view: wgpu::TextureView,
     lum_pipeline: wgpu::RenderPipeline,
     lum_layout: wgpu::BindGroupLayout,
     lum_bind_group: Option<wgpu::BindGroup>,
@@ -1703,7 +1706,7 @@ impl<'window> Renderer<'window> {
         });
 
         // Auto-exposure: a 1x1 average-luminance target + reduction pipeline.
-        let lum_tex = device.create_texture(&wgpu::TextureDescriptor {
+        let lum_desc = wgpu::TextureDescriptor {
             label: Some("luminance-1x1"),
             size: wgpu::Extent3d {
                 width: 1,
@@ -1714,10 +1717,21 @@ impl<'window> Renderer<'window> {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::R32Float,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
-        });
+        };
+        let lum_tex = device.create_texture(&lum_desc);
         let lum_view = lum_tex.create_view(&wgpu::TextureViewDescriptor::default());
+        // Previous adapted luminance (eye adaptation): the reduction blends toward
+        // it, then it's copied from the new value, so exposure changes smoothly.
+        let lum_history = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("luminance-history-1x1"),
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            ..lum_desc
+        });
+        let lum_history_view = lum_history.create_view(&wgpu::TextureViewDescriptor::default());
         let lum_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("luminance-shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader/luminance.wgsl").into()),
@@ -1739,6 +1753,17 @@ impl<'window> Renderer<'window> {
                     binding: 1,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                // Previous adapted luminance (read via textureLoad).
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
                     count: None,
                 },
             ],
@@ -1963,6 +1988,8 @@ impl<'window> Renderer<'window> {
             prev_view_proj: Mat4::IDENTITY,
             lum_tex,
             lum_view,
+            lum_history,
+            lum_history_view,
             lum_pipeline,
             lum_layout,
             lum_bind_group: None,
@@ -2235,6 +2262,10 @@ impl<'window> Renderer<'window> {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: wgpu::BindingResource::Sampler(&self.post_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&self.lum_history_view),
                 },
             ],
         }));
@@ -2832,7 +2863,7 @@ impl<'window> Renderer<'window> {
             let eye = center + sun_dir * (SHADOW_RADIUS * 2.5);
             let up = if sun_dir.y.abs() > 0.99 { Vec3::Z } else { Vec3::Y };
             let view = Mat4::look_at_rh(eye, center, up);
-            let proj = Mat4::orthographic_rh(
+            let mut proj = Mat4::orthographic_rh(
                 -SHADOW_RADIUS,
                 SHADOW_RADIUS,
                 -SHADOW_RADIUS,
@@ -2840,6 +2871,16 @@ impl<'window> Renderer<'window> {
                 0.1,
                 SHADOW_RADIUS * 5.0,
             );
+            // Texel snapping: quantize the frustum so it shifts in whole
+            // shadow-map texels as the camera moves, removing the per-frame
+            // sub-texel shimmer (shadow flicker).
+            let vp = proj * view;
+            let origin = vp.transform_point3(Vec3::ZERO);
+            let half = SHADOW_DIM as f32 * 0.5;
+            let dx = (origin.x * half).round() / half - origin.x;
+            let dy = (origin.y * half).round() / half - origin.y;
+            proj.w_axis.x += dx;
+            proj.w_axis.y += dy;
             proj * view
         } else {
             Mat4::IDENTITY
@@ -3407,6 +3448,27 @@ impl<'window> Renderer<'window> {
                 lp.set_pipeline(&self.lum_pipeline);
                 lp.set_bind_group(0, lb, &[]);
                 lp.draw(0..3, 0..1);
+                drop(lp);
+                // Save this frame's adapted luminance as next frame's history.
+                encoder.copy_texture_to_texture(
+                    wgpu::ImageCopyTexture {
+                        texture: &self.lum_tex,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::ImageCopyTexture {
+                        texture: &self.lum_history,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::Extent3d {
+                        width: 1,
+                        height: 1,
+                        depth_or_array_layers: 1,
+                    },
+                );
             }
         }
 
