@@ -29,16 +29,18 @@ impl GuiMainMenu {
         let j = ctx.height / 4 + 48 * s;
 
         self.buttons = vec![
-            // Singleplayer (Demo): (cx-100, j), 200×20
-            GuiButton::at_px(cx - 100 * s, j, 200 * s, s, "Singleplayer (Demo)"),
-            // Multiplayer: (cx-100, j+24), 200×20
+            // [0] Singleplayer: (cx-100, j), 200×20
+            GuiButton::at_px(cx - 100 * s, j, 200 * s, s, "Singleplayer"),
+            // [1] Multiplayer: (cx-100, j+24), 200×20
             GuiButton::at_px(cx - 100 * s, j + 24 * s, 200 * s, s, "Multiplayer"),
-            // Accounts (replaces Realms): (cx-100, j+48), 200×20
+            // [2] Accounts: (cx-100, j+48), 200×20
             GuiButton::at_px(cx - 100 * s, j + 48 * s, 200 * s, s, "Accounts"),
-            // Options: (cx-100, j+72+12), 98×20
-            GuiButton::at_px(cx - 100 * s, j + 84 * s, 98 * s, s, "Options..."),
-            // Quit: (cx+2, j+72+12), 98×20
-            GuiButton::at_px(cx + 2 * s, j + 84 * s, 98 * s, s, "Quit Game"),
+            // [3] Demo World: (cx-100, j+84), 98×20
+            GuiButton::at_px(cx - 100 * s, j + 84 * s, 98 * s, s, "Demo World"),
+            // [4] Options: (cx+2, j+84), 98×20
+            GuiButton::at_px(cx + 2 * s, j + 84 * s, 98 * s, s, "Options..."),
+            // [5] Quit: centered, (cx-100, j+108), 200×20
+            GuiButton::at_px(cx - 100 * s, j + 108 * s, 200 * s, s, "Quit Game"),
         ];
     }
 }
@@ -109,11 +111,11 @@ impl GuiScreen for GuiMainMenu {
     }
 
     fn mouse_clicked(&mut self, x: f64, y: f64, _ctx: &mut ScreenCtx) -> Vec<GuiAction> {
-        if self.buttons.len() < 5 {
+        if self.buttons.len() < 6 {
             return Vec::new();
         }
         if self.buttons[0].clicked(x, y) {
-            return vec![GuiAction::SetScreen(Box::new(GuiDemoSelect::new()))];
+            return vec![GuiAction::StartSingleplayer];
         }
         if self.buttons[1].clicked(x, y) {
             return vec![GuiAction::SetScreen(Box::new(GuiMultiplayer::new()))];
@@ -122,9 +124,12 @@ impl GuiScreen for GuiMainMenu {
             return vec![GuiAction::SetScreen(Box::new(GuiAccounts::new()))];
         }
         if self.buttons[3].clicked(x, y) {
-            return vec![GuiAction::SetScreen(Box::new(GuiOptions::from_main_menu()))];
+            return vec![GuiAction::SetScreen(Box::new(GuiDemoSelect::new()))];
         }
         if self.buttons[4].clicked(x, y) {
+            return vec![GuiAction::SetScreen(Box::new(GuiOptions::from_main_menu()))];
+        }
+        if self.buttons[5].clicked(x, y) {
             return vec![GuiAction::Quit];
         }
         Vec::new()

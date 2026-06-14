@@ -116,6 +116,8 @@ pub enum GuiAction {
     /// Close the screen and return to gameplay (re-captures the cursor).
     CloseScreen,
     StartDemo(crate::game::DemoKind),
+    /// Launch a local Paper server and auto-connect once it's ready.
+    StartSingleplayer,
     Connect { host: String, port: u16 },
     QuitToTitle,
     Quit,

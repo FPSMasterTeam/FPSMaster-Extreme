@@ -7,6 +7,7 @@ mod item_renderer;
 mod network;
 mod player_list;
 mod scoreboard;
+mod singleplayer;
 mod skin;
 mod servers;
 mod settings;
@@ -29,7 +30,10 @@ use gui::ingame::{GuiIngame, HudState};
 use gui::ingame_menu::GuiIngameMenu;
 use gui::inventory::GuiContainer;
 use gui::main_menu::GuiMainMenu;
-use gui::progress::{GuiAuthCode, GuiConnecting, GuiDisconnected, GuiProgress, Parent};
+use gui::progress::{
+    GuiAuthCode, GuiConnecting, GuiDisconnected, GuiProgress, GuiStartingServer, Parent,
+};
+use singleplayer::LocalServer;
 use gui::{AccountEntry, DrawCtx, GuiAction, GuiScreen, ScreenCtx};
 use item_renderer::ItemRenderer;
 use network::{NetworkEvent, NetworkHandle};
@@ -89,6 +93,8 @@ struct App {
     tab_open: bool,
     /// Per-player skin downloads and atlas-row allocation.
     skin_manager: skin::SkinManager,
+    /// Child process for the local Paper server (singleplayer mode).
+    local_server: Option<LocalServer>,
     /// Vanilla `panoramaTimer` — incremented every frame on the title screen.
     panorama_timer: f32,
     /// Reused across frames so the per-frame entity rebuild keeps its vertex/index
@@ -256,6 +262,7 @@ fn main() -> anyhow::Result<()> {
         username,
         tab_open: false,
         skin_manager: skin::SkinManager::new(),
+        local_server: None,
         panorama_timer: 0.0,
         entity_model: recraft_render::ModelMesh::new(),
         quit: false,
@@ -815,6 +822,24 @@ fn handle_actions(
                 app.in_world = true;
                 app.screen = None;
             }
+            GuiAction::StartSingleplayer => {
+                match LocalServer::start(&app.username) {
+                    Ok((server, ready_rx)) => {
+                        let port = server.port();
+                        app.local_server = Some(server);
+                        app.screen =
+                            Some(Box::new(GuiStartingServer::new(ready_rx, port)));
+                    }
+                    Err(msg) => {
+                        log::error!("singleplayer: {msg}");
+                        app.screen = Some(Box::new(GuiDisconnected::new(
+                            "Failed to start server",
+                            msg,
+                            Parent::MainMenu,
+                        )));
+                    }
+                }
+            }
             GuiAction::Connect { host, port } => {
                 app.game = GameState::empty_for_server(renderer.aspect());
                 renderer.upload_world(&app.game.world);
@@ -830,6 +855,7 @@ fn handle_actions(
             }
             GuiAction::QuitToTitle => {
                 app.network = None;
+                app.local_server = None;
                 app.connecting = false;
                 app.in_world = false;
                 // Drop the session world; the title screen needs none.
@@ -998,13 +1024,20 @@ fn pump_network(app: &mut App, window: &winit::window::Window, cursor_captured: 
     }
 
     if let Some(message) = disconnect {
+        let was_singleplayer = app.local_server.is_some();
         app.network = None;
+        app.local_server = None;
         app.in_world = false;
         app.connecting = false;
+        let parent = if was_singleplayer {
+            Parent::MainMenu
+        } else {
+            Parent::Multiplayer
+        };
         app.screen = Some(Box::new(GuiDisconnected::new(
             "Connection Lost",
             message,
-            Parent::Multiplayer,
+            parent,
         )));
     } else if app.connecting && app.game.loaded_chunk_count() > 0 {
         // World data has arrived: enter gameplay.
