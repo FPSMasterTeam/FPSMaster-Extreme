@@ -3337,6 +3337,17 @@ impl<'window> Renderer<'window> {
                     },
                 );
             }
+            // SSR samples the depth texture, so its pass must bind depth read-only
+            // (the water shader tests but never writes depth). The Fast path
+            // writes depth and doesn't sample it, so it uses a normal attachment.
+            let depth_ops = if use_ssr {
+                None
+            } else {
+                Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                })
+            };
             let mut wp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("water-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -3349,10 +3360,7 @@ impl<'window> Renderer<'window> {
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &self.depth_view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    }),
+                    depth_ops,
                     stencil_ops: None,
                 }),
                 occlusion_query_set: None,
