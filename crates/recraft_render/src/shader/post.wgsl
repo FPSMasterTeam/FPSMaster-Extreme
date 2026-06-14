@@ -31,14 +31,22 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
     return out;
 }
 
-// Narkowicz ACES filmic approximation.
-fn aces(x: vec3<f32>) -> vec3<f32> {
+// Narkowicz ACES filmic curve, scalar form.
+fn aces_scalar(x: f32) -> f32 {
     let a = 2.51;
     let b = 0.03;
     let c = 2.43;
     let d = 0.59;
     let e = 0.14;
-    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
+    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+}
+
+// Tone-map on luminance only and rescale the colour, so hue and saturation are
+// preserved (no per-channel ACES hue shift / highlight desaturation). Keeps the
+// filmic highlight roll-off without the colour cast.
+fn tonemap(c: vec3<f32>) -> vec3<f32> {
+    let l = max(dot(c, vec3<f32>(0.2126, 0.7152, 0.0722)), 1e-4);
+    return c * (aces_scalar(l) / l);
 }
 
 @fragment
@@ -66,7 +74,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     }
 
     color = color * params.q.x;        // exposure
-    color = aces(color);               // filmic tone map (HDR -> linear [0,1])
+    color = tonemap(color);            // filmic tone map (HDR -> linear [0,1])
 
     // Saturation around luma.
     let l = dot(color, vec3<f32>(0.2126, 0.7152, 0.0722));

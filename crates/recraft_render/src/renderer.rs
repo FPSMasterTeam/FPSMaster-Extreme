@@ -1882,14 +1882,16 @@ impl<'window> Renderer<'window> {
         let bloom = if self.bloom_enabled { 1.0f32 } else { 0.0 };
         // p: bloom threshold, bloom intensity, texel.x, texel.y
         // q: exposure, saturation, contrast, bloom-enabled
+        // Neutral grade (sat/contrast 1.0) + slightly-under exposure so sunlit
+        // blocks keep texture detail instead of blowing out.
         let params = [
             1.0f32,
-            0.8,
+            0.6,
             1.0 / w as f32,
             1.0 / h as f32,
-            1.1,
-            1.15,
-            1.06,
+            0.85,
+            1.0,
+            1.0,
             bloom,
         ];
         self.queue
