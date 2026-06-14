@@ -20,6 +20,29 @@ impl BlockState {
         self.id == 0
     }
 
+    /// Block-light this block emits (0..=15), matching vanilla 1.8 light values.
+    /// Used by the offline/demo light engine (servers send their own lightmap).
+    pub const fn luminance(self) -> u8 {
+        match self.id {
+            10 | 11 => 15,  // lava (flowing/still)
+            39 => 0,        // brown mushroom (vanilla 1, negligible)
+            50 => 14,       // torch
+            51 => 15,       // fire
+            62 => 13,       // lit furnace
+            74 => 9,        // lit redstone ore
+            76 => 7,        // redstone torch (lit)
+            89 => 15,       // glowstone
+            90 => 11,       // nether portal
+            91 => 15,       // jack o'lantern
+            119 => 15,      // end portal
+            124 => 15,      // redstone lamp (lit)
+            130 => 7,       // ender chest
+            138 => 15,      // beacon
+            169 => 15,      // sea lantern
+            _ => 0,
+        }
+    }
+
     fn shape(self) -> Shape {
         blocks::registry()
             .def(self.id)

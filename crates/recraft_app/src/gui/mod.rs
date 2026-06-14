@@ -145,6 +145,7 @@ pub enum GuiAction {
     SetShaderSpecular(bool),
     SetShaderFog(bool),
     SetShaderBloom(bool),
+    SetBrightness(f32),
     /// Persist the current settings to disk (emitted when options close).
     SaveSettings,
     /// Send a serverbound packet (inventory clicks, window close, …).

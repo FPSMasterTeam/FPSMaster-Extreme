@@ -429,10 +429,6 @@ pub struct Renderer<'window> {
     /// server sends a time update.
     world_time: f64,
     ui_pipeline: wgpu::RenderPipeline,
-    /// Resets the depth buffer to the far plane mid-pass (fullscreen draw,
-    /// color writes masked off) so the GUI block-icon cubes depth-test among
-    /// themselves inside the single frame pass.
-    depth_reset_pipeline: wgpu::RenderPipeline,
     ui_bind_group_layout: wgpu::BindGroupLayout,
     ui_sampler: wgpu::Sampler,
     ui_cache: Option<UiCache>,
@@ -458,6 +454,10 @@ pub struct Renderer<'window> {
     model_texture_layout: wgpu::BindGroupLayout,
     gui_atlas: GuiAtlas,
     depth_view: wgpu::TextureView,
+    /// Full-window depth target for the final UI pass (which draws to the
+    /// swapchain after the off-screen world composite, so bloom never blooms the
+    /// HUD). Sized to the swapchain, independent of the world render scale.
+    window_depth_view: wgpu::TextureView,
     /// Block atlas bound once per mipmap level (index = active level); the
     /// "Mipmaps" option selects which to bind.
     texture_bind_groups: Vec<wgpu::BindGroup>,
@@ -476,6 +476,8 @@ pub struct Renderer<'window> {
     shadows_enabled: bool,
     specular_enabled: bool,
     fog_enabled: bool,
+    /// Overall lighting brightness multiplier (user "Brightness" option).
+    brightness: f32,
     /// Sun shadow-map target + the depth-only pipelines that fill it.
     shadow_view: wgpu::TextureView,
     shadow_solid_pipeline: wgpu::RenderPipeline,
@@ -834,6 +836,7 @@ impl<'window> Renderer<'window> {
             push_constant_ranges: &[],
         });
         let depth_view = create_depth_view(&device, &config);
+        let window_depth_view = create_depth_view(&device, &config);
 
         // Solid colour pass. Depth is already filled by the pre-pass below, so it
         // only tests (LessEqual, matching the pre-pass's recorded depth) without
@@ -1393,49 +1396,6 @@ impl<'window> Renderer<'window> {
             multiview: None,
         });
 
-        let depth_reset_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("depth-reset-pipeline-layout"),
-            bind_group_layouts: &[],
-            push_constant_ranges: &[],
-        });
-        let depth_reset_pipeline =
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("depth-reset-pipeline"),
-                layout: Some(&depth_reset_layout),
-                vertex: wgpu::VertexState {
-                    module: &ui_shader,
-                    entry_point: "vs_depth_reset",
-                    buffers: &[],
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &ui_shader,
-                    entry_point: "fs_depth_reset",
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::empty(),
-                    })],
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    strip_index_format: None,
-                    front_face: wgpu::FrontFace::Ccw,
-                    cull_mode: None,
-                    polygon_mode: wgpu::PolygonMode::Fill,
-                    unclipped_depth: false,
-                    conservative: false,
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: DEPTH_FORMAT,
-                    depth_write_enabled: true,
-                    depth_compare: wgpu::CompareFunction::Always,
-                    stencil: wgpu::StencilState::default(),
-                    bias: wgpu::DepthBiasState::default(),
-                }),
-                multisample: wgpu::MultisampleState::default(),
-                multiview: None,
-            });
-
         // Nametag text atlas: a small RGBA texture, rebuilt when names change.
         // It shares the model pass's texture+sampler layout so nametag billboards
         // draw through the model pipeline.
@@ -1749,7 +1709,6 @@ impl<'window> Renderer<'window> {
             star_quads,
             world_time: 6000.0,
             ui_pipeline,
-            depth_reset_pipeline,
             ui_bind_group_layout,
             ui_sampler,
             ui_cache: None,
@@ -1765,6 +1724,7 @@ impl<'window> Renderer<'window> {
             model_texture_layout: entity_texture_layout,
             gui_atlas,
             depth_view,
+            window_depth_view,
             texture_bind_groups,
             water_opaque_pipeline,
             render_scale: 1.0,
@@ -1776,6 +1736,7 @@ impl<'window> Renderer<'window> {
             shadows_enabled: false,
             specular_enabled: false,
             fog_enabled: false,
+            brightness: 1.0,
             shadow_view,
             shadow_solid_pipeline,
             shadow_cutout_pipeline,
@@ -1852,6 +1813,11 @@ impl<'window> Renderer<'window> {
         self.fog_enabled = on;
     }
 
+    /// Overall lighting brightness multiplier (vanilla "Brightness" gamma).
+    pub fn set_brightness(&mut self, value: f32) {
+        self.brightness = value;
+    }
+
     /// Bloom (glow around bright pixels). Forces the off-screen path so the scene
     /// can be post-composited, so it recreates the scaled targets.
     pub fn set_bloom_enabled(&mut self, on: bool) {
@@ -1899,6 +1865,7 @@ impl<'window> Renderer<'window> {
         self.config.width = size.width;
         self.config.height = size.height;
         self.surface.configure(&self.device, &self.config);
+        self.window_depth_view = create_depth_view(&self.device, &self.config);
         self.rebuild_scaled_targets();
     }
 
@@ -2561,7 +2528,7 @@ impl<'window> Renderer<'window> {
                     camera.z_far * 0.45,
                     camera.z_far * 0.92,
                     on(self.fog_enabled),
-                    0.0,
+                    self.brightness,
                 ],
             }),
         );
@@ -2978,42 +2945,6 @@ impl<'window> Renderer<'window> {
                 draw_calls += 1;
             }
             } // else (non-panorama sky + world content)
-
-            if draw_ui && !self.debug_skip.ui {
-                // UI background layer (under the 3D block icons).
-                if let Some(cache) = &self.ui_cache {
-                    pass.set_pipeline(&self.ui_pipeline);
-                    pass.set_bind_group(0, &cache.bind_group, &[]);
-                    pass.draw(0..3, 0..1);
-                    draw_calls += 1;
-                }
-                // 3D block icons: convex cubes (cull-free) baked into clip space
-                // via the identity camera. They need a fresh depth buffer, so a
-                // fullscreen always-pass draw resets depth to the far plane first
-                // (color writes masked off) instead of a separate cleared pass.
-                if let Some(mesh) = self.gui_item_mesh.as_ref().filter(|m| m.index_count > 0) {
-                    pass.set_pipeline(&self.depth_reset_pipeline);
-                    pass.draw(0..3, 0..1);
-                    pass.set_pipeline(&self.gui_cube_pipeline);
-                    pass.set_bind_group(0, &self.gui_camera_bind_group, &[]);
-                    pass.set_bind_group(
-                    1,
-                    &self.texture_bind_groups[self.mipmap_levels as usize],
-                    &[],
-                );
-                    pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-                    pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                    pass.draw_indexed(0..mesh.index_count, 0, 0..1);
-                    draw_calls += 2;
-                }
-                // UI foreground layer (counts, hover, carried stack) over the cubes.
-                if let Some(cache) = &self.ui_overlay_cache {
-                    pass.set_pipeline(&self.ui_pipeline);
-                    pass.set_bind_group(0, &cache.bind_group, &[]);
-                    pass.draw(0..3, 0..1);
-                    draw_calls += 1;
-                }
-            }
         }
         // Off-screen → swapchain: bloom composite when enabled, else a plain
         // upscale blit (render scale < 1.0). Either way one fullscreen pass.
@@ -3040,6 +2971,60 @@ impl<'window> Renderer<'window> {
             blit.set_pipeline(pipeline);
             blit.set_bind_group(0, bind, &[]);
             blit.draw(0..3, 0..1);
+        }
+
+        // UI pass: drawn to the swapchain AFTER the world composite, so the HUD
+        // is never fed through bloom/blit. Loads the composited (or directly
+        // rendered) world colour and clears its own full-window depth for the 3D
+        // block icons. Skipped entirely when this frame has no UI.
+        if draw_ui && !self.debug_skip.ui {
+            let mut up = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("ui-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &swapchain_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.window_depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Discard,
+                    }),
+                    stencil_ops: None,
+                }),
+                occlusion_query_set: None,
+                timestamp_writes: None,
+            });
+            // UI background layer (under the 3D block icons).
+            if let Some(cache) = &self.ui_cache {
+                up.set_pipeline(&self.ui_pipeline);
+                up.set_bind_group(0, &cache.bind_group, &[]);
+                up.draw(0..3, 0..1);
+                draw_calls += 1;
+            }
+            // 3D block icons: convex cubes (cull-free) baked into clip space via
+            // the identity camera. The pass cleared depth to the far plane, so
+            // they depth-test correctly among themselves.
+            if let Some(mesh) = self.gui_item_mesh.as_ref().filter(|m| m.index_count > 0) {
+                up.set_pipeline(&self.gui_cube_pipeline);
+                up.set_bind_group(0, &self.gui_camera_bind_group, &[]);
+                up.set_bind_group(1, &self.texture_bind_groups[self.mipmap_levels as usize], &[]);
+                up.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                up.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                up.draw_indexed(0..mesh.index_count, 0, 0..1);
+                draw_calls += 1;
+            }
+            // UI foreground layer (counts, hover, carried stack) over the cubes.
+            if let Some(cache) = &self.ui_overlay_cache {
+                up.set_pipeline(&self.ui_pipeline);
+                up.set_bind_group(0, &cache.bind_group, &[]);
+                up.draw(0..3, 0..1);
+                draw_calls += 1;
+            }
         }
         // Resolve this frame's timestamps into the readback buffer (still in the
         // same command buffer, after the pass that wrote them).

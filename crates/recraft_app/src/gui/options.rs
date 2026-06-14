@@ -16,6 +16,7 @@ enum Slider {
     Sensitivity,
     FpsCap,
     RenderScale,
+    Brightness,
 }
 
 #[derive(Default)]
@@ -23,6 +24,7 @@ pub struct GuiOptions {
     sensitivity_rect: UiRect,
     fps_rect: UiRect,
     render_scale_rect: UiRect,
+    brightness_rect: UiRect,
     vsync: Option<GuiButton>,
     graphics: Option<GuiButton>,
     mipmaps: Option<GuiButton>,
@@ -66,12 +68,13 @@ impl GuiOptions {
         self.vsync = Some(GuiButton::at_px(x, top + 24 * s, 200 * s, s, ""));
         self.fps_rect = UiRect::new(x, top + 48 * s, 200 * s, BUTTON_HEIGHT * s);
         self.render_scale_rect = UiRect::new(x, top + 72 * s, 200 * s, BUTTON_HEIGHT * s);
-        self.graphics = Some(GuiButton::at_px(x, top + 96 * s, 98 * s, s, ""));
-        self.mipmaps = Some(GuiButton::at_px(x + 102 * s, top + 96 * s, 98 * s, s, ""));
-        self.resolution = Some(GuiButton::at_px(x, top + 120 * s, 98 * s, s, ""));
-        self.fullscreen = Some(GuiButton::at_px(x + 102 * s, top + 120 * s, 98 * s, s, ""));
-        self.shaders_btn = Some(GuiButton::at_px(x, top + 144 * s, 200 * s, s, "Shaders..."));
-        self.done = Some(GuiButton::at_px(x, top + 180 * s, 200 * s, s, "Done"));
+        self.brightness_rect = UiRect::new(x, top + 96 * s, 200 * s, BUTTON_HEIGHT * s);
+        self.graphics = Some(GuiButton::at_px(x, top + 120 * s, 98 * s, s, ""));
+        self.mipmaps = Some(GuiButton::at_px(x + 102 * s, top + 120 * s, 98 * s, s, ""));
+        self.resolution = Some(GuiButton::at_px(x, top + 144 * s, 98 * s, s, ""));
+        self.fullscreen = Some(GuiButton::at_px(x + 102 * s, top + 144 * s, 98 * s, s, ""));
+        self.shaders_btn = Some(GuiButton::at_px(x, top + 168 * s, 200 * s, s, "Shaders..."));
+        self.done = Some(GuiButton::at_px(x, top + 204 * s, 200 * s, s, "Done"));
     }
 
     fn slider_fraction(rect: UiRect, x: f64) -> f32 {
@@ -92,6 +95,9 @@ impl GuiOptions {
             Some(Slider::RenderScale) => ctx
                 .settings
                 .set_render_scale_from01(Self::slider_fraction(self.render_scale_rect, x)),
+            Some(Slider::Brightness) => ctx
+                .settings
+                .set_brightness_from01(Self::slider_fraction(self.brightness_rect, x)),
             None => {}
         }
     }
@@ -176,6 +182,13 @@ impl GuiScreen for GuiOptions {
             ctx.settings.render_scale_fraction(),
             &format!("Render Scale: {}%", ctx.settings.render_scale_percent()),
         );
+        draw_slider(
+            ui,
+            self.brightness_rect,
+            s,
+            ctx.settings.brightness_fraction(),
+            &format!("Brightness: {}%", ctx.settings.brightness_percent()),
+        );
         if let Some(graphics) = &mut self.graphics {
             graphics.label = format!(
                 "Graphics: {}",
@@ -219,6 +232,11 @@ impl GuiScreen for GuiOptions {
         }
         if self.render_scale_rect.contains(x, y) {
             self.dragging = Some(Slider::RenderScale);
+            self.apply_drag(x, ctx);
+            return Vec::new();
+        }
+        if self.brightness_rect.contains(x, y) {
+            self.dragging = Some(Slider::Brightness);
             self.apply_drag(x, ctx);
             return Vec::new();
         }
@@ -266,11 +284,11 @@ impl GuiScreen for GuiOptions {
         ctx: &mut ScreenCtx,
     ) -> Vec<GuiAction> {
         // Render scale recreates off-screen targets, so apply it once on release
-        // rather than on every drag tick.
-        let action = if self.dragging == Some(Slider::RenderScale) {
-            vec![GuiAction::SetRenderScale(ctx.settings.render_scale)]
-        } else {
-            Vec::new()
+        // rather than on every drag tick; brightness just updates a uniform.
+        let action = match self.dragging {
+            Some(Slider::RenderScale) => vec![GuiAction::SetRenderScale(ctx.settings.render_scale)],
+            Some(Slider::Brightness) => vec![GuiAction::SetBrightness(ctx.settings.brightness)],
+            _ => Vec::new(),
         };
         self.dragging = None;
         action

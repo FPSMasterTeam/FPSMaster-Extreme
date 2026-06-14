@@ -344,6 +344,10 @@ pub struct GameState {
     previous_player_position: DVec3,
     physics: PlayerPhysics,
     has_sky_light: bool,
+    /// Run a client-side block-light flood-fill on placement/break. Demos have no
+    /// server lightmap, so emissive blocks must be lit locally; off in multiplayer
+    /// (the server is authoritative for light there).
+    local_lighting: bool,
     /// World time of day in ticks (0..24000), driving the day/night sky and
     /// lightmap. Advanced locally each tick and resynced by S03 TimeUpdate;
     /// starts at noon until the server reports otherwise.
@@ -542,8 +546,12 @@ impl GameState {
             DemoKind::Terrain => build_demo_terrain(&mut world),
             DemoKind::SingleCube => build_demo_single_cube(&mut world),
         };
+        // Demo worlds default every cell to full sky-light; cast it vertically so
+        // caves/interiors are dark (and lit only by placed block sources).
+        world.recompute_vertical_skylight();
         let mut state = Self::new(world, EntityId(0), spawn, aspect);
         state.capabilities.allow_flying = true;
+        state.local_lighting = true;
         if matches!(kind, DemoKind::ChunkStress) {
             state.camera.pitch = 45.0;
         }
@@ -564,8 +572,9 @@ impl GameState {
         // two (a full vanilla day is 20 min), and stock the hotbar with light
         // sources so emissive lighting/shadows are easy to try at night.
         state.time_rate = 12;
-        let lights = [89, 50, 169, 91, 124]; // glowstone, torch, sea lantern, jack-o-lantern, redstone lamp (lit)
-        for (i, id) in lights.into_iter().enumerate() {
+        // glowstone, torch, sea lantern, jack-o-lantern, redstone lamp (lit), stone
+        let hotbar = [89, 50, 169, 91, 124, 1];
+        for (i, id) in hotbar.into_iter().enumerate() {
             state.inventory[36 + i] = Some(SlotItem {
                 id,
                 count: 64,
@@ -602,6 +611,7 @@ impl GameState {
             player,
             physics: PlayerPhysics::default(),
             has_sky_light: true,
+            local_lighting: false,
             world_time: 6000,
             daylight_cycle: true,
             time_rate: 1,
@@ -1326,9 +1336,11 @@ impl GameState {
         &self,
         mesh: &mut ModelMesh,
         tick_alpha: f32,
+        brightness: f32,
         skin_rows: &std::collections::HashMap<[u8; 16], u32>,
     ) {
         mesh.clear();
+        let sun_b = recraft_render::sky::sun_brightness(self.world_time(tick_alpha));
         // Cull entities outside the view frustum up front: most mobs in a loaded
         // world are off-screen at any moment, and building each one's articulated
         // mesh is the dominant per-frame cost in entity-dense scenes.
@@ -1389,6 +1401,7 @@ impl GameState {
                 swing_progress: entity.render_swing(tick_alpha),
                 sneaking: entity.sneaking,
             };
+            let start = mesh.vertices.len();
             mesh.push_entity(
                 entity.kind,
                 feet,
@@ -1398,7 +1411,26 @@ impl GameState {
                 &anim,
                 skin_row,
             );
+            // Light the entity by the world lightmap at its body centre (vanilla
+            // samples the lightmap per entity), so mobs darken at night/in caves
+            // instead of glowing full-bright. Folded into the per-face shade
+            // already baked in the vertex colour.
+            let center = Vec3::new(feet.x, feet.y + height as f32 * 0.5, feet.z);
+            let factor = entity_light(&self.world, center, sun_b, brightness);
+            for v in &mut mesh.vertices[start..] {
+                v.color[0] *= factor;
+                v.color[1] *= factor;
+                v.color[2] *= factor;
+            }
         }
+    }
+
+    /// World-light factor (0..1) for a model drawn at `pos`, matching the chunk
+    /// shader's day/night + block-light + brightness-gamma so entities and the
+    /// first-person hand sit at the same brightness as the terrain around them.
+    pub fn world_light_factor(&self, pos: Vec3, brightness: f32, tick_alpha: f32) -> f32 {
+        let sun_b = recraft_render::sky::sun_brightness(self.world_time(tick_alpha));
+        entity_light(&self.world, pos, sun_b, brightness)
     }
 
     /// The dropped items to render this frame (object type 2 with a known
@@ -1861,12 +1893,25 @@ impl GameState {
     /// Locally clear a just-broken block so the crosshair stops targeting it
     /// (prevents an immediate re-dig before the server's BlockChange arrives).
     fn predict_break(&mut self, x: i32, y: i32, z: i32) {
+        let old = self.world.block_at(x, y, z);
         if self
             .world
             .set_block_if_chunk_loaded(x, y, z, BlockState::AIR)
         {
             self.mark_block_dirty_urgent(x, y, z);
+            self.relight_after_edit(x, y, z, old);
         }
+    }
+
+    /// Offline/demo block-light update: flood-fill block light around an edit and
+    /// queue every affected section for an urgent re-mesh. No-op in multiplayer.
+    fn relight_after_edit(&mut self, x: i32, y: i32, z: i32, old: BlockState) {
+        if !self.local_lighting {
+            return;
+        }
+        let sections = self.world.update_block_light(x, y, z, old);
+        self.dirty_chunks.extend(sections.iter().copied());
+        self.urgent_remesh.extend(sections);
     }
 
     /// Mirror vanilla's client-side placement: the instant we send a block
@@ -1926,8 +1971,10 @@ impl GameState {
                 return;
             }
         }
+        let old = self.world.block_at(px, py, pz);
         if self.world.set_block_if_chunk_loaded(px, py, pz, state) {
             self.mark_block_dirty_urgent(px, py, pz);
+            self.relight_after_edit(px, py, pz, old);
         }
     }
 
@@ -2904,6 +2951,23 @@ impl GameState {
 
 fn to_render_vec3(position: DVec3) -> Vec3 {
     Vec3::new(position.x as f32, position.y as f32, position.z as f32)
+}
+
+/// Flat world-light factor (0..1) at a world position: vanilla lightmap combine
+/// (day/night-scaled skylight vs. block light) with a small floor, run through
+/// the same brightness-gamma the chunk shader uses. Keeps models in step with
+/// the terrain's brightness, including the Brightness option and time of day.
+fn entity_light(world: &World, pos: Vec3, sun_brightness: f32, brightness: f32) -> f32 {
+    let (block_l, sky_l) = world.light_at(
+        pos.x.floor() as i32,
+        pos.y.floor() as i32,
+        pos.z.floor() as i32,
+    );
+    let level = (sky_l as f32 / 15.0 * sun_brightness)
+        .max(block_l as f32 / 15.0)
+        .max(0.05);
+    let gamma = 1.0 + (1.0 - brightness) * 1.5;
+    level.powf(gamma)
 }
 
 fn lerp(a: f32, b: f32, t: f32) -> f32 {

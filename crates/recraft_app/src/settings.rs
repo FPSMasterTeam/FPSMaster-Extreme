@@ -44,6 +44,10 @@ pub struct Settings {
     pub shader_fog: bool,
     /// Bloom glow around bright pixels (independent of the master toggle).
     pub shader_bloom: bool,
+    /// Brightness gamma in 0..=1 (vanilla "Brightness"): 1.0 leaves lighting
+    /// untouched, lower values darken the shadow/low-light end (not a flat
+    /// multiply). Default sits below neutral so nights and caves read dark.
+    pub brightness: f32,
 }
 
 /// Selectable resolutions (None = native). Common 16:9 modes most panels scale.
@@ -62,6 +66,11 @@ const FPS_STEP: u32 = 10;
 const RENDER_SCALE_MIN: f32 = 0.5;
 /// Highest selectable mipmap level (16px tiles → mips 0..4).
 pub const MIPMAP_MAX: u32 = 4;
+// Brightness is a gamma knob (0 = darkest shadows, 1 = neutral), not a flat
+// multiplier — it pulls the dark/low-light end down while leaving fully-lit
+// surfaces alone.
+const BRIGHTNESS_MIN: f32 = 0.0;
+const BRIGHTNESS_MAX: f32 = 1.0;
 
 impl Default for Settings {
     fn default() -> Self {
@@ -79,6 +88,7 @@ impl Default for Settings {
             shader_specular: true,
             shader_fog: false,
             shader_bloom: false,
+            brightness: 0.5,
         }
     }
 }
@@ -173,6 +183,11 @@ impl Settings {
                         s.shader_bloom = v;
                     }
                 }
+                "brightness" => {
+                    if let Ok(v) = val.parse() {
+                        s.brightness = v;
+                    }
+                }
                 _ => {}
             }
         }
@@ -180,6 +195,7 @@ impl Settings {
         s.fps_cap = s.fps_cap.clamp(FPS_MIN, FPS_MAX);
         s.render_scale = s.render_scale.clamp(RENDER_SCALE_MIN, 1.0);
         s.mipmap_levels = s.mipmap_levels.min(MIPMAP_MAX);
+        s.brightness = s.brightness.clamp(BRIGHTNESS_MIN, BRIGHTNESS_MAX);
         s.resolution = if res_w > 0 && res_h > 0 {
             Some((res_w, res_h))
         } else {
@@ -197,7 +213,7 @@ impl Settings {
     fn save_to(&self, path: &std::path::Path) {
         let (res_w, res_h) = self.resolution.unwrap_or((0, 0));
         let text = format!(
-            "sensitivity={}\nvsync={}\nfps_cap={}\nrender_scale={}\nfancy_graphics={}\nmipmap_levels={}\nresolution_w={}\nresolution_h={}\nfullscreen={}\nshaders={}\nshader_shadows={}\nshader_specular={}\nshader_fog={}\nshader_bloom={}\n",
+            "sensitivity={}\nvsync={}\nfps_cap={}\nrender_scale={}\nfancy_graphics={}\nmipmap_levels={}\nresolution_w={}\nresolution_h={}\nfullscreen={}\nshaders={}\nshader_shadows={}\nshader_specular={}\nshader_fog={}\nshader_bloom={}\nbrightness={}\n",
             self.sensitivity,
             self.vsync,
             self.fps_cap,
@@ -212,6 +228,7 @@ impl Settings {
             self.shader_specular,
             self.shader_fog,
             self.shader_bloom,
+            self.brightness,
         );
         if let Err(err) = std::fs::write(path, text) {
             log::warn!("failed to save settings to {}: {err}", path.display());
@@ -275,6 +292,21 @@ impl Settings {
         let raw = RENDER_SCALE_MIN + value.clamp(0.0, 1.0) * (1.0 - RENDER_SCALE_MIN);
         // Snap to 5% steps for clean labels (50%, 55%, … 100%).
         self.render_scale = ((raw * 20.0).round() / 20.0).clamp(RENDER_SCALE_MIN, 1.0);
+    }
+
+    /// Brightness slider fill fraction in 0..=1.
+    pub fn brightness_fraction(self) -> f32 {
+        (self.brightness - BRIGHTNESS_MIN) / (BRIGHTNESS_MAX - BRIGHTNESS_MIN)
+    }
+
+    pub fn brightness_percent(self) -> u32 {
+        (self.brightness * 100.0).round() as u32
+    }
+
+    pub fn set_brightness_from01(&mut self, value: f32) {
+        let raw = BRIGHTNESS_MIN + value.clamp(0.0, 1.0) * (BRIGHTNESS_MAX - BRIGHTNESS_MIN);
+        // Snap to 5% steps for clean labels.
+        self.brightness = ((raw * 20.0).round() / 20.0).clamp(BRIGHTNESS_MIN, BRIGHTNESS_MAX);
     }
 
     /// Advance the mipmap level, wrapping `0 → 1 → … → MIPMAP_MAX → 0`.
@@ -358,6 +390,7 @@ mod tests {
         original.render_scale = 0.7;
         original.fancy_graphics = false;
         original.mipmap_levels = 2;
+        original.brightness = 0.55;
         original.save_to(&path);
 
         let loaded = Settings::load_from(&path);
@@ -367,6 +400,7 @@ mod tests {
         assert!((loaded.render_scale - 0.7).abs() < 1e-6);
         assert!(!loaded.fancy_graphics);
         assert_eq!(loaded.mipmap_levels, 2);
+        assert!((loaded.brightness - 0.55).abs() < 1e-6);
 
         let _ = std::fs::remove_file(&path);
     }

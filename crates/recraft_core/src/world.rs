@@ -1,6 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::{BlockState, Chunk, ChunkPos, EntityId, EntityState};
+use crate::{BlockState, Chunk, ChunkPos, EntityId, EntityState, SectionPos};
 
 #[derive(Debug, Default)]
 pub struct World {
@@ -107,6 +107,113 @@ impl World {
         chunk.light_at(local_x, y, local_z)
     }
 
+    /// Recompute sky-light by a simple vertical cast for every loaded column
+    /// (offline/demo worlds, which ship every cell at sky-light 15 by default so
+    /// caves and interiors look fully lit). For each column the topmost opaque
+    /// block and everything below it are set to sky-light 0; open air above keeps
+    /// the default 15. Only touches already-allocated sections. Block-light is
+    /// left untouched. Run once after generating a demo world.
+    pub fn recompute_vertical_skylight(&mut self) {
+        for chunk in self.chunks.values_mut() {
+            chunk.recompute_vertical_skylight();
+        }
+    }
+
+    /// Flood-fill block-light around a just-changed block (offline/demo worlds,
+    /// which have no server lightmap). `old` is the block previously at (x,y,z);
+    /// the new block must already be set. Runs the classic Minecraft two-phase
+    /// update (remove the old light, then re-propagate) and returns every section
+    /// whose light changed so the caller can re-mesh them. Only spreads into
+    /// already-loaded chunks. Sky-light is left untouched.
+    pub fn update_block_light(&mut self, x: i32, y: i32, z: i32, old: BlockState) -> Vec<SectionPos> {
+        let mut changed: HashSet<SectionPos> = HashSet::new();
+        let old_level = old.luminance().max(self.light_at(x, y, z).0);
+
+        // Phase 1: removal. Clear the source and any cell that was lit only by it,
+        // collecting brighter borders as re-propagation seeds.
+        let mut removal: VecDeque<(i32, i32, i32, u8)> = VecDeque::new();
+        let mut additions: VecDeque<(i32, i32, i32)> = VecDeque::new();
+        self.set_block_light_tracked(x, y, z, 0, &mut changed);
+        removal.push_back((x, y, z, old_level));
+        while let Some((cx, cy, cz, level)) = removal.pop_front() {
+            for (nx, ny, nz) in neighbors(cx, cy, cz) {
+                if !(0..256).contains(&ny) || !self.is_block_column_loaded(nx, nz) {
+                    continue;
+                }
+                let nl = self.light_at(nx, ny, nz).0;
+                if nl != 0 && nl < level {
+                    self.set_block_light_tracked(nx, ny, nz, 0, &mut changed);
+                    removal.push_back((nx, ny, nz, nl));
+                } else if nl >= level {
+                    additions.push_back((nx, ny, nz));
+                }
+            }
+        }
+
+        // Phase 2: addition. Seed the new emitter, then flood outward.
+        let emit = self.block_at(x, y, z).luminance();
+        if emit > 0 {
+            self.set_block_light_tracked(x, y, z, emit, &mut changed);
+            additions.push_back((x, y, z));
+        }
+        while let Some((cx, cy, cz)) = additions.pop_front() {
+            let level = self.light_at(cx, cy, cz).0;
+            if level <= 1 {
+                continue;
+            }
+            for (nx, ny, nz) in neighbors(cx, cy, cz) {
+                if !(0..256).contains(&ny) || !self.is_block_column_loaded(nx, nz) {
+                    continue;
+                }
+                if self.block_at(nx, ny, nz).is_opaque_cube() {
+                    continue;
+                }
+                let nl = self.light_at(nx, ny, nz).0;
+                if level - 1 > nl {
+                    self.set_block_light_tracked(nx, ny, nz, level - 1, &mut changed);
+                    additions.push_back((nx, ny, nz));
+                }
+            }
+        }
+
+        changed.into_iter().collect()
+    }
+
+    /// Set only the block-light nibble (preserving sky-light) and record the
+    /// affected section plus any neighbour section across a touched border (so
+    /// cross-section smooth lighting re-meshes too).
+    fn set_block_light_tracked(
+        &mut self,
+        x: i32,
+        y: i32,
+        z: i32,
+        value: u8,
+        changed: &mut HashSet<SectionPos>,
+    ) {
+        let sky = self.light_at(x, y, z).1;
+        self.set_light(x, y, z, value, sky);
+        let sx = div_floor(x, 16);
+        let sz = div_floor(z, 16);
+        let sy = y.div_euclid(16);
+        changed.insert(SectionPos::new(sx, sy, sz));
+        let (lx, ly, lz) = (mod_floor(x, 16), y.rem_euclid(16), mod_floor(z, 16));
+        if lx == 0 {
+            changed.insert(SectionPos::new(sx - 1, sy, sz));
+        } else if lx == 15 {
+            changed.insert(SectionPos::new(sx + 1, sy, sz));
+        }
+        if lz == 0 {
+            changed.insert(SectionPos::new(sx, sy, sz - 1));
+        } else if lz == 15 {
+            changed.insert(SectionPos::new(sx, sy, sz + 1));
+        }
+        if ly == 0 && sy > 0 {
+            changed.insert(SectionPos::new(sx, sy - 1, sz));
+        } else if ly == 15 && sy < 15 {
+            changed.insert(SectionPos::new(sx, sy + 1, sz));
+        }
+    }
+
     pub fn upsert_entity(&mut self, entity: EntityState) {
         self.entities.insert(entity.id, entity);
     }
@@ -132,6 +239,17 @@ impl World {
     }
 }
 
+fn neighbors(x: i32, y: i32, z: i32) -> [(i32, i32, i32); 6] {
+    [
+        (x - 1, y, z),
+        (x + 1, y, z),
+        (x, y - 1, z),
+        (x, y + 1, z),
+        (x, y, z - 1),
+        (x, y, z + 1),
+    ]
+}
+
 fn div_floor(value: i32, divisor: i32) -> i32 {
     let quotient = value / divisor;
     let remainder = value % divisor;
@@ -154,6 +272,40 @@ fn mod_floor(value: i32, divisor: i32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn block_light_floods_and_clears() {
+        let mut world = World::new();
+        // A loaded air column (creates chunk 0,0 so propagation is allowed).
+        world.set_block(8, 8, 8, BlockState::AIR);
+        let glowstone = BlockState::new(89, 0);
+
+        world.set_block(8, 8, 8, glowstone);
+        world.update_block_light(8, 8, 8, BlockState::AIR);
+        assert_eq!(world.light_at(8, 8, 8).0, 15, "emitter is full bright");
+        assert_eq!(world.light_at(9, 8, 8).0, 14, "neighbour falls off by 1");
+        assert_eq!(world.light_at(13, 8, 8).0, 10, "5 blocks away = 15-5");
+        assert_eq!(world.light_at(8, 8, 8).1, 15, "sky-light untouched");
+
+        // Removing it clears the whole flood (no other sources).
+        world.set_block(8, 8, 8, BlockState::AIR);
+        world.update_block_light(8, 8, 8, glowstone);
+        assert_eq!(world.light_at(8, 8, 8).0, 0);
+        assert_eq!(world.light_at(9, 8, 8).0, 0);
+        assert_eq!(world.light_at(13, 8, 8).0, 0);
+    }
+
+    #[test]
+    fn block_light_does_not_enter_opaque_blocks() {
+        let mut world = World::new();
+        world.set_block(8, 8, 8, BlockState::AIR);
+        // Wall of stone directly beside where the torch will go.
+        world.set_block(9, 8, 8, BlockState::STONE);
+        world.set_block(8, 8, 8, BlockState::new(50, 0)); // torch (lum 14)
+        world.update_block_light(8, 8, 8, BlockState::AIR);
+        assert_eq!(world.light_at(8, 8, 8).0, 14);
+        assert_eq!(world.light_at(9, 8, 8).0, 0, "opaque stone receives no light");
+    }
 
     #[test]
     fn world_coordinates_handle_negative_chunks() {

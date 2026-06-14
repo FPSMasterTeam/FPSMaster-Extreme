@@ -210,6 +210,7 @@ fn main() -> anyhow::Result<()> {
     renderer.set_specular_enabled(settings.shader_specular);
     renderer.set_fog_enabled(settings.shader_fog);
     renderer.set_bloom_enabled(settings.shader_bloom);
+    renderer.set_brightness(settings.brightness);
     apply_display(window, &settings);
     // Atlas UV table snapshot for first-person item geometry (cheap clone of
     // the name→tile map, taken once).
@@ -898,6 +899,7 @@ fn handle_actions(
             GuiAction::SetShaderSpecular(on) => renderer.set_specular_enabled(on),
             GuiAction::SetShaderFog(on) => renderer.set_fog_enabled(on),
             GuiAction::SetShaderBloom(on) => renderer.set_bloom_enabled(on),
+            GuiAction::SetBrightness(v) => renderer.set_brightness(v),
             GuiAction::SaveSettings => app.settings.save(),
             GuiAction::SendPacket(packet) => {
                 if let Some(network) = &app.network {
@@ -1243,12 +1245,34 @@ fn render_frame(
         app.skin_manager.poll(renderer);
 
         let first_person = app.game.first_person_view(tick_alpha);
-        app.game
-            .build_entity_model(&mut app.entity_model, tick_alpha, app.skin_manager.rows());
+        app.game.build_entity_model(
+            &mut app.entity_model,
+            tick_alpha,
+            app.settings.brightness,
+            app.skin_manager.rows(),
+        );
         if hud_visible {
+            // Light the first-person hand + held item by the lightmap at the eye,
+            // so they darken at night/in caves like the rest of the scene.
+            let hand_light = app.game.world_light_factor(
+                app.game.camera.position,
+                app.settings.brightness,
+                tick_alpha,
+            );
+            let arm_start = app.entity_model.vertices.len();
             ItemRenderer::render_arm(&mut app.entity_model, &app.game.camera, &first_person);
-            let (vertices, indices) =
+            for v in &mut app.entity_model.vertices[arm_start..] {
+                v.color[0] *= hand_light;
+                v.color[1] *= hand_light;
+                v.color[2] *= hand_light;
+            }
+            let (mut vertices, indices) =
                 ItemRenderer::build_held_item(&app.game.camera, &first_person, atlas_uv);
+            for v in &mut vertices {
+                v.color[0] *= hand_light;
+                v.color[1] *= hand_light;
+                v.color[2] *= hand_light;
+            }
             renderer.set_first_person_item(&vertices, &indices);
             // 3D world-space player nametags (billboarded, depth-occluded).
             let nametags = app.game.player_nametags(tick_alpha);

@@ -25,7 +25,7 @@ struct Lighting {
     // x = master enable, y = shadows, z = specular, w = shadow map texel size.
     flags: vec4<f32>,
     fog_color: vec4<f32>,  // rgb: fog (horizon) colour
-    fog_params: vec4<f32>, // x: start dist, y: end dist, z: enabled
+    fog_params: vec4<f32>, // x: start dist, y: end dist, z: enabled, w: brightness
 };
 
 @group(2) @binding(0)
@@ -96,11 +96,23 @@ fn sun_shadow(world_pos: vec3<f32>, ndotl: f32) -> f32 {
     return sum / 9.0;
 }
 
+// Brightness gamma: pull the shadow/low-light end down while leaving fully-lit
+// surfaces alone. Values in [0,1] are raised to `gamma` (>1 darkens; 1->1,
+// 0->0); anything above 1 (bright sun) passes through linearly so daylight keeps
+// its punch. This is a curve, not a flat multiply — dark gets darker, bright stays.
+fn light_curve(light: vec3<f32>, gamma: f32) -> vec3<f32> {
+    let low = pow(clamp(light, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(gamma));
+    let high = max(light - vec3<f32>(1.0), vec3<f32>(0.0));
+    return low + high;
+}
+
 // Apply the shader-pack lighting model to an albedo colour. Falls back to the
 // vanilla flat day/night brightness when shaders are disabled.
 fn apply_lighting(albedo: vec3<f32>, in: VertexOutput) -> vec3<f32> {
+    // Brightness option (fog_params.w in 0..1) → gamma: 1.0 neutral, lower darker.
+    let gamma = 1.0 + (1.0 - lighting.fog_params.w) * 1.5;
     if (lighting.flags.x < 0.5) {
-        return albedo * day_night(in.light);
+        return albedo * light_curve(vec3<f32>(day_night(in.light)), gamma);
     }
     let n = normalize(in.normal);
     let ndotl = max(dot(n, lighting.sun_dir.xyz), 0.0);
@@ -110,12 +122,17 @@ fn apply_lighting(albedo: vec3<f32>, in: VertexOutput) -> vec3<f32> {
     }
     let sky = in.light.x;       // skylight 0..1 — gates the sun (indoors = none)
     let block = in.light.y;     // blocklight 0..1 — torches/lava
-    let ambient = lighting.ambient.rgb * (0.35 + 0.65 * sky);
+    // Ambient must track day/night: the skylight channel stays high at night
+    // (only the directional sun sets), so gate the sky-driven ambient by the
+    // day/night brightness, leaving a small floor so it's never pure black.
+    let day = max(camera.sky_brightness, 0.04);
+    let ambient = lighting.ambient.rgb * (0.08 + 0.92 * sky) * day;
     let sun = lighting.sun_color.rgb * (ndotl * shadow * sky);
     let torch = vec3<f32>(1.0, 0.82, 0.55) * block;
-    var lit = albedo * (ambient + sun + torch);
+    var lit = albedo * light_curve(ambient + sun + torch, gamma);
 
-    // Blinn-Phong specular (phase 2): a tight sun highlight, sky-gated.
+    // Blinn-Phong specular (phase 2): a tight sun highlight, sky-gated. Added
+    // after the gamma curve so highlights stay crisp.
     if (lighting.flags.z > 0.5) {
         let view_dir = normalize(lighting.camera_pos.xyz - in.world_pos);
         let half_dir = normalize(lighting.sun_dir.xyz + view_dir);
