@@ -164,22 +164,27 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         color += bloom / wsum * params.p.y;
     }
 
-    // Exposure: the manual base, optionally scaled by auto-exposure so the scene
-    // average maps toward a mid-grey key (clamped so caves/bright scenes don't
-    // over-correct). s.x enables it.
-    var exposure = params.q.x;
-    if (params.s.x > 0.5) {
-        let avg = textureLoad(lum_tex, vec2<i32>(0, 0), 0).r;
-        exposure = exposure * clamp(0.35 / max(avg, 1e-4), 0.5, 1.8);
-    }
-    color = color * exposure;
-    color = tonemap(color);            // filmic tone map (HDR -> linear [0,1])
+    // Tone-mapping + grade only with shaders on (s.y). With shaders off the pass
+    // is a plain passthrough, so the world matches the vanilla direct render
+    // (no ACES lift/flattening, no exposure change).
+    if (params.s.y > 0.5) {
+        // Exposure: the manual base, optionally scaled by auto-exposure so the
+        // scene average maps toward a mid-grey key (clamped so caves/bright
+        // scenes don't over-correct). s.x enables it.
+        var exposure = params.q.x;
+        if (params.s.x > 0.5) {
+            let avg = textureLoad(lum_tex, vec2<i32>(0, 0), 0).r;
+            exposure = exposure * clamp(0.35 / max(avg, 1e-4), 0.5, 1.8);
+        }
+        color = color * exposure;
+        color = tonemap(color);        // filmic tone map (HDR -> linear [0,1])
 
-    // Saturation around luma.
-    let l = dot(color, vec3<f32>(0.2126, 0.7152, 0.0722));
-    color = mix(vec3<f32>(l), color, params.q.y);
-    // Contrast around mid-grey.
-    color = clamp((color - 0.5) * params.q.z + 0.5, vec3<f32>(0.0), vec3<f32>(1.0));
+        // Saturation around luma.
+        let l = dot(color, vec3<f32>(0.2126, 0.7152, 0.0722));
+        color = mix(vec3<f32>(l), color, params.q.y);
+        // Contrast around mid-grey.
+        color = clamp((color - 0.5) * params.q.z + 0.5, vec3<f32>(0.0), vec3<f32>(1.0));
+    }
 
     // Vignette: darken toward the corners. r.x is the strength (0 = off).
     if (params.r.x > 0.0) {

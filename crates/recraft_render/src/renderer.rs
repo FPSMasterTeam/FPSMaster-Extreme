@@ -2303,7 +2303,9 @@ impl<'window> Renderer<'window> {
             on(self.dof_enabled, 1.0),
             on(self.motion_blur_enabled, 1.0),
             on(self.auto_exposure_enabled, 1.0),
-            0.0,
+            // s.y: tone-mapping enabled (= shaders). With shaders off the post
+            // pass is a plain passthrough so the world looks like vanilla.
+            if sh { 1.0 } else { 0.0 },
             0.0,
             0.0,
         ];
