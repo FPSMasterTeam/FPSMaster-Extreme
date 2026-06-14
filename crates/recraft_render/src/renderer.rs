@@ -3425,8 +3425,13 @@ impl<'window> Renderer<'window> {
                 occlusion_query_set: None,
                 timestamp_writes: None,
             });
+            // Three water looks: the full SSR water shader (shaders + Fancy);
+            // plain alpha-blended translucent water (Fancy, shaders off — the
+            // vanilla Fancy look); opaque water (Fast graphics).
             wp.set_pipeline(if use_ssr {
                 &self.water_pipeline
+            } else if self.fancy_graphics {
+                &self.transparent_pipeline
             } else {
                 &self.water_opaque_pipeline
             });
