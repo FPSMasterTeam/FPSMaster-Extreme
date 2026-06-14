@@ -489,6 +489,12 @@ pub struct Renderer<'window> {
     blit_pipeline: wgpu::RenderPipeline,
     blit_sampler: wgpu::Sampler,
     blit_layout: wgpu::BindGroupLayout,
+    /// Single-pass bloom composite (replaces the blit when bloom is on).
+    bloom_enabled: bool,
+    bloom_pipeline: wgpu::RenderPipeline,
+    bloom_layout: wgpu::BindGroupLayout,
+    bloom_params_buffer: wgpu::Buffer,
+    bloom_bind_group: Option<wgpu::BindGroup>,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     chunk_solid: ChunkLayer,
@@ -1538,6 +1544,76 @@ impl<'window> Renderer<'window> {
             multiview: None,
         });
 
+        // Bloom composite (single pass over the off-screen scene → swapchain).
+        let bloom_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("bloom-shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shader/bloom.wgsl").into()),
+        });
+        let bloom_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("bloom-layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let bloom_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("bloom-params"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bloom_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("bloom-pipeline-layout"),
+            bind_group_layouts: &[&bloom_layout],
+            push_constant_ranges: &[],
+        });
+        let bloom_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("bloom-pipeline"),
+            layout: Some(&bloom_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &bloom_shader,
+                entry_point: "vs_main",
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &bloom_shader,
+                entry_point: "fs_composite",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+        });
+
         // Sun shadow-map pass: render chunk depth from the light's view. Solid is
         // depth-only (no fragment); cutout alpha-tests so leaves cast shaped
         // shadows. Both target only a depth attachment.
@@ -1710,6 +1786,11 @@ impl<'window> Renderer<'window> {
             blit_pipeline,
             blit_sampler,
             blit_layout,
+            bloom_enabled: false,
+            bloom_pipeline,
+            bloom_layout,
+            bloom_params_buffer,
+            bloom_bind_group: None,
             camera_buffer,
             camera_bind_group,
             chunk_solid,
@@ -1769,6 +1850,15 @@ impl<'window> Renderer<'window> {
     /// shader toggle).
     pub fn set_fog_enabled(&mut self, on: bool) {
         self.fog_enabled = on;
+    }
+
+    /// Bloom (glow around bright pixels). Forces the off-screen path so the scene
+    /// can be post-composited, so it recreates the scaled targets.
+    pub fn set_bloom_enabled(&mut self, on: bool) {
+        if on != self.bloom_enabled {
+            self.bloom_enabled = on;
+            self.rebuild_scaled_targets();
+        }
     }
 
     /// Set the 3D-world render-resolution scale (0.5..=1.0). Below 1.0 the world
@@ -1833,7 +1923,9 @@ impl<'window> Renderer<'window> {
             h
         );
         self.depth_view = create_depth_view_sized(&self.device, w, h);
-        if self.render_scale < 0.999 {
+        // The world renders off-screen whenever it must be post-processed: render
+        // scale < 1 (upscale blit) or bloom (composite).
+        if self.render_scale < 0.999 || self.bloom_enabled {
             let color = self.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("offscreen-world-color"),
                 size: wgpu::Extent3d {
@@ -1864,11 +1956,40 @@ impl<'window> Renderer<'window> {
                     },
                 ],
             });
+            self.bloom_bind_group = if self.bloom_enabled {
+                // params: threshold, intensity, texel.x, texel.y
+                self.queue.write_buffer(
+                    &self.bloom_params_buffer,
+                    0,
+                    bytemuck::cast_slice(&[0.65f32, 1.1, 1.0 / w as f32, 1.0 / h as f32]),
+                );
+                Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("bloom-bind-group"),
+                    layout: &self.bloom_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(&view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Sampler(&self.blit_sampler),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: self.bloom_params_buffer.as_entire_binding(),
+                        },
+                    ],
+                }))
+            } else {
+                None
+            };
             self.offscreen_view = Some(view);
             self.blit_bind_group = Some(bind);
         } else {
             self.offscreen_view = None;
             self.blit_bind_group = None;
+            self.bloom_bind_group = None;
         }
     }
 
@@ -2894,10 +3015,16 @@ impl<'window> Renderer<'window> {
                 }
             }
         }
-        // Render scale < 1.0: upscale the off-screen world into the swapchain.
-        if let Some(blit_bind) = &self.blit_bind_group {
+        // Off-screen → swapchain: bloom composite when enabled, else a plain
+        // upscale blit (render scale < 1.0). Either way one fullscreen pass.
+        let post = self
+            .bloom_bind_group
+            .as_ref()
+            .map(|b| (&self.bloom_pipeline, b))
+            .or_else(|| self.blit_bind_group.as_ref().map(|b| (&self.blit_pipeline, b)));
+        if let Some((pipeline, bind)) = post {
             let mut blit = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("upscale-blit"),
+                label: Some("post-composite"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &swapchain_view,
                     resolve_target: None,
@@ -2910,8 +3037,8 @@ impl<'window> Renderer<'window> {
                 occlusion_query_set: None,
                 timestamp_writes: None,
             });
-            blit.set_pipeline(&self.blit_pipeline);
-            blit.set_bind_group(0, blit_bind, &[]);
+            blit.set_pipeline(pipeline);
+            blit.set_bind_group(0, bind, &[]);
             blit.draw(0..3, 0..1);
         }
         // Resolve this frame's timestamps into the readback buffer (still in the

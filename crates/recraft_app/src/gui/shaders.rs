@@ -14,6 +14,7 @@ pub struct GuiShaders {
     shadows: Option<GuiButton>,
     specular: Option<GuiButton>,
     fog: Option<GuiButton>,
+    bloom: Option<GuiButton>,
     done: Option<GuiButton>,
     from_main_menu: bool,
 }
@@ -42,7 +43,8 @@ impl GuiShaders {
         self.shadows = Some(GuiButton::at_px(x, top + 24 * s, 200 * s, s, ""));
         self.specular = Some(GuiButton::at_px(x, top + 48 * s, 200 * s, s, ""));
         self.fog = Some(GuiButton::at_px(x, top + 72 * s, 200 * s, s, ""));
-        self.done = Some(GuiButton::at_px(x, top + 108 * s, 200 * s, s, "Done"));
+        self.bloom = Some(GuiButton::at_px(x, top + 96 * s, 200 * s, s, ""));
+        self.done = Some(GuiButton::at_px(x, top + 132 * s, 200 * s, s, "Done"));
     }
 }
 
@@ -77,6 +79,10 @@ impl GuiScreen for GuiShaders {
             b.label = format!("Fog: {}", on_off(ctx.settings.shader_fog));
             b.draw(ui, s, ctx.mouse, ctx.mouse_down);
         }
+        if let Some(b) = &mut self.bloom {
+            b.label = format!("Bloom: {}", on_off(ctx.settings.shader_bloom));
+            b.draw(ui, s, ctx.mouse, ctx.mouse_down);
+        }
         if let Some(b) = &self.done {
             b.draw(ui, s, ctx.mouse, ctx.mouse_down);
         }
@@ -98,6 +104,10 @@ impl GuiScreen for GuiShaders {
         if self.fog.as_ref().is_some_and(|b| b.clicked(x, y)) {
             ctx.settings.shader_fog = !ctx.settings.shader_fog;
             return vec![GuiAction::SetShaderFog(ctx.settings.shader_fog)];
+        }
+        if self.bloom.as_ref().is_some_and(|b| b.clicked(x, y)) {
+            ctx.settings.shader_bloom = !ctx.settings.shader_bloom;
+            return vec![GuiAction::SetShaderBloom(ctx.settings.shader_bloom)];
         }
         if self.done.as_ref().is_some_and(|b| b.clicked(x, y)) {
             return vec![GuiAction::SaveSettings, GuiAction::SetScreen(self.back_screen())];
