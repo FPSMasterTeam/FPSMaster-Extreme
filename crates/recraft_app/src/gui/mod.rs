@@ -18,6 +18,7 @@ pub mod main_menu;
 pub mod multiplayer;
 pub mod options;
 pub mod progress;
+pub mod shaders;
 pub mod widgets;
 
 use recraft_protocol::v1_8_9::packets::ServerboundPacket;
@@ -138,6 +139,10 @@ pub enum GuiAction {
     SetResolution(Option<(u32, u32)>),
     /// Toggle exclusive fullscreen at the chosen resolution.
     SetFullscreen(bool),
+    /// Shader-pack toggles: master lighting, sun shadows, specular.
+    SetShaders(bool),
+    SetShaderShadows(bool),
+    SetShaderSpecular(bool),
     /// Persist the current settings to disk (emitted when options close).
     SaveSettings,
     /// Send a serverbound packet (inventory clicks, window close, …).

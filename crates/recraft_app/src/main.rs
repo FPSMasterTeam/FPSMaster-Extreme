@@ -205,6 +205,9 @@ fn main() -> anyhow::Result<()> {
     renderer.set_fancy_graphics(settings.fancy_graphics);
     renderer.set_mipmap_levels(settings.mipmap_levels);
     renderer.set_render_scale(settings.render_scale);
+    renderer.set_shaders_enabled(settings.shaders);
+    renderer.set_shadows_enabled(settings.shader_shadows);
+    renderer.set_specular_enabled(settings.shader_specular);
     apply_display(window, &settings);
     // Atlas UV table snapshot for first-person item geometry (cheap clone of
     // the name→tile map, taken once).
@@ -883,6 +886,9 @@ fn handle_actions(
             GuiAction::SetMipmapLevels(levels) => renderer.set_mipmap_levels(levels),
             GuiAction::SetResolution(_) => apply_display(window, &app.settings),
             GuiAction::SetFullscreen(_) => apply_display(window, &app.settings),
+            GuiAction::SetShaders(on) => renderer.set_shaders_enabled(on),
+            GuiAction::SetShaderShadows(on) => renderer.set_shadows_enabled(on),
+            GuiAction::SetShaderSpecular(on) => renderer.set_specular_enabled(on),
             GuiAction::SaveSettings => app.settings.save(),
             GuiAction::SendPacket(packet) => {
                 if let Some(network) = &app.network {

@@ -49,6 +49,20 @@ impl CameraUniform {
     }
 }
 
+/// Shader-pack lighting uniform (chunk shader group 2): directional sun +
+/// ambient, plus the light-space matrix reserved for the shadow map.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct LightingUniform {
+    light_view_proj: [[f32; 4]; 4],
+    sun_dir: [f32; 4],
+    sun_color: [f32; 4],
+    ambient: [f32; 4],
+    camera_pos: [f32; 4],
+    /// x = master enable, y = shadows, z = specular, w = shadow texel size.
+    flags: [f32; 4],
+}
+
 /// Uniform for the fullscreen sky-gradient pass: the inverse rotation-only
 /// view-projection (to reconstruct a per-pixel view ray) plus the time-of-day
 /// gradient and sunset-glow colors.
@@ -450,6 +464,13 @@ pub struct Renderer<'window> {
     render_scale: f32,
     fancy_graphics: bool,
     mipmap_levels: u32,
+    /// Shader-pack lighting uniform + bind group (chunk group 2), and which
+    /// sub-effects are enabled.
+    lighting_buffer: wgpu::Buffer,
+    lighting_bind_group: wgpu::BindGroup,
+    shaders_enabled: bool,
+    shadows_enabled: bool,
+    specular_enabled: bool,
     /// Off-screen world target + upscale-blit resources, present only while
     /// render_scale < 1.0; `None` means the world draws straight to the swapchain.
     offscreen_view: Option<wgpu::TextureView>,
@@ -704,6 +725,41 @@ impl<'window> Renderer<'window> {
             bind_group_layouts: &[&camera_layout, &texture_layout],
             push_constant_ranges: &[],
         });
+        // Shader-pack lighting bind group (chunk group 2): one uniform for now;
+        // the shadow map texture/sampler join it in the shadow step.
+        let lighting_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("lighting-layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let lighting_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("lighting-uniform"),
+            size: std::mem::size_of::<LightingUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let lighting_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("lighting-bind-group"),
+            layout: &lighting_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: lighting_buffer.as_entire_binding(),
+            }],
+        });
+        // Chunk colour pipelines also bind the lighting group (group 2).
+        let lit_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("chunk-lit-pipeline-layout"),
+            bind_group_layouts: &[&camera_layout, &texture_layout, &lighting_layout],
+            push_constant_ranges: &[],
+        });
         let depth_view = create_depth_view(&device, &config);
 
         // Solid colour pass. Depth is already filled by the pre-pass below, so it
@@ -711,7 +767,7 @@ impl<'window> Renderer<'window> {
         // writing — early-z then rejects every occluded fragment before shading.
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("chunk-pipeline"),
-            layout: Some(&pipeline_layout),
+            layout: Some(&lit_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: "vs_main",
@@ -749,7 +805,7 @@ impl<'window> Renderer<'window> {
         // the `--bench-passes` flat config to measure texture-read cost.
         let flat_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("chunk-flat-pipeline"),
-            layout: Some(&pipeline_layout),
+            layout: Some(&lit_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: "vs_main",
@@ -789,7 +845,7 @@ impl<'window> Renderer<'window> {
         // versus the textured overdraw it removes on fill/bandwidth-bound GPUs.
         let depth_prepass_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("chunk-depth-prepass-pipeline"),
-            layout: Some(&pipeline_layout),
+            layout: Some(&lit_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: "vs_main",
@@ -830,7 +886,7 @@ impl<'window> Renderer<'window> {
         // be seen from both sides, emit a face for each direction in the mesher.
         let cutout_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("chunk-cutout-pipeline"),
-            layout: Some(&pipeline_layout),
+            layout: Some(&lit_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: "vs_main",
@@ -951,7 +1007,7 @@ impl<'window> Renderer<'window> {
         // visible faces only.
         let transparent_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("chunk-transparent-pipeline"),
-            layout: Some(&pipeline_layout),
+            layout: Some(&lit_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: "vs_main",
@@ -989,7 +1045,7 @@ impl<'window> Renderer<'window> {
         // writes depth so it occludes properly. Saves the alpha-blend bandwidth.
         let water_opaque_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("chunk-water-opaque-pipeline"),
-            layout: Some(&pipeline_layout),
+            layout: Some(&lit_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: "vs_main",
@@ -1481,6 +1537,11 @@ impl<'window> Renderer<'window> {
             render_scale: 1.0,
             fancy_graphics: true,
             mipmap_levels: crate::texture::ATLAS_MIP_LEVELS - 1,
+            lighting_buffer,
+            lighting_bind_group,
+            shaders_enabled: false,
+            shadows_enabled: false,
+            specular_enabled: false,
             offscreen_view: None,
             blit_bind_group: None,
             blit_pipeline,
@@ -1526,6 +1587,19 @@ impl<'window> Renderer<'window> {
     /// Swaps which per-level sampler bind group is bound at draw time.
     pub fn set_mipmap_levels(&mut self, levels: u32) {
         self.mipmap_levels = levels.min(crate::texture::ATLAS_MIP_LEVELS - 1);
+    }
+
+    /// Master toggle for the shader-pack lighting (directional sun + ambient).
+    pub fn set_shaders_enabled(&mut self, on: bool) {
+        self.shaders_enabled = on;
+    }
+
+    pub fn set_shadows_enabled(&mut self, on: bool) {
+        self.shadows_enabled = on;
+    }
+
+    pub fn set_specular_enabled(&mut self, on: bool) {
+        self.specular_enabled = on;
     }
 
     /// Set the 3D-world render-resolution scale (0.5..=1.0). Below 1.0 the world
@@ -2144,6 +2218,32 @@ impl<'window> Renderer<'window> {
         );
         self.prepare_sky(camera, &sky);
 
+        // Shader-pack lighting uniform: directional sun (day/night scaled) +
+        // ambient, consumed by the chunk fragment when shaders are enabled.
+        let sun_dir = crate::sky::celestial_rotation(self.world_time)
+            .transform_vector3(Vec3::Y)
+            .normalize();
+        let sb = sky.sun_brightness;
+        let cam = camera.position;
+        let on = |b: bool| if b { 1.0 } else { 0.0 };
+        self.queue.write_buffer(
+            &self.lighting_buffer,
+            0,
+            bytemuck::bytes_of(&LightingUniform {
+                light_view_proj: Mat4::IDENTITY.to_cols_array_2d(),
+                sun_dir: [sun_dir.x, sun_dir.y, sun_dir.z, 0.0],
+                sun_color: [1.0 * sb, 0.96 * sb, 0.88 * sb, 0.0],
+                ambient: [0.45, 0.48, 0.55, 0.0],
+                camera_pos: [cam.x, cam.y, cam.z, 0.0],
+                flags: [
+                    on(self.shaders_enabled),
+                    on(self.shaders_enabled && self.shadows_enabled),
+                    on(self.shaders_enabled && self.specular_enabled),
+                    0.0,
+                ],
+            }),
+        );
+
         // GPU-time profiler: collect any completed readback, then decide whether
         // to issue a fresh timestamp pair this frame (only when no readback is in
         // flight, so the readback buffer is free to write).
@@ -2316,6 +2416,7 @@ impl<'window> Renderer<'window> {
                     &self.texture_bind_groups[self.mipmap_levels as usize],
                     &[],
                 );
+                pass.set_bind_group(2, &self.lighting_bind_group, &[]);
 
                 // Depth pre-pass: fill the solid layer's depth first (colour
                 // masked off) so the solid colour pass below shades each visible
@@ -2416,6 +2517,7 @@ impl<'window> Renderer<'window> {
                     &self.texture_bind_groups[self.mipmap_levels as usize],
                     &[],
                 );
+                pass.set_bind_group(2, &self.lighting_bind_group, &[]);
                 // Graphics: Fast renders water/glass opaque (no blend dst read).
                 pass.set_pipeline(if self.fancy_graphics {
                     &self.transparent_pipeline

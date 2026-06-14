@@ -28,6 +28,7 @@ pub struct GuiOptions {
     mipmaps: Option<GuiButton>,
     resolution: Option<GuiButton>,
     fullscreen: Option<GuiButton>,
+    shaders_btn: Option<GuiButton>,
     done: Option<GuiButton>,
     dragging: Option<Slider>,
     /// Whether this was opened from the title screen (Done returns there) vs.
@@ -69,7 +70,8 @@ impl GuiOptions {
         self.mipmaps = Some(GuiButton::at_px(x + 102 * s, top + 96 * s, 98 * s, s, ""));
         self.resolution = Some(GuiButton::at_px(x, top + 120 * s, 98 * s, s, ""));
         self.fullscreen = Some(GuiButton::at_px(x + 102 * s, top + 120 * s, 98 * s, s, ""));
-        self.done = Some(GuiButton::at_px(x, top + 156 * s, 200 * s, s, "Done"));
+        self.shaders_btn = Some(GuiButton::at_px(x, top + 144 * s, 200 * s, s, "Shaders..."));
+        self.done = Some(GuiButton::at_px(x, top + 180 * s, 200 * s, s, "Done"));
     }
 
     fn slider_fraction(rect: UiRect, x: f64) -> f32 {
@@ -196,6 +198,9 @@ impl GuiScreen for GuiOptions {
             );
             fullscreen.draw(ui, s, ctx.mouse, ctx.mouse_down);
         }
+        if let Some(b) = &self.shaders_btn {
+            b.draw(ui, s, ctx.mouse, ctx.mouse_down);
+        }
         if let Some(done) = &self.done {
             done.draw(ui, s, ctx.mouse, ctx.mouse_down);
         }
@@ -236,6 +241,12 @@ impl GuiScreen for GuiOptions {
         if self.fullscreen.as_ref().is_some_and(|b| b.clicked(x, y)) {
             ctx.settings.fullscreen = !ctx.settings.fullscreen;
             return vec![GuiAction::SetFullscreen(ctx.settings.fullscreen)];
+        }
+        if self.shaders_btn.as_ref().is_some_and(|b| b.clicked(x, y)) {
+            return vec![
+                GuiAction::SaveSettings,
+                GuiAction::SetScreen(Box::new(super::shaders::GuiShaders::new(self.from_main_menu))),
+            ];
         }
         if self.done.as_ref().is_some_and(|b| b.clicked(x, y)) {
             return vec![GuiAction::SaveSettings, GuiAction::SetScreen(self.back_screen())];

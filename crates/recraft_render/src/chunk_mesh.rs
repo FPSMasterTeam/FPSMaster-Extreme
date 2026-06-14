@@ -55,11 +55,14 @@ pub struct ChunkVertex {
     pub color: [u8; 4],
     /// Normalized atlas UV as Unorm16×2.
     pub uv: [u16; 2],
+    /// Geometric face normal as Snorm8×4 (xyz in −1..1, w unused), derived from
+    /// the quad winding — used by the shader lighting pass.
+    pub normal: [i8; 4],
 }
 
 impl ChunkVertex {
-    pub const ATTRIBUTES: [wgpu::VertexAttribute; 3] =
-        wgpu::vertex_attr_array![0 => Sint16x4, 1 => Unorm8x4, 2 => Unorm16x2];
+    pub const ATTRIBUTES: [wgpu::VertexAttribute; 4] =
+        wgpu::vertex_attr_array![0 => Sint16x4, 1 => Unorm8x4, 2 => Unorm16x2, 3 => Snorm8x4];
 
     pub fn layout<'a>() -> wgpu::VertexBufferLayout<'a> {
         wgpu::VertexBufferLayout {
@@ -111,14 +114,39 @@ impl ChunkMeshBuffers {
         colors: [[f32; 4]; 4],
         lights: [[f32; 2]; 4],
     ) {
+        // Derive the face normal from the winding (CCW front face). All meshed
+        // quads are planar, so the cross product of two edges is the geometric
+        // normal for cubes, slabs, stairs and (per side) cross-plants.
+        let normal = quad_normal(corners);
         let start = self.vertices.len() as u16;
         for (((position, uv), color), light) in
             corners.into_iter().zip(uvs).zip(colors).zip(lights)
         {
-            self.vertices.push(encode_chunk_vertex(position, color, uv, light));
+            self.vertices
+                .push(encode_chunk_vertex(position, color, uv, light, normal));
         }
         self.indices
             .extend_from_slice(&[start, start + 1, start + 2, start, start + 2, start + 3]);
+    }
+}
+
+/// Unit normal of a planar quad from its first three corners (CCW = front).
+fn quad_normal(corners: [[f32; 3]; 4]) -> [f32; 3] {
+    let a = corners[0];
+    let b = corners[1];
+    let c = corners[2];
+    let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+    let n = [
+        u[1] * v[2] - u[2] * v[1],
+        u[2] * v[0] - u[0] * v[2],
+        u[0] * v[1] - u[1] * v[0],
+    ];
+    let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+    if len > 1e-6 {
+        [n[0] / len, n[1] / len, n[2] / len]
+    } else {
+        [0.0, 1.0, 0.0]
     }
 }
 
@@ -127,7 +155,9 @@ fn encode_chunk_vertex(
     color: [f32; 4],
     uv: [f32; 2],
     light: [f32; 2],
+    normal: [f32; 3],
 ) -> ChunkVertex {
+    let snorm = |x: f32| (x.clamp(-1.0, 1.0) * 127.0).round() as i8;
     let px = (position[0] * 64.0).round() as i16;
     let py = (position[1] * 64.0).round() as i16;
     let pz = (position[2] * 64.0).round() as i16;
@@ -146,6 +176,7 @@ fn encode_chunk_vertex(
             (uv[0] * 65535.0 + 0.5) as u16,
             (uv[1] * 65535.0 + 0.5) as u16,
         ],
+        normal: [snorm(normal[0]), snorm(normal[1]), snorm(normal[2]), 0],
     }
 }
 
