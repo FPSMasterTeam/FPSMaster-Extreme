@@ -1033,7 +1033,16 @@ fn handle_actions(
             GuiAction::SetMipmapLevels(levels) => renderer.set_mipmap_levels(levels),
             GuiAction::SetResolution => apply_display(window, &app.settings),
             GuiAction::SetFullscreen => apply_display(window, &app.settings),
-            GuiAction::SetShaders(on) => renderer.set_shaders_enabled(on),
+            GuiAction::SetShaders(on) => {
+                // Shaders force smooth meshing; if that flips the mesh format
+                // (Smooth Light was off), re-mesh the world so the vertex format
+                // matches the pipeline that will draw it.
+                let was_flat = renderer.flat_meshing();
+                renderer.set_shaders_enabled(on);
+                if renderer.flat_meshing() != was_flat {
+                    app.game.mark_all_sections_dirty();
+                }
+            }
             GuiAction::SetShaderShadows(on) => renderer.set_shadows_enabled(on),
             GuiAction::SetShaderSpecular(on) => renderer.set_specular_enabled(on),
             GuiAction::SetShaderFog(on) => renderer.set_fog_enabled(on),

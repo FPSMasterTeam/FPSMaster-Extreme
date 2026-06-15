@@ -593,9 +593,13 @@ pub struct Renderer {
     /// camera (square/Chebyshev distance in chunks) are skipped before frustum
     /// culling. The biggest fill/vertex/draw-call saving on weak hardware.
     render_distance: u32,
-    /// Flat (greedy, smooth-lighting-off) meshing: cube faces merge into big quads
-    /// and the greedy pipelines/shader draw them. The biggest geometry saving on
-    /// open terrain; trades away ambient occlusion + per-vertex light gradients.
+    /// User's "Smooth Lighting" preference. Flat/greedy meshing is its inverse, but
+    /// ONLY when shaders are off — the shader pack needs the smooth vertex format
+    /// (per-vertex light + normals), which greedy drops, so shaders force smooth.
+    smooth_lighting: bool,
+    /// Effective flat meshing = `!smooth_lighting && !shaders_enabled`. The greedy
+    /// pipelines/shader draw the merged-cube meshes; the biggest geometry saving on
+    /// open terrain, trading away ambient occlusion + per-vertex light gradients.
     flat_meshing: bool,
     fancy_graphics: bool,
     mipmap_levels: u32,
@@ -2408,6 +2412,7 @@ impl Renderer {
             start_time: Instant::now(),
             render_scale: 1.0,
             render_distance: 12,
+            smooth_lighting: true,
             flat_meshing: false,
             fancy_graphics: true,
             mipmap_levels: crate::texture::ATLAS_MIP_LEVELS - 1,
@@ -2514,10 +2519,30 @@ impl Renderer {
         let changed = self.shaders_enabled != on;
         self.shaders_enabled = on;
         self.update_post_params();
+        // Shaders force smooth meshing (the pack needs normals/per-vertex light).
+        self.refresh_flat_meshing();
         // Allocate (or free) the shaders-only SSR scene/depth copies.
         if changed {
             self.rebuild_scaled_targets();
         }
+    }
+
+    /// Recompute the effective flat-meshing mode (`!smooth_lighting && !shaders`)
+    /// and push it to the mesh worker. Returns true if it flipped, so the caller
+    /// can re-mesh the loaded world (the vertex format + draw pipeline change).
+    fn refresh_flat_meshing(&mut self) -> bool {
+        let flat = !self.smooth_lighting && !self.shaders_enabled;
+        if flat == self.flat_meshing {
+            return false;
+        }
+        self.flat_meshing = flat;
+        self.mesh_worker.set_flat(flat);
+        true
+    }
+
+    /// Whether the chunk meshes currently use the flat/greedy vertex format.
+    pub fn flat_meshing(&self) -> bool {
+        self.flat_meshing
     }
 
     pub fn set_shadows_enabled(&mut self, on: bool) {
@@ -2602,11 +2627,12 @@ impl Renderer {
     }
 
     /// Smooth lighting: ON = per-vertex light + AO (default). OFF = flat per-face
-    /// light with greedy-merged cube faces (the big geometry win on weak hardware).
-    /// The caller re-meshes the loaded world so the change reaches built sections.
+    /// light with greedy-merged cube faces — but only takes effect when shaders are
+    /// off (shaders need the smooth vertex format). The caller re-meshes the loaded
+    /// world so the change reaches built sections.
     pub fn set_smooth_lighting(&mut self, on: bool) {
-        self.flat_meshing = !on;
-        self.mesh_worker.set_flat(!on);
+        self.smooth_lighting = on;
+        self.refresh_flat_meshing();
     }
 
     pub fn set_pass_skip(&mut self, sky: bool, water: bool, ui: bool, flat: bool) {
