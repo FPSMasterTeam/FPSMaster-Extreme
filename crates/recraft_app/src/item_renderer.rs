@@ -138,9 +138,10 @@ impl ItemRenderer {
         let up = right.cross(forward).normalize_or_zero();
 
         for d in items {
-            // Vanilla hover: sin(age/10 + start) * 0.1 + 0.1, lifted off the floor.
+            // Vanilla `RenderEntityItem`: sin((age+partial)/10 + hoverStart) * 0.1 + 0.1,
+            // lifted 0.25 blocks off the floor.
             let bob = (d.phase * 0.1).sin() * 0.1 + 0.1;
-            let base = d.pos + Vec3::new(0.0, 0.2 + bob, 0.0);
+            let base = d.pos + Vec3::new(0.0, 0.25 + bob, 0.0);
 
             // Sprite billboard: model x→camera right, y→up, thin depth toward view.
             let sprite_to_world = |size: f32| {
@@ -164,7 +165,7 @@ impl ItemRenderer {
                         push_sprite(
                             &mut vertices,
                             &mut indices,
-                            &sprite_to_world(0.5),
+                            &sprite_to_world(0.25),
                             name.as_deref(),
                             atlas,
                             tint,
@@ -172,9 +173,9 @@ impl ItemRenderer {
                         );
                     }
                     _ => {
-                        // Spinning cube about Y (vanilla item entities rotate).
-                        let (s, c) = (d.phase * 0.08).sin_cos();
-                        let size = 0.42;
+                        // Spinning cube about Y: vanilla rotates at (age+partial)/20 rad/tick.
+                        let (s, c) = (d.phase * 0.05).sin_cos();
+                        let size = 0.25;
                         let spin_to_world = |v: Vec3| {
                             let p = (v - Vec3::splat(0.5)) * size;
                             base + Vec3::new(p.x * c - p.z * s, p.y, p.x * s + p.z * c)
@@ -187,7 +188,7 @@ impl ItemRenderer {
                 push_sprite(
                     &mut vertices,
                     &mut indices,
-                    &sprite_to_world(0.5),
+                    &sprite_to_world(0.25),
                     Some(&name),
                     atlas,
                     [1.0, 1.0, 1.0],
@@ -571,6 +572,7 @@ mod tests {
             },
             pos: Vec3::new(0.0, 64.0, -3.0),
             phase: 5.0,
+            light: [1.0, 0.0],
         }
     }
 
