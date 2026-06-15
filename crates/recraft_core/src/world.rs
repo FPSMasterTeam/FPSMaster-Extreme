@@ -107,15 +107,80 @@ impl World {
         chunk.light_at(local_x, y, local_z)
     }
 
-    /// Recompute sky-light by a simple vertical cast for every loaded column
-    /// (offline/demo worlds, which ship every cell at sky-light 15 by default so
-    /// caves and interiors look fully lit). For each column the topmost opaque
-    /// block and everything below it are set to sky-light 0; open air above keeps
-    /// the default 15. Only touches already-allocated sections. Block-light is
-    /// left untouched. Run once after generating a demo world.
+    /// Recompute sky-light for all loaded columns: per-column vertical cast
+    /// followed by BFS horizontal/downward propagation so caves and overhangs
+    /// get gradual sky light from nearby openings. Run once after generating a
+    /// demo/offline world.
     pub fn recompute_vertical_skylight(&mut self) {
         for chunk in self.chunks.values_mut() {
             chunk.recompute_vertical_skylight();
+        }
+        self.propagate_sky_light();
+    }
+
+    /// BFS-propagate sky light from vertical-cast boundaries into covered
+    /// areas. Decays by 1 per horizontal/upward step; passes straight down
+    /// through transparent blocks with no decay (vanilla rule).
+    fn propagate_sky_light(&mut self) {
+        let mut lit_cells: Vec<(i32, i32, i32)> = Vec::new();
+        for (cpos, chunk) in &self.chunks {
+            let cx = cpos.x * 16;
+            let cz = cpos.z * 16;
+            for section in chunk.sections() {
+                let sy = section.y();
+                for yl in 0..16u8 {
+                    for zl in 0..16u8 {
+                        for xl in 0..16u8 {
+                            if section.sky_light(xl, yl, zl) > 0 {
+                                lit_cells.push((
+                                    cx + xl as i32,
+                                    sy * 16 + yl as i32,
+                                    cz + zl as i32,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut queue: VecDeque<(i32, i32, i32)> = VecDeque::new();
+        for (wx, wy, wz) in lit_cells {
+            let sky = self.light_at(wx, wy, wz).1;
+            let is_seed = neighbors(wx, wy, wz).iter().any(|&(nx, ny, nz)| {
+                if !(0..256).contains(&ny) || !self.is_block_column_loaded(nx, nz) {
+                    return false;
+                }
+                if self.block_at(nx, ny, nz).is_opaque_cube() {
+                    return false;
+                }
+                let new_level = if ny < wy { sky } else { sky.saturating_sub(1) };
+                new_level > 0 && new_level > self.light_at(nx, ny, nz).1
+            });
+            if is_seed {
+                queue.push_back((wx, wy, wz));
+            }
+        }
+
+        while let Some((cx, cy, cz)) = queue.pop_front() {
+            let level = self.light_at(cx, cy, cz).1;
+            if level == 0 {
+                continue;
+            }
+            for (nx, ny, nz) in neighbors(cx, cy, cz) {
+                if !(0..256).contains(&ny) || !self.is_block_column_loaded(nx, nz) {
+                    continue;
+                }
+                if self.block_at(nx, ny, nz).is_opaque_cube() {
+                    continue;
+                }
+                let new_level = if ny < cy { level } else { level.saturating_sub(1) };
+                if new_level > 0 && new_level > self.light_at(nx, ny, nz).1 {
+                    let bl = self.light_at(nx, ny, nz).0;
+                    self.set_light(nx, ny, nz, bl, new_level);
+                    queue.push_back((nx, ny, nz));
+                }
+            }
         }
     }
 
@@ -194,36 +259,120 @@ impl World {
         insert_section_borders(x, y, z, changed);
     }
 
-    /// Recompute sky-light for one column by the vertical cast (used after a block
-    /// edit so e.g. building a roof darkens the space below, and digging a shaft
-    /// lets daylight back in). Returns the sections whose sky-light changed.
-    pub fn update_column_skylight(&mut self, x: i32, z: i32) -> Vec<SectionPos> {
+    /// Two-phase sky-light update after a block edit: vertical cast for the
+    /// edited column, BFS removal of stale propagated light, then BFS
+    /// re-propagation from remaining bright borders. Decays by 1 per
+    /// horizontal/upward step; passes straight down through transparent blocks
+    /// with no decay (vanilla rule). Returns sections whose sky-light changed.
+    pub fn update_sky_light(
+        &mut self,
+        x: i32,
+        y: i32,
+        z: i32,
+        old: BlockState,
+    ) -> Vec<SectionPos> {
+        let mut changed: HashSet<SectionPos> = HashSet::new();
+        let mut removal: VecDeque<(i32, i32, i32, u8)> = VecDeque::new();
+        let mut additions: VecDeque<(i32, i32, i32)> = VecDeque::new();
+
+        // --- Vertical cast for the edited column ----------------------------
         let cpos = ChunkPos::new(div_floor(x, 16), div_floor(z, 16));
         let section_ys: Vec<i32> = match self.chunks.get(&cpos) {
             Some(chunk) => chunk.sections().map(|s| s.y()).collect(),
             None => return Vec::new(),
         };
-        let Some(&top) = section_ys.iter().max() else {
-            return Vec::new();
-        };
-        let mut changed: HashSet<SectionPos> = HashSet::new();
-        let mut blocked = false;
-        let mut y = top * 16 + 15;
-        while y >= 0 {
-            if section_ys.contains(&y.div_euclid(16)) {
-                if !blocked && self.block_at(x, y, z).is_opaque_cube() {
-                    blocked = true;
+        if let Some(&top) = section_ys.iter().max() {
+            let mut blocked = false;
+            let mut vy = top * 16 + 15;
+            while vy >= 0 {
+                if section_ys.contains(&vy.div_euclid(16)) {
+                    if !blocked && self.block_at(x, vy, z).is_opaque_cube() {
+                        blocked = true;
+                    }
+                    let want = if blocked { 0 } else { 15 };
+                    let (block_l, old_sky) = self.light_at(x, vy, z);
+                    if old_sky != want {
+                        self.set_light(x, vy, z, block_l, want);
+                        insert_section_borders(x, vy, z, &mut changed);
+                        if want < old_sky {
+                            removal.push_back((x, vy, z, old_sky));
+                        } else {
+                            additions.push_back((x, vy, z));
+                        }
+                    }
                 }
-                let want = if blocked { 0 } else { 15 };
-                let (block_l, sky_l) = self.light_at(x, y, z);
-                if sky_l != want {
-                    self.set_light(x, y, z, block_l, want);
-                    insert_section_borders(x, y, z, &mut changed);
+                vy -= 1;
+            }
+        }
+
+        // --- Handle opacity change at the edited position -------------------
+        if old.is_opaque_cube() && !self.block_at(x, y, z).is_opaque_cube() {
+            for (nx, ny, nz) in neighbors(x, y, z) {
+                if (0..256).contains(&ny)
+                    && self.is_block_column_loaded(nx, nz)
+                    && self.light_at(nx, ny, nz).1 > 0
+                {
+                    additions.push_back((nx, ny, nz));
                 }
             }
-            y -= 1;
         }
+
+        // --- Phase 1: BFS removal of stale propagated sky light -------------
+        while let Some((cx, cy, cz, level)) = removal.pop_front() {
+            for (nx, ny, nz) in neighbors(cx, cy, cz) {
+                if !(0..256).contains(&ny) || !self.is_block_column_loaded(nx, nz) {
+                    continue;
+                }
+                let nl = self.light_at(nx, ny, nz).1;
+                if nl == 0 {
+                    continue;
+                }
+                // Downward: no decay, so the neighbour could be at `level`.
+                let removes = if ny < cy { nl <= level } else { nl < level };
+                if removes {
+                    self.set_sky_light_tracked(nx, ny, nz, 0, &mut changed);
+                    removal.push_back((nx, ny, nz, nl));
+                } else {
+                    additions.push_back((nx, ny, nz));
+                }
+            }
+        }
+
+        // --- Phase 2: BFS re-propagation ------------------------------------
+        while let Some((cx, cy, cz)) = additions.pop_front() {
+            let level = self.light_at(cx, cy, cz).1;
+            if level == 0 {
+                continue;
+            }
+            for (nx, ny, nz) in neighbors(cx, cy, cz) {
+                if !(0..256).contains(&ny) || !self.is_block_column_loaded(nx, nz) {
+                    continue;
+                }
+                if self.block_at(nx, ny, nz).is_opaque_cube() {
+                    continue;
+                }
+                let new_level = if ny < cy { level } else { level.saturating_sub(1) };
+                if new_level > 0 && new_level > self.light_at(nx, ny, nz).1 {
+                    self.set_sky_light_tracked(nx, ny, nz, new_level, &mut changed);
+                    additions.push_back((nx, ny, nz));
+                }
+            }
+        }
+
         changed.into_iter().collect()
+    }
+
+    fn set_sky_light_tracked(
+        &mut self,
+        x: i32,
+        y: i32,
+        z: i32,
+        value: u8,
+        changed: &mut HashSet<SectionPos>,
+    ) {
+        let bl = self.light_at(x, y, z).0;
+        self.set_light(x, y, z, bl, value);
+        insert_section_borders(x, y, z, changed);
     }
 
     pub fn upsert_entity(&mut self, entity: EntityState) {
@@ -335,19 +484,89 @@ mod tests {
     #[test]
     fn roofing_a_column_darkens_skylight_below() {
         let mut world = World::new();
-        world.set_block(2, 64, 2, BlockState::STONE); // floor (creates the chunk)
+        world.set_block(2, 64, 2, BlockState::STONE);
         world.recompute_vertical_skylight();
-        assert_eq!(world.light_at(2, 70, 2).1, 15, "open air above the floor is sky-lit");
+        assert_eq!(world.light_at(2, 70, 2).1, 15);
 
-        // Roof the column: everything below the roof loses sky-light.
         world.set_block(2, 72, 2, BlockState::STONE);
-        world.update_column_skylight(2, 2);
-        assert_eq!(world.light_at(2, 70, 2).1, 0, "roofing darkens the space below");
+        world.update_sky_light(2, 72, 2, BlockState::AIR);
+        // Adjacent columns are open sky → horizontal propagation provides 14.
+        assert_eq!(world.light_at(2, 70, 2).1, 14);
 
-        // Removing the roof lets daylight back in.
         world.set_block(2, 72, 2, BlockState::AIR);
-        world.update_column_skylight(2, 2);
-        assert_eq!(world.light_at(2, 70, 2).1, 15, "removing the roof relights it");
+        world.update_sky_light(2, 72, 2, BlockState::STONE);
+        assert_eq!(world.light_at(2, 70, 2).1, 15);
+    }
+
+    #[test]
+    fn sky_light_propagates_under_ceiling() {
+        let mut world = World::new();
+        // 3×3 ceiling with a 1×1 opening at the centre.
+        for x in -1..=1 {
+            for z in -1..=1 {
+                world.set_block(x, 68, z, BlockState::STONE);
+                world.set_block(x, 64, z, BlockState::STONE);
+            }
+        }
+        world.set_block(0, 68, 0, BlockState::AIR); // skylight opening
+
+        world.recompute_vertical_skylight();
+
+        assert_eq!(world.light_at(0, 67, 0).1, 15, "directly under opening");
+        assert_eq!(world.light_at(1, 67, 0).1, 14, "one block from opening");
+        assert_eq!(world.light_at(-1, 67, 0).1, 14);
+        assert_eq!(world.light_at(0, 67, 1).1, 14);
+        assert_eq!(world.light_at(0, 67, -1).1, 14);
+    }
+
+    #[test]
+    fn sky_light_descends_without_decay() {
+        let mut world = World::new();
+        // Open column at x=0, y=69 is the lowest open-air block.
+        // Wall at x=0 from y=68 down blocks horizontal light to x=1.
+        world.set_block(0, 64, 0, BlockState::STONE);
+        for wy in 65..=68 {
+            world.set_block(0, wy, 0, BlockState::STONE);
+        }
+        // Covered shaft at x=1: ceiling at y=70, open inside.
+        world.set_block(1, 70, 0, BlockState::STONE);
+        world.set_block(1, 64, 0, BlockState::STONE);
+        // Seal z-sides and far x-side of the shaft.
+        for wy in 65..70 {
+            world.set_block(1, wy, -1, BlockState::STONE);
+            world.set_block(1, wy, 1, BlockState::STONE);
+            world.set_block(2, wy, 0, BlockState::STONE);
+        }
+
+        world.recompute_vertical_skylight();
+
+        assert_eq!(world.light_at(0, 69, 0).1, 15, "open air");
+        assert_eq!(world.light_at(1, 69, 0).1, 14, "horizontal from open column");
+        // Below: the only light path is downward from (1,69) — no horizontal
+        // source because of the wall at x=0. Downward has no decay.
+        assert_eq!(world.light_at(1, 68, 0).1, 14, "down without decay");
+        assert_eq!(world.light_at(1, 67, 0).1, 14, "still 14 further down");
+        assert_eq!(world.light_at(1, 66, 0).1, 14, "still 14 at bottom");
+    }
+
+    #[test]
+    fn incremental_sky_light_removes_and_restores() {
+        let mut world = World::new();
+        // Two columns: x=0 open, x=1 will be covered.
+        world.set_block(0, 64, 0, BlockState::STONE);
+        world.set_block(1, 64, 0, BlockState::STONE);
+        world.recompute_vertical_skylight();
+        assert_eq!(world.light_at(1, 67, 0).1, 15);
+
+        // Roof x=1 → sky drops, but gets propagated 14 from x=0.
+        world.set_block(1, 70, 0, BlockState::STONE);
+        world.update_sky_light(1, 70, 0, BlockState::AIR);
+        assert_eq!(world.light_at(1, 69, 0).1, 14);
+
+        // Remove roof → full sky-light restored.
+        world.set_block(1, 70, 0, BlockState::AIR);
+        world.update_sky_light(1, 70, 0, BlockState::STONE);
+        assert_eq!(world.light_at(1, 69, 0).1, 15);
     }
 
     #[test]

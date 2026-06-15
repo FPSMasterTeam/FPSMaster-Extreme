@@ -1922,7 +1922,7 @@ impl GameState {
         let block_light = self.world.update_block_light(x, y, z, old);
         // Also recompute the column's sky-light so roofing over darkens the space
         // below (and digging a shaft lets daylight back in).
-        let sky_light = self.world.update_column_skylight(x, z);
+        let sky_light = self.world.update_sky_light(x, y, z, old);
         self.dirty_chunks.extend(block_light.iter().copied());
         self.dirty_chunks.extend(sky_light.iter().copied());
         self.urgent_remesh.extend(block_light);
