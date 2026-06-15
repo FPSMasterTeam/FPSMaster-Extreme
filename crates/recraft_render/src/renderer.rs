@@ -487,6 +487,9 @@ pub struct Renderer {
     /// Depth-only pass for the solid layer: fills the depth buffer first so the
     /// colour pass's early-z skips shading every occluded solid fragment.
     depth_prepass_pipeline: wgpu::RenderPipeline,
+    /// Solid pipeline that writes depth itself, used when the pre-pass is skipped
+    /// (shaders off) so cheap fragments don't pay for doubled geometry submission.
+    solid_depthwrite_pipeline: wgpu::RenderPipeline,
     /// Flat-colour solid pipeline (no atlas fetch) for the texture-cost benchmark.
     flat_pipeline: wgpu::RenderPipeline,
     cutout_pipeline: wgpu::RenderPipeline,
@@ -578,6 +581,10 @@ pub struct Renderer {
     start_time: Instant,
     /// Settings: 3D render-resolution scale, fancy graphics, mipmap level.
     render_scale: f32,
+    /// Max horizontal chunk render distance: sections farther than this from the
+    /// camera (square/Chebyshev distance in chunks) are skipped before frustum
+    /// culling. The biggest fill/vertex/draw-call saving on weak hardware.
+    render_distance: u32,
     fancy_graphics: bool,
     mipmap_levels: u32,
     /// Shader-pack lighting uniform + bind group (chunk group 2), and which
@@ -1107,6 +1114,50 @@ impl Renderer {
             multisample: wgpu::MultisampleState::default(),
         cache: None,
         multiview_mask: None,
+        });
+        // Depth-writing clone of the solid pipeline for the no-pre-pass path
+        // (shaders off): writes depth itself (Less, write on) so the cutout/
+        // entity/water passes still depth-test correctly. Used instead of the
+        // pre-pass when cheap fragments make the pre-pass's doubled geometry a net
+        // loss on vertex/bandwidth-bound hardware.
+        let solid_depthwrite_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("chunk-pipeline-depthwrite"),
+            layout: Some(&lit_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[ChunkVertex::layout()],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: Some(wgpu::Face::Back),
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            cache: None,
+            multiview_mask: None,
         });
         // Flat-colour clone of the solid pipeline (no atlas fetch), used only by
         // the `--bench-passes` flat config to measure texture-read cost.
@@ -2219,6 +2270,7 @@ impl Renderer {
             size,
             pipeline,
             depth_prepass_pipeline,
+            solid_depthwrite_pipeline,
             flat_pipeline,
             cutout_pipeline,
             gui_cube_pipeline,
@@ -2274,6 +2326,7 @@ impl Renderer {
             water_pipeline,
             start_time: Instant::now(),
             render_scale: 1.0,
+            render_distance: 12,
             fancy_graphics: true,
             mipmap_levels: crate::texture::ATLAS_MIP_LEVELS - 1,
             lighting_buffer,
@@ -2450,6 +2503,12 @@ impl Renderer {
             self.render_scale = scale;
             self.rebuild_scaled_targets();
         }
+    }
+
+    /// Max chunk render distance (square cull around the camera). Cheap to change
+    /// — it only narrows the per-frame visible set, allocating nothing.
+    pub fn set_render_distance(&mut self, chunks: u32) {
+        self.render_distance = chunks.max(2);
     }
 
     pub fn set_pass_skip(&mut self, sky: bool, water: bool, ui: bool, flat: bool) {
@@ -3747,11 +3806,22 @@ impl Renderer {
             let cmd_stride = std::mem::size_of::<IndirectCmd>() as u64;
             let trans_batches = if !self.chunk_sections.is_empty() {
                 let frustum = camera.frustum();
+                // Square (Chebyshev) render-distance cull around the camera chunk,
+                // applied before the frustum test. The biggest saving on weak
+                // hardware: it drops far sections from every layer, the indirect
+                // buffer and the draw loop at once.
+                let cam_cx = (camera.position.x / 16.0).floor() as i32;
+                let cam_cz = (camera.position.z / 16.0).floor() as i32;
+                let rd = self.render_distance as i32;
                 let visible: Vec<SectionPos> = self
                     .chunk_sections
                     .iter()
                     .copied()
-                    .filter(|pos| section_in_frustum(&frustum, *pos))
+                    .filter(|pos| {
+                        (pos.x - cam_cx).abs() <= rd
+                            && (pos.z - cam_cz).abs() <= rd
+                            && section_in_frustum(&frustum, *pos)
+                    })
                     .collect();
                 visible_chunks = visible.len() as u32;
 
@@ -3813,7 +3883,14 @@ impl Renderer {
                 // masked off) so the solid colour pass below shades each visible
                 // pixel exactly once. A local offset walks the same solid
                 // commands; the colour passes keep the running cmd_offset.
-                if !solid_batches.is_empty() {
+                // The depth pre-pass shades each solid pixel once (early-z), worth
+                // its doubled geometry only when fragments are expensive. With
+                // shaders off the fragment is a cheap texture+light fetch, so skip
+                // the pre-pass and let a depth-writing solid pass do the work in one
+                // go (the `flat` benchmark keeps the pre-pass for an apples-to-apples
+                // texture-cost figure).
+                let use_prepass = self.shaders_enabled || self.debug_skip.flat;
+                if use_prepass && !solid_batches.is_empty() {
                     pass.set_pipeline(&self.depth_prepass_pipeline);
                     let mut pre_offset = 0u64;
                     for batch in &solid_batches {
@@ -3835,8 +3912,10 @@ impl Renderer {
                 if !solid_batches.is_empty() {
                     let solid_pipeline = if self.debug_skip.flat {
                         &self.flat_pipeline
-                    } else {
+                    } else if use_prepass {
                         &self.pipeline
+                    } else {
+                        &self.solid_depthwrite_pipeline
                     };
                     pass.set_pipeline(solid_pipeline);
                     for batch in &solid_batches {

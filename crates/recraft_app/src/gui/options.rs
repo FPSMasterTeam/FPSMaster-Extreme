@@ -250,12 +250,14 @@ impl GuiScreen for GuiOptions {
 enum VideoSlider {
     FpsCap,
     RenderScale,
+    RenderDistance,
 }
 
 #[derive(Default)]
 pub struct GuiVideoSettings {
     fps_rect: UiRect,
     render_scale_rect: UiRect,
+    render_distance_rect: UiRect,
     vsync: Option<GuiButton>,
     graphics: Option<GuiButton>,
     mipmaps: Option<GuiButton>,
@@ -290,14 +292,15 @@ impl GuiVideoSettings {
         let top = ctx.height / 4 - 40 * s;
         self.fps_rect = UiRect::new(x, top, 200 * s, BUTTON_HEIGHT * s);
         self.render_scale_rect = UiRect::new(x, top + 24 * s, 200 * s, BUTTON_HEIGHT * s);
-        self.vsync = Some(GuiButton::at_px(x, top + 48 * s, 200 * s, s, ""));
-        self.graphics = Some(GuiButton::at_px(x, top + 72 * s, 98 * s, s, ""));
-        self.mipmaps = Some(GuiButton::at_px(x + 102 * s, top + 72 * s, 98 * s, s, ""));
-        self.resolution = Some(GuiButton::at_px(x, top + 96 * s, 98 * s, s, ""));
-        self.fullscreen = Some(GuiButton::at_px(x + 102 * s, top + 96 * s, 98 * s, s, ""));
-        self.shaders_btn = Some(GuiButton::at_px(x, top + 120 * s, 200 * s, s, "Shaders..."));
+        self.render_distance_rect = UiRect::new(x, top + 48 * s, 200 * s, BUTTON_HEIGHT * s);
+        self.vsync = Some(GuiButton::at_px(x, top + 72 * s, 200 * s, s, ""));
+        self.graphics = Some(GuiButton::at_px(x, top + 96 * s, 98 * s, s, ""));
+        self.mipmaps = Some(GuiButton::at_px(x + 102 * s, top + 96 * s, 98 * s, s, ""));
+        self.resolution = Some(GuiButton::at_px(x, top + 120 * s, 98 * s, s, ""));
+        self.fullscreen = Some(GuiButton::at_px(x + 102 * s, top + 120 * s, 98 * s, s, ""));
+        self.shaders_btn = Some(GuiButton::at_px(x, top + 144 * s, 200 * s, s, "Shaders..."));
         // A gap above Done, echoing vanilla's separated bottom button.
-        self.done = Some(GuiButton::at_px(x, top + 156 * s, 200 * s, s, "Done"));
+        self.done = Some(GuiButton::at_px(x, top + 180 * s, 200 * s, s, "Done"));
     }
 
     fn apply_drag(&mut self, x: f64, ctx: &mut ScreenCtx) {
@@ -308,6 +311,9 @@ impl GuiVideoSettings {
             Some(VideoSlider::RenderScale) => ctx
                 .settings
                 .set_render_scale_from01(slider_fraction(self.render_scale_rect, x)),
+            Some(VideoSlider::RenderDistance) => ctx
+                .settings
+                .set_render_distance_from01(slider_fraction(self.render_distance_rect, x)),
             None => {}
         }
     }
@@ -333,6 +339,13 @@ impl GuiScreen for GuiVideoSettings {
             s,
             ctx.settings.clone().render_scale_fraction(),
             &format!("Render Scale: {}%", ctx.settings.clone().render_scale_percent()),
+        );
+        draw_slider(
+            ui,
+            self.render_distance_rect,
+            s,
+            ctx.settings.clone().render_distance_fraction(),
+            &format!("Render Distance: {} chunks", ctx.settings.render_distance),
         );
         if let Some(vsync) = &mut self.vsync {
             vsync.label = format!("VSync: {}", if ctx.settings.vsync { "ON" } else { "OFF" });
@@ -376,6 +389,11 @@ impl GuiScreen for GuiVideoSettings {
         }
         if self.render_scale_rect.contains(x, y) {
             self.dragging = Some(VideoSlider::RenderScale);
+            self.apply_drag(x, ctx);
+            return Vec::new();
+        }
+        if self.render_distance_rect.contains(x, y) {
+            self.dragging = Some(VideoSlider::RenderDistance);
             self.apply_drag(x, ctx);
             return Vec::new();
         }
@@ -427,6 +445,9 @@ impl GuiScreen for GuiVideoSettings {
         let action = match self.dragging {
             Some(VideoSlider::RenderScale) => {
                 vec![GuiAction::SetRenderScale(ctx.settings.render_scale)]
+            }
+            Some(VideoSlider::RenderDistance) => {
+                vec![GuiAction::SetRenderDistance(ctx.settings.render_distance)]
             }
             _ => Vec::new(),
         };

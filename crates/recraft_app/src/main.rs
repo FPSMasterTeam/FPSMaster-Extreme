@@ -102,6 +102,10 @@ struct App {
     /// Reused across frames so the per-frame entity rebuild keeps its vertex/index
     /// allocations instead of reallocating from empty each frame.
     entity_model: recraft_render::ModelMesh,
+    /// Fingerprint of the inputs that produced the currently-uploaded entity model
+    /// + hand + nametags. When the next frame's fingerprint matches, the rebuild
+    /// and GPU upload are skipped (the renderer keeps the previous mesh).
+    last_entity_key: Option<u64>,
     quit: bool,
 }
 
@@ -282,6 +286,7 @@ impl ApplicationHandler for WinitApp {
         renderer.set_fancy_graphics(settings.fancy_graphics);
         renderer.set_mipmap_levels(settings.mipmap_levels);
         renderer.set_render_scale(settings.render_scale);
+        renderer.set_render_distance(settings.render_distance);
         renderer.set_shaders_enabled(settings.shaders);
         renderer.set_shadows_enabled(settings.shader_shadows);
         renderer.set_specular_enabled(settings.shader_specular);
@@ -341,6 +346,7 @@ impl ApplicationHandler for WinitApp {
             local_server: None,
             panorama_timer: 0.0,
             entity_model: recraft_render::ModelMesh::new(),
+            last_entity_key: None,
             quit: false,
         };
         renderer.upload_world(&app.game.world);
@@ -944,6 +950,7 @@ fn handle_actions(
             }
             GuiAction::SetVsync(on) => renderer.set_vsync(on),
             GuiAction::SetRenderScale(scale) => renderer.set_render_scale(scale),
+            GuiAction::SetRenderDistance(chunks) => renderer.set_render_distance(chunks),
             GuiAction::SetFancyGraphics(on) => renderer.set_fancy_graphics(on),
             GuiAction::SetMipmapLevels(levels) => renderer.set_mipmap_levels(levels),
             GuiAction::SetResolution => apply_display(window, &app.settings),
@@ -1317,44 +1324,57 @@ fn render_frame(
         }
         app.skin_manager.poll(renderer);
 
-        let first_person = app.game.first_person_view(tick_alpha);
-        app.game.build_entity_model(
-            &mut app.entity_model,
+        // Skip the whole entity-model + hand + nametag rebuild and its GPU upload
+        // when nothing that feeds them changed since last frame — the renderer
+        // keeps the previously uploaded mesh. Saves the per-frame vertex generation
+        // (the dominant entity cost) and upload in crowded-but-idle scenes.
+        let entity_key = app.game.entity_render_fingerprint(
             tick_alpha,
             app.settings.brightness,
+            hud_visible,
             app.skin_manager.rows(),
         );
-        if hud_visible {
-            // Light the first-person hand + held item by the lightmap at the eye,
-            // so they darken at night/in caves like the rest of the scene.
-            let hand_light = app.game.world_light_factor(
-                app.game.camera.position,
-                app.settings.brightness,
+        if app.last_entity_key != Some(entity_key) {
+            app.last_entity_key = Some(entity_key);
+            let first_person = app.game.first_person_view(tick_alpha);
+            app.game.build_entity_model(
+                &mut app.entity_model,
                 tick_alpha,
+                app.settings.brightness,
+                app.skin_manager.rows(),
             );
-            let arm_start = app.entity_model.vertices.len();
-            ItemRenderer::render_arm(&mut app.entity_model, &app.game.camera, &first_person);
-            for v in &mut app.entity_model.vertices[arm_start..] {
-                v.color[0] *= hand_light;
-                v.color[1] *= hand_light;
-                v.color[2] *= hand_light;
+            if hud_visible {
+                // Light the first-person hand + held item by the lightmap at the eye,
+                // so they darken at night/in caves like the rest of the scene.
+                let hand_light = app.game.world_light_factor(
+                    app.game.camera.position,
+                    app.settings.brightness,
+                    tick_alpha,
+                );
+                let arm_start = app.entity_model.vertices.len();
+                ItemRenderer::render_arm(&mut app.entity_model, &app.game.camera, &first_person);
+                for v in &mut app.entity_model.vertices[arm_start..] {
+                    v.color[0] *= hand_light;
+                    v.color[1] *= hand_light;
+                    v.color[2] *= hand_light;
+                }
+                let (mut vertices, indices) =
+                    ItemRenderer::build_held_item(&app.game.camera, &first_person, atlas_uv);
+                for v in &mut vertices {
+                    v.color[0] *= hand_light;
+                    v.color[1] *= hand_light;
+                    v.color[2] *= hand_light;
+                }
+                renderer.set_first_person_item(&vertices, &indices);
+                // 3D world-space player nametags (billboarded, depth-occluded).
+                let nametags = app.game.player_nametags(tick_alpha);
+                renderer.set_nametags(&app.game.camera, &nametags);
+            } else {
+                renderer.set_first_person_item(&[], &[]);
+                renderer.set_nametags(&app.game.camera, &[]);
             }
-            let (mut vertices, indices) =
-                ItemRenderer::build_held_item(&app.game.camera, &first_person, atlas_uv);
-            for v in &mut vertices {
-                v.color[0] *= hand_light;
-                v.color[1] *= hand_light;
-                v.color[2] *= hand_light;
-            }
-            renderer.set_first_person_item(&vertices, &indices);
-            // 3D world-space player nametags (billboarded, depth-occluded).
-            let nametags = app.game.player_nametags(tick_alpha);
-            renderer.set_nametags(&app.game.camera, &nametags);
-        } else {
-            renderer.set_first_person_item(&[], &[]);
-            renderer.set_nametags(&app.game.camera, &[]);
+            renderer.upload_model(&app.entity_model);
         }
-        renderer.upload_model(&app.entity_model);
         let dropped = app.game.dropped_items(tick_alpha);
         let (mut item_vertices, mut item_indices) =
             ItemRenderer::build_world_items(&app.game.camera, &dropped, atlas_uv);
@@ -1365,6 +1385,7 @@ fn render_frame(
         item_indices.extend(held_i.iter().map(|i| i + base));
         renderer.set_world_items(&item_vertices, &item_indices);
     } else {
+        app.last_entity_key = None;
         renderer.upload_model(&recraft_render::ModelMesh::new());
         renderer.set_first_person_item(&[], &[]);
         renderer.set_world_items(&[], &[]);

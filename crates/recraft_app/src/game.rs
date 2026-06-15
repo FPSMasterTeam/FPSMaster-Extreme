@@ -1622,6 +1622,108 @@ impl GameState {
         items
     }
 
+    /// A cheap fingerprint of everything the per-frame entity model + first-person
+    /// hand + nametags are built from: camera, day/night, and each entity's
+    /// interpolated transform, animation, hurt flash, equipment and resolved skin.
+    /// When it matches the previous frame the caller skips the whole rebuild + GPU
+    /// upload and the renderer keeps last frame's mesh — the win on weak CPUs in
+    /// crowded-but-idle scenes. Block-light changes around a stationary entity are
+    /// deliberately not tracked (day/night, the dominant variation, is via
+    /// `sun_brightness`); such an entity's tint just lags until it next moves.
+    pub fn entity_render_fingerprint(
+        &self,
+        tick_alpha: f32,
+        brightness: f32,
+        hud_visible: bool,
+        skin_rows: &std::collections::HashMap<[u8; 16], u32>,
+    ) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut mix = |v: u64| h = (h ^ v).wrapping_mul(0x0000_0100_0000_01b3);
+        // Quantize positions (≈1/256 block) and angles/anim (≈1/64) so the float
+        // residual of a "still" player/entity — friction decays velocity toward,
+        // but never exactly to, zero — doesn't churn the key every frame, while
+        // real motion still crosses many steps and rebuilds. The grid is far below
+        // a pixel at any view distance, so a skipped sub-step is invisible.
+        let qp = |v: f64| (v * 256.0).round() as i64 as u64;
+        let qa = |v: f32| (v * 64.0).round() as i64 as u64;
+        // Camera drives frustum culling, the hand pose and nametag projection.
+        let c = &self.camera;
+        mix(qp(c.position.x as f64));
+        mix(qp(c.position.y as f64));
+        mix(qp(c.position.z as f64));
+        mix(qa(c.yaw));
+        mix(qa(c.pitch));
+        // Day/night + brightness gamma fold into every entity's lighting.
+        let sun_b = recraft_render::sky::sun_brightness(self.world_time(tick_alpha));
+        mix((sun_b * 1024.0) as u64);
+        mix(brightness.to_bits() as u64);
+        mix(hud_visible as u64);
+        // First-person hand/held-item pose.
+        let fp = self.first_person_view(tick_alpha);
+        mix(fp
+            .item
+            .as_ref()
+            .map(|s| (s.id as u16 as u64) << 24 | (s.count as u64) << 16 | s.damage as u16 as u64)
+            .unwrap_or(0));
+        mix(qa(fp.equip_progress));
+        mix(qa(fp.swing_progress));
+        mix(qa(fp.arm_lag_pitch));
+        mix(qa(fp.arm_lag_yaw));
+        mix(fp.use_action as u64);
+        // `use_ticks` carries the partial tick every frame, but only drives the
+        // pose while an item is actually in use — folding it in when idle would
+        // churn the key forever (the active case rebuilds per frame, as intended).
+        if fp.use_action != ItemUseAction::None {
+            mix(qa(fp.use_ticks));
+        }
+        // Every renderable entity's interpolated state (matches build_entity_model's
+        // skip rules so the fingerprint changes exactly when its output would).
+        for e in self.world.entities() {
+            if e.id == self.player.id || e.kind == EntityKind::Object(2) {
+                continue;
+            }
+            mix(e.id.0 as u32 as u64);
+            let p = e.render_position(tick_alpha as f64);
+            mix(qp(p.x));
+            mix(qp(p.y));
+            mix(qp(p.z));
+            mix(qa(e.render_yaw(tick_alpha)));
+            mix(qa(e.render_head_yaw(tick_alpha)));
+            mix(qa(e.render_pitch(tick_alpha)));
+            let (ls, lsa) = e.render_limb_swing(tick_alpha);
+            mix(qa(ls));
+            mix(qa(lsa));
+            mix(qa(e.render_swing(tick_alpha)));
+            mix(e.hurt_time as u64);
+            mix((e.sneaking as u64) << 2 | (e.invisible as u64) << 1 | e.custom_name_visible as u64);
+            if let Some(name) = &e.custom_name {
+                for b in name.as_bytes() {
+                    mix(*b as u64);
+                }
+            }
+            if let Some(slots) = self.entity_equipment.get(&e.id) {
+                for slot in slots {
+                    mix(slot
+                        .as_ref()
+                        .map(|s| (s.id as u16 as u64) << 16 | s.damage as u16 as u64)
+                        .unwrap_or(0));
+                }
+            }
+            let skin_row = (e.kind == EntityKind::RemotePlayer)
+                .then(|| self.entity_uuids.get(&e.id))
+                .flatten()
+                .and_then(|uuid| skin_rows.get(uuid))
+                .copied();
+            mix(skin_row.map(|r| r as u64 + 1).unwrap_or(0));
+            // A passenger renders at its vehicle's position; fold the vehicle id so
+            // a vehicle swap re-triggers even if the passenger's own state is still.
+            if let Some(v) = self.vehicles.get(&e.id) {
+                mix(v.0 as u32 as u64);
+            }
+        }
+        h
+    }
+
     /// Nametag labels to draw this frame: the decorated name and the world
     /// anchor above each entity's head. Remote players take their name from the
     /// tab roster and are hidden behind terrain; entities with a visible custom

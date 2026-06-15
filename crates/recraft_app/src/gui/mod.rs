@@ -141,6 +141,8 @@ pub enum GuiAction {
     SetVsync(bool),
     /// Apply the 3D-world render-resolution scale (recreates off-screen targets).
     SetRenderScale(f32),
+    /// Apply the max chunk render distance (square cull around the camera).
+    SetRenderDistance(u32),
     /// Toggle fancy graphics (sky gradient + transparent water).
     SetFancyGraphics(bool),
     /// Set the block-atlas mipmap level (0 = off .. MIPMAP_MAX).
