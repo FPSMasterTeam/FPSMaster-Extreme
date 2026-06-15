@@ -33,14 +33,15 @@ impl GuiMainMenu {
             GuiButton::at_px(cx - 100 * s, j, 200 * s, s, "Singleplayer"),
             // [1] Multiplayer: (cx-100, j+24), 200×20
             GuiButton::at_px(cx - 100 * s, j + 24 * s, 200 * s, s, "Multiplayer"),
-            // [2] Accounts: (cx-100, j+48), 200×20
+            // [2] Accounts: (cx-100, j+48), 200×20 (our equivalent of Realms)
             GuiButton::at_px(cx - 100 * s, j + 48 * s, 200 * s, s, "Accounts"),
-            // [3] Demo World: (cx-100, j+84), 98×20
-            GuiButton::at_px(cx - 100 * s, j + 84 * s, 98 * s, s, "Demo World"),
-            // [4] Options: (cx+2, j+84), 98×20
-            GuiButton::at_px(cx + 2 * s, j + 84 * s, 98 * s, s, "Options..."),
-            // [5] Quit: centered, (cx-100, j+108), 200×20
-            GuiButton::at_px(cx - 100 * s, j + 108 * s, 200 * s, s, "Quit Game"),
+            // [3] Demo World: (cx-100, j+72), 200×20
+            GuiButton::at_px(cx - 100 * s, j + 72 * s, 200 * s, s, "Demo World"),
+            // Bottom split row, vanilla-style: Options + Quit side by side.
+            // [4] Options: (cx-100, j+96), 98×20
+            GuiButton::at_px(cx - 100 * s, j + 96 * s, 98 * s, s, "Options..."),
+            // [5] Quit: (cx+2, j+96), 98×20
+            GuiButton::at_px(cx + 2 * s, j + 96 * s, 98 * s, s, "Quit Game"),
         ];
     }
 }

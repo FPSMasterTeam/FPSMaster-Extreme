@@ -27,7 +27,8 @@ impl GuiScreen for GuiIngameMenu {
         self.buttons = vec![
             GuiButton::at_px(x, top, 200 * s, s, "Back to Game"),
             GuiButton::at_px(x, top + 24 * s, 200 * s, s, "Options..."),
-            GuiButton::at_px(x, top + 48 * s, 200 * s, s, "Quit to Title"),
+            // Vanilla separates the leave button from the rest with a gap.
+            GuiButton::at_px(x, top + 72 * s, 200 * s, s, "Quit to Title"),
         ];
         draw_default_background(ui, ctx);
         draw_centered_text(ui, ctx.width, ctx.height / 4, s, super::TEXT_WHITE, "Game Menu");
