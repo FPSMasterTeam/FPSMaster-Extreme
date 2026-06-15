@@ -83,6 +83,14 @@ pub struct EntityState {
     pub hurt_time: u8,
     /// Entity metadata index 0 bit 0x01: the entity is on fire.
     pub on_fire: bool,
+    /// Entity metadata index 0 bit 0x20: the entity is invisible. The renderer
+    /// skips its model (a visible custom-name plate still shows).
+    pub invisible: bool,
+    /// Custom name (metadata index 2) and its always-visible flag (index 3).
+    /// Drives the floating nameplate for armor stands (floating text) and named
+    /// mobs.
+    pub custom_name: Option<String>,
+    pub custom_name_visible: bool,
 }
 
 /// Vanilla `getArmSwingAnimationEnd` with no haste: a swing runs 6 ticks.
@@ -150,6 +158,9 @@ impl EntityState {
             age: 0,
             hurt_time: 0,
             on_fire: false,
+            invisible: false,
+            custom_name: None,
+            custom_name_visible: false,
         }
     }
 
@@ -355,6 +366,8 @@ fn entity_size(kind: EntityKind) -> (f64, f64) {
     match kind {
         EntityKind::LocalPlayer | EntityKind::RemotePlayer => (0.3, 1.8),
         EntityKind::Mob(_) => (0.3, 1.9),
+        // Armor stand (object type 78): vanilla box is 0.5 wide, 1.975 tall.
+        EntityKind::Object(78) => (0.25, 1.975),
         EntityKind::Object(_) => (0.125, 0.25),
     }
 }

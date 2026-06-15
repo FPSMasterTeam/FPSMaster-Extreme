@@ -1497,16 +1497,15 @@ impl GameState {
                 sneaking: entity.sneaking,
             };
             let start = mesh.vertices.len();
-            mesh.push_entity(
-                entity.kind,
-                feet,
-                half_width as f32,
-                height as f32,
-                body_yaw,
-                &anim,
-                skin_row,
-            );
-            // Armor overlay for players with equipped armor.
+            // Invisible entities (metadata flag 0x20) render no body model — but
+            // a player's worn armor still shows (vanilla renders armor/held items
+            // on invisible players), and a visible custom-name plate is drawn by
+            // player_nametags.
+            if !entity.invisible {
+                mesh.push_entity(entity.kind, feet, body_yaw, &anim, skin_row);
+            }
+            // Armor overlay for players with equipped armor (shown even when the
+            // player is invisible).
             if matches!(entity.kind, EntityKind::RemotePlayer) {
                 if let Some(slots) = self.entity_equipment.get(&entity.id) {
                     let ids: [Option<i16>; 5] = [
@@ -1623,10 +1622,12 @@ impl GameState {
         items
     }
 
-    /// Player nametag labels to draw this frame: the decorated name and the
-    /// world anchor above each visible remote player's head. Filtered by view
-    /// distance and a coarse block-occlusion check; screen projection and the
-    /// behind-camera cull happen at the draw site.
+    /// Nametag labels to draw this frame: the decorated name and the world
+    /// anchor above each entity's head. Remote players take their name from the
+    /// tab roster and are hidden behind terrain; entities with a visible custom
+    /// name (armor-stand floating text, named mobs) show it through walls, like
+    /// vanilla's `alwaysRenderNameTag`. Filtered by view distance; screen
+    /// projection and the behind-camera cull happen at the draw site.
     pub fn player_nametags(&self, tick_alpha: f32) -> Vec<(String, Vec3)> {
         let eye = DVec3::new(
             self.camera.position.x as f64,
@@ -1635,7 +1636,27 @@ impl GameState {
         );
         let mut tags = Vec::new();
         for entity in self.world.entities() {
-            if entity.kind != EntityKind::RemotePlayer || entity.id == self.player.id {
+            if entity.id == self.player.id {
+                continue;
+            }
+            let pos = entity.render_position(tick_alpha as f64);
+            let (_, height) = entity.size();
+            // Distance cutoff (vanilla renders names within ~64 blocks).
+            let head = pos + DVec3::new(0.0, height + 0.5, 0.0);
+            if head.distance(eye) > 64.0 {
+                continue;
+            }
+            // A visible custom name is shown for any entity and renders through
+            // walls (no occlusion check), matching vanilla floating text.
+            if entity.custom_name_visible {
+                if let Some(name) = &entity.custom_name {
+                    tags.push((name.clone(), to_render_vec3(head)));
+                    continue;
+                }
+            }
+            // Otherwise only other players get a plate, from the tab roster, and
+            // only when not occluded by terrain.
+            if entity.kind != EntityKind::RemotePlayer {
                 continue;
             }
             let Some(uuid) = self.entity_uuids.get(&entity.id) else {
@@ -1644,13 +1665,6 @@ impl GameState {
             let Some(info) = self.player_list.get(uuid) else {
                 continue;
             };
-            let pos = entity.render_position(tick_alpha as f64);
-            let (_, height) = entity.size();
-            // Distance cutoff (vanilla renders names within ~64 blocks).
-            let head = pos + DVec3::new(0.0, height + 0.5, 0.0);
-            if head.distance(eye) > 64.0 {
-                continue;
-            }
             // Coarse occlusion: hide the name if a block sits between eye and head.
             let to_head = head - eye;
             let dist = to_head.length();
@@ -2956,8 +2970,9 @@ impl GameState {
     }
 
     /// Apply an EntityMetadata update to a tracked entity. Index 0 is the shared
-    /// entity flags byte (bit 0x02 = crouching, drives the sneak pose); index 10
-    /// is the dropped-item entity's ItemStack.
+    /// entity flags byte (0x02 = crouching → sneak pose, 0x20 = invisible);
+    /// index 2/3 are the custom name and its always-visible flag (armor-stand
+    /// floating text, named mobs); index 10 is the dropped-item ItemStack.
     fn apply_entity_metadata(
         &mut self,
         entity_id: i32,
@@ -2968,12 +2983,24 @@ impl GameState {
                 (0, MetadataValue::Byte(flags)) => {
                     let on_fire = flags & 0x01 != 0;
                     let sneaking = flags & 0x02 != 0;
+                    let invisible = flags & 0x20 != 0;
                     if entity_id == self.player.id.0 {
                         self.player.on_fire = on_fire;
                     }
                     if let Some(entity) = self.remote_entity_mut(entity_id) {
                         entity.sneaking = sneaking;
                         entity.on_fire = on_fire;
+                        entity.invisible = invisible;
+                    }
+                }
+                (2, MetadataValue::Str(name)) => {
+                    if let Some(entity) = self.remote_entity_mut(entity_id) {
+                        entity.custom_name = (!name.is_empty()).then(|| name.clone());
+                    }
+                }
+                (3, MetadataValue::Byte(visible)) => {
+                    if let Some(entity) = self.remote_entity_mut(entity_id) {
+                        entity.custom_name_visible = *visible != 0;
                     }
                 }
                 (10, MetadataValue::Slot(Some(item))) => {
@@ -4840,6 +4867,90 @@ mod interaction_tests {
         gs.tick(0.05);
         gs.tick(0.05);
         assert!((x(&gs) - 13.0).abs() < 1.0e-9, "settled on the target");
+    }
+
+    #[test]
+    fn invisible_armor_stand_hides_model_but_shows_floating_text() {
+        use recraft_protocol::v1_8_9::packets::MetadataEntry;
+        let mut g = GameState::empty_for_server(1.0);
+        g.camera.position = Vec3::new(0.5, 81.0, 0.5);
+        // An armor stand (object type 78) a few blocks from the player.
+        g.apply_play_packet(ClientboundPlayPacket::SpawnObject {
+            entity_id: 7,
+            kind: 78,
+            x: 3.0,
+            y: 80.0,
+            z: 0.5,
+            yaw: 0.0,
+            pitch: 0.0,
+            data: 0,
+            velocity: None,
+        });
+        // Invisible (flag 0x20) + a visible custom name → floating text.
+        g.apply_play_packet(ClientboundPlayPacket::EntityMetadata {
+            entity_id: 7,
+            metadata: vec![
+                MetadataEntry { index: 0, value: MetadataValue::Byte(0x20) },
+                MetadataEntry { index: 2, value: MetadataValue::Str("Hello".to_string()) },
+                MetadataEntry { index: 3, value: MetadataValue::Byte(1) },
+            ],
+        });
+        let stand = g.world.entity(EntityId(7)).unwrap();
+        assert!(stand.invisible);
+        assert_eq!(stand.custom_name.as_deref(), Some("Hello"));
+        assert!(stand.custom_name_visible);
+
+        // The invisible stand contributes no model geometry…
+        let mut mesh = ModelMesh::new();
+        let skins = std::collections::HashMap::new();
+        g.build_entity_model(&mut mesh, 1.0, 1.0, &skins);
+        assert!(mesh.is_empty(), "invisible entity must not render a model");
+
+        // …but its floating-text plate is still emitted.
+        let tags = g.player_nametags(1.0);
+        assert!(
+            tags.iter().any(|(name, _)| name == "Hello"),
+            "floating text must show for a named invisible stand"
+        );
+    }
+
+    #[test]
+    fn invisible_player_still_shows_worn_armor() {
+        use recraft_protocol::v1_8_9::packets::MetadataEntry;
+        let mut g = GameState::empty_for_server(1.0);
+        // Camera overlaps the entity so it always clears the frustum cull.
+        g.camera.position = Vec3::new(0.5, 81.0, 0.5);
+        let skins = std::collections::HashMap::new();
+
+        // An invisible player right next to the camera.
+        g.apply_play_packet(ClientboundPlayPacket::SpawnPlayer {
+            entity_id: 8,
+            uuid: [0u8; 16],
+            x: 0.5,
+            y: 80.5,
+            z: 0.5,
+            yaw: 0.0,
+            pitch: 0.0,
+        });
+        g.apply_play_packet(ClientboundPlayPacket::EntityMetadata {
+            entity_id: 8,
+            metadata: vec![MetadataEntry { index: 0, value: MetadataValue::Byte(0x20) }],
+        });
+
+        // Bare invisible player: nothing renders.
+        let mut bare = ModelMesh::new();
+        g.build_entity_model(&mut bare, 1.0, 1.0, &skins);
+        assert!(bare.is_empty(), "invisible player with no armor renders nothing");
+
+        // Give it an iron helmet (slot 4, id 306): the worn armor still shows.
+        g.apply_play_packet(ClientboundPlayPacket::EntityEquipment {
+            entity_id: 8,
+            slot: 4,
+            item: Some(SlotItem::new(306, 1, 0)),
+        });
+        let mut armored = ModelMesh::new();
+        g.build_entity_model(&mut armored, 1.0, 1.0, &skins);
+        assert!(!armored.is_empty(), "invisible player must still show worn armor");
     }
 
     #[test]

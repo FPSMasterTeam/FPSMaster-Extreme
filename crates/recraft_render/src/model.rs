@@ -194,19 +194,17 @@ impl ModelMesh {
         );
     }
 
-    /// Append an entity model at `feet` (bottom-center of the entity), scaled
-    /// to `height` and rotated to face `yaw_degrees`. Players render as the
-    /// skinned humanoid; known mobs render as their archetype (biped,
-    /// quadruped, creeper or chicken) sampling that mob's atlas slot; unknown
-    /// mobs render as a solid colored box at the entity AABB and objects as a
-    /// small colored box.
-    #[allow(clippy::too_many_arguments)]
+    /// Append an entity model at `feet` (bottom-center of the entity), at the
+    /// fixed 1/16-block model scale and rotated to face `yaw_degrees`. Players
+    /// render as the skinned humanoid; known mobs render as their archetype (biped,
+    /// quadruped, creeper or chicken) sampling that mob's atlas slot; armor
+    /// stands (object type 78) render the wooden stand model. Unmodelled mobs
+    /// and other object types emit no geometry (hidden) rather than a
+    /// placeholder box.
     pub fn push_entity(
         &mut self,
         kind: EntityKind,
         feet: Vec3,
-        half_width: f32,
-        height: f32,
         yaw_degrees: f32,
         anim: &EntityAnim,
         skin_row: Option<u32>,
@@ -220,23 +218,26 @@ impl ModelMesh {
                     .unwrap_or(EntitySlot::Player as u32);
                 self.push_parts(&humanoid_parts(true), &humanoid_poses(anim), row, feet, yaw_degrees);
             }
-            EntityKind::Mob(id) => match mob_model(id) {
-                Some(model) => self.push_mob(model, feet, yaw_degrees, anim),
-                None => {
-                    // Unmodelled mob type: a solid colored box at the entity AABB
-                    // so it never reads as a player.
-                    let w = half_width.max(0.1);
-                    let min = Vec3::new(feet.x - w, feet.y, feet.z - w);
-                    let max = Vec3::new(feet.x + w, feet.y + height.max(0.2), feet.z + w);
-                    self.push_box(min, max, entity_color(kind));
+            EntityKind::Mob(id) => {
+                // Unmodelled mob types are hidden rather than drawn as a
+                // placeholder box that could be mistaken for a real entity.
+                if let Some(model) = mob_model(id) {
+                    self.push_mob(model, feet, yaw_degrees, anim);
                 }
-            },
-            EntityKind::Object(_) => {
-                let w = half_width.max(0.06);
-                let min = Vec3::new(feet.x - w, feet.y, feet.z - w);
-                let max = Vec3::new(feet.x + w, feet.y + height.max(0.12), feet.z + w);
-                self.push_box(min, max, entity_color(kind));
             }
+            // Armor stand (object type 78): the wooden stand model. Every other
+            // object type is unmodelled and hidden (item entities are drawn in
+            // the separate world-item pass, never reaching here).
+            EntityKind::Object(78) => {
+                self.push_parts(
+                    &armor_stand_parts(),
+                    &[],
+                    EntitySlot::ArmorStand as u32,
+                    feet,
+                    yaw_degrees,
+                );
+            }
+            EntityKind::Object(_) => {}
         }
     }
 
@@ -552,6 +553,23 @@ fn chicken_parts() -> [Part; 8] {
         vbox([0.0, 15.0, -4.0], [-1.0, -2.0, -3.0], [2.0, 2.0, 2.0], [14.0, 4.0], 0.0),
         vbox([-4.0, 13.0, 0.0], [0.0, 0.0, -3.0], [1.0, 4.0, 6.0], [24.0, 13.0], 0.0),
         vbox([4.0, 13.0, 0.0], [-1.0, 0.0, -3.0], [1.0, 4.0, 6.0], [24.0, 13.0], 0.0),
+    ]
+}
+
+/// Armor stand (`ModelArmorStand`, armorstand/wood.png 64x64): the wooden
+/// stand — head, body, two legs, two vertical side posts, a waist bar and the
+/// base plate. The default vanilla stand shows no arms (the `ShowArms` flag is
+/// off), so they are omitted. Order is irrelevant since the model is static.
+fn armor_stand_parts() -> [Part; 8] {
+    [
+        vbox([0.0, 0.0, 0.0], [-1.0, -7.0, -1.0], [2.0, 7.0, 2.0], [0.0, 0.0], 0.0), // head
+        vbox([0.0, 0.0, 0.0], [-6.0, 0.0, -1.5], [12.0, 3.0, 3.0], [0.0, 26.0], 0.0), // body
+        vbox([-1.9, 12.0, 0.0], [-1.0, 0.0, -1.0], [2.0, 11.0, 2.0], [8.0, 0.0], 0.0), // right leg
+        vbox([1.9, 12.0, 0.0], [-1.0, 0.0, -1.0], [2.0, 11.0, 2.0], [40.0, 16.0], 0.0), // left leg
+        vbox([0.0, 0.0, 0.0], [-3.0, 3.0, -1.0], [2.0, 7.0, 2.0], [16.0, 0.0], 0.0), // right side
+        vbox([0.0, 0.0, 0.0], [1.0, 3.0, -1.0], [2.0, 7.0, 2.0], [48.0, 16.0], 0.0), // left side
+        vbox([0.0, 0.0, 0.0], [-4.0, 10.0, -1.0], [8.0, 2.0, 2.0], [0.0, 48.0], 0.0), // waist
+        vbox([0.0, 12.0, 0.0], [-6.0, 11.0, -6.0], [12.0, 1.0, 12.0], [0.0, 32.0], 0.0), // base
     ]
 }
 
@@ -1098,15 +1116,6 @@ fn plane_frac(f: usize, p: Vec3, min: Vec3, max: Vec3) -> (f32, f32) {
     }
 }
 
-/// Per-kind solid color for objects and unknown mobs.
-fn entity_color(kind: EntityKind) -> [f32; 4] {
-    match kind {
-        EntityKind::LocalPlayer | EntityKind::RemotePlayer => [0.85, 0.74, 0.62, 1.0],
-        EntityKind::Mob(_) => [0.62, 0.36, 0.66, 1.0],
-        EntityKind::Object(_) => [0.80, 0.78, 0.30, 1.0],
-    }
-}
-
 // ─── Armor overlay ──────────────────────────────────────────────────────────
 
 /// Armor material derived from item id, with the two atlas layer slots.
@@ -1267,8 +1276,6 @@ mod tests {
         mesh.push_entity(
             EntityKind::Mob(id),
             Vec3::new(1.0, 65.0, -3.0),
-            0.3,
-            1.9,
             30.0,
             &EntityAnim::default(),
             None,
@@ -1309,8 +1316,6 @@ mod tests {
         mesh.push_entity(
             EntityKind::RemotePlayer,
             Vec3::new(0.0, 64.0, 0.0),
-            0.3,
-            1.8,
             45.0,
             &EntityAnim::default(),
             None,
@@ -1347,11 +1352,10 @@ mod tests {
     fn different_mob_ids_produce_distinct_models() {
         let zombie = build_mob(54); // biped: 6 boxes
         let chicken = build_mob(93); // chicken: 4 boxes
-        let unknown = build_mob(63); // no 1.8 mob: solid fallback box
+        let unknown = build_mob(63); // no 1.8 model: hidden (no geometry)
         assert_ne!(zombie.vertices.len(), chicken.vertices.len());
         assert_ne!(chicken.vertices.len(), unknown.vertices.len());
-        assert_eq!(unknown.vertices.len(), 24);
-        assert!(unknown.vertices.iter().all(|v| v.uv == ENTITY_WHITE_UV));
+        assert!(unknown.vertices.is_empty(), "unmodelled mobs must be hidden");
 
         // Same shape but different texture slot still differs (zombie vs pig
         // sample disjoint V ranges).
@@ -1389,33 +1393,26 @@ mod tests {
         let mut mesh = ModelMesh::new();
         mesh.push_box(Vec3::ZERO, Vec3::ONE, [1.0, 0.0, 0.0, 1.0]);
         assert!(mesh.vertices.iter().all(|v| v.uv == ENTITY_WHITE_UV));
+    }
 
-        let mut object = ModelMesh::new();
-        object.push_entity(
-            EntityKind::Object(1),
-            Vec3::ZERO,
-            0.125,
-            0.25,
-            0.0,
-            &EntityAnim::default(),
-            None,
-        );
-        assert_eq!(object.vertices.len(), 24); // a single box
-        assert!(object.vertices.iter().all(|v| v.uv == ENTITY_WHITE_UV));
+    #[test]
+    fn unimplemented_entities_are_hidden() {
+        let push = |kind| {
+            let mut mesh = ModelMesh::new();
+            mesh.push_entity(kind, Vec3::ZERO, 0.0, &EntityAnim::default(), None);
+            mesh
+        };
+        // Unmodelled mob types and non-armor-stand objects emit no geometry.
+        assert!(push(EntityKind::Mob(200)).is_empty(), "unmodelled mob must be hidden");
+        assert!(push(EntityKind::Object(1)).is_empty(), "unmodelled object must be hidden");
+        // The armor stand (object type 78) does render.
+        assert!(!push(EntityKind::Object(78)).is_empty(), "armor stand must render");
     }
 
     /// Build a player mesh at the origin (yaw 0) with the given animation.
     fn player_mesh(anim: &EntityAnim) -> ModelMesh {
         let mut mesh = ModelMesh::new();
-        mesh.push_entity(
-            EntityKind::RemotePlayer,
-            Vec3::ZERO,
-            0.3,
-            1.8,
-            0.0,
-            anim,
-            None,
-        );
+        mesh.push_entity(EntityKind::RemotePlayer, Vec3::ZERO, 0.0, anim, None);
         mesh
     }
 
@@ -1492,15 +1489,7 @@ mod tests {
     fn skin_row_samples_the_per_player_atlas_region() {
         let player = |row: Option<u32>| {
             let mut mesh = ModelMesh::new();
-            mesh.push_entity(
-                EntityKind::RemotePlayer,
-                Vec3::ZERO,
-                0.3,
-                1.8,
-                0.0,
-                &EntityAnim::default(),
-                row,
-            );
+            mesh.push_entity(EntityKind::RemotePlayer, Vec3::ZERO, 0.0, &EntityAnim::default(), row);
             mesh
         };
         let default = player(None);
