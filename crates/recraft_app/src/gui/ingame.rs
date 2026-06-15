@@ -90,6 +90,10 @@ impl GuiIngame {
         hud: &HudState,
         chat_input: Option<&mut TextInput>,
         debug: Option<&DebugInfo>,
+        // Whether a screen (inventory / pause / chat) is open. The HUD still draws
+        // (over the screen's scrim) so the hotbar/status bars stay visible, but the
+        // crosshair is hidden so it doesn't sit in the middle of the menu.
+        screen_open: bool,
     ) {
         let scale = gui_scale(width, height);
 
@@ -101,24 +105,29 @@ impl GuiIngame {
             None => draw_fps_panel(ui, scale, fps, chunk_count),
         }
 
-        // Crosshair: 10 GUI px arms, 2 GUI px thick.
-        let center_x = width / 2;
-        let center_y = height / 2;
-        ui.rect(
-            UiRect::new(center_x - 5 * scale, center_y - scale, 10 * scale, 2 * scale),
-            WHITE_DIM,
-        );
-        ui.rect(
-            UiRect::new(center_x - scale, center_y - 5 * scale, 2 * scale, 10 * scale),
-            WHITE_DIM,
-        );
+        // Crosshair: 10 GUI px arms, 2 GUI px thick. Hidden while a screen is open.
+        if !screen_open {
+            let center_x = width / 2;
+            let center_y = height / 2;
+            ui.rect(
+                UiRect::new(center_x - 5 * scale, center_y - scale, 10 * scale, 2 * scale),
+                WHITE_DIM,
+            );
+            ui.rect(
+                UiRect::new(center_x - scale, center_y - 5 * scale, 2 * scale, 10 * scale),
+                WHITE_DIM,
+            );
+        }
 
+        // Chat is the bottom-most HUD layer: the status bars (health / hunger / XP)
+        // and the hotbar draw on top of it, so an open chat or a long backlog never
+        // covers the HUD — solved by z-order, not by repositioning the chat.
+        draw_chat(ui, width, height, hud, chat_input);
         draw_status_bars(ui, width, height, hud);
         draw_hotbar(ui, width, height, hud);
         draw_title(ui, width, height, hud);
         draw_action_bar(ui, width, height, hud);
         draw_sidebar(ui, width, height, hud);
-        draw_chat(ui, width, height, hud, chat_input);
         draw_tab_list(ui, width, height, hud);
     }
 }

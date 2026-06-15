@@ -101,8 +101,8 @@ impl Container {
     /// hotbar — vanilla `ContainerPlayer` slot order/positions.
     pub fn player() -> Self {
         let mut slots = Vec::with_capacity(45);
-        slots.push(Slot { back: SlotBack::Player(0), x: 154, y: 28, kind: SlotKind::Output });
-        let craft = [(98, 18), (116, 18), (98, 36), (116, 36)];
+        slots.push(Slot { back: SlotBack::Player(0), x: 144, y: 36, kind: SlotKind::Output });
+        let craft = [(88, 26), (106, 26), (88, 44), (106, 44)];
         for (i, (x, y)) in craft.into_iter().enumerate() {
             slots.push(Slot { back: SlotBack::Player(1 + i), x, y, kind: SlotKind::Normal });
         }

@@ -27,6 +27,7 @@ struct PostCamera {
 @group(0) @binding(3) var depth_tex: texture_depth_2d;
 @group(0) @binding(4) var<uniform> cam: PostCamera;
 @group(0) @binding(5) var lum_tex: texture_2d<f32>;
+@group(0) @binding(6) var vol_tex: texture_2d<f32>;
 
 // Reconstruct world position from a screen UV + non-linear depth.
 fn world_from_depth(uv: vec2<f32>, depth: f32) -> vec3<f32> {
@@ -156,6 +157,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             }
         }
         color += bloom / wsum * params.p.y;
+    }
+
+    // Volumetric light (god rays): add the half-res sun-shaft in-scatter, upsampled
+    // by the linear sampler. Added before tone-mapping so bright shafts roll off
+    // filmically instead of clipping.
+    if (params.s.z > 0.5) {
+        color += textureSample(vol_tex, scene_sampler, in.uv).rgb;
     }
 
     // Tone-mapping + grade only with shaders on (s.y). With shaders off the pass

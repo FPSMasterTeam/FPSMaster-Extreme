@@ -55,6 +55,8 @@ pub struct Settings {
     pub post_motion_blur: bool,
     pub post_auto_exposure: bool,
     pub volumetric_clouds: bool,
+    /// Volumetric sun shafts (god rays); only active while `shaders` is on.
+    pub volumetric_light: bool,
     /// Active resource pack name (subdirectory or zip filename under
     /// `resourcepacks/`), or `None` for default 1.8 textures.
     pub resource_pack: Option<String>,
@@ -105,6 +107,7 @@ impl Default for Settings {
             post_motion_blur: false,
             post_auto_exposure: true,
             volumetric_clouds: true,
+            volumetric_light: true,
             resource_pack: None,
         }
     }
@@ -235,6 +238,11 @@ impl Settings {
                         s.volumetric_clouds = v;
                     }
                 }
+                "volumetric_light" => {
+                    if let Ok(v) = val.parse() {
+                        s.volumetric_light = v;
+                    }
+                }
                 "resource_pack" => {
                     if !val.is_empty() {
                         s.resource_pack = Some(val.to_owned());
@@ -265,7 +273,7 @@ impl Settings {
     fn save_to(&self, path: &std::path::Path) {
         let (res_w, res_h) = self.resolution.unwrap_or((0, 0));
         let text = format!(
-            "sensitivity={}\nvsync={}\nfps_cap={}\nrender_scale={}\nfancy_graphics={}\nmipmap_levels={}\nresolution_w={}\nresolution_h={}\nfullscreen={}\nshaders={}\nshader_shadows={}\nshader_specular={}\nshader_fog={}\nshader_bloom={}\nbrightness={}\npost_vignette={}\npost_chromatic={}\npost_dof={}\npost_motion_blur={}\npost_auto_exposure={}\nvolumetric_clouds={}\nresource_pack={}\n",
+            "sensitivity={}\nvsync={}\nfps_cap={}\nrender_scale={}\nfancy_graphics={}\nmipmap_levels={}\nresolution_w={}\nresolution_h={}\nfullscreen={}\nshaders={}\nshader_shadows={}\nshader_specular={}\nshader_fog={}\nshader_bloom={}\nbrightness={}\npost_vignette={}\npost_chromatic={}\npost_dof={}\npost_motion_blur={}\npost_auto_exposure={}\nvolumetric_clouds={}\nvolumetric_light={}\nresource_pack={}\n",
             self.sensitivity,
             self.vsync,
             self.fps_cap,
@@ -287,6 +295,7 @@ impl Settings {
             self.post_motion_blur,
             self.post_auto_exposure,
             self.volumetric_clouds,
+            self.volumetric_light,
             self.resource_pack.as_deref().unwrap_or(""),
         );
         if let Err(err) = std::fs::write(path, text) {

@@ -105,6 +105,14 @@ pub trait GuiScreen {
         false
     }
 
+    /// Whether the world should be dimmed by a scrim (drawn before the HUD, so the
+    /// HUD stays at full brightness on top of it) while this screen is open.
+    /// Defaults to the same as `draws_over_hud`; chat and the death screen (which
+    /// draws its own red scrim) override it.
+    fn dims_world(&self) -> bool {
+        self.draws_over_hud()
+    }
+
     /// Whether this screen wants the panorama skybox background.
     fn wants_panorama(&self) -> bool {
         false
@@ -155,6 +163,7 @@ pub enum GuiAction {
     SetMotionBlur(bool),
     SetAutoExposure(bool),
     SetClouds(bool),
+    SetVolumetricLight(bool),
     /// Reload the block atlas from a resource pack (or `None` for default).
     ReloadResourcePack(Option<std::path::PathBuf>),
     /// Persist the current settings to disk (emitted when options close).
@@ -222,10 +231,11 @@ pub(crate) const TEXT_GREEN: UiColor = UiColor::rgba(85, 255, 85, 255);
 /// Vanilla `drawDefaultBackground`: the tiled dirt texture (tinted gray 64,
 /// one repeat per 32 GUI px) on menus, or a translucent scrim over a world.
 pub(crate) fn draw_default_background(ui: &mut UiFrame, ctx: &DrawCtx) {
-    let full = UiRect::new(0, 0, ctx.width, ctx.height);
-    if ctx.in_world {
-        ui.rect(full, UiColor::rgba(16, 16, 16, 160));
-    } else {
+    // In-world overlay screens are dimmed centrally by the world scrim drawn before
+    // the HUD (see `draw_world_scrim`), so the HUD stays visible on top. Only the
+    // title-screen variant needs the tiled dirt background here.
+    if !ctx.in_world {
+        let full = UiRect::new(0, 0, ctx.width, ctx.height);
         ui.tiled_image(
             full,
             GuiTexture::OptionsBackground,
@@ -233,6 +243,13 @@ pub(crate) fn draw_default_background(ui: &mut UiFrame, ctx: &DrawCtx) {
             UiColor::rgba(64, 64, 64, 255),
         );
     }
+}
+
+/// The dim scrim drawn over the world behind an in-game overlay screen. Drawn
+/// before the HUD so the HUD (hotbar / status bars / chat / scoreboard) stays at
+/// full brightness on top of it.
+pub(crate) fn draw_world_scrim(ui: &mut UiFrame, width: i32, height: i32) {
+    ui.rect(UiRect::new(0, 0, width, height), UiColor::rgba(16, 16, 16, 160));
 }
 
 /// The item tooltip box (vanilla `GuiUtils.drawHoveringText`): the dark

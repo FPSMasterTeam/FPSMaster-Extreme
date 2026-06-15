@@ -78,10 +78,8 @@ fn send(packets: Vec<ServerboundPacket>) -> Vec<GuiAction> {
 
 impl GuiScreen for GuiContainer {
     fn draw(&mut self, ui: &mut UiFrame, ctx: &DrawCtx) {
-        ui.rect(
-            UiRect::new(0, 0, ctx.width, ctx.height),
-            UiColor::rgba(16, 16, 16, 160),
-        );
+        // The world scrim is drawn centrally before the HUD (so the HUD stays
+        // visible); here we only draw the inventory window + its contents.
         let Some(hud) = ctx.hud else { return };
         let Some(container) = hud.container else { return };
 

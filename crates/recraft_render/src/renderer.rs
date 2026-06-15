@@ -80,6 +80,21 @@ struct PostCamera {
     camera_pos: [f32; 4],
 }
 
+/// Uniform for the volumetric-light raymarch pass: unproject depth to a world ray,
+/// project samples into the shadow map, and shade in-scatter toward the sun.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct VolUniform {
+    inv_view_proj: [[f32; 4]; 4],
+    light_view_proj: [[f32; 4]; 4],
+    sun_dir: [f32; 4],
+    sun_color: [f32; 4],
+    /// xyz = camera world position, w = day factor (sky_brightness).
+    camera_pos: [f32; 4],
+    /// x = density, y = max distance, z = HG g, w = intensity.
+    params: [f32; 4],
+}
+
 /// Uniform for the fullscreen sky-gradient pass: the inverse rotation-only
 /// view-projection (to reconstruct a per-pixel view ray) plus the time-of-day
 /// gradient and sunset-glow colors.
@@ -625,6 +640,15 @@ pub struct Renderer {
     lum_pipeline: wgpu::RenderPipeline,
     lum_layout: wgpu::BindGroupLayout,
     lum_bind_group: Option<wgpu::BindGroup>,
+    /// Volumetric light (sun shafts / god rays): a half-res HDR in-scatter target
+    /// raymarched from the world depth + shadow map, added to the scene in post.
+    volumetric_enabled: bool,
+    vol_pipeline: wgpu::RenderPipeline,
+    vol_layout: wgpu::BindGroupLayout,
+    vol_uniform_buffer: wgpu::Buffer,
+    vol_tex: Option<wgpu::Texture>,
+    vol_view: Option<wgpu::TextureView>,
+    vol_bind_group: Option<wgpu::BindGroup>,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     chunk_solid: ChunkLayer,
@@ -1837,6 +1861,18 @@ impl Renderer {
                     },
                     count: None,
                 },
+                // Volumetric-light in-scatter (half-res, upsampled with the linear
+                // sampler and added to the scene before tone-mapping).
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
         let post_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -1980,6 +2016,92 @@ impl Renderer {
             multisample: wgpu::MultisampleState::default(),
         cache: None,
         multiview_mask: None,
+        });
+
+        // Volumetric light pass: a half-res raymarch of the sun shafts (god rays),
+        // sampling the world depth + the sun shadow map. The result is added to the
+        // scene in the post pass. Bindings: world depth (0), shadow map (1) +
+        // comparison sampler (2), and the volumetric uniform (3).
+        let vol_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("volumetric-shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shader/volumetric.wgsl").into()),
+        });
+        let vol_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("volumetric-layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let vol_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("volumetric-uniform"),
+            size: std::mem::size_of::<VolUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let vol_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("volumetric-pipeline-layout"),
+            bind_group_layouts: &[Some(&vol_layout)],
+            immediate_size: 0,
+        });
+        let vol_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("volumetric-pipeline"),
+            layout: Some(&vol_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &vol_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &vol_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: HDR_FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            cache: None,
+            multiview_mask: None,
         });
 
         // Sun shadow-map pass: render chunk depth from the light's view. Solid is
@@ -2195,6 +2317,13 @@ impl Renderer {
             lum_pipeline,
             lum_layout,
             lum_bind_group: None,
+            volumetric_enabled: false,
+            vol_pipeline,
+            vol_layout,
+            vol_uniform_buffer,
+            vol_tex: None,
+            vol_view: None,
+            vol_bind_group: None,
             camera_buffer,
             camera_bind_group,
             chunk_solid,
@@ -2294,6 +2423,14 @@ impl Renderer {
 
     pub fn set_clouds_enabled(&mut self, on: bool) {
         self.clouds_enabled = on;
+    }
+
+    /// Volumetric sun shafts (god rays). Gated by the master shader toggle; forces
+    /// the shadow map to render even when terrain shadows are off, since the
+    /// raymarch needs it. Refreshes the post params (which composite the result).
+    pub fn set_volumetric_light_enabled(&mut self, on: bool) {
+        self.volumetric_enabled = on;
+        self.update_post_params();
     }
 
     /// Bloom (HDR glow around over-bright pixels). The world already renders to
@@ -2445,6 +2582,47 @@ impl Renderer {
         self.scene_copy_tex = Some(scene_copy);
         self.depth_copy_view = Some(depth_copy_view);
         self.depth_copy_tex = Some(depth_copy);
+        // Half-resolution volumetric in-scatter target + its bind group (reads the
+        // final world depth and the sun shadow map). Half-res keeps the raymarch
+        // cheap; the post pass upsamples it with the linear sampler.
+        let (vw, vh) = ((w / 2).max(1), (h / 2).max(1));
+        let vol = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("volumetric-halfres-hdr"),
+            size: wgpu::Extent3d {
+                width: vw,
+                height: vh,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: HDR_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let vol_view = vol.create_view(&wgpu::TextureViewDescriptor::default());
+        self.vol_bind_group = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("volumetric-bind-group"),
+            layout: &self.vol_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&self.depth_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&self.shadow_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.shadow_compare_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.vol_uniform_buffer.as_entire_binding(),
+                },
+            ],
+        }));
         self.post_bind_group = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("post-bind-group"),
             layout: &self.post_layout,
@@ -2473,8 +2651,14 @@ impl Renderer {
                     binding: 5,
                     resource: wgpu::BindingResource::TextureView(&self.lum_view),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::TextureView(&vol_view),
+                },
             ],
         }));
+        self.vol_tex = Some(vol);
+        self.vol_view = Some(vol_view);
         // Auto-exposure reduction reads the (full) off-screen scene.
         self.lum_bind_group = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("luminance-bind-group"),
@@ -2529,7 +2713,8 @@ impl Renderer {
             // s.y: tone-mapping enabled (= shaders). With shaders off the post
             // pass is a plain passthrough so the world looks like vanilla.
             if sh { 1.0 } else { 0.0 },
-            0.0,
+            // s.z: add the volumetric in-scatter target.
+            on(self.volumetric_enabled, 1.0),
             0.0,
         ];
         self.queue
@@ -3254,14 +3439,43 @@ impl Renderer {
         let cam = camera.position;
         let on = |b: bool| if b { 1.0 } else { 0.0 };
         let shadows_on = self.shaders_enabled && self.shadows_enabled;
+        // Volumetric light reads the shadow map too, so render it whenever either
+        // terrain shadows or the volumetric pass is active.
+        let render_shadow_map =
+            self.shaders_enabled && (self.shadows_enabled || self.volumetric_enabled);
         // Orthographic light frustum centred just ahead of the camera, viewed
         // from the sun direction — covers the near scene the player actually sees.
-        let light_view_proj = if shadows_on {
-            let center = camera.position + camera.direction() * (SHADOW_RADIUS * 0.5);
-            let eye = center + sun_dir * (SHADOW_RADIUS * 2.5);
-            let up = if sun_dir.y.abs() > 0.99 { Vec3::Z } else { Vec3::Y };
+        let light_view_proj = if render_shadow_map {
+            // Keep the shadow camera off the horizon. At sunset the real sun grazes
+            // y≈0, which stretches shadows toward infinity and makes the fixed-size
+            // ortho frustum badly undersample them (aliased, shimmering edges).
+            // Floor the elevation for the *shadow* camera only — the shading sun_dir
+            // (ndotl, god-ray direction) keeps the real, low sun.
+            let mut shadow_sun = sun_dir;
+            if shadow_sun.y < 0.2 {
+                shadow_sun.y = 0.2;
+                shadow_sun = shadow_sun.normalize();
+            }
+            let up = if shadow_sun.y.abs() > 0.99 { Vec3::Z } else { Vec3::Y };
+            // Texel snapping anchored to the camera-relative frustum centre (NOT the
+            // world origin). Snap the centre to whole shadow-map texels in light
+            // space so a given world surface lands in the same texel every frame.
+            // `light_rot` shares the final view's rotation but sits at the origin, so
+            // its xy is exactly the centre's light-space xy — what must be quantized.
+            // A world-origin anchor instead leaves a lever arm = the player's
+            // distance from origin, so the slow sun rotation swings the grid by many
+            // texels per frame out there: the high-frequency shadow shimmer, worst at
+            // sunset where the long shadows magnify it.
+            let light_rot = Mat4::look_at_rh(shadow_sun, Vec3::ZERO, up);
+            let units_per_texel = (2.0 * SHADOW_RADIUS) / SHADOW_DIM as f32;
+            let raw_center = camera.position + camera.direction() * (SHADOW_RADIUS * 0.5);
+            let mut c_ls = light_rot.transform_point3(raw_center);
+            c_ls.x = (c_ls.x / units_per_texel).round() * units_per_texel;
+            c_ls.y = (c_ls.y / units_per_texel).round() * units_per_texel;
+            let center = light_rot.inverse().transform_point3(c_ls);
+            let eye = center + shadow_sun * (SHADOW_RADIUS * 2.5);
             let view = Mat4::look_at_rh(eye, center, up);
-            let mut proj = Mat4::orthographic_rh(
+            let proj = Mat4::orthographic_rh(
                 -SHADOW_RADIUS,
                 SHADOW_RADIUS,
                 -SHADOW_RADIUS,
@@ -3269,16 +3483,6 @@ impl Renderer {
                 0.1,
                 SHADOW_RADIUS * 5.0,
             );
-            // Texel snapping: quantize the frustum so it shifts in whole
-            // shadow-map texels as the camera moves, removing the per-frame
-            // sub-texel shimmer (shadow flicker).
-            let vp = proj * view;
-            let origin = vp.transform_point3(Vec3::ZERO);
-            let half = SHADOW_DIM as f32 * 0.5;
-            let dx = (origin.x * half).round() / half - origin.x;
-            let dy = (origin.y * half).round() / half - origin.y;
-            proj.w_axis.x += dx;
-            proj.w_axis.y += dy;
             proj * view
         } else {
             Mat4::IDENTITY
@@ -3310,6 +3514,23 @@ impl Renderer {
                     on(self.shaders_enabled && self.fog_enabled),
                     self.brightness,
                 ],
+            }),
+        );
+
+        // Volumetric-light uniform (consumed by the half-res raymarch pass). The
+        // sun colour/day factor fade the shafts out at night; the params are the
+        // scattering density, max march distance, HG forward-scatter g, and the
+        // overall intensity.
+        self.queue.write_buffer(
+            &self.vol_uniform_buffer,
+            0,
+            bytemuck::bytes_of(&VolUniform {
+                inv_view_proj: view_proj.inverse().to_cols_array_2d(),
+                light_view_proj: light_view_proj.to_cols_array_2d(),
+                sun_dir: [sun_dir.x, sun_dir.y, sun_dir.z, 0.0],
+                sun_color: [1.0 * sb, 0.96 * sb, 0.88 * sb, 0.0],
+                camera_pos: [cam.x, cam.y, cam.z, sb],
+                params: [0.04, 110.0, 0.72, 0.5],
             }),
         );
 
@@ -3369,7 +3590,7 @@ impl Renderer {
         // Sun shadow pass: render chunk-section depth from the light's view,
         // culled to the light frustum — sections outside the shadow map's
         // coverage contribute nothing, so there's no need to draw them all.
-        if shadows_on {
+        if render_shadow_map {
             let light_frustum = Frustum::from_view_projection(light_view_proj);
             let mut sp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("shadow-pass"),
@@ -3711,30 +3932,6 @@ impl Renderer {
                 }
             }
 
-            // Water in the main pass when SSR isn't used (shaders off, or Fast
-            // graphics) — avoids a separate pass and keeping the depth buffer.
-            // Fancy = translucent (alpha blend), Fast = opaque.
-            if !water_draws.is_empty()
-                && !self.debug_skip.water
-                && !(self.shaders_enabled && self.fancy_graphics)
-            {
-                pass.set_bind_group(0, &self.camera_bind_group, &[]);
-                pass.set_bind_group(1, &self.texture_bind_groups[self.mipmap_levels as usize], &[]);
-                pass.set_bind_group(2, &self.lighting_bind_group, &[]);
-                pass.set_pipeline(if self.fancy_graphics {
-                    &self.transparent_pipeline
-                } else {
-                    &self.water_opaque_pipeline
-                });
-                for (page, c) in &water_draws {
-                    let p = &self.chunk_water.pages[*page];
-                    pass.set_vertex_buffer(0, p.vertex_buf.slice(..));
-                    pass.set_index_buffer(p.index_buf.slice(..), wgpu::IndexFormat::Uint16);
-                    pass.draw_indexed(c.first_index..c.first_index + c.index_count, c.base_vertex, 0..1);
-                    draw_calls += 1;
-                }
-            }
-
             // Mining crack overlay: drawn with the translucent pipeline (alpha
             // blended, depth-tested, no depth write) so the crack texels darken
             // the mined block in place.
@@ -3787,6 +3984,33 @@ impl Renderer {
                 pass.set_index_buffer(items.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..items.index_count, 0, 0..1);
                 draw_calls += 1;
+            }
+
+            // Water in the main pass when SSR isn't used (shaders off, or Fast
+            // graphics) — avoids a separate pass and keeping the depth buffer.
+            // Drawn AFTER the opaque entities/dropped items so translucent (Fancy)
+            // water blends over — and thus occludes — anything underwater, instead
+            // of those entities drawing on top of the already-blended surface.
+            // Fancy = translucent (alpha blend), Fast = opaque.
+            if !water_draws.is_empty()
+                && !self.debug_skip.water
+                && !(self.shaders_enabled && self.fancy_graphics)
+            {
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                pass.set_bind_group(1, &self.texture_bind_groups[self.mipmap_levels as usize], &[]);
+                pass.set_bind_group(2, &self.lighting_bind_group, &[]);
+                pass.set_pipeline(if self.fancy_graphics {
+                    &self.transparent_pipeline
+                } else {
+                    &self.water_opaque_pipeline
+                });
+                for (page, c) in &water_draws {
+                    let p = &self.chunk_water.pages[*page];
+                    pass.set_vertex_buffer(0, p.vertex_buf.slice(..));
+                    pass.set_index_buffer(p.index_buf.slice(..), wgpu::IndexFormat::Uint16);
+                    pass.draw_indexed(c.first_index..c.first_index + c.index_count, c.base_vertex, 0..1);
+                    draw_calls += 1;
+                }
             }
 
             // First-person held item, textured from the block/item atlas. Drawn
@@ -3892,6 +4116,34 @@ impl Renderer {
                 wp.set_index_buffer(p.index_buf.slice(..), wgpu::IndexFormat::Uint16);
                 wp.draw_indexed(c.first_index..c.first_index + c.index_count, c.base_vertex, 0..1);
                 draw_calls += 1;
+            }
+        }
+
+        // Volumetric light pass: raymarch sun shafts into the half-res target that
+        // the post pass adds back into the scene. Runs when the master shader
+        // toggle + the volumetric option are on (the shadow map was rendered above
+        // because `render_shadow_map` includes the volumetric case).
+        if self.shaders_enabled && self.volumetric_enabled {
+            if let (Some(vv), Some(vb)) = (&self.vol_view, &self.vol_bind_group) {
+                let mut vp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("volumetric-pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: vv,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    occlusion_query_set: None,
+                    timestamp_writes: None,
+                    multiview_mask: None,
+                });
+                vp.set_pipeline(&self.vol_pipeline);
+                vp.set_bind_group(0, vb, &[]);
+                vp.draw(0..3, 0..1);
             }
         }
 

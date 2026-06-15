@@ -17,6 +17,7 @@ pub struct GuiShaders {
     specular: Option<GuiButton>,
     fog: Option<GuiButton>,
     bloom: Option<GuiButton>,
+    volumetric: Option<GuiButton>,
     // Right column: post / world.
     vignette: Option<GuiButton>,
     chromatic: Option<GuiButton>,
@@ -58,6 +59,7 @@ impl GuiShaders {
         self.specular = Some(GuiButton::at_px(x, row(2), cw, s, "").disabled(off));
         self.fog = Some(GuiButton::at_px(x, row(3), cw, s, "").disabled(off));
         self.bloom = Some(GuiButton::at_px(x, row(4), cw, s, "").disabled(off));
+        self.volumetric = Some(GuiButton::at_px(x, row(5), cw, s, "").disabled(off));
         self.vignette = Some(GuiButton::at_px(xr, row(0), cw, s, "").disabled(off));
         self.chromatic = Some(GuiButton::at_px(xr, row(1), cw, s, "").disabled(off));
         self.dof = Some(GuiButton::at_px(xr, row(2), cw, s, "").disabled(off));
@@ -95,6 +97,10 @@ impl GuiScreen for GuiShaders {
         draw(&mut self.specular, format!("Specular: {}", on_off(st.shader_specular)));
         draw(&mut self.fog, format!("Fog: {}", on_off(st.shader_fog)));
         draw(&mut self.bloom, format!("Bloom: {}", on_off(st.shader_bloom)));
+        draw(
+            &mut self.volumetric,
+            format!("VolLight: {}", on_off(st.volumetric_light)),
+        );
         draw(&mut self.vignette, format!("Vignette: {}", on_off(st.post_vignette)));
         draw(&mut self.chromatic, format!("Chroma: {}", on_off(st.post_chromatic)));
         draw(&mut self.dof, format!("DoF: {}", on_off(st.post_dof)));
@@ -126,6 +132,10 @@ impl GuiScreen for GuiShaders {
         if self.bloom.as_ref().is_some_and(|b| b.clicked(x, y)) {
             ctx.settings.shader_bloom = !ctx.settings.shader_bloom;
             return vec![GuiAction::SetShaderBloom(ctx.settings.shader_bloom)];
+        }
+        if self.volumetric.as_ref().is_some_and(|b| b.clicked(x, y)) {
+            ctx.settings.volumetric_light = !ctx.settings.volumetric_light;
+            return vec![GuiAction::SetVolumetricLight(ctx.settings.volumetric_light)];
         }
         if self.vignette.as_ref().is_some_and(|b| b.clicked(x, y)) {
             ctx.settings.post_vignette = !ctx.settings.post_vignette;

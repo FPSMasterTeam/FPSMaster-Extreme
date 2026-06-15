@@ -294,6 +294,7 @@ impl ApplicationHandler for WinitApp {
         renderer.set_motion_blur_enabled(settings.post_motion_blur);
         renderer.set_auto_exposure_enabled(settings.post_auto_exposure);
         renderer.set_clouds_enabled(settings.volumetric_clouds);
+        renderer.set_volumetric_light_enabled(settings.volumetric_light);
         if !settings.fullscreen {
             apply_display(&window, &settings);
         }
@@ -959,6 +960,7 @@ fn handle_actions(
             GuiAction::SetMotionBlur(on) => renderer.set_motion_blur_enabled(on),
             GuiAction::SetAutoExposure(on) => renderer.set_auto_exposure_enabled(on),
             GuiAction::SetClouds(on) => renderer.set_clouds_enabled(on),
+            GuiAction::SetVolumetricLight(on) => renderer.set_volumetric_light_enabled(on),
             GuiAction::SaveSettings => app.settings.save(),
             GuiAction::SendPacket(packet) => {
                 if let Some(network) = &app.network {
@@ -1406,6 +1408,21 @@ fn render_frame(
         screen_overlay: game.screen_overlay(),
         overlay_textures: &overlay_textures,
     };
+    let wants_panorama = screen
+        .as_ref()
+        .is_some_and(|s| s.wants_panorama());
+    let has_panorama = wants_panorama && renderer.has_panorama();
+    let screen_open = screen.is_some();
+    let dim_world = screen.as_ref().is_some_and(|s| s.dims_world());
+
+    // Three-layer composite so an open overlay screen never hides the HUD:
+    //   1. a dim scrim over the world (focus),
+    //   2. the HUD on top of it (hotbar / status bars / chat / scoreboard, full
+    //      brightness — all live in GuiIngame, so they share this layer),
+    //   3. the screen's own panel / tooltips / held item on top of the HUD.
+    if dim_world {
+        gui::draw_world_scrim(&mut ui, width, height);
+    }
     if hud_visible {
         // The render stats are the previous frame's (collected after the draw);
         // one frame stale is fine for a live debug readout.
@@ -1426,13 +1443,9 @@ fn render_frame(
             &hud,
             chat_input,
             debug.as_ref(),
+            screen_open,
         );
     }
-    let wants_panorama = screen
-        .as_ref()
-        .is_some_and(|s| s.wants_panorama());
-    let has_panorama = wants_panorama && renderer.has_panorama();
-
     if let Some(screen) = screen.as_mut() {
         let ctx = DrawCtx {
             width,

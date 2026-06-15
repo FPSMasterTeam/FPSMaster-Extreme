@@ -72,10 +72,17 @@ pub fn is_block_icon(id: i16, damage: i16) -> Option<(u16, u8)> {
     Some((id as u16, meta))
 }
 
-/// The isometric GUI pose, matching vanilla's `block` builtin `gui` display
-/// (`rotation [30, 225, 0]`, applied as Ry(225)·Rx(30) per `applyTransform`).
+/// The 3D block GUI pose, matching vanilla 1.8's `RenderItem.setupGuiTransform`
+/// for `isGui3d` items: `rotate(210°, X)` then `rotate(-135°, Y)` (applied as
+/// Rx(210)·Ry(-135)), plus the `scale(1, 1, -1)` Z-flip. (1.8 cubes have no model
+/// `display.gui` transform — the `[30, 225, 0]` pose only exists from 1.9+, so the
+/// previous value showed the block from the opposite corner.) The `diag(1,-1,1)`
+/// factor folds vanilla's Y-down GUI projection / Z-flip into our orthographic
+/// `to_clip` mapping (which treats +y as up), so the result lands pixel-identical.
 fn gui_rotation() -> Mat3 {
-    Mat3::from_rotation_y(225.0_f32.to_radians()) * Mat3::from_rotation_x(30.0_f32.to_radians())
+    Mat3::from_diagonal(Vec3::new(1.0, -1.0, 1.0))
+        * Mat3::from_rotation_x(210.0_f32.to_radians())
+        * Mat3::from_rotation_y(-135.0_f32.to_radians())
 }
 
 /// Append a block's 3D icon geometry (clip-space `Vertex`es) for slot `rect`.

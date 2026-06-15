@@ -67,4 +67,9 @@ impl GuiScreen for GuiGameOver {
     fn draws_over_hud(&self) -> bool {
         true
     }
+
+    // The death screen draws its own red scrim, so skip the central one.
+    fn dims_world(&self) -> bool {
+        false
+    }
 }

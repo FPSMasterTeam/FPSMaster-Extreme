@@ -82,4 +82,9 @@ impl GuiScreen for GuiChat {
     fn draws_over_hud(&self) -> bool {
         true
     }
+
+    // Chat keeps the world bright (no scrim), vanilla-style.
+    fn dims_world(&self) -> bool {
+        false
+    }
 }
