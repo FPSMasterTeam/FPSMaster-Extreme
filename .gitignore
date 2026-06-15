@@ -13,3 +13,6 @@ CLAUDE.md
 # Runtime artifacts
 recraft_options.txt
 logs/
+
+# Machine-local Claude Code config (settings.local.json, etc.)
+/.claude/
