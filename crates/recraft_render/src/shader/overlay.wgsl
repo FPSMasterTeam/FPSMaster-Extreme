@@ -36,8 +36,12 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     return out;
 }
 
+fn light_level(l: f32) -> f32 {
+    return l / (4.0 - 3.0 * clamp(l, 0.0, 1.0));
+}
+
 fn day_night(light: vec2<f32>) -> f32 {
-    return max(light.x * camera.sky_brightness, light.y);
+    return max(light_level(light.x) * camera.sky_brightness, light_level(light.y));
 }
 
 @fragment

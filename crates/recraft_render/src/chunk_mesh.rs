@@ -1200,11 +1200,10 @@ fn neighbor_light<S: BlockSource>(ctx: &BlockCtx<S>, x: i32, y: i32, z: i32) -> 
     }
 }
 
-/// Map a 0..15 light level to a 0..1 brightness, keeping dark areas readable
-/// while preserving the chunk light signal (the original flat-light curve).
+/// Normalize a 0..15 light level to 0..1 for the shader's brightness curve.
 #[inline]
 fn light_curve(level: f32) -> f32 {
-    0.18 + (level / 15.0) * 0.82
+    level / 15.0
 }
 
 /// Flat per-face light: the light of the single block in front of the face,

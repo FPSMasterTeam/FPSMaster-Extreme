@@ -71,7 +71,7 @@ fn vs_main(input: VertexInput) -> VertexOutput {
 }
 
 fn day_night(light: vec2<f32>) -> f32 {
-    return max(light.x * camera.sky_brightness, light.y);
+    return max(light_level(light.x) * camera.sky_brightness, light_level(light.y));
 }
 
 // Vanilla per-level brightness curve: light falls off steeply toward the dark
