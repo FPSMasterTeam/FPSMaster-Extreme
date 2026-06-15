@@ -255,9 +255,9 @@ fn network_thread(
     let mut has_sky_light = true;
 
     loop {
-        while let Ok(command) = commands.try_recv() {
-            match command {
-                NetworkCommand::Move(movement) => {
+        loop {
+            match commands.try_recv() {
+                Ok(NetworkCommand::Move(movement)) => {
                     for packet in walking_packets.next_packets(movement) {
                         log::debug!("sending {}", packet_debug_name(&packet));
                         let frame = packet.into_frame();
@@ -268,7 +268,7 @@ fn network_thread(
                         }
                     }
                 }
-                NetworkCommand::Send(packet) => {
+                Ok(NetworkCommand::Send(packet)) => {
                     log::debug!("sending {}", packet_debug_name(&packet));
                     if let Err(err) = client.write_packet(packet.into_frame()) {
                         let _ =
@@ -276,6 +276,8 @@ fn network_thread(
                         return;
                     }
                 }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => return,
             }
         }
 

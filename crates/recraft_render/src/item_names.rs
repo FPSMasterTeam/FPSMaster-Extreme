@@ -336,6 +336,27 @@ pub fn build_tooltip(item: &SlotItem) -> Vec<String> {
         }
     }
 
+    // Attribute modifiers (flag bit 1).
+    if hide_flags & 2 == 0 {
+        let modifiers = if let Some(list) = nbt
+            .and_then(|t| t.get("AttributeModifiers"))
+            .and_then(|t| t.as_list())
+        {
+            nbt_attribute_modifiers(list)
+        } else {
+            default_attribute_modifiers(item.id)
+        };
+        if !modifiers.is_empty() {
+            lines.push(String::new());
+            for (attr, amount, operation) in modifiers {
+                let display = format_modifier(&attr, amount, operation);
+                if let Some(line) = display {
+                    lines.push(line);
+                }
+            }
+        }
+    }
+
     lines
 }
 
@@ -369,6 +390,97 @@ fn item_rarity_color(item: &SlotItem) -> &'static str {
     } else {
         "\u{00a7}f" // WHITE
     }
+}
+
+/// Read attribute modifiers from the NBT `AttributeModifiers` list.
+fn nbt_attribute_modifiers(list: &[NbtTag]) -> Vec<(String, f64, i32)> {
+    let mut out = Vec::new();
+    for tag in list {
+        if let NbtTag::Compound(c) = tag {
+            let attr = match c.get("AttributeName").and_then(|t| t.as_str()) {
+                Some(s) => s.to_owned(),
+                None => continue,
+            };
+            let amount = c.get("Amount").and_then(|t| t.as_f64()).unwrap_or(0.0);
+            let operation = c
+                .get("Operation")
+                .and_then(|t| t.as_i32())
+                .unwrap_or(0);
+            out.push((attr, amount, operation));
+        }
+    }
+    out
+}
+
+/// Default attribute modifiers for vanilla weapons/tools (1.8.9).
+fn default_attribute_modifiers(id: i16) -> Vec<(String, f64, i32)> {
+    let damage = match id {
+        // Swords: 4.0 + material bonus
+        268 | 283 => 4.0,       // wood, gold
+        272 => 5.0,             // stone
+        267 => 6.0,             // iron
+        276 => 7.0,             // diamond
+        // Axes: 3.0 + material bonus
+        271 | 286 => 3.0,       // wood, gold
+        275 => 4.0,             // stone
+        258 => 5.0,             // iron
+        279 => 6.0,             // diamond
+        // Pickaxes: 2.0 + material bonus
+        270 | 285 => 2.0,       // wood, gold
+        274 => 3.0,             // stone
+        257 => 4.0,             // iron
+        278 => 5.0,             // diamond
+        // Shovels: 1.0 + material bonus
+        269 | 284 => 1.0,       // wood, gold
+        273 => 2.0,             // stone
+        256 => 3.0,             // iron
+        277 => 4.0,             // diamond
+        _ => return Vec::new(),
+    };
+    vec![("generic.attackDamage".to_owned(), damage, 0)]
+}
+
+/// Format one attribute modifier line with the vanilla color/sign convention.
+fn format_modifier(attr: &str, amount: f64, operation: i32) -> Option<String> {
+    let mut display_amount = amount;
+
+    if operation == 1 || operation == 2 {
+        display_amount *= 100.0;
+    } else if attr == "generic.attackDamage" {
+        display_amount += 1.0; // player base attack damage
+    }
+
+    if display_amount.abs() < 1e-9 {
+        return None;
+    }
+
+    let name = attribute_display_name(attr);
+    let abs = display_amount.abs();
+    let formatted = format_amount(abs);
+    let pct = if operation == 1 || operation == 2 { "%" } else { "" };
+
+    if display_amount > 0.0 {
+        Some(format!("\u{00a7}9 +{formatted}{pct} {name}"))
+    } else {
+        Some(format!("\u{00a7}c -{formatted}{pct} {name}"))
+    }
+}
+
+fn attribute_display_name(attr: &str) -> &str {
+    match attr {
+        "generic.attackDamage" => "Attack Damage",
+        "generic.movementSpeed" => "Speed",
+        "generic.maxHealth" => "Max Health",
+        "generic.knockbackResistance" => "Knockback Resistance",
+        "generic.followRange" => "Follow Range",
+        _ => attr,
+    }
+}
+
+fn format_amount(v: f64) -> String {
+    let s = format!("{v:.2}");
+    let s = s.trim_end_matches('0');
+    s.trim_end_matches('.').to_owned()
 }
 
 fn enchantment_name(id: i16, level: i16) -> Option<String> {
@@ -516,6 +628,27 @@ mod tests {
         nbt.insert("HideFlags".into(), NbtTag::Int(1)); // hide enchantments
         let item = SlotItem { id: 276, count: 1, damage: 0, nbt: Some(nbt) };
         let lines = build_tooltip(&item);
-        assert_eq!(lines.len(), 1); // only the name, no enchantments
+        // Name + blank + attack damage (enchantments hidden, attributes shown).
+        assert_eq!(lines.len(), 3);
+        assert!(!lines.iter().any(|l| l.contains("Sharpness")));
+        assert_eq!(lines[2], "\u{00a7}9 +8 Attack Damage");
+    }
+
+    #[test]
+    fn tooltip_hide_flags_suppresses_attributes() {
+        let mut nbt = NbtCompound::new();
+        nbt.insert("HideFlags".into(), NbtTag::Int(2)); // hide attributes
+        let item = SlotItem { id: 276, count: 1, damage: 0, nbt: Some(nbt) };
+        let lines = build_tooltip(&item);
+        assert_eq!(lines.len(), 1); // only the name
+    }
+
+    #[test]
+    fn tooltip_diamond_sword_shows_attack_damage() {
+        let item = SlotItem::new(276, 1, 0);
+        let lines = build_tooltip(&item);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[1], "");
+        assert_eq!(lines[2], "\u{00a7}9 +8 Attack Damage");
     }
 }

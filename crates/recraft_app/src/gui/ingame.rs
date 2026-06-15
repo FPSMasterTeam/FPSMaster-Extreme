@@ -19,6 +19,7 @@ use crate::text_input::TextInput;
 pub struct HudState<'a> {
     pub health: f32,
     pub food: i32,
+    pub armor: i32,
     pub xp_bar: f32,
     pub xp_level: i32,
     pub selected_slot: i32,
@@ -336,6 +337,21 @@ fn draw_status_bars(ui: &mut UiFrame, width: i32, height: i32, hud: &HudState) {
             n if n >= 2 => ui.image(dst, GuiTexture::Icons, 52, 0, 9, 9), // full
             1 => ui.image(dst, GuiTexture::Icons, 61, 0, 9, 9),           // half
             _ => {}
+        }
+    }
+
+    // Armor bar, left-aligned above health (only when wearing armor).
+    let armor = hud.armor.clamp(0, 20);
+    if armor > 0 {
+        let armor_y = row_y - 10 * scale;
+        for i in 0..10 {
+            let dst = UiRect::new(layout.x0 + i * step, armor_y, icon, icon);
+            ui.image(dst, GuiTexture::Icons, 16, 9, 9, 9); // empty
+            match armor - i * 2 {
+                n if n >= 2 => ui.image(dst, GuiTexture::Icons, 34, 9, 9, 9), // full
+                1 => ui.image(dst, GuiTexture::Icons, 25, 9, 9, 9),           // half
+                _ => {}
+            }
         }
     }
 

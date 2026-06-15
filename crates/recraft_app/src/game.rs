@@ -202,9 +202,21 @@ pub struct FirstPersonView {
     /// `rotateWithPlayerRotations` lag rotations, in degrees.
     pub arm_lag_pitch: f32,
     pub arm_lag_yaw: f32,
-    /// Whether the held item is actively in use (sword blocking) — drives the
-    /// vanilla `EnumAction.BLOCK` first-person pose.
-    pub blocking: bool,
+    /// The active use action (blocking, eating, drinking, bow draw) driving
+    /// the first-person pose and the movement slowdown.
+    pub use_action: ItemUseAction,
+    /// How many ticks the item has been in use (includes partial tick for smooth animation).
+    pub use_ticks: f32,
+}
+
+/// Vanilla `EnumAction`: the client-side use state for the held item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ItemUseAction {
+    None,
+    Block,
+    Eat,
+    Drink,
+    Bow,
 }
 
 /// Standing eye height above the feet, in blocks (vanilla 1.8).
@@ -464,10 +476,11 @@ pub struct GameState {
     selected_slot: i32,
     /// The block currently being mined (survival), with accumulated progress.
     breaking: Option<BreakProgress>,
-    /// Vanilla `itemInUse`: the held item is being used right now — set while a
-    /// sword is raised to block (right-mouse held). Drives the block pose and
-    /// the 0.2x movement slowdown, and gates the C07 release packet.
-    using_item: bool,
+    /// Vanilla `itemInUse`: the active use action for the held item (blocking,
+    /// eating, drinking, bow draw). Drives the first-person pose, the 0.2×
+    /// movement slowdown, and gates the C07 release packet.
+    use_action: ItemUseAction,
+    use_item_ticks: i32,
     /// Vanilla `Minecraft.leftClickCounter`: a 10-tick lockout after a survival
     /// left-click that hits nothing — blocks new attacks/digs while it runs.
     left_click_counter: i32,
@@ -538,10 +551,24 @@ struct BreakProgress {
 /// Vanilla arm-swing length in ticks (getArmSwingAnimationEnd, no haste).
 const ARM_SWING_END_TICKS: i32 = 6;
 
-/// 1.8 sword item ids (wood/gold/stone/iron/diamond) — the only items whose
-/// `getItemUseAction` is `BLOCK`, so the only ones that raise to block.
+/// 1.8 sword item ids (wood/gold/stone/iron/diamond).
 fn is_sword(id: i16) -> bool {
     matches!(id, 268 | 283 | 272 | 267 | 276)
+}
+
+/// Vanilla `Item.getItemUseAction` for 1.8.9 items.
+fn item_use_action(id: i16, damage: i16) -> ItemUseAction {
+    match id {
+        268 | 272 | 267 | 276 | 283 => ItemUseAction::Block,
+        261 => ItemUseAction::Bow,
+        373 if damage & 0x4000 == 0 => ItemUseAction::Drink,
+        335 => ItemUseAction::Drink,
+        260 | 282 | 297 | 319 | 320 | 322 | 349 | 350 | 357 | 360 | 363 | 364 | 365 | 366
+        | 367 | 375 | 391 | 392 | 393 | 394 | 396 | 400 | 412 | 413 | 423 | 424 => {
+            ItemUseAction::Eat
+        }
+        _ => ItemUseAction::None,
+    }
 }
 
 /// Whether a held item id is a placeable block (`ItemBlock`), used to decide if
@@ -670,7 +697,8 @@ impl GameState {
             prev_render_arm_yaw: 0.0,
             selected_slot: 0,
             breaking: None,
-            using_item: false,
+            use_action: ItemUseAction::None,
+            use_item_ticks: 0,
             left_click_counter: 0,
             right_click_delay_timer: 0,
             block_hit_delay: 0,
@@ -868,6 +896,15 @@ impl GameState {
     pub fn request_respawn(&mut self) {
         self.needs_respawn = true;
         self.is_dead = false;
+    }
+
+    /// Total armor points from equipped armor (inventory slots 5-8).
+    pub fn armor(&self) -> i32 {
+        self.inventory[5..9]
+            .iter()
+            .filter_map(|s| s.as_ref())
+            .map(|item| armor_points(item.id))
+            .sum()
     }
 
     /// The 9 hotbar slots (inventory indices 36..45) for the HUD.
@@ -1075,10 +1112,27 @@ impl GameState {
         // Hotbar slot change. Vanilla sets `inventory.currentItem` directly here
         // and does NOT send C09 — that goes out lazily via syncCurrentPlayItem
         // inside the next click/dig/use.
+        let prev_slot = self.selected_slot;
         if let Some(slot) = a.slot_select {
             self.selected_slot = slot.clamp(0, 8);
         } else if a.slot_scroll != 0 {
             self.selected_slot = (self.selected_slot + a.slot_scroll).rem_euclid(9);
+        }
+        if self.selected_slot != prev_slot && self.is_using_item() {
+            self.on_stopped_using_item(&mut out);
+        }
+
+        // Clear use state if the held item was consumed/changed by the server.
+        if self.is_using_item() {
+            if self
+                .held_item()
+                .map_or(true, |it| item_use_action(it.id, it.damage) != self.use_action)
+            {
+                self.use_action = ItemUseAction::None;
+                self.use_item_ticks = 0;
+            } else {
+                self.use_item_ticks += 1;
+            }
         }
 
         // `if (isUsingItem()) { ... } else { ... }` — while an item is in use
@@ -1237,7 +1291,7 @@ impl GameState {
         let mut move_forward = (f32::from(self.input.forward) - f32::from(self.input.backward))
             * if self.input.sneak { 0.3 } else { 1.0 };
         let sprint_key_down = self.input.sprint;
-        if self.using_item {
+        if self.is_using_item() {
             // Sword block slows the input to 0.2 (below the 0.8 sprint threshold).
             move_forward *= 0.2;
             self.sprint_toggle_timer = 0;
@@ -1253,7 +1307,7 @@ impl GameState {
             && move_forward >= 0.8
             && !self.sprinting
             && flag3
-            && !self.using_item
+            && !self.is_using_item()
         {
             if self.sprint_toggle_timer <= 0 && !sprint_key_down {
                 self.sprint_toggle_timer = 7;
@@ -1266,7 +1320,7 @@ impl GameState {
             && !self.sprinting
             && move_forward >= 0.8
             && flag3
-            && !self.using_item
+            && !self.is_using_item()
             && sprint_key_down
         {
             self.sprinting = true;
@@ -1288,7 +1342,7 @@ impl GameState {
             input.walk_speed = self.walk_speed_attribute;
             // Vanilla `EntityPlayerSP.onLivingUpdate`: using an item (sword
             // blocking) scales movement input to 0.2 — Grim's NoSlow expects it.
-            if self.using_item {
+            if self.is_using_item() {
                 input.forward *= 0.2;
                 input.strafe *= 0.2;
             }
@@ -1662,7 +1716,8 @@ impl GameState {
             swing_progress: self.swing_progress(partial),
             arm_lag_pitch: (self.player.pitch - arm_pitch) * 0.1,
             arm_lag_yaw: (self.player.yaw - arm_yaw) * 0.1,
-            blocking: self.using_item,
+            use_action: self.use_action,
+            use_ticks: self.use_item_ticks as f32 + partial,
         }
     }
 
@@ -1760,7 +1815,7 @@ impl GameState {
     }
 
     fn is_using_item(&self) -> bool {
-        self.using_item
+        self.use_action != ItemUseAction::None
     }
 
     /// Vanilla `EntityPlayerSP.swingItem`: start the local swing animation and
@@ -2055,23 +2110,19 @@ impl GameState {
         face: u8,
         cursor_y: u8,
         held: Option<&SlotItem>,
-    ) {
-        let Some(item) = held else { return };
-        // Right-clicking an interactable block (without sneaking) activates it
-        // rather than placing — don't conjure a phantom block in that case.
+    ) -> bool {
+        let Some(item) = held else { return false };
         if !self.input.sneak && is_interactable(self.world.block_at(x, y, z)) {
-            return;
+            return false;
         }
         let Some(state) = placement_block_state(item, face, self.player.yaw, cursor_y) else {
-            return;
+            return false;
         };
         let (dx, dy, dz) = face_offset(face);
         let (px, py, pz) = (x + dx, y + dy, z + dz);
         if !is_replaceable(self.world.block_at(px, py, pz)) {
-            return;
+            return false;
         }
-        // Vanilla forbids placing a block whose collision box would intersect the
-        // player (you can't seal yourself inside a cube).
         let pa = self.player.aabb;
         for b in state.collision_boxes().as_slice() {
             let min = DVec3::new(
@@ -2091,13 +2142,16 @@ impl GameState {
                 && pa.max.z > min.z
                 && pa.min.z < max.z
             {
-                return;
+                return false;
             }
         }
         let old = self.world.block_at(px, py, pz);
         if self.world.set_block_if_chunk_loaded(px, py, pz, state) {
             self.mark_block_dirty_urgent(px, py, pz);
             self.relight_after_edit(px, py, pz, old);
+            true
+        } else {
+            false
         }
     }
 
@@ -2204,8 +2258,7 @@ impl GameState {
         // onItemUse: a block item places (and is consumed); other items don't.
         match &held {
             Some(item) if is_block_item(item.id) => {
-                self.predict_placement(x, y, z, face, cursor_y, held.as_ref());
-                true
+                self.predict_placement(x, y, z, face, cursor_y, held.as_ref())
             }
             _ => false,
         }
@@ -2231,9 +2284,12 @@ impl GameState {
             cursor_y: 0,
             cursor_z: 0,
         });
-        // useItemRightClick: only a sword (EnumAction.BLOCK) enters the use state.
-        if held.is_some_and(|it| is_sword(it.id)) {
-            self.using_item = true;
+        if let Some(it) = held {
+            let action = item_use_action(it.id, it.damage);
+            if action != ItemUseAction::None {
+                self.use_action = action;
+                self.use_item_ticks = 0;
+            }
         }
     }
 
@@ -2248,7 +2304,8 @@ impl GameState {
             z: 0,
             face: 0,
         });
-        self.using_item = false;
+        self.use_action = ItemUseAction::None;
+        self.use_item_ticks = 0;
     }
 
     /// One-line diagnostic of the local player's physics state and the block it
@@ -3832,6 +3889,18 @@ fn build_demo_entity_stress(world: &mut World) -> DVec3 {
     DVec3::new(0.5, 2.0, 0.5)
 }
 
+/// Armor defense points per item ID (vanilla 1.8.9).
+fn armor_points(id: i16) -> i32 {
+    match id {
+        298 => 1, 299 => 3, 300 => 2, 301 => 1, // leather
+        302 => 2, 303 => 5, 304 => 4, 305 => 1, // chainmail
+        306 => 2, 307 => 6, 308 => 5, 309 => 2, // iron
+        310 => 3, 311 => 8, 312 => 6, 313 => 3, // diamond
+        314 => 2, 315 => 5, 316 => 3, 317 => 1, // gold
+        _ => 0,
+    }
+}
+
 #[cfg(test)]
 mod interaction_tests {
     use super::*;
@@ -4125,7 +4194,7 @@ mod interaction_tests {
             ),
             "got {start:?}"
         );
-        assert!(gs.using_item);
+        assert_eq!(gs.use_action, ItemUseAction::Block);
         // Holding keeps the item in use without re-sending anything.
         assert!(act(
             &mut gs,
@@ -4135,7 +4204,7 @@ mod interaction_tests {
             }
         )
         .is_empty());
-        assert!(gs.using_item);
+        assert_eq!(gs.use_action, ItemUseAction::Block);
         // Releasing sends C07 RELEASE_USE_ITEM and clears the state.
         let stop = act(&mut gs, TickActions::default());
         assert!(
@@ -4148,7 +4217,7 @@ mod interaction_tests {
             ),
             "got {stop:?}"
         );
-        assert!(!gs.using_item);
+        assert_eq!(gs.use_action, ItemUseAction::None);
     }
 
     #[test]
@@ -4156,7 +4225,7 @@ mod interaction_tests {
         let mut gs = looking_along_x();
         gs.inventory[36] = Some(SlotItem::new(1, 1, 0));
         // Vanilla sendUseItem fires for any held item (the "right-click air"
-        // C08), but only a sword enters the use/block state.
+        // C08), but only usable items enter the use state.
         let packets = use_item(&mut gs);
         assert!(
             matches!(
@@ -4165,7 +4234,7 @@ mod interaction_tests {
             ),
             "got {packets:?}"
         );
-        assert!(!gs.using_item);
+        assert_eq!(gs.use_action, ItemUseAction::None);
     }
 
     #[test]
@@ -4178,13 +4247,13 @@ mod interaction_tests {
         // Hold a sword and keep blocking (right held) so the tick keeps the
         // item in use and slows movement below the sprint threshold.
         gs.inventory[36] = Some(SlotItem::new(276, 1, 0));
-        gs.using_item = true;
+        gs.use_action = ItemUseAction::Block;
         gs.set_pending_actions(TickActions {
             right_held: true,
             ..Default::default()
         });
         let (_packets, movement) = gs.tick(0.05).expect("not a freeze tick");
-        assert!(gs.using_item, "still blocking while the button is held");
+        assert_eq!(gs.use_action, ItemUseAction::Block);
         assert!(!movement.sprinting, "blocking drops sprint within the tick");
     }
 

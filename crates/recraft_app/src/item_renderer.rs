@@ -21,7 +21,7 @@ use recraft_protocol::v1_8_9::packets::SlotItem;
 use recraft_render::texture::item_texture_name;
 use recraft_render::{AtlasUv, BiomeColors, Camera, HeldItemFrame, ModelMesh, Vertex};
 
-use crate::game::FirstPersonView;
+use crate::game::{FirstPersonView, ItemUseAction};
 
 /// One dropped item to render in the world: its stack, world position (entity
 /// feet) and animation phase (`age + partialTicks`) driving bob and spin.
@@ -73,14 +73,23 @@ impl ItemRenderer {
         // first-person pose. The item-model transforms below follow vanilla's
         // RenderItem order per branch.
         let mut m = first_person_base(view);
-        if view.blocking {
-            // Vanilla `EnumAction.BLOCK`: the swing is forced to 0 (no swing
-            // translation), then the sword is canted up to the block pose.
-            transform_first_person_item(&mut m, view.equip_progress, 0.0);
-            do_block_transformations(&mut m);
-        } else {
-            do_item_used_transformations(&mut m, view.swing_progress);
-            transform_first_person_item(&mut m, view.equip_progress, view.swing_progress);
+        match view.use_action {
+            ItemUseAction::Block => {
+                transform_first_person_item(&mut m, view.equip_progress, 0.0);
+                do_block_transformations(&mut m);
+            }
+            ItemUseAction::Eat | ItemUseAction::Drink => {
+                do_eat_drink_transformations(&mut m, view.use_ticks);
+                transform_first_person_item(&mut m, view.equip_progress, 0.0);
+            }
+            ItemUseAction::Bow => {
+                transform_first_person_item(&mut m, view.equip_progress, 0.0);
+                do_bow_transformations(&mut m, view.use_ticks);
+            }
+            ItemUseAction::None => {
+                do_item_used_transformations(&mut m, view.swing_progress);
+                transform_first_person_item(&mut m, view.equip_progress, view.swing_progress);
+            }
         }
 
         if (0..256).contains(&item.id) {
@@ -351,6 +360,44 @@ fn do_block_transformations(m: &mut Mat4) {
     gl_rotate(m, 30.0, 0.0, 1.0, 0.0);
     gl_rotate(m, -80.0, 1.0, 0.0, 0.0);
     gl_rotate(m, 60.0, 0.0, 1.0, 0.0);
+}
+
+/// Vanilla `performDrinking` (EAT/DRINK): vertical bobble then rotate the item
+/// toward the face, applied BEFORE `transformFirstPersonItem(equip, 0)`.
+fn do_eat_drink_transformations(m: &mut Mat4, use_ticks: f32) {
+    let pi = std::f32::consts::PI;
+    let max_duration = 32.0f32;
+    let remaining = (max_duration - use_ticks).max(1.0);
+    let ratio = remaining / max_duration;
+    let bobble = if ratio < 0.8 {
+        (remaining / 4.0 * pi).cos().abs() * 0.1
+    } else {
+        0.0
+    };
+    gl_translate(m, 0.0, bobble, 0.0);
+    let f = 1.0 - ratio.powi(27);
+    gl_translate(m, f * 0.6, f * -0.5, 0.0);
+    gl_rotate(m, f * 90.0, 0.0, 1.0, 0.0);
+    gl_rotate(m, f * 10.0, 1.0, 0.0, 0.0);
+    gl_rotate(m, f * 30.0, 0.0, 0.0, 1.0);
+}
+
+/// Vanilla `doBowTransformations`: the bow draws back over ~20 ticks with a
+/// subtle wobble, applied AFTER `transformFirstPersonItem(equip, 0)`.
+fn do_bow_transformations(m: &mut Mat4, use_ticks: f32) {
+    gl_rotate(m, -18.0, 0.0, 0.0, 1.0);
+    gl_rotate(m, -12.0, 0.0, 1.0, 0.0);
+    gl_rotate(m, -8.0, 1.0, 0.0, 0.0);
+    gl_translate(m, -0.9, 0.2, 0.0);
+    let elapsed = use_ticks;
+    let pull = ((elapsed / 20.0).powi(2) + elapsed / 20.0 * 2.0) / 3.0;
+    let pull = pull.min(1.0);
+    if pull > 0.1 {
+        let wobble = ((elapsed - 0.1) * 1.3).sin() * (pull - 0.1);
+        gl_translate(m, 0.0, wobble * 0.01, 0.0);
+    }
+    gl_translate(m, 0.0, 0.0, pull * 0.1);
+    gl_scale(m, 1.0, 1.0, 1.0 + pull * 0.2);
 }
 
 /// The 1.8 generated/handheld firstperson display transform
@@ -637,7 +684,8 @@ mod tests {
             swing_progress: 0.0,
             arm_lag_pitch: 0.0,
             arm_lag_yaw: 0.0,
-            blocking: false,
+            use_action: crate::game::ItemUseAction::None,
+            use_ticks: 0.0,
         }
     }
 

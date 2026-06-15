@@ -183,7 +183,15 @@ impl Container {
             WindowKind::Player => (84, 142, 176, 166),
         };
         add_player_inv(&mut slots, main_y, hot_y);
-        let inv = vec![None; container_size];
+        let needed = slots
+            .iter()
+            .filter_map(|s| match s.back {
+                SlotBack::Container(i) => Some(i + 1),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        let inv = vec![None; container_size.max(needed)];
         Self::with_slots(window_id, kind, title, inv, slots, x_size, y_size)
     }
 

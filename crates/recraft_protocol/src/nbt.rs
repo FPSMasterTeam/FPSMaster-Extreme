@@ -56,6 +56,14 @@ impl NbtTag {
         }
     }
 
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            NbtTag::Double(v) => Some(*v),
+            NbtTag::Float(v) => Some(*v as f64),
+            _ => None,
+        }
+    }
+
     pub fn as_bool(&self) -> bool {
         match self {
             NbtTag::Byte(v) => *v != 0,
