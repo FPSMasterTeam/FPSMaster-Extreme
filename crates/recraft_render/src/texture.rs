@@ -709,6 +709,89 @@ pub fn build_atlas_mip_chain(base: &[u8], width: u32, height: u32) -> Vec<(Vec<u
     levels
 }
 
+/// Edge length of the tileable 3D cloud-noise texture.
+pub const CLOUD_NOISE_DIM: u32 = 64;
+
+/// Generate a tileable 3D noise texture for volumetric clouds (RG8):
+/// R = low-frequency base shape, G = high-frequency detail (erosion). Sampling a
+/// precomputed 3D texture replaces hundreds of per-pixel `sin`-based fbm calls and
+/// gives real volumetric structure. Tileable so it can be sampled with Repeat.
+pub fn generate_cloud_noise() -> Vec<u8> {
+    let n = CLOUD_NOISE_DIM;
+    let mut data = vec![0u8; (n * n * n * 2) as usize];
+    for z in 0..n {
+        for y in 0..n {
+            for x in 0..n {
+                let p = [
+                    x as f32 / n as f32,
+                    y as f32 / n as f32,
+                    z as f32 / n as f32,
+                ];
+                let base = noise_fbm3(p, 4, 4.0);
+                let detail = noise_fbm3(p, 3, 12.0);
+                let i = ((z * n * n + y * n + x) * 2) as usize;
+                data[i] = (base.clamp(0.0, 1.0) * 255.0) as u8;
+                data[i + 1] = (detail.clamp(0.0, 1.0) * 255.0) as u8;
+            }
+        }
+    }
+    data
+}
+
+/// Deterministic 0..1 hash of an integer lattice point, wrapped to `period` so the
+/// noise tiles seamlessly over the texture domain.
+fn noise_hash3(xi: i32, yi: i32, zi: i32, period: i32) -> f32 {
+    let x = xi.rem_euclid(period) as u32;
+    let y = yi.rem_euclid(period) as u32;
+    let z = zi.rem_euclid(period) as u32;
+    let mut h = x
+        .wrapping_mul(73856093)
+        ^ y.wrapping_mul(19349663)
+        ^ z.wrapping_mul(83492791);
+    h ^= h >> 13;
+    h = h.wrapping_mul(0x5bd1_e995);
+    h ^= h >> 15;
+    (h & 0x00ff_ffff) as f32 / 0x00ff_ffff as f32
+}
+
+/// Trilinear value noise at `freq` cells over the [0,1) domain (lattice wraps at
+/// `freq` → tileable).
+fn noise_value3(p: [f32; 3], freq: f32) -> f32 {
+    let period = freq as i32;
+    let fp = [p[0] * freq, p[1] * freq, p[2] * freq];
+    let i = [fp[0].floor() as i32, fp[1].floor() as i32, fp[2].floor() as i32];
+    let f = [fp[0] - i[0] as f32, fp[1] - i[1] as f32, fp[2] - i[2] as f32];
+    let u = [
+        f[0] * f[0] * (3.0 - 2.0 * f[0]),
+        f[1] * f[1] * (3.0 - 2.0 * f[1]),
+        f[2] * f[2] * (3.0 - 2.0 * f[2]),
+    ];
+    let c = |dx: i32, dy: i32, dz: i32| noise_hash3(i[0] + dx, i[1] + dy, i[2] + dz, period);
+    let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t;
+    let x00 = lerp(c(0, 0, 0), c(1, 0, 0), u[0]);
+    let x10 = lerp(c(0, 1, 0), c(1, 1, 0), u[0]);
+    let x01 = lerp(c(0, 0, 1), c(1, 0, 1), u[0]);
+    let x11 = lerp(c(0, 1, 1), c(1, 1, 1), u[0]);
+    let y0 = lerp(x00, x10, u[1]);
+    let y1 = lerp(x01, x11, u[1]);
+    lerp(y0, y1, u[2])
+}
+
+/// Normalized fractal sum of [`noise_value3`] octaves (each doubles the frequency).
+fn noise_fbm3(p: [f32; 3], octaves: u32, base_freq: f32) -> f32 {
+    let mut v = 0.0;
+    let mut amp = 0.5;
+    let mut freq = base_freq;
+    let mut norm = 0.0;
+    for _ in 0..octaves {
+        v += amp * noise_value3(p, freq);
+        norm += amp;
+        freq *= 2.0;
+        amp *= 0.5;
+    }
+    v / norm
+}
+
 /// Average each 2×2 block of an RGBA8 image into one texel. RGB is weighted by
 /// source alpha (so fully-transparent texels contribute no colour), alpha is the
 /// straight mean.

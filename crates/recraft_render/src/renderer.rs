@@ -525,6 +525,15 @@ pub struct Renderer {
     panorama: Option<PanoramaResources>,
     sky_uniform_buffer: wgpu::Buffer,
     sky_bind_group: wgpu::BindGroup,
+    /// Volumetric clouds: half-res raymarch into `cloud_tex` from a 3D noise
+    /// texture; the sky pass samples `sky_cloud_bind_group` to composite it.
+    cloud_pipeline: wgpu::RenderPipeline,
+    _cloud_noise_texture: wgpu::Texture,
+    cloud_noise_bind_group: wgpu::BindGroup,
+    cloud_sample_layout: wgpu::BindGroupLayout,
+    cloud_tex: Option<wgpu::Texture>,
+    cloud_view: Option<wgpu::TextureView>,
+    sky_cloud_bind_group: Option<wgpu::BindGroup>,
     /// Sun/moon/stars pass: textured quads at infinity drawn after the gradient.
     celestial_pipeline: wgpu::RenderPipeline,
     celestial_uniform_buffer: wgpu::Buffer,
@@ -883,6 +892,145 @@ impl Renderer {
                 binding: 0,
                 resource: sky_uniform_buffer.as_entire_binding(),
             }],
+        });
+
+        // Volumetric clouds: a tileable 3D noise texture (base + detail) sampled by
+        // the half-res cloud pass, which the sky pass upsamples + composites.
+        let cnd = crate::texture::CLOUD_NOISE_DIM;
+        let noise_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("cloud-noise-3d"),
+            size: wgpu::Extent3d {
+                width: cnd,
+                height: cnd,
+                depth_or_array_layers: cnd,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D3,
+            format: wgpu::TextureFormat::Rg8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &noise_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &crate::texture::generate_cloud_noise(),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(cnd * 2),
+                rows_per_image: Some(cnd),
+            },
+            wgpu::Extent3d {
+                width: cnd,
+                height: cnd,
+                depth_or_array_layers: cnd,
+            },
+        );
+        let noise_view = noise_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let noise_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("cloud-noise-sampler"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            address_mode_w: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+        let noise_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("cloud-noise-layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let noise_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("cloud-noise-bind-group"),
+            layout: &noise_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&noise_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&noise_sampler),
+                },
+            ],
+        });
+        // Layout for the sky pass's group(1): the half-res cloud result + sampler.
+        let cloud_sample_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("cloud-sample-layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let cloud_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("cloud-shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shader/cloud.wgsl").into()),
+        });
+        let cloud_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("cloud-pipeline-layout"),
+            bind_group_layouts: &[Some(&sky_uniform_layout), Some(&noise_layout)],
+            immediate_size: 0,
+        });
+        let cloud_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("cloud-pipeline"),
+            layout: Some(&cloud_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &cloud_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &cloud_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: HDR_FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            cache: None,
+            multiview_mask: None,
         });
 
         // Celestial pass (sun/moon/stars): a rotation-only view-projection at
@@ -1716,7 +1864,7 @@ impl Renderer {
 
         let sky_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("sky-pipeline-layout"),
-            bind_group_layouts: &[Some(&sky_uniform_layout)],
+            bind_group_layouts: &[Some(&sky_uniform_layout), Some(&cloud_sample_layout)],
         immediate_size: 0,
         });
         let sky_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -2375,6 +2523,13 @@ impl Renderer {
             panorama,
             sky_uniform_buffer,
             sky_bind_group,
+            cloud_pipeline,
+            _cloud_noise_texture: noise_texture,
+            cloud_noise_bind_group: noise_bind_group,
+            cloud_sample_layout,
+            cloud_tex: None,
+            cloud_view: None,
+            sky_cloud_bind_group: None,
             celestial_pipeline,
             celestial_uniform_buffer,
             celestial_uniform_bind_group,
@@ -2852,6 +3007,38 @@ impl Renderer {
         }));
         self.vol_tex = Some(vol);
         self.vol_view = Some(vol_view);
+        // Half-resolution cloud target + the sky pass's bind group that samples it.
+        let cloud = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("cloud-halfres-hdr"),
+            size: wgpu::Extent3d {
+                width: vw,
+                height: vh,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: HDR_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let cloud_view = cloud.create_view(&wgpu::TextureViewDescriptor::default());
+        self.sky_cloud_bind_group = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("sky-cloud-bind-group"),
+            layout: &self.cloud_sample_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&cloud_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.post_sampler),
+                },
+            ],
+        }));
+        self.cloud_tex = Some(cloud);
+        self.cloud_view = Some(cloud_view);
         // Auto-exposure reduction reads the (full) off-screen scene.
         self.lum_bind_group = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("luminance-bind-group"),
@@ -3329,9 +3516,9 @@ impl Renderer {
                 ],
                 cloud_params: [
                     if self.shaders_enabled && self.clouds_enabled { 1.0 } else { 0.0 },
-                    0.0,
-                    0.0,
-                    0.0,
+                    0.5,                // coverage (fraction of sky filled)
+                    1.0,                // density multiplier
+                    sky.sun_brightness, // day factor for cloud lighting
                 ],
             }),
         );
@@ -3901,6 +4088,33 @@ impl Renderer {
             );
         }
 
+        // Half-resolution cloud pass: raymarch the cloud slab into cloud_tex; the
+        // sky pass below upsamples + composites it. Runs only when clouds are on.
+        if self.shaders_enabled && self.clouds_enabled && !panorama_active {
+            if let Some(cv) = &self.cloud_view {
+                let mut cp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("cloud-pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: cv,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    occlusion_query_set: None,
+                    timestamp_writes: None,
+                    multiview_mask: None,
+                });
+                cp.set_pipeline(&self.cloud_pipeline);
+                cp.set_bind_group(0, &self.sky_bind_group, &[]);
+                cp.set_bind_group(1, &self.cloud_noise_bind_group, &[]);
+                cp.draw(0..3, 0..1);
+            }
+        }
+
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main-render-pass"),
@@ -4137,6 +4351,9 @@ impl Renderer {
             if !self.debug_skip.sky && self.fancy_graphics {
             pass.set_pipeline(&self.sky_pipeline);
             pass.set_bind_group(0, &self.sky_bind_group, &[]);
+            if let Some(scb) = &self.sky_cloud_bind_group {
+                pass.set_bind_group(1, scb, &[]);
+            }
             pass.draw(0..3, 0..1);
             if let Some(mesh) = self.celestial_mesh.as_ref().filter(|m| m.index_count > 0) {
                 pass.set_pipeline(&self.celestial_pipeline);
