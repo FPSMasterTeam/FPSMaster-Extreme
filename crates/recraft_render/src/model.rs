@@ -1107,6 +1107,155 @@ fn entity_color(kind: EntityKind) -> [f32; 4] {
     }
 }
 
+// ─── Armor overlay ──────────────────────────────────────────────────────────
+
+/// Armor material derived from item id, with the two atlas layer slots.
+#[derive(Debug, Clone, Copy)]
+struct ArmorMaterial {
+    layer1: EntitySlot,
+    layer2: EntitySlot,
+}
+
+const LEATHER: ArmorMaterial = ArmorMaterial { layer1: EntitySlot::ArmorLeather1, layer2: EntitySlot::ArmorLeather2 };
+const CHAIN: ArmorMaterial = ArmorMaterial { layer1: EntitySlot::ArmorChain1, layer2: EntitySlot::ArmorChain2 };
+const IRON: ArmorMaterial = ArmorMaterial { layer1: EntitySlot::ArmorIron1, layer2: EntitySlot::ArmorIron2 };
+const GOLD: ArmorMaterial = ArmorMaterial { layer1: EntitySlot::ArmorGold1, layer2: EntitySlot::ArmorGold2 };
+const DIAMOND: ArmorMaterial = ArmorMaterial { layer1: EntitySlot::ArmorDiamond1, layer2: EntitySlot::ArmorDiamond2 };
+
+/// Map an armor item id to its material. Returns None for non-armor items.
+fn armor_material(item_id: i16) -> Option<ArmorMaterial> {
+    Some(match item_id {
+        298..=301 => LEATHER,
+        302..=305 => CHAIN,
+        306..=309 => IRON,
+        310..=313 => DIAMOND,
+        314..=317 => GOLD,
+        _ => return None,
+    })
+}
+
+/// Helmet overlay: an inflated head box (layer 1 texture, head UV region).
+/// Vanilla ModelBiped.bipedHead: rp(0,0,0), addBox(-4,-8,-4, 8,8,8, grow).
+fn helmet_parts() -> [Part; 1] {
+    [vbox([0.0, 0.0, 0.0], [-4.0, -8.0, -4.0], [8.0, 8.0, 8.0], [0.0, 0.0], 1.0)]
+}
+
+/// Chestplate overlay: inflated body + two arm boxes (layer 1 texture).
+/// rp/offset match the vanilla ModelBiped so the overlay tracks the skin.
+fn chestplate_parts() -> [Part; 3] {
+    let body = vbox([0.0, 0.0, 0.0], [-4.0, 0.0, -2.0], [8.0, 12.0, 4.0], [16.0, 16.0], 1.0);
+    // bipedRightArm: rp(-5,2,0), addBox(-3,-2,-2, 4,12,4, grow)
+    let arm_r = vbox([-5.0, 2.0, 0.0], [-3.0, -2.0, -2.0], [4.0, 12.0, 4.0], [40.0, 16.0], 1.0);
+    // bipedLeftArm: rp(5,2,0), addBox(-1,-2,-2, 4,12,4, grow)
+    let arm_l = vbox([5.0, 2.0, 0.0], [-1.0, -2.0, -2.0], [4.0, 12.0, 4.0], [40.0, 16.0], 1.0);
+    [body, arm_r, arm_l]
+}
+
+/// Leggings overlay: inflated body (waist) + two leg boxes (layer 2 texture).
+fn leggings_parts() -> [Part; 3] {
+    let body = vbox([0.0, 0.0, 0.0], [-4.0, 0.0, -2.0], [8.0, 12.0, 4.0], [16.0, 16.0], 0.5);
+    // bipedRightLeg: rp(-2,12,0), addBox(-2,0,-2, 4,12,4, grow)
+    let leg_r = vbox([-2.0, 12.0, 0.0], [-2.0, 0.0, -2.0], [4.0, 12.0, 4.0], [0.0, 16.0], 0.5);
+    let leg_l = vbox([2.0, 12.0, 0.0], [-2.0, 0.0, -2.0], [4.0, 12.0, 4.0], [0.0, 16.0], 0.5);
+    [body, leg_r, leg_l]
+}
+
+/// Boots overlay: two inflated leg boxes (layer 1 texture, leg UV region).
+fn boots_parts() -> [Part; 2] {
+    let leg_r = vbox([-2.0, 12.0, 0.0], [-2.0, 0.0, -2.0], [4.0, 12.0, 4.0], [0.0, 16.0], 1.0);
+    let leg_l = vbox([2.0, 12.0, 0.0], [-2.0, 0.0, -2.0], [4.0, 12.0, 4.0], [0.0, 16.0], 1.0);
+    [leg_r, leg_l]
+}
+
+impl ModelMesh {
+    /// Draw armor overlay boxes for the given equipment slots. Slots are indexed
+    /// 0=held(ignored), 1=boots, 2=leggings, 3=chestplate, 4=helmet.
+    /// `item_ids` are the item ids in each slot (None = empty).
+    pub fn push_armor(
+        &mut self,
+        equipment: &[Option<i16>; 5],
+        anim: &EntityAnim,
+        feet: Vec3,
+        yaw_degrees: f32,
+    ) {
+        let poses = humanoid_poses(anim);
+
+        // Helmet (slot 4)
+        if let Some(mat) = equipment[4].and_then(armor_material) {
+            let parts = helmet_parts();
+            let helmet_pose = [poses[5]]; // head pose
+            self.push_parts(&parts, &helmet_pose, mat.layer1 as u32, feet, yaw_degrees);
+        }
+
+        // Chestplate (slot 3): body + right arm + left arm
+        if let Some(mat) = equipment[3].and_then(armor_material) {
+            let parts = chestplate_parts();
+            let chest_poses = [poses[2], poses[3], poses[4]]; // body, right arm, left arm
+            self.push_parts(&parts, &chest_poses, mat.layer1 as u32, feet, yaw_degrees);
+        }
+
+        // Leggings (slot 2): body + right leg + left leg
+        if let Some(mat) = equipment[2].and_then(armor_material) {
+            let parts = leggings_parts();
+            let leg_poses = [poses[2], poses[0], poses[1]]; // body, right leg, left leg
+            self.push_parts(&parts, &leg_poses, mat.layer2 as u32, feet, yaw_degrees);
+        }
+
+        // Boots (slot 1): right leg + left leg
+        if let Some(mat) = equipment[1].and_then(armor_material) {
+            let parts = boots_parts();
+            let boot_poses = [poses[0], poses[1]]; // right leg, left leg
+            self.push_parts(&parts, &boot_poses, mat.layer1 as u32, feet, yaw_degrees);
+        }
+    }
+}
+
+// ─── Held item hand frame ───────────────────────────────────────────────────
+
+/// World-space reference frame for a held item in the right hand: the hand
+/// position plus three orthogonal axes that orient the item with the arm.
+#[derive(Debug, Clone, Copy)]
+pub struct HeldItemFrame {
+    /// World position of the hand (bottom of the right arm).
+    pub hand: Vec3,
+    /// Unit vector along the arm, from shoulder to hand (item extends here).
+    pub arm_dir: Vec3,
+    /// Unit vector the body faces (entity's +z in model space, rotated by yaw).
+    pub forward: Vec3,
+    /// Right-hand cross: arm_dir × forward, for the item's lateral axis.
+    pub right: Vec3,
+}
+
+/// Compute the world-space reference frame for an item held in the right hand.
+/// `feet` is the entity's world feet position, `yaw_degrees` the body yaw.
+pub fn held_item_frame(feet: Vec3, yaw_degrees: f32, anim: &EntityAnim) -> HeldItemFrame {
+    let poses = humanoid_poses(anim);
+    let arm_pose = &poses[3]; // right arm
+
+    // Two reference points on the arm in model px:
+    //  - shoulder = pivot = (-6, 24, 0)
+    //  - hand     = bottom of the arm box = (-6, 12, 0)
+    let shoulder_px = Vec3::new(-6.0, 24.0, 0.0);
+    let hand_px = Vec3::new(-6.0, 12.0, 0.0);
+
+    // Articulate both through the arm's rotation and the optional sneak tilt,
+    // then scale px → world and rotate by the body yaw.
+    let yaw = yaw_degrees.to_radians();
+    let (sin, cos) = (yaw.sin(), yaw.cos());
+    let to_world = |px: Vec3| rotate_y(apply_part_rotation(px, arm_pose) * MODEL_SCALE, sin, cos) + feet;
+
+    let shoulder = to_world(shoulder_px);
+    let hand = to_world(hand_px);
+
+    let arm_dir = (hand - shoulder).normalize_or_zero();
+    let forward = rotate_y(Vec3::Z, sin, cos); // body +z rotated by yaw
+    // Orthogonalize: right = arm_dir × forward, then re-derive forward
+    let right = arm_dir.cross(forward).normalize_or_zero();
+    let forward = right.cross(arm_dir).normalize_or_zero();
+
+    HeldItemFrame { hand, arm_dir, forward, right }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

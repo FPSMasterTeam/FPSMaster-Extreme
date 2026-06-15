@@ -94,19 +94,12 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         color = textureSample(scene_tex, scene_sampler, in.uv).rgb;
     }
 
-    // Depth of field: keep a wide sharp band around the auto-focused screen
-    // centre and gently blur only the distant background (never the focus plane
-    // or anything nearer, so blocks you look at / your hand stay crisp). r.z is
-    // the strength (0 = off).
+    // Near-field depth of field: blur only pixels very close to the camera
+    // (face pressed against a block). No auto-focus — fixed threshold.
     if (params.r.z > 0.0) {
         let texel = params.p.zw;
-        let focus_dist = length(
-            world_from_depth(vec2<f32>(0.5, 0.5), load_depth(vec2<f32>(0.5, 0.5))) - cam.camera_pos.xyz
-        );
         let pix_dist = length(world_from_depth(in.uv, load_depth(in.uv)) - cam.camera_pos.xyz);
-        // Sharp until 1.5x the focus distance (+8 block margin), ramping to full
-        // blur only by ~5.5x (+24). Far-field only — nearer pixels stay sharp.
-        let coc = smoothstep(focus_dist * 1.5 + 8.0, focus_dist * 5.5 + 24.0, pix_dist);
+        let coc = smoothstep(1.5, 0.3, pix_dist);
         let radius = coc * params.r.z * 4.0;
         if (radius > 0.5) {
             var acc = color;
@@ -121,11 +114,12 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         }
     }
 
-    // Motion blur: smear along the screen-space velocity from reprojecting this
-    // pixel into the previous frame. r.w is the strength (0 = off).
+    // Motion blur: reproject directly in clip space (prev_VP * inv_VP) to avoid
+    // large-world-coordinate precision loss that causes static-camera blur.
     if (params.r.w > 0.0) {
-        let pix_w = world_from_depth(in.uv, load_depth(in.uv));
-        let prev_clip = cam.prev_view_proj * vec4<f32>(pix_w, 1.0);
+        let depth = load_depth(in.uv);
+        let cur_clip = vec4<f32>(in.uv.x * 2.0 - 1.0, 1.0 - in.uv.y * 2.0, depth, 1.0);
+        let prev_clip = cam.prev_view_proj * (cam.inv_view_proj * cur_clip);
         let prev_uv = vec2<f32>(
             prev_clip.x / prev_clip.w * 0.5 + 0.5,
             0.5 - prev_clip.y / prev_clip.w * 0.5,

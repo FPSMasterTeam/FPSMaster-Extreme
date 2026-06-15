@@ -12,6 +12,8 @@ glam.workspace = true
 image.workspace = true
 log.workspace = true
 recraft_core = { path = "../recraft_core" }
+recraft_protocol = { path = "../recraft_protocol" }
+serde_json.workspace = true
 thiserror.workspace = true
 wgpu.workspace = true
 winit.workspace = true

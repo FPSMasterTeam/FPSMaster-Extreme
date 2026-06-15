@@ -34,6 +34,12 @@ var<uniform> lighting: Lighting;
 var shadow_map: texture_depth_2d;
 @group(2) @binding(2)
 var shadow_sampler: sampler_comparison;
+@group(2) @binding(3)
+var normal_atlas: texture_2d<f32>;
+@group(2) @binding(4)
+var specular_atlas: texture_2d<f32>;
+@group(2) @binding(5)
+var pbr_sampler: sampler;
 
 struct VertexInput {
     // xyz: world position × 64 as fixed-point i16.
@@ -125,6 +131,50 @@ fn light_curve(light: vec3<f32>, gamma: f32) -> vec3<f32> {
     return low + high;
 }
 
+// GGX normal distribution function.
+fn ggx_distribution(ndoth: f32, roughness: f32) -> f32 {
+    let a2 = roughness * roughness;
+    let d = ndoth * ndoth * (a2 - 1.0) + 1.0;
+    return a2 / (3.14159 * d * d);
+}
+
+// Smith geometry term (GGX, combined masking-shadowing).
+fn smith_ggx(ndotv: f32, ndotl: f32, roughness: f32) -> f32 {
+    let r = roughness + 1.0;
+    let k = (r * r) / 8.0;
+    let gv = ndotv / (ndotv * (1.0 - k) + k);
+    let gl = ndotl / (ndotl * (1.0 - k) + k);
+    return gv * gl;
+}
+
+// Schlick Fresnel approximation.
+fn fresnel_schlick(cos_theta: f32, f0: vec3<f32>) -> vec3<f32> {
+    return f0 + (vec3<f32>(1.0) - f0) * pow(1.0 - cos_theta, 5.0);
+}
+
+// Build TBN from geometric face normal (axis-aligned in Minecraft) and sample
+// the tangent-space normal from the PBR normal atlas.
+fn sample_pbr_normal(uv: vec2<f32>, geo_n: vec3<f32>) -> vec3<f32> {
+    let n_tex = textureSample(normal_atlas, pbr_sampler, uv);
+    var ts = n_tex.rgb * 2.0 - vec3<f32>(1.0);
+    ts.x = ts.x * 1.5;
+    ts.y = ts.y * 1.5;
+    let abs_n = abs(geo_n);
+    var tangent: vec3<f32>;
+    var bitangent: vec3<f32>;
+    if (abs_n.y > 0.9) {
+        tangent = vec3<f32>(1.0, 0.0, 0.0);
+        bitangent = vec3<f32>(0.0, 0.0, sign(geo_n.y));
+    } else if (abs_n.x > 0.9) {
+        tangent = vec3<f32>(0.0, 0.0, -sign(geo_n.x));
+        bitangent = vec3<f32>(0.0, 1.0, 0.0);
+    } else {
+        tangent = vec3<f32>(sign(geo_n.z), 0.0, 0.0);
+        bitangent = vec3<f32>(0.0, 1.0, 0.0);
+    }
+    return normalize(tangent * ts.x + bitangent * ts.y + geo_n * ts.z);
+}
+
 // Apply the shader-pack lighting model to an albedo colour. Falls back to the
 // vanilla flat day/night brightness when shaders are disabled.
 fn apply_lighting(albedo: vec3<f32>, in: VertexOutput) -> vec3<f32> {
@@ -135,27 +185,49 @@ fn apply_lighting(albedo: vec3<f32>, in: VertexOutput) -> vec3<f32> {
         // the steep per-level falloff, then the brightness gamma.
         return albedo * light_curve(vanilla_lightmap(in.light), gamma);
     }
-    let n = normalize(in.normal);
+    let geo_n = normalize(in.normal);
+    let pbr_on = lighting.fog_color.w > 0.5;
+    let n = select(geo_n, sample_pbr_normal(in.uv, geo_n), pbr_on);
     let ndotl = max(dot(n, lighting.sun_dir.xyz), 0.0);
     var shadow = 1.0;
     if (lighting.flags.y > 0.5) {
         shadow = sun_shadow(in.world_pos, ndotl);
     }
-    let sky = in.light.x;       // skylight 0..1 — gates the sun (indoors = none)
-    let block = in.light.y;     // blocklight 0..1 — torches/lava
-    // Ambient must track day/night: the skylight channel stays high at night
-    // (only the directional sun sets), so gate the sky-driven ambient by the
-    // day/night brightness, leaving a small floor so it's never pure black.
-    // Only the skylight-driven part tracks day/night; the small floor is constant
-    // so an enclosed/sky-less space stays the same brightness day or night.
+    let sky = in.light.x;
+    let block = in.light.y;
     let day = max(camera.sky_brightness, 0.04);
     let ambient = lighting.ambient.rgb * (0.08 + 0.92 * sky * day);
-    let sun = lighting.sun_color.rgb * (ndotl * shadow * sky);
     let torch = vec3<f32>(1.0, 0.82, 0.55) * block;
-    var lit = albedo * light_curve(ambient + sun + torch, gamma);
 
-    // Blinn-Phong specular (phase 2): a tight sun highlight, sky-gated. Added
-    // after the gamma curve so highlights stay crisp.
+    if (pbr_on) {
+        let view_dir = normalize(lighting.camera_pos.xyz - in.world_pos);
+        let spec_tex = textureSample(specular_atlas, pbr_sampler, in.uv);
+        let smoothness = spec_tex.r;
+        let metallic = spec_tex.g;
+        let emissive = spec_tex.b;
+        let roughness = max((1.0 - smoothness) * (1.0 - smoothness), 0.04);
+        let f0 = mix(vec3<f32>(0.04), albedo, metallic);
+        let half_dir = normalize(lighting.sun_dir.xyz + view_dir);
+        let ndotv = max(dot(n, view_dir), 0.001);
+        let ndoth = max(dot(n, half_dir), 0.0);
+        let vdoth = max(dot(view_dir, half_dir), 0.0);
+        let D = ggx_distribution(ndoth, roughness);
+        let G = smith_ggx(ndotv, ndotl, roughness);
+        let F = fresnel_schlick(vdoth, f0);
+        let spec_brdf = (D * G * F) / max(4.0 * ndotv * ndotl, 0.001);
+        let kd = (vec3<f32>(1.0) - F) * (1.0 - metallic);
+        let sun_light = lighting.sun_color.rgb * (ndotl * shadow * sky);
+        let ao = clamp(dot(n, geo_n), 0.3, 1.0);
+        var lit = (kd * albedo + spec_brdf) * sun_light
+            + albedo * light_curve(ambient * ao + torch, gamma);
+        let env_spec = f0 * smoothness * smoothness * ambient * ao * sky * 0.5;
+        lit = lit + env_spec;
+        lit = lit + albedo * emissive * 3.0;
+        return lit;
+    }
+
+    let sun = lighting.sun_color.rgb * (ndotl * shadow * sky);
+    var lit = albedo * light_curve(ambient + sun + torch, gamma);
     if (lighting.flags.z > 0.5) {
         let view_dir = normalize(lighting.camera_pos.xyz - in.world_pos);
         let half_dir = normalize(lighting.sun_dir.xyz + view_dir);

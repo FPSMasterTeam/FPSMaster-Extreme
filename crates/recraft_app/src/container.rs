@@ -225,8 +225,8 @@ impl Container {
     /// Read a window slot for rendering / engine use.
     fn get(&self, slot: usize, player: &[Option<SlotItem>]) -> Option<SlotItem> {
         match self.slots[slot].back {
-            SlotBack::Container(i) => self.container_inv.get(i).copied().flatten(),
-            SlotBack::Player(i) => player.get(i).copied().flatten(),
+            SlotBack::Container(i) => self.container_inv.get(i).cloned().flatten(),
+            SlotBack::Player(i) => player.get(i).cloned().flatten(),
         }
     }
 
@@ -336,7 +336,7 @@ impl Container {
             } else if self.drag_event == 1 {
                 if slot_id >= 0 && (slot_id as usize) < self.slots.len() {
                     let s = slot_id as usize;
-                    let c = cursor.expect("cursor present");
+                    let c = cursor.clone().expect("cursor present");
                     let existing = self.get(s, player);
                     if can_add_to_slot(&self.slots[s], existing, &c, true)
                         && self.slots[s].is_item_valid()
@@ -348,13 +348,13 @@ impl Container {
                 }
             } else if self.drag_event == 2 {
                 if !self.drag_slots.is_empty() {
-                    let c = cursor.expect("cursor present");
+                    let c = cursor.clone().expect("cursor present");
                     let mut remaining = c.count as i32;
                     let n = self.drag_slots.len();
                     let slots = self.drag_slots.clone();
                     for s in slots {
                         let existing = self.get(s, player);
-                        if !(can_add_to_slot(&self.slots[s], existing, &c, true)
+                        if !(can_add_to_slot(&self.slots[s], existing.clone(), &c, true)
                             && self.slots[s].is_item_valid()
                             && c.count as usize >= n)
                         {
@@ -365,7 +365,7 @@ impl Container {
                         let limit = max_stack(&c).min(self.slots[s].stack_limit()) as i32;
                         let total = (per + have).min(limit);
                         remaining -= total - have;
-                        self.set(s, player, Some(SlotItem { count: total as u8, ..c }));
+                        self.set(s, player, Some(SlotItem { count: total as u8, ..c.clone() }));
                     }
                     *cursor = (remaining > 0).then_some(SlotItem {
                         count: remaining as u8,
@@ -381,7 +381,7 @@ impl Container {
         } else if (mode == 0 || mode == 1) && (button == 0 || button == 1) {
             if slot_id == -999 {
                 // ── Drop the cursor outside the window ────────────────────
-                if let Some(mut c) = *cursor {
+                if let Some(mut c) = cursor.clone() {
                     if button == 0 {
                         *cursor = None;
                     } else {
@@ -398,7 +398,7 @@ impl Container {
                     let before = self.get(s, player);
                     let moved = self.transfer_stack_in_slot(s, player);
                     if let Some(m) = moved {
-                        ret = Some(m);
+                        ret = Some(m.clone());
                         // Retry while the slot still holds the same item (vanilla
                         // empties a partially-moved stack with repeated transfers).
                         if before.is_some_and(|b| b.id == m.id) {
@@ -417,15 +417,15 @@ impl Container {
                 // ── Normal pick / place / swap / merge ────────────────────
                 let s = slot_id as usize;
                 let slot_stack = self.get(s, player);
-                if let Some(ss) = slot_stack {
+                if let Some(ss) = slot_stack.clone() {
                     ret = Some(ss);
                 }
-                match (*cursor, slot_stack) {
+                match (cursor.clone(), slot_stack) {
                     (Some(cur), None) => {
                         if self.slots[s].is_item_valid() {
                             let mut take = if button == 0 { cur.count } else { 1 };
                             take = take.min(self.slots[s].stack_limit());
-                            self.set(s, player, Some(SlotItem { count: take, ..cur }));
+                            self.set(s, player, Some(SlotItem { count: take, ..cur.clone() }));
                             let left = cur.count - take;
                             *cursor = (left > 0).then_some(SlotItem { count: left, ..cur });
                         }
@@ -433,7 +433,7 @@ impl Container {
                     (None, Some(ss)) => {
                         if self.slots[s].can_take() {
                             let take = if button == 0 { ss.count } else { ss.count.div_ceil(2) };
-                            *cursor = Some(SlotItem { count: take, ..ss });
+                            *cursor = Some(SlotItem { count: take, ..ss.clone() });
                             let left = ss.count - take;
                             self.set(s, player, (left > 0).then_some(SlotItem { count: left, ..ss }));
                         }
@@ -476,7 +476,7 @@ impl Container {
                 let hb = 36 + button as usize; // hotbar slot in the player inventory
                 if self.slots[s].can_take() {
                     let slot_stack = self.get(s, player);
-                    let hot = player.get(hb).copied().flatten();
+                    let hot = player.get(hb).cloned().flatten();
                     // Vanilla only allows the swap when the destination can hold
                     // the displaced stack (same inventory / item valid / a spare).
                     let into_slot_ok = hot.is_none()
@@ -520,7 +520,7 @@ impl Container {
             // ── Double-click: collect matching items onto the cursor ──────
             let s = slot_id as usize;
             let slot_stack = self.get(s, player);
-            if let Some(mut cur) = *cursor {
+            if let Some(mut cur) = cursor.clone() {
                 let blocked = slot_stack.is_none() || !self.slots[s].can_take();
                 if blocked {
                     let len = self.slots.len();
@@ -560,7 +560,7 @@ impl Container {
     /// original stack (or None if nothing moved).
     fn transfer_stack_in_slot(&mut self, s: usize, player: &mut [Option<SlotItem>]) -> Option<SlotItem> {
         let original = self.get(s, player)?;
-        let mut stack = original;
+        let mut stack = original.clone();
         let c = self.container_size();
         let total = self.slots.len();
         let moved = match self.kind {
@@ -580,8 +580,9 @@ impl Container {
             return None;
         }
         // Write back the shrunk source stack.
-        self.set(s, player, (stack.count > 0).then_some(stack));
-        if stack.count == original.count {
+        let remaining = stack.count;
+        self.set(s, player, if remaining > 0 { Some(stack) } else { None });
+        if remaining == original.count {
             // Nothing actually moved (full target) — vanilla returns null.
             return None;
         }
@@ -648,7 +649,9 @@ impl Container {
             for &i in &order {
                 if self.get(i, player).is_none() && self.slots[i].is_item_valid() {
                     let put = stack.count.min(self.slots[i].stack_limit());
-                    self.set(i, player, Some(SlotItem { count: put, ..*stack }));
+                    let mut new_item = stack.clone();
+                    new_item.count = put;
+                    self.set(i, player, Some(new_item));
                     stack.count -= put;
                     flag = true;
                     break;

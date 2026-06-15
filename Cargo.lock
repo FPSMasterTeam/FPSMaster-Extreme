@@ -2130,6 +2130,8 @@ dependencies = [
  "log",
  "pollster",
  "recraft_core",
+ "recraft_protocol",
+ "serde_json",
  "thiserror 1.0.69",
  "wgpu",
  "winit",

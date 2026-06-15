@@ -19,7 +19,7 @@ use glam::{Mat4, Vec3};
 use recraft_core::{BlockFace, BlockState, RenderShape, Tint};
 use recraft_protocol::v1_8_9::packets::SlotItem;
 use recraft_render::texture::item_texture_name;
-use recraft_render::{AtlasUv, BiomeColors, Camera, ModelMesh, Vertex};
+use recraft_render::{AtlasUv, BiomeColors, Camera, HeldItemFrame, ModelMesh, Vertex};
 
 use crate::game::FirstPersonView;
 
@@ -30,6 +30,14 @@ pub struct DroppedItem {
     pub pos: Vec3,
     pub phase: f32,
     /// `[sky_light, block_light]` in 0..1, sampled at the entity position.
+    pub light: [f32; 2],
+}
+
+/// A held item on another player, with the arm's world-space reference frame
+/// so the item model can be oriented correctly.
+pub struct PlayerHeldItem {
+    pub item: SlotItem,
+    pub frame: HeldItemFrame,
     pub light: [f32; 2],
 }
 
@@ -57,7 +65,7 @@ impl ItemRenderer {
     ) -> (Vec<Vertex>, Vec<u32>) {
         let mut vertices = Vec::new();
         let mut indices = Vec::new();
-        let Some(item) = view.item else {
+        let Some(ref item) = view.item else {
             return (vertices, indices);
         };
 
@@ -152,7 +160,7 @@ impl ItemRenderer {
                 }
             };
 
-            let item = d.item;
+            let item = &d.item;
             if (0..256).contains(&item.id) {
                 let block = BlockState::new(item.id as u16, (item.damage.max(0) & 15) as u8);
                 if block.is_air() || block.render_shape() == RenderShape::None {
@@ -193,6 +201,85 @@ impl ItemRenderer {
                     atlas,
                     [1.0, 1.0, 1.0],
                     d.light,
+                );
+            }
+        }
+        (vertices, indices)
+    }
+
+    /// Build geometry for items held by other players. Each item is positioned
+    /// at the player's right hand and oriented along the arm, replicating
+    /// vanilla's `LayerHeldItem` third-person appearance.
+    pub fn build_player_held_items(
+        held: &[PlayerHeldItem],
+        atlas: &AtlasUv,
+    ) -> (Vec<Vertex>, Vec<u32>) {
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+
+        for h in held {
+            let f = &h.frame;
+            let item = &h.item;
+            // The item extends along the arm direction, centered at the hand.
+            // `arm_dir` points shoulder→hand (roughly downward at rest),
+            // `forward` is the body's front, `right` is the lateral axis.
+            let size = 0.35;
+            let half = size * 0.5;
+
+            // Build a local→world transform using the arm frame:
+            //  - item X → frame.right
+            //  - item Y → -frame.arm_dir  (up = opposite to arm direction)
+            //  - item Z → frame.forward
+            // Origin: hand, shifted slightly along arm_dir so the item hangs
+            // below the hand rather than centering on it.
+            let origin = f.hand + f.arm_dir * half;
+
+            let to_world = |c: Vec3| {
+                let local = (c - Vec3::splat(0.5)) * size;
+                origin + f.right * local.x - f.arm_dir * local.y + f.forward * local.z
+            };
+
+            if (0..256).contains(&item.id) {
+                let block =
+                    BlockState::new(item.id as u16, (item.damage.max(0) & 15) as u8);
+                if block.is_air() || block.render_shape() == RenderShape::None {
+                    continue;
+                }
+                match block.render_shape() {
+                    RenderShape::Cross | RenderShape::Rail | RenderShape::Ladder => {
+                        let name = block.texture_name(BlockFace::Side).map(str::to_owned);
+                        let tint = tint3(block.tint(BlockFace::Side));
+                        push_held_sprite(
+                            &mut vertices,
+                            &mut indices,
+                            &to_world,
+                            name.as_deref(),
+                            atlas,
+                            tint,
+                            h.light,
+                        );
+                    }
+                    _ => {
+                        push_block_cube(
+                            &mut vertices,
+                            &mut indices,
+                            &to_world,
+                            block,
+                            atlas,
+                            h.light,
+                        );
+                    }
+                }
+            } else if let Some(name) = item_texture_name(item.id) {
+                let name = format!("items/{name}");
+                push_held_sprite(
+                    &mut vertices,
+                    &mut indices,
+                    &to_world,
+                    Some(&name),
+                    atlas,
+                    [1.0, 1.0, 1.0],
+                    h.light,
                 );
             }
         }
@@ -407,6 +494,44 @@ fn push_block_cube(
     }
 }
 
+/// Simplified held sprite: front and back quads through the caller's transform
+/// (oriented by the arm frame, not billboarded). No per-pixel extrusion —
+/// just the two flat faces, which is enough at third-person distance.
+fn push_held_sprite(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+    to_world: &dyn Fn(Vec3) -> Vec3,
+    name: Option<&str>,
+    atlas: &AtlasUv,
+    tint: [f32; 3],
+    light: [f32; 2],
+) {
+    let rect = atlas.tile_rect(name);
+    let uv = |u: f32, v: f32| [rect[0] + u * rect[2], rect[1] + v * rect[3]];
+    let color = [tint[0], tint[1], tint[2], 1.0];
+    let w = |x: f32, y: f32, z: f32| to_world(Vec3::new(x, y, z));
+
+    const ZF: f32 = 0.53;
+    const ZB: f32 = 0.47;
+
+    push_quad(
+        vertices,
+        indices,
+        [w(0.0, 1.0, ZF), w(0.0, 0.0, ZF), w(1.0, 0.0, ZF), w(1.0, 1.0, ZF)],
+        [uv(0.0, 0.0), uv(0.0, 1.0), uv(1.0, 1.0), uv(1.0, 0.0)],
+        color,
+        light,
+    );
+    push_quad(
+        vertices,
+        indices,
+        [w(1.0, 1.0, ZB), w(1.0, 0.0, ZB), w(0.0, 0.0, ZB), w(0.0, 1.0, ZB)],
+        [uv(1.0, 0.0), uv(1.0, 1.0), uv(0.0, 1.0), uv(0.0, 0.0)],
+        color,
+        light,
+    );
+}
+
 /// A held sprite item: vanilla `ItemModelGenerator` geometry — the 16×16
 /// layer extruded into a 1px-deep slab (z 7.5/16 to 8.5/16). Front and back
 /// faces carry the texture (alpha-cut by the cutout shader), and every pixel
@@ -507,11 +632,7 @@ mod tests {
 
     fn view(id: Option<i16>) -> FirstPersonView {
         FirstPersonView {
-            item: id.map(|id| SlotItem {
-                id,
-                count: 1,
-                damage: 0,
-            }),
+            item: id.map(|id| SlotItem::new(id, 1, 0)),
             equip_progress: 0.0,
             swing_progress: 0.0,
             arm_lag_pitch: 0.0,
@@ -565,11 +686,7 @@ mod tests {
 
     fn dropped(id: i16) -> DroppedItem {
         DroppedItem {
-            item: SlotItem {
-                id,
-                count: 1,
-                damage: 0,
-            },
+            item: SlotItem::new(id, 1, 0),
             pos: Vec3::new(0.0, 64.0, -3.0),
             phase: 5.0,
             light: [1.0, 0.0],

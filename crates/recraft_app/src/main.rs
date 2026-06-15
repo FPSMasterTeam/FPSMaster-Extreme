@@ -230,9 +230,15 @@ fn main() -> anyhow::Result<()> {
     if !settings.fullscreen {
         apply_display(window, &settings);
     }
-    // Atlas UV table snapshot for first-person item geometry (cheap clone of
-    // the name→tile map, taken once).
-    let atlas_uv = renderer.atlas_uv().clone();
+    // Load saved resource pack (if any) before taking the atlas snapshot.
+    if let Some(ref pack_name) = settings.resource_pack {
+        let pack_path = std::path::PathBuf::from("resourcepacks").join(pack_name);
+        if pack_path.exists() {
+            renderer.reload_atlas(Some(pack_path));
+        }
+    }
+    let mut atlas_uv = renderer.atlas_uv().clone();
+    let overlay_textures = recraft_render::OverlayTextures::load();
 
     let auto_connect = config.server.clone();
     let auto_demo = auto_play && auto_connect.is_none();
@@ -388,7 +394,7 @@ fn main() -> anyhow::Result<()> {
                             Vec::new()
                         };
                         app.screen = taken;
-                        handle_actions(&mut app, &mut renderer, window, actions);
+                        handle_actions(&mut app, &mut renderer, window, actions, &mut atlas_uv);
                     } else if app.in_world {
                         // Gameplay input.
                         let pressed = event.state == ElementState::Pressed;
@@ -486,7 +492,7 @@ fn main() -> anyhow::Result<()> {
                                 Vec::new()
                             };
                             app.screen = taken;
-                            handle_actions(&mut app, &mut renderer, window, actions);
+                            handle_actions(&mut app, &mut renderer, window, actions, &mut atlas_uv);
                         }
                     } else if app.screen.is_some() {
                         if is_left || is_right || is_middle {
@@ -516,7 +522,7 @@ fn main() -> anyhow::Result<()> {
                                 Vec::new()
                             };
                             app.screen = taken;
-                            handle_actions(&mut app, &mut renderer, window, actions);
+                            handle_actions(&mut app, &mut renderer, window, actions, &mut atlas_uv);
                             sync_cursor(window, &mut cursor_captured, &app);
                         }
                     } else if app.in_world {
@@ -548,7 +554,7 @@ fn main() -> anyhow::Result<()> {
             } if app.in_world && app.screen.is_none() => app.game.rotate_view(
                 delta.0 as f32,
                 delta.1 as f32,
-                app.settings.mouse_factor(),
+                app.settings.clone().mouse_factor(),
             ),
             Event::AboutToWait => {
                 // --- Network event pump (bounded per iteration). ---
@@ -579,7 +585,7 @@ fn main() -> anyhow::Result<()> {
                     Vec::new()
                 };
                 app.screen = taken;
-                handle_actions(&mut app, &mut renderer, window, actions);
+                handle_actions(&mut app, &mut renderer, window, actions, &mut atlas_uv);
 
                 // Scripted runs auto-respawn so the smoke driver keeps moving.
                 if scripted_smoke_seconds.is_some() && app.game.is_dead() {
@@ -690,7 +696,7 @@ fn main() -> anyhow::Result<()> {
                 // The pass benchmark runs uncapped so the frame time reflects GPU
                 // cost (a cap would just turn saved GPU time into sleep).
                 if pass_bench.is_none() {
-                    if let Some(cap) = app.settings.fps_limit() {
+                    if let Some(cap) = app.settings.clone().fps_limit() {
                         let deadline = last_frame + Duration::from_secs_f64(1.0 / cap as f64);
                         let now = Instant::now();
                         if now < deadline {
@@ -707,6 +713,7 @@ fn main() -> anyhow::Result<()> {
                     &mut app,
                     window,
                     &atlas_uv,
+                    &overlay_textures,
                     &mut fps_counter,
                     &mut last_frame,
                     tick_accumulator,
@@ -812,6 +819,7 @@ fn handle_actions(
     renderer: &mut Renderer,
     window: &winit::window::Window,
     actions: Vec<GuiAction>,
+    atlas_uv: &mut recraft_render::AtlasUv,
 ) {
     for action in actions {
         match action {
@@ -953,6 +961,10 @@ fn handle_actions(
                     network.send_packet(packet);
                 }
             }
+            GuiAction::ReloadResourcePack(path) => {
+                log::info!("resource pack reload requested: {:?}", path);
+                *atlas_uv = renderer.reload_atlas(path);
+            }
         }
     }
 }
@@ -1001,24 +1013,24 @@ fn poll_auth_events(app: &mut App) {
     }
 }
 
-/// Process a bounded number of network events per iteration so the join-time
-/// chunk burst can't stall the loop; the rest drain on following iterations.
+/// Drain all pending network events. Transaction pongs are sent immediately
+/// on the network thread, so all preceding game-state packets (especially
+/// DestroyEntities) must be processed before the next tick — otherwise the
+/// server (Grim) considers entities removed while the client still sees them,
+/// causing BadPacketsW ("interacted with non-existent entity").
 fn pump_network(app: &mut App, window: &winit::window::Window, cursor_captured: &mut bool) {
     let Some(network) = &app.network else { return };
-    let mut packet_budget = 64;
     let mut disconnect: Option<String> = None;
-    while packet_budget > 0 {
+    loop {
         match network.events.try_recv() {
             Ok(NetworkEvent::Connected { username, uuid }) => {
                 log::info!("logged in as {username} ({uuid})");
             }
             Ok(NetworkEvent::PlayPacket(packet)) => {
                 app.game.apply_play_packet(packet);
-                packet_budget -= 1;
             }
             Ok(NetworkEvent::ChunkColumn { x, z, column }) => {
                 app.game.apply_chunk_column(x, z, &column);
-                packet_budget -= 1;
             }
             Ok(NetworkEvent::ChunkUnload { x, z }) => {
                 app.game.unload_chunk(x, z);
@@ -1245,6 +1257,7 @@ fn render_frame(
     app: &mut App,
     window: &winit::window::Window,
     atlas_uv: &recraft_render::AtlasUv,
+    overlay_textures: &recraft_render::OverlayTextures,
     fps_counter: &mut FpsCounter,
     last_frame: &mut Instant,
     tick_accumulator: f32,
@@ -1337,8 +1350,13 @@ fn render_frame(
         }
         renderer.upload_model(&app.entity_model);
         let dropped = app.game.dropped_items(tick_alpha);
-        let (item_vertices, item_indices) =
+        let (mut item_vertices, mut item_indices) =
             ItemRenderer::build_world_items(&app.game.camera, &dropped, atlas_uv);
+        let held = app.game.player_held_items(tick_alpha);
+        let (held_v, held_i) = ItemRenderer::build_player_held_items(&held, atlas_uv);
+        let base = item_vertices.len() as u32;
+        item_vertices.extend(held_v);
+        item_indices.extend(held_i.iter().map(|i| i + base));
         renderer.set_world_items(&item_vertices, &item_indices);
     } else {
         renderer.upload_model(&recraft_render::ModelMesh::new());
@@ -1380,6 +1398,8 @@ fn render_frame(
         player_list: &game.player_list,
         tab_open,
         title: game.title_overlay(tick_accumulator / 0.05),
+        screen_overlay: game.screen_overlay(),
+        overlay_textures: &overlay_textures,
     };
     if hud_visible {
         // The render stats are the previous frame's (collected after the draw);

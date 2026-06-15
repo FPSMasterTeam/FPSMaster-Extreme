@@ -1,6 +1,7 @@
 pub mod codec;
 pub mod crypto;
 pub mod io;
+pub mod nbt;
 pub mod net;
 pub mod v1_8_9;
 pub mod version;

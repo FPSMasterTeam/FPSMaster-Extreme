@@ -622,6 +622,11 @@ pub enum ClientboundPlayPacket {
         entity_id: i32,
         animation: u8,
     },
+    /// S1A EntityStatus — entity event byte: 2 = hurt, 3 = dead, etc.
+    EntityStatus {
+        entity_id: i32,
+        status: i8,
+    },
     /// S1B AttachEntity — `entity_id` mounts (or leashes) onto `vehicle_id`;
     /// `vehicle_id == -1` detaches, and `leash` distinguishes a leash from a
     /// ride. Both ids are full ints in 1.8, not VarInts.
@@ -646,12 +651,19 @@ pub enum ClientboundPlayPacket {
     },
 }
 
-/// Minimal decoded Slot data (id/count/damage; NBT is skipped).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Decoded Slot data: id, count, damage, and the optional NBT compound.
+#[derive(Debug, Clone, PartialEq)]
 pub struct SlotItem {
     pub id: i16,
     pub count: u8,
     pub damage: i16,
+    pub nbt: Option<crate::nbt::NbtCompound>,
+}
+
+impl SlotItem {
+    pub fn new(id: i16, count: u8, damage: i16) -> Self {
+        Self { id, count, damage, nbt: None }
+    }
 }
 
 impl ServerboundPacket {
@@ -1357,6 +1369,10 @@ impl ClientboundPlayPacket {
                 entity_id: body.read_var_i32()?,
                 head_yaw: angle(body.read_i8()?),
             }),
+            0x1a => Ok(Self::EntityStatus {
+                entity_id: body.read_i32()?,
+                status: body.read_i8()?,
+            }),
             0x1b => Ok(Self::AttachEntity {
                 entity_id: body.read_i32()?,
                 vehicle_id: body.read_i32()?,
@@ -1674,33 +1690,24 @@ mod tests {
         let mut reader = PacketReader::new(&bytes);
         assert_eq!(
             read_slot(&mut reader).unwrap(),
-            Some(SlotItem {
-                id: 1,
-                count: 1,
-                damage: 0,
-            })
+            Some(SlotItem::new(1, 1, 0))
         );
         assert!(reader.is_empty());
     }
 
     #[test]
-    fn read_slot_skips_empty_compound_nbt() {
+    fn read_slot_parses_empty_compound_nbt() {
         // id=1, count=1, damage=0, then TAG_Compound, empty name, TAG_End.
         let bytes = [0x00, 0x01, 0x01, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00];
         let mut reader = PacketReader::new(&bytes);
-        assert_eq!(
-            read_slot(&mut reader).unwrap(),
-            Some(SlotItem {
-                id: 1,
-                count: 1,
-                damage: 0,
-            })
-        );
+        let item = read_slot(&mut reader).unwrap().unwrap();
+        assert_eq!((item.id, item.count, item.damage), (1, 1, 0));
+        assert_eq!(item.nbt, Some(std::collections::HashMap::new()));
         assert!(reader.is_empty());
     }
 
     #[test]
-    fn read_slot_skips_nested_nbt_children() {
+    fn read_slot_parses_nested_nbt_children() {
         // id=276, count=1, damage=3, then a compound with a string and a list.
         let mut bytes = vec![0x01, 0x14, 0x01, 0x00, 0x03];
         bytes.extend_from_slice(&[0x0a, 0x00, 0x00]); // TAG_Compound "" {
@@ -1709,14 +1716,11 @@ mod tests {
         bytes.extend_from_slice(&[0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x08]);
         bytes.push(0x00); // TAG_End }
         let mut reader = PacketReader::new(&bytes);
-        assert_eq!(
-            read_slot(&mut reader).unwrap(),
-            Some(SlotItem {
-                id: 276,
-                count: 1,
-                damage: 3,
-            })
-        );
+        let item = read_slot(&mut reader).unwrap().unwrap();
+        assert_eq!((item.id, item.count, item.damage), (276, 1, 3));
+        let nbt = item.nbt.as_ref().unwrap();
+        assert_eq!(nbt.get("x").and_then(|t| t.as_str()), Some("hi"));
+        assert_eq!(nbt.get("l").and_then(|t| t.as_list()).map(|l| l.len()), Some(2));
         assert!(reader.is_empty());
     }
 
@@ -1739,11 +1743,7 @@ mod tests {
                 window_id: 0,
                 items: vec![
                     None,
-                    Some(SlotItem {
-                        id: 1,
-                        count: 1,
-                        damage: 0,
-                    }),
+                    Some(SlotItem::new(1, 1, 0)),
                 ],
             }
         );
@@ -1766,11 +1766,7 @@ mod tests {
             ClientboundPlayPacket::SetSlot {
                 window_id: 0,
                 slot: 36,
-                item: Some(SlotItem {
-                    id: 4,
-                    count: 64,
-                    damage: 0,
-                }),
+                item: Some(SlotItem::new(4, 64, 0)),
             }
         );
     }
@@ -2212,11 +2208,7 @@ mod tests {
         assert_eq!(metadata[1].index, 10);
         assert_eq!(
             metadata[1].value,
-            MetadataValue::Slot(Some(SlotItem {
-                id: 1,
-                count: 3,
-                damage: 0
-            }))
+            MetadataValue::Slot(Some(SlotItem::new(1, 3, 0)))
         );
     }
 
@@ -2228,11 +2220,7 @@ mod tests {
             button: 0,
             action_number: 1,
             mode: 0,
-            clicked_item: Some(SlotItem {
-                id: 1,
-                count: 64,
-                damage: 0,
-            }),
+            clicked_item: Some(SlotItem::new(1, 64, 0)),
         }
         .into_frame();
         assert_eq!(frame.id, 0x0e);
@@ -2242,7 +2230,7 @@ mod tests {
         assert_eq!(r.read_i8().unwrap(), 0);
         assert_eq!(r.read_i16().unwrap(), 1);
         assert_eq!(r.read_i8().unwrap(), 0);
-        assert_eq!(read_slot(&mut r).unwrap(), Some(SlotItem { id: 1, count: 64, damage: 0 }));
+        assert_eq!(read_slot(&mut r).unwrap(), Some(SlotItem::new(1, 64, 0)));
         assert!(r.is_empty());
     }
 
@@ -2406,7 +2394,7 @@ fn read_metadata(body: &mut PacketReader<'_>) -> Result<Vec<MetadataEntry>> {
 }
 
 /// Read a 1.8 Slot: Short id (-1 = empty), then Byte count, Short damage and
-/// an optional NBT compound which is skipped.
+/// an optional NBT compound.
 fn read_slot(body: &mut PacketReader<'_>) -> Result<Option<SlotItem>> {
     let id = body.read_i16()?;
     if id == -1 {
@@ -2414,79 +2402,10 @@ fn read_slot(body: &mut PacketReader<'_>) -> Result<Option<SlotItem>> {
     }
     let count = body.read_u8()?;
     let damage = body.read_i16()?;
-    let tag_type = body.read_u8()?;
-    if tag_type != 0 {
-        // Named root tag: UShort name length + name bytes, then the payload.
-        let name_len = body.read_u16()? as usize;
-        body.read_bytes(name_len)?;
-        skip_nbt_payload(body, tag_type)?;
-    }
-    Ok(Some(SlotItem { id, count, damage }))
+    let nbt = crate::nbt::read_slot_nbt(body)?;
+    Ok(Some(SlotItem { id, count, damage, nbt }))
 }
 
-/// Skip the payload of an NBT tag of the given type (1.8 uncompressed NBT).
-fn skip_nbt_payload(body: &mut PacketReader<'_>, tag_type: u8) -> Result<()> {
-    match tag_type {
-        0 => Ok(()),                       // TAG_End
-        1 => body.read_bytes(1).map(drop), // TAG_Byte
-        2 => body.read_bytes(2).map(drop), // TAG_Short
-        3 => body.read_bytes(4).map(drop), // TAG_Int
-        4 => body.read_bytes(8).map(drop), // TAG_Long
-        5 => body.read_bytes(4).map(drop), // TAG_Float
-        6 => body.read_bytes(8).map(drop), // TAG_Double
-        7 => {
-            // TAG_Byte_Array
-            let len = read_nbt_len(body)?;
-            body.read_bytes(len).map(drop)
-        }
-        8 => {
-            // TAG_String
-            let len = body.read_u16()? as usize;
-            body.read_bytes(len).map(drop)
-        }
-        9 => {
-            // TAG_List
-            let element_type = body.read_u8()?;
-            let len = read_nbt_len(body)?;
-            for _ in 0..len {
-                skip_nbt_payload(body, element_type)?;
-            }
-            Ok(())
-        }
-        10 => {
-            // TAG_Compound: named children until TAG_End.
-            loop {
-                let child_type = body.read_u8()?;
-                if child_type == 0 {
-                    return Ok(());
-                }
-                let name_len = body.read_u16()? as usize;
-                body.read_bytes(name_len)?;
-                skip_nbt_payload(body, child_type)?;
-            }
-        }
-        11 => {
-            // TAG_Int_Array
-            let len = read_nbt_len(body)?;
-            body.read_bytes(len * 4).map(drop)
-        }
-        12 => {
-            // TAG_Long_Array
-            let len = read_nbt_len(body)?;
-            body.read_bytes(len * 8).map(drop)
-        }
-        _ => Err(ProtocolError::InvalidData("unknown NBT tag")),
-    }
-}
-
-/// Read an NBT Int length, rejecting negative values.
-fn read_nbt_len(body: &mut PacketReader<'_>) -> Result<usize> {
-    let len = body.read_i32()?;
-    if len < 0 {
-        return Err(ProtocolError::InvalidData("negative NBT length"));
-    }
-    Ok(len as usize)
-}
 
 fn read_block_pos(reader: &mut PacketReader<'_>) -> Result<(i32, i32, i32)> {
     let value = reader.read_i64()? as u64;

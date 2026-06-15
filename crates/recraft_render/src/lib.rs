@@ -16,10 +16,10 @@ pub use chunk_mesh::{
     Vertex, FULLBRIGHT,
 };
 pub use font::char_width;
-pub use item_names::item_display_name;
-pub use model::{EntityAnim, ModelMesh, ModelVertex};
+pub use item_names::{build_tooltip, item_display_name};
+pub use model::{held_item_frame, EntityAnim, HeldItemFrame, ModelMesh, ModelVertex};
 pub use renderer::{RenderStats, Renderer, RendererError};
-pub use texture::{AtlasUv, TextureAtlasImage};
+pub use texture::{AtlasUv, OverlayTextures, PackMeta, PbrAtlases, TextureAtlasImage, discover_resource_packs};
 pub use ui::{
     gui_pixel_scale, text_height, text_width, GuiAtlas, GuiTexture, UiColor, UiFrame, UiRect,
 };

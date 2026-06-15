@@ -31,6 +31,7 @@ pub struct GuiOptions {
     resolution: Option<GuiButton>,
     fullscreen: Option<GuiButton>,
     shaders_btn: Option<GuiButton>,
+    resource_packs_btn: Option<GuiButton>,
     done: Option<GuiButton>,
     dragging: Option<Slider>,
     /// Whether this was opened from the title screen (Done returns there) vs.
@@ -74,7 +75,8 @@ impl GuiOptions {
         self.resolution = Some(GuiButton::at_px(x, top + 144 * s, 98 * s, s, ""));
         self.fullscreen = Some(GuiButton::at_px(x + 102 * s, top + 144 * s, 98 * s, s, ""));
         self.shaders_btn = Some(GuiButton::at_px(x, top + 168 * s, 200 * s, s, "Shaders..."));
-        self.done = Some(GuiButton::at_px(x, top + 204 * s, 200 * s, s, "Done"));
+        self.resource_packs_btn = Some(GuiButton::at_px(x, top + 192 * s, 200 * s, s, "Resource Packs..."));
+        self.done = Some(GuiButton::at_px(x, top + 228 * s, 200 * s, s, "Done"));
     }
 
     fn slider_fraction(rect: UiRect, x: f64) -> f32 {
@@ -162,7 +164,7 @@ impl GuiScreen for GuiOptions {
             self.sensitivity_rect,
             s,
             ctx.settings.sensitivity,
-            &format!("Sensitivity: {:.0}%", ctx.settings.sensitivity_percent()),
+            &format!("Sensitivity: {:.0}%", ctx.settings.clone().sensitivity_percent()),
         );
         if let Some(vsync) = &mut self.vsync {
             vsync.label = format!("VSync: {}", if ctx.settings.vsync { "ON" } else { "OFF" });
@@ -172,22 +174,22 @@ impl GuiScreen for GuiOptions {
             ui,
             self.fps_rect,
             s,
-            ctx.settings.fps_fraction(),
-            &format!("Max Framerate: {}", ctx.settings.fps_label()),
+            ctx.settings.clone().fps_fraction(),
+            &format!("Max Framerate: {}", ctx.settings.clone().fps_label()),
         );
         draw_slider(
             ui,
             self.render_scale_rect,
             s,
-            ctx.settings.render_scale_fraction(),
-            &format!("Render Scale: {}%", ctx.settings.render_scale_percent()),
+            ctx.settings.clone().render_scale_fraction(),
+            &format!("Render Scale: {}%", ctx.settings.clone().render_scale_percent()),
         );
         draw_slider(
             ui,
             self.brightness_rect,
             s,
-            ctx.settings.brightness_fraction(),
-            &format!("Brightness: {}%", ctx.settings.brightness_percent()),
+            ctx.settings.clone().brightness_fraction(),
+            &format!("Brightness: {}%", ctx.settings.clone().brightness_percent()),
         );
         if let Some(graphics) = &mut self.graphics {
             graphics.label = format!(
@@ -197,11 +199,11 @@ impl GuiScreen for GuiOptions {
             graphics.draw(ui, s, ctx.mouse, ctx.mouse_down);
         }
         if let Some(mipmaps) = &mut self.mipmaps {
-            mipmaps.label = format!("Mipmaps: {}", ctx.settings.mipmap_label());
+            mipmaps.label = format!("Mipmaps: {}", ctx.settings.clone().mipmap_label());
             mipmaps.draw(ui, s, ctx.mouse, ctx.mouse_down);
         }
         if let Some(resolution) = &mut self.resolution {
-            resolution.label = format!("Res: {}", ctx.settings.resolution_label());
+            resolution.label = format!("Res: {}", ctx.settings.clone().resolution_label());
             resolution.draw(ui, s, ctx.mouse, ctx.mouse_down);
         }
         if let Some(fullscreen) = &mut self.fullscreen {
@@ -212,6 +214,9 @@ impl GuiScreen for GuiOptions {
             fullscreen.draw(ui, s, ctx.mouse, ctx.mouse_down);
         }
         if let Some(b) = &self.shaders_btn {
+            b.draw(ui, s, ctx.mouse, ctx.mouse_down);
+        }
+        if let Some(b) = &self.resource_packs_btn {
             b.draw(ui, s, ctx.mouse, ctx.mouse_down);
         }
         if let Some(done) = &self.done {
@@ -264,6 +269,14 @@ impl GuiScreen for GuiOptions {
             return vec![
                 GuiAction::SaveSettings,
                 GuiAction::SetScreen(Box::new(super::shaders::GuiShaders::new(self.from_main_menu))),
+            ];
+        }
+        if self.resource_packs_btn.as_ref().is_some_and(|b| b.clicked(x, y)) {
+            return vec![
+                GuiAction::SaveSettings,
+                GuiAction::SetScreen(Box::new(
+                    super::resource_packs::GuiResourcePacks::new(self.from_main_menu, ctx.settings),
+                )),
             ];
         }
         if self.done.as_ref().is_some_and(|b| b.clicked(x, y)) {

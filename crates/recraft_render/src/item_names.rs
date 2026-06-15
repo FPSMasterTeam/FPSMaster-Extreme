@@ -1,10 +1,13 @@
-//! Display names for inventory tooltips. Vanilla resolves an item's name from
-//! the lang file via its unlocalized key; recraft has no numeric-id → key
-//! registry, so this maps the common 1.8.9 blocks/items to their exact vanilla
-//! English names and falls back to a title-cased texture base-name for the long
-//! tail. NBT custom names aren't modeled (`SlotItem` drops NBT).
+//! Display names and tooltip lines for inventory items. Vanilla resolves an
+//! item's name from the lang file via its unlocalized key; recraft has no
+//! numeric-id → key registry, so this maps the common 1.8.9 blocks/items to
+//! their exact vanilla English names and falls back to a title-cased texture
+//! base-name for the long tail. NBT is parsed for custom names, enchantments,
+//! lore, unbreakable, and HideFlags.
 
 use recraft_core::{BlockFace, BlockState};
+use recraft_protocol::nbt::{NbtCompound, NbtTag};
+use recraft_protocol::v1_8_9::packets::SlotItem;
 
 use crate::texture::item_texture_name;
 
@@ -268,6 +271,151 @@ fn title_case(s: &str) -> String {
         .join(" ")
 }
 
+/// Build the vanilla-style tooltip lines for an item stack, including NBT data.
+/// Each line may contain `§` formatting codes (rarity color, enchant gray, lore
+/// purple/italic). The first line is always the display name with rarity color.
+pub fn build_tooltip(item: &SlotItem) -> Vec<String> {
+    let nbt = item.nbt.as_ref();
+    let hide_flags = nbt
+        .and_then(|t| t.get("HideFlags"))
+        .and_then(|t| t.as_i32())
+        .unwrap_or(0);
+
+    let mut lines = Vec::new();
+
+    // Line 1: display name with rarity color.
+    let has_custom_name = has_display_name(nbt);
+    let name = if has_custom_name {
+        custom_display_name(nbt).unwrap_or_default()
+    } else {
+        item_display_name(item.id, item.damage)
+    };
+
+    let rarity_color = item_rarity_color(item);
+    let name_line = if has_custom_name {
+        // Custom names are italic.
+        format!("{rarity_color}\u{00a7}o{name}\u{00a7}r")
+    } else {
+        format!("{rarity_color}{name}\u{00a7}r")
+    };
+    lines.push(name_line);
+
+    // Enchantments (flag bit 0).
+    if hide_flags & 1 == 0 {
+        if let Some(ench_list) = nbt
+            .and_then(|t| t.get("ench"))
+            .and_then(|t| t.as_list())
+        {
+            for ench in ench_list {
+                if let NbtTag::Compound(c) = ench {
+                    let id = c.get("id").and_then(|t| t.as_short()).unwrap_or(0);
+                    let lvl = c.get("lvl").and_then(|t| t.as_short()).unwrap_or(0);
+                    if let Some(name) = enchantment_name(id, lvl) {
+                        lines.push(format!("\u{00a7}7{name}"));
+                    }
+                }
+            }
+        }
+    }
+
+    // Lore (under display compound).
+    if let Some(display) = nbt.and_then(|t| t.get("display")).and_then(|t| t.as_compound()) {
+        if let Some(lore_list) = display.get("Lore").and_then(|t| t.as_list()) {
+            for lore_tag in lore_list {
+                if let Some(text) = lore_tag.as_str() {
+                    lines.push(format!("\u{00a7}5\u{00a7}o{text}"));
+                }
+            }
+        }
+    }
+
+    // Unbreakable (flag bit 2).
+    if hide_flags & 4 == 0 {
+        if nbt.and_then(|t| t.get("Unbreakable")).map(|t| t.as_bool()).unwrap_or(false) {
+            lines.push("\u{00a7}9Unbreakable".to_owned());
+        }
+    }
+
+    lines
+}
+
+fn has_display_name(nbt: Option<&NbtCompound>) -> bool {
+    nbt.and_then(|t| t.get("display"))
+        .and_then(|t| t.as_compound())
+        .and_then(|d| d.get("Name"))
+        .and_then(|t| t.as_str())
+        .is_some()
+}
+
+fn custom_display_name(nbt: Option<&NbtCompound>) -> Option<String> {
+    nbt.and_then(|t| t.get("display"))
+        .and_then(|t| t.as_compound())
+        .and_then(|d| d.get("Name"))
+        .and_then(|t| t.as_str())
+        .map(|s| s.to_owned())
+}
+
+/// Vanilla item rarity color code. Enchanted items are AQUA (rare),
+/// everything else is WHITE (common) by default.
+fn item_rarity_color(item: &SlotItem) -> &'static str {
+    let is_enchanted = item
+        .nbt
+        .as_ref()
+        .and_then(|t| t.get("ench"))
+        .and_then(|t| t.as_list())
+        .is_some_and(|l| !l.is_empty());
+    if is_enchanted {
+        "\u{00a7}b" // AQUA
+    } else {
+        "\u{00a7}f" // WHITE
+    }
+}
+
+fn enchantment_name(id: i16, level: i16) -> Option<String> {
+    let base = match id {
+        0 => "Protection",
+        1 => "Fire Protection",
+        2 => "Feather Falling",
+        3 => "Blast Protection",
+        4 => "Projectile Protection",
+        5 => "Respiration",
+        6 => "Aqua Affinity",
+        7 => "Thorns",
+        8 => "Depth Strider",
+        16 => "Sharpness",
+        17 => "Smite",
+        18 => "Bane of Arthropods",
+        19 => "Knockback",
+        20 => "Fire Aspect",
+        21 => "Looting",
+        32 => "Efficiency",
+        33 => "Silk Touch",
+        34 => "Unbreaking",
+        35 => "Fortune",
+        48 => "Power",
+        49 => "Punch",
+        50 => "Flame",
+        51 => "Infinity",
+        61 => "Luck of the Sea",
+        62 => "Lure",
+        _ => return None,
+    };
+    let roman = match level {
+        1 => "I",
+        2 => "II",
+        3 => "III",
+        4 => "IV",
+        5 => "V",
+        6 => "VI",
+        7 => "VII",
+        8 => "VIII",
+        9 => "IX",
+        10 => "X",
+        n => return Some(format!("{base} {n}")),
+    };
+    Some(format!("{base} {roman}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,5 +443,79 @@ mod tests {
     #[test]
     fn unknown_ids_fall_back_gracefully() {
         assert_eq!(item_display_name(20000, 0), "Item 20000");
+    }
+
+    #[test]
+    fn tooltip_plain_item_shows_white_name() {
+        let item = SlotItem::new(1, 64, 0);
+        let lines = build_tooltip(&item);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0], "\u{00a7}fStone\u{00a7}r");
+    }
+
+    #[test]
+    fn tooltip_custom_name_is_italic() {
+        let mut nbt = NbtCompound::new();
+        let mut display = NbtCompound::new();
+        display.insert("Name".into(), NbtTag::String("My Sword".into()));
+        nbt.insert("display".into(), NbtTag::Compound(display));
+        let item = SlotItem { id: 276, count: 1, damage: 0, nbt: Some(nbt) };
+        let lines = build_tooltip(&item);
+        assert_eq!(lines[0], "\u{00a7}f\u{00a7}oMy Sword\u{00a7}r");
+    }
+
+    #[test]
+    fn tooltip_enchanted_item_shows_aqua_name_and_enchantments() {
+        let mut nbt = NbtCompound::new();
+        let mut ench = NbtCompound::new();
+        ench.insert("id".into(), NbtTag::Short(16)); // Sharpness
+        ench.insert("lvl".into(), NbtTag::Short(5));
+        nbt.insert("ench".into(), NbtTag::List(vec![NbtTag::Compound(ench)]));
+        let item = SlotItem { id: 276, count: 1, damage: 0, nbt: Some(nbt) };
+        let lines = build_tooltip(&item);
+        // Aqua rarity for enchanted items.
+        assert!(lines[0].starts_with("\u{00a7}b"));
+        assert_eq!(lines[1], "\u{00a7}7Sharpness V");
+    }
+
+    #[test]
+    fn tooltip_lore_lines_are_dark_purple_italic() {
+        let mut nbt = NbtCompound::new();
+        let mut display = NbtCompound::new();
+        display.insert(
+            "Lore".into(),
+            NbtTag::List(vec![
+                NbtTag::String("Line one".into()),
+                NbtTag::String("Line two".into()),
+            ]),
+        );
+        nbt.insert("display".into(), NbtTag::Compound(display));
+        let item = SlotItem { id: 1, count: 1, damage: 0, nbt: Some(nbt) };
+        let lines = build_tooltip(&item);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[1], "\u{00a7}5\u{00a7}oLine one");
+        assert_eq!(lines[2], "\u{00a7}5\u{00a7}oLine two");
+    }
+
+    #[test]
+    fn tooltip_unbreakable_shown_in_blue() {
+        let mut nbt = NbtCompound::new();
+        nbt.insert("Unbreakable".into(), NbtTag::Byte(1));
+        let item = SlotItem { id: 276, count: 1, damage: 0, nbt: Some(nbt) };
+        let lines = build_tooltip(&item);
+        assert!(lines.iter().any(|l| l == "\u{00a7}9Unbreakable"));
+    }
+
+    #[test]
+    fn tooltip_hide_flags_suppresses_enchantments() {
+        let mut nbt = NbtCompound::new();
+        let mut ench = NbtCompound::new();
+        ench.insert("id".into(), NbtTag::Short(16));
+        ench.insert("lvl".into(), NbtTag::Short(5));
+        nbt.insert("ench".into(), NbtTag::List(vec![NbtTag::Compound(ench)]));
+        nbt.insert("HideFlags".into(), NbtTag::Int(1)); // hide enchantments
+        let item = SlotItem { id: 276, count: 1, damage: 0, nbt: Some(nbt) };
+        let lines = build_tooltip(&item);
+        assert_eq!(lines.len(), 1); // only the name, no enchantments
     }
 }

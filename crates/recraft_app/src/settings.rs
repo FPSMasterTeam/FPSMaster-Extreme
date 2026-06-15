@@ -7,7 +7,7 @@ use std::time::Instant;
 const SETTINGS_FILE: &str = "recraft_options.txt";
 
 /// User-adjustable options edited from the options screen.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Settings {
     /// Mouse sensitivity slider position in 0..=1 (0.5 == vanilla default).
     pub sensitivity: f32,
@@ -55,6 +55,9 @@ pub struct Settings {
     pub post_motion_blur: bool,
     pub post_auto_exposure: bool,
     pub volumetric_clouds: bool,
+    /// Active resource pack name (subdirectory or zip filename under
+    /// `resourcepacks/`), or `None` for default 1.8 textures.
+    pub resource_pack: Option<String>,
 }
 
 /// Selectable resolutions (None = native). Common 16:9 modes most panels scale.
@@ -102,6 +105,7 @@ impl Default for Settings {
             post_motion_blur: false,
             post_auto_exposure: true,
             volumetric_clouds: true,
+            resource_pack: None,
         }
     }
 }
@@ -231,6 +235,11 @@ impl Settings {
                         s.volumetric_clouds = v;
                     }
                 }
+                "resource_pack" => {
+                    if !val.is_empty() {
+                        s.resource_pack = Some(val.to_owned());
+                    }
+                }
                 _ => {}
             }
         }
@@ -256,7 +265,7 @@ impl Settings {
     fn save_to(&self, path: &std::path::Path) {
         let (res_w, res_h) = self.resolution.unwrap_or((0, 0));
         let text = format!(
-            "sensitivity={}\nvsync={}\nfps_cap={}\nrender_scale={}\nfancy_graphics={}\nmipmap_levels={}\nresolution_w={}\nresolution_h={}\nfullscreen={}\nshaders={}\nshader_shadows={}\nshader_specular={}\nshader_fog={}\nshader_bloom={}\nbrightness={}\npost_vignette={}\npost_chromatic={}\npost_dof={}\npost_motion_blur={}\npost_auto_exposure={}\nvolumetric_clouds={}\n",
+            "sensitivity={}\nvsync={}\nfps_cap={}\nrender_scale={}\nfancy_graphics={}\nmipmap_levels={}\nresolution_w={}\nresolution_h={}\nfullscreen={}\nshaders={}\nshader_shadows={}\nshader_specular={}\nshader_fog={}\nshader_bloom={}\nbrightness={}\npost_vignette={}\npost_chromatic={}\npost_dof={}\npost_motion_blur={}\npost_auto_exposure={}\nvolumetric_clouds={}\nresource_pack={}\n",
             self.sensitivity,
             self.vsync,
             self.fps_cap,
@@ -278,6 +287,7 @@ impl Settings {
             self.post_motion_blur,
             self.post_auto_exposure,
             self.volumetric_clouds,
+            self.resource_pack.as_deref().unwrap_or(""),
         );
         if let Err(err) = std::fs::write(path, text) {
             log::warn!("failed to save settings to {}: {err}", path.display());

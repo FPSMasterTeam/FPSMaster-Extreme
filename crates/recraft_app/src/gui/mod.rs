@@ -18,6 +18,7 @@ pub mod main_menu;
 pub mod multiplayer;
 pub mod options;
 pub mod progress;
+pub mod resource_packs;
 pub mod shaders;
 pub mod widgets;
 
@@ -154,6 +155,8 @@ pub enum GuiAction {
     SetMotionBlur(bool),
     SetAutoExposure(bool),
     SetClouds(bool),
+    /// Reload the block atlas from a resource pack (or `None` for default).
+    ReloadResourcePack(Option<std::path::PathBuf>),
     /// Persist the current settings to disk (emitted when options close).
     SaveSettings,
     /// Send a serverbound packet (inventory clicks, window close, …).

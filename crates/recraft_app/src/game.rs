@@ -29,7 +29,7 @@ use recraft_protocol::v1_8_9::{
         TitleAction, UseEntityKind,
     },
 };
-use recraft_render::{Camera, EntityAnim, ModelMesh};
+use recraft_render::{held_item_frame, Camera, EntityAnim, HeldItemFrame, ModelMesh};
 use winit::{
     event::{ElementState, KeyEvent},
     keyboard::{KeyCode, PhysicalKey},
@@ -37,9 +37,17 @@ use winit::{
 
 use crate::chat::{self, ChatState};
 use crate::container::{max_stack, stackable, Container};
-use crate::item_renderer::DroppedItem;
+use crate::item_renderer::{DroppedItem, PlayerHeldItem};
 use crate::player_list::PlayerList;
 use crate::scoreboard::Scoreboard;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScreenOverlay {
+    None,
+    Water,
+    Lava,
+    Fire,
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct MovementSnapshot {
@@ -184,7 +192,7 @@ fn effective_attribute_value(
 
 /// Snapshot driving the first-person hand/item rendering for one frame
 /// (vanilla ItemRenderer inputs at a given partialTicks).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct FirstPersonView {
     /// The item the hand currently shows (lags the selection by the equip dip).
     pub item: Option<SlotItem>,
@@ -412,6 +420,9 @@ pub struct GameState {
     /// The item stack carried by each dropped-item entity (from EntityMetadata
     /// index 10), used to render the floating item.
     entity_items: std::collections::HashMap<EntityId, SlotItem>,
+    /// Equipment worn/held by other entities (S04 EntityEquipment). Indexed
+    /// 0 = held, 1 = boots, 2 = leggings, 3 = chestplate, 4 = helmet.
+    entity_equipment: std::collections::HashMap<EntityId, [Option<SlotItem>; 5]>,
     /// Passenger → vehicle mount relationships (S1B AttachEntity). Drives the
     /// rider render offset and the local player following its mount.
     vehicles: std::collections::HashMap<EntityId, EntityId>,
@@ -477,6 +488,10 @@ pub struct GameState {
     sprinting: bool,
     /// Vanilla `sprintToggleTimer`: the 7-tick double-tap-W window.
     sprint_toggle_timer: i32,
+    /// Set on the tick an attack cancels sprint (the "w-tap reset"); blocks
+    /// the sprint-key-held re-enable for THIS tick so the server sees the
+    /// StopSprinting before the next StartSprinting.
+    sprint_reset_by_attack: bool,
     /// `movementInput.sneak` / `moveForward` from the previous tick (vanilla's
     /// `flag1` / `flag2`, read before `updatePlayerMoveState`).
     prev_sneak: bool,
@@ -505,7 +520,7 @@ pub struct GameState {
 
 /// In-progress survival block break: the target cell, the face the dig started
 /// on, accumulated 0..1 progress and how much to add each 20 Hz tick.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct BreakProgress {
     x: i32,
     y: i32,
@@ -575,11 +590,7 @@ impl GameState {
         // glowstone, torch, sea lantern, jack-o-lantern, redstone lamp (lit), stone
         let hotbar = [89, 50, 169, 91, 124, 1];
         for (i, id) in hotbar.into_iter().enumerate() {
-            state.inventory[36 + i] = Some(SlotItem {
-                id,
-                count: 64,
-                damage: 0,
-            });
+            state.inventory[36 + i] = Some(SlotItem::new(id, 64, 0));
         }
         state
     }
@@ -636,6 +647,7 @@ impl GameState {
             creative: false,
             entity_uuids: std::collections::HashMap::new(),
             entity_items: std::collections::HashMap::new(),
+            entity_equipment: std::collections::HashMap::new(),
             vehicles: std::collections::HashMap::new(),
             dirty_chunks: HashSet::new(),
             urgent_remesh: HashSet::new(),
@@ -666,6 +678,7 @@ impl GameState {
             pending_actions: TickActions::default(),
             sprinting: false,
             sprint_toggle_timer: 0,
+            sprint_reset_by_attack: false,
             prev_sneak: false,
             prev_move_forward: 0.0,
             capabilities: PlayerCapabilities::default(),
@@ -870,8 +883,8 @@ impl GameState {
     }
 
     /// The stack currently carried on the cursor (vanilla slot -1).
-    pub fn cursor_item(&self) -> Option<SlotItem> {
-        self.cursor_item
+    pub fn cursor_item(&self) -> Option<&SlotItem> {
+        self.cursor_item.as_ref()
     }
 
     /// The open window (player inventory or a server container), if any. The
@@ -958,7 +971,7 @@ impl GameState {
         if !self.drag_active || slot < 0 || self.drag_slots.contains(&slot) {
             return;
         }
-        let Some(cursor) = self.cursor_item else {
+        let Some(ref cursor) = self.cursor_item else {
             return;
         };
         let Some(container) = self.open_container.as_ref() else {
@@ -1024,6 +1037,24 @@ impl GameState {
     /// Whether the player is standing on the ground (F3 debug overlay).
     pub fn player_on_ground(&self) -> bool {
         self.player.on_ground
+    }
+
+    pub fn screen_overlay(&self) -> ScreenOverlay {
+        let eye_y = self.player.position.y + STANDING_EYE_HEIGHT
+            - SNEAK_EYE_DROP * self.sneak_amount as f64;
+        let bx = self.player.position.x.floor() as i32;
+        let by = eye_y.floor() as i32;
+        let bz = self.player.position.z.floor() as i32;
+        let block = self.world.block_at(bx, by, bz);
+        if block.is_water() {
+            ScreenOverlay::Water
+        } else if block.is_lava() {
+            ScreenOverlay::Lava
+        } else if self.player.on_fire {
+            ScreenOverlay::Fire
+        } else {
+            ScreenOverlay::None
+        }
     }
 
     /// Stage this tick's input intents; [`tick`](Self::tick) consumes them.
@@ -1213,7 +1244,10 @@ impl GameState {
         }
         let flag3 = self.food > 6 || self.capabilities.allow_flying;
         // Double-tap-W start (on the ground, on a fresh forward press).
-        if self.player.on_ground
+        // Suppress on the tick an attack just cancelled sprint so the server
+        // sees StopSprinting before the re-enable (the "w-tap" gap).
+        if !self.sprint_reset_by_attack
+            && self.player.on_ground
             && !flag1
             && !flag2
             && move_forward >= 0.8
@@ -1228,7 +1262,13 @@ impl GameState {
             }
         }
         // Sprint-key-held start (no onGround requirement, exactly like vanilla).
-        if !self.sprinting && move_forward >= 0.8 && flag3 && !self.using_item && sprint_key_down {
+        if !self.sprint_reset_by_attack
+            && !self.sprinting
+            && move_forward >= 0.8
+            && flag3
+            && !self.using_item
+            && sprint_key_down
+        {
             self.sprinting = true;
         }
         // Stop: forward dropped below 0.8 (release / sneak / block), a wall, or low food.
@@ -1237,6 +1277,7 @@ impl GameState {
         {
             self.sprinting = false;
         }
+        self.sprint_reset_by_attack = false;
         self.prev_sneak = self.input.sneak;
         self.prev_move_forward = move_forward;
         if self.world.is_block_column_loaded(bx, bz) {
@@ -1411,16 +1452,43 @@ impl GameState {
                 &anim,
                 skin_row,
             );
+            // Armor overlay for players with equipped armor.
+            if matches!(entity.kind, EntityKind::RemotePlayer) {
+                if let Some(slots) = self.entity_equipment.get(&entity.id) {
+                    let ids: [Option<i16>; 5] = [
+                        None, // slot 0 (held) is not armor
+                        slots[1].as_ref().map(|s| s.id),
+                        slots[2].as_ref().map(|s| s.id),
+                        slots[3].as_ref().map(|s| s.id),
+                        slots[4].as_ref().map(|s| s.id),
+                    ];
+                    if ids[1].is_some() || ids[2].is_some() || ids[3].is_some() || ids[4].is_some() {
+                        mesh.push_armor(&ids, &anim, feet, body_yaw);
+                    }
+                }
+            }
             // Light the entity by the world lightmap at its body centre (vanilla
             // samples the lightmap per entity), so mobs darken at night/in caves
             // instead of glowing full-bright. Folded into the per-face shade
             // already baked in the vertex colour.
             let center = Vec3::new(feet.x, feet.y + height as f32 * 0.5, feet.z);
             let factor = entity_light(&self.world, center, sun_b, brightness);
+            // Vanilla damage flash: when hurtTime > 0, the entity is tinted red.
+            // The intensity fades with the remaining hurt ticks (10 → 0).
+            let hurt_flash = if entity.hurt_time > 0 {
+                entity.hurt_time as f32 / 10.0
+            } else {
+                0.0
+            };
             for v in &mut mesh.vertices[start..] {
                 v.color[0] *= factor;
                 v.color[1] *= factor;
                 v.color[2] *= factor;
+                if hurt_flash > 0.0 {
+                    v.color[0] = v.color[0] + (1.0 - v.color[0]) * hurt_flash * 0.5;
+                    v.color[1] *= 1.0 - hurt_flash * 0.4;
+                    v.color[2] *= 1.0 - hurt_flash * 0.4;
+                }
             }
         }
     }
@@ -1441,7 +1509,7 @@ impl GameState {
             if entity.kind != EntityKind::Object(2) {
                 continue;
             }
-            let Some(&item) = self.entity_items.get(&entity.id) else {
+            let Some(item) = self.entity_items.get(&entity.id) else {
                 continue;
             };
             let pos = to_render_vec3(entity.render_position(tick_alpha as f64));
@@ -1453,11 +1521,50 @@ impl GameState {
             );
             let light = [sky_l as f32 / 15.0, block_l as f32 / 15.0];
             items.push(DroppedItem {
-                item,
+                item: item.clone(),
                 pos,
                 phase,
                 light,
             });
+        }
+        items
+    }
+
+    /// Held items of remote players, each with the arm's world-space reference
+    /// frame so the item renderer can orient the model correctly in the hand.
+    pub fn player_held_items(&self, tick_alpha: f32) -> Vec<PlayerHeldItem> {
+        let mut items = Vec::new();
+        for entity in self.world.entities() {
+            if entity.kind != EntityKind::RemotePlayer || entity.id == self.player.id {
+                continue;
+            }
+            let Some(slots) = self.entity_equipment.get(&entity.id) else {
+                continue;
+            };
+            let Some(ref item) = slots[0] else {
+                continue;
+            };
+            let feet = to_render_vec3(entity.render_position(tick_alpha as f64));
+            let body_yaw = entity.render_yaw(tick_alpha);
+            let (limb_swing, limb_swing_amount) = entity.render_limb_swing(tick_alpha);
+            let net_head_yaw =
+                wrap_degrees(entity.render_head_yaw(tick_alpha) - body_yaw).clamp(-75.0, 75.0);
+            let anim = EntityAnim {
+                limb_swing,
+                limb_swing_amount,
+                net_head_yaw,
+                head_pitch: entity.render_pitch(tick_alpha),
+                swing_progress: entity.render_swing(tick_alpha),
+                sneaking: entity.sneaking,
+            };
+            let frame = held_item_frame(feet, body_yaw, &anim);
+            let (block_l, sky_l) = self.world.light_at(
+                frame.hand.x.floor() as i32,
+                frame.hand.y.floor() as i32,
+                frame.hand.z.floor() as i32,
+            );
+            let light = [sky_l as f32 / 15.0, block_l as f32 / 15.0];
+            items.push(PlayerHeldItem { item: item.clone(), frame, light });
         }
         items
     }
@@ -1522,7 +1629,7 @@ impl GameState {
     /// rendered item only swaps once the hand has dipped below 0.1.
     fn update_equipped_item(&mut self) {
         self.prev_equipped_progress = self.equipped_progress;
-        let current = self.held_item();
+        let current = self.held_item().cloned();
         let raised =
             self.equipped_slot == self.selected_slot && current == self.rendered_item;
         let target = if raised { 1.0 } else { 0.0 };
@@ -1550,7 +1657,7 @@ impl GameState {
         let arm_pitch = lerp(self.prev_render_arm_pitch, self.render_arm_pitch, partial);
         let arm_yaw = lerp(self.prev_render_arm_yaw, self.render_arm_yaw, partial);
         FirstPersonView {
-            item: self.rendered_item,
+            item: self.rendered_item.clone(),
             equip_progress: 1.0 - equip,
             swing_progress: self.swing_progress(partial),
             arm_lag_pitch: (self.player.pitch - arm_pitch) * 0.1,
@@ -1560,11 +1667,10 @@ impl GameState {
     }
 
     /// The item in the selected hotbar slot, if any.
-    pub fn held_item(&self) -> Option<SlotItem> {
+    pub fn held_item(&self) -> Option<&SlotItem> {
         self.inventory
             .get(36 + self.selected_slot.clamp(0, 8) as usize)
-            .copied()
-            .flatten()
+            .and_then(|s| s.as_ref())
     }
 
     /// Block-interaction reach: 5.0 in creative, 4.5 otherwise (vanilla
@@ -1711,6 +1817,7 @@ impl GameState {
             self.player.velocity.x *= 0.6;
             self.player.velocity.z *= 0.6;
             self.sprinting = false;
+            self.sprint_reset_by_attack = true;
         }
     }
 
@@ -1736,7 +1843,7 @@ impl GameState {
             return;
         }
         if !self.is_hitting_position(x, y, z) {
-            if let Some(b) = self.breaking {
+            if let Some(ref b) = self.breaking {
                 // Abort the previous dig: vanilla sends the OLD block with the
                 // NEW face here (resetBlockRemoving's face-DOWN is a separate path).
                 out.push(ServerboundPacket::PlayerDigging {
@@ -1766,7 +1873,7 @@ impl GameState {
                     z,
                     progress: 0.0,
                     per_tick: 1.0 / ticks,
-                    item: self.held_item(),
+                    item: self.held_item().cloned(),
                 });
             }
         }
@@ -1776,7 +1883,8 @@ impl GameState {
     /// held item as when the dig began (a hotbar switch fails this → restart).
     fn is_hitting_position(&self, x: i32, y: i32, z: i32) -> bool {
         self.breaking
-            .is_some_and(|b| b.x == x && b.y == y && b.z == z && b.item == self.held_item())
+            .as_ref()
+            .is_some_and(|b| b.x == x && b.y == y && b.z == z && b.item.as_ref() == self.held_item())
     }
 
     /// Vanilla `PlayerControllerMP.onPlayerDamageBlock`: advance the held dig.
@@ -1946,7 +2054,7 @@ impl GameState {
         z: i32,
         face: u8,
         cursor_y: u8,
-        held: Option<SlotItem>,
+        held: Option<&SlotItem>,
     ) {
         let Some(item) = held else { return };
         // Right-clicking an interactable block (without sneaking) activates it
@@ -2072,7 +2180,7 @@ impl GameState {
         out: &mut Vec<ServerboundPacket>,
     ) -> bool {
         self.sync_current_play_item(out);
-        let held = self.held_item();
+        let held = self.held_item().cloned();
         // onBlockActivated: an interactable block opens unless sneaking with an item.
         let activated =
             (!self.input.sneak || held.is_none()) && is_interactable(self.world.block_at(x, y, z));
@@ -2081,7 +2189,7 @@ impl GameState {
             y,
             z,
             face,
-            held_item: held.map(|it| HeldItem {
+            held_item: held.as_ref().map(|it| HeldItem {
                 id: it.id,
                 count: it.count,
                 damage: it.damage,
@@ -2094,9 +2202,9 @@ impl GameState {
             return true;
         }
         // onItemUse: a block item places (and is consumed); other items don't.
-        match held {
+        match &held {
             Some(item) if is_block_item(item.id) => {
-                self.predict_placement(x, y, z, face, cursor_y, held);
+                self.predict_placement(x, y, z, face, cursor_y, held.as_ref());
                 true
             }
             _ => false,
@@ -2535,6 +2643,7 @@ impl GameState {
                     self.world.remove_entity(id);
                     self.entity_uuids.remove(&id);
                     self.entity_items.remove(&id);
+                    self.entity_equipment.remove(&id);
                     // Drop both directions of any mount relationship.
                     self.vehicles.remove(&id);
                     self.vehicles.retain(|_, vehicle| *vehicle != id);
@@ -2663,10 +2772,28 @@ impl GameState {
                 entity_id,
                 animation,
             } => {
-                // 0 = swing main arm; the rest (hurt/crit/…) aren't modelled.
-                if animation == 0 {
-                    if let Some(entity) = self.remote_entity_mut(entity_id) {
-                        entity.start_swing();
+                match animation {
+                    0 => {
+                        if let Some(entity) = self.remote_entity_mut(entity_id) {
+                            entity.start_swing();
+                        }
+                    }
+                    1 => {
+                        if let Some(entity) = self.remote_entity_mut(entity_id) {
+                            entity.start_hurt();
+                        }
+                    }
+                    _ => {}
+                }
+                false
+            }
+            ClientboundPlayPacket::EntityStatus {
+                entity_id,
+                status,
+            } => {
+                if status == 2 {
+                    if let Some(entity) = self.world.entity_mut(EntityId(entity_id)) {
+                        entity.start_hurt();
                     }
                 }
                 false
@@ -2685,9 +2812,21 @@ impl GameState {
                 self.world_time = time_of_day.abs();
                 false
             }
-            // Parsed in P0; handlers land in later phases (dropped items P3).
-            ClientboundPlayPacket::EntityEquipment { .. }
-            | ClientboundPlayPacket::CollectItem { .. } => false,
+            ClientboundPlayPacket::EntityEquipment {
+                entity_id,
+                slot,
+                item,
+            } => {
+                if (0..5).contains(&slot) {
+                    let slots = self
+                        .entity_equipment
+                        .entry(EntityId(entity_id))
+                        .or_insert_with(Default::default);
+                    slots[slot as usize] = item;
+                }
+                false
+            }
+            ClientboundPlayPacket::CollectItem { .. } => false,
             // ConfirmTransaction is ponged on the network thread (vanilla replies
             // immediately), so the game loop never needs to act on it.
             ClientboundPlayPacket::KeepAlive { .. }
@@ -2739,12 +2878,18 @@ impl GameState {
         for entry in metadata {
             match (entry.index, &entry.value) {
                 (0, MetadataValue::Byte(flags)) => {
+                    let on_fire = flags & 0x01 != 0;
+                    let sneaking = flags & 0x02 != 0;
+                    if entity_id == self.player.id.0 {
+                        self.player.on_fire = on_fire;
+                    }
                     if let Some(entity) = self.remote_entity_mut(entity_id) {
-                        entity.sneaking = flags & 0x02 != 0;
+                        entity.sneaking = sneaking;
+                        entity.on_fire = on_fire;
                     }
                 }
                 (10, MetadataValue::Slot(Some(item))) => {
-                    self.entity_items.insert(EntityId(entity_id), *item);
+                    self.entity_items.insert(EntityId(entity_id), item.clone());
                 }
                 _ => {}
             }
@@ -3154,7 +3299,7 @@ fn is_interactable(block: BlockState) -> bool {
 /// food, or doors/beds whose item id differs from the block id), or an oriented
 /// block whose placement context we don't model (torches, rails, …), which then
 /// waits for the server rather than risk a wrong phantom.
-fn placement_block_state(item: SlotItem, face: u8, yaw: f32, cursor_y: u8) -> Option<BlockState> {
+fn placement_block_state(item: &SlotItem, face: u8, yaw: f32, cursor_y: u8) -> Option<BlockState> {
     let raw = item.id;
     if !(1..=255).contains(&raw) {
         return None;
@@ -3704,11 +3849,7 @@ mod interaction_tests {
     }
 
     fn item(id: i16, count: u8) -> SlotItem {
-        SlotItem {
-            id,
-            count,
-            damage: 0,
-        }
+        SlotItem::new(id, count, 0)
     }
 
     /// Stage `a` and run the vanilla runTick input section (the real path).
@@ -3968,11 +4109,7 @@ mod interaction_tests {
     fn sword_right_click_air_starts_and_releases_blocking() {
         let mut gs = looking_along_x();
         // Diamond sword in the selected hotbar slot, aiming at empty air.
-        gs.inventory[36] = Some(SlotItem {
-            id: 276,
-            count: 1,
-            damage: 0,
-        });
+        gs.inventory[36] = Some(SlotItem::new(276, 1, 0));
         // Vanilla `sendUseItem`: C08 with the in-air position (-1,-1,-1)/face 255.
         let start = use_item(&mut gs);
         assert!(
@@ -4017,11 +4154,7 @@ mod interaction_tests {
     #[test]
     fn non_sword_right_click_air_sends_use_but_does_not_block() {
         let mut gs = looking_along_x();
-        gs.inventory[36] = Some(SlotItem {
-            id: 1,
-            count: 1,
-            damage: 0,
-        });
+        gs.inventory[36] = Some(SlotItem::new(1, 1, 0));
         // Vanilla sendUseItem fires for any held item (the "right-click air"
         // C08), but only a sword enters the use/block state.
         let packets = use_item(&mut gs);
@@ -4044,11 +4177,7 @@ mod interaction_tests {
         gs.input.forward = true;
         // Hold a sword and keep blocking (right held) so the tick keeps the
         // item in use and slows movement below the sprint threshold.
-        gs.inventory[36] = Some(SlotItem {
-            id: 276,
-            count: 1,
-            damage: 0,
-        });
+        gs.inventory[36] = Some(SlotItem::new(276, 1, 0));
         gs.using_item = true;
         gs.set_pending_actions(TickActions {
             right_held: true,
@@ -4224,11 +4353,7 @@ mod interaction_tests {
         let mut gs = looking_along_x();
         gs.world.set_block(3, 0, 0, BlockState::STONE);
         gs.selected_slot = 0;
-        gs.inventory[36] = Some(SlotItem {
-            id: 1,
-            count: 64,
-            damage: 0,
-        }); // stone in hotbar slot 0
+        gs.inventory[36] = Some(SlotItem::new(1, 64, 0)); // stone in hotbar slot 0
         assert!(gs.world.block_at(2, 0, 0).is_air());
 
         let packets = use_item(&mut gs);
@@ -4253,11 +4378,7 @@ mod interaction_tests {
         let mut gs = looking_along_x();
         gs.world.set_block(3, 0, 0, BlockState::STONE);
         gs.selected_slot = 0;
-        gs.inventory[36] = Some(SlotItem {
-            id: 1,
-            count: 64,
-            damage: 0,
-        });
+        gs.inventory[36] = Some(SlotItem::new(1, 64, 0));
         let _ = use_item(&mut gs);
         assert_eq!(
             gs.world.block_at(2, 0, 0),
@@ -4286,11 +4407,7 @@ mod interaction_tests {
         let mut gs = looking_along_x();
         gs.world.set_block(3, 0, 0, BlockState::new(54, 2)); // chest
         gs.selected_slot = 0;
-        gs.inventory[36] = Some(SlotItem {
-            id: 1,
-            count: 64,
-            damage: 0,
-        });
+        gs.inventory[36] = Some(SlotItem::new(1, 64, 0));
         let _ = use_item(&mut gs);
         assert!(
             gs.world.block_at(2, 0, 0).is_air(),
@@ -4300,52 +4417,32 @@ mod interaction_tests {
 
     #[test]
     fn placement_block_state_orients_common_blocks() {
-        let stone = SlotItem {
-            id: 1,
-            count: 1,
-            damage: 0,
-        };
+        let stone = SlotItem::new(1, 1, 0);
         assert_eq!(
-            placement_block_state(stone, 1, 0.0, 8),
+            placement_block_state(&stone, 1, 0.0, 8),
             Some(BlockState::new(1, 0))
         );
         // Slab on top of a block → bottom half; on the underside → top half.
-        let slab = SlotItem {
-            id: 44,
-            count: 1,
-            damage: 0,
-        };
+        let slab = SlotItem::new(44, 1, 0);
         assert_eq!(
-            placement_block_state(slab, 1, 0.0, 8),
+            placement_block_state(&slab, 1, 0.0, 8),
             Some(BlockState::new(44, 0))
         );
         assert_eq!(
-            placement_block_state(slab, 0, 0.0, 8),
+            placement_block_state(&slab, 0, 0.0, 8),
             Some(BlockState::new(44, 8))
         );
         // Log placed against an x-facing face → x axis (meta bit 4).
-        let log = SlotItem {
-            id: 17,
-            count: 1,
-            damage: 0,
-        };
+        let log = SlotItem::new(17, 1, 0);
         assert_eq!(
-            placement_block_state(log, 4, 0.0, 8),
+            placement_block_state(&log, 4, 0.0, 8),
             Some(BlockState::new(17, 4))
         );
         // Non-block items and oriented blocks we don't model are not predicted.
-        let pickaxe = SlotItem {
-            id: 278,
-            count: 1,
-            damage: 0,
-        };
-        assert!(placement_block_state(pickaxe, 1, 0.0, 8).is_none());
-        let torch = SlotItem {
-            id: 50,
-            count: 1,
-            damage: 0,
-        };
-        assert!(placement_block_state(torch, 1, 0.0, 8).is_none());
+        let pickaxe = SlotItem::new(278, 1, 0);
+        assert!(placement_block_state(&pickaxe, 1, 0.0, 8).is_none());
+        let torch = SlotItem::new(50, 1, 0);
+        assert!(placement_block_state(&torch, 1, 0.0, 8).is_none());
     }
 
     #[test]

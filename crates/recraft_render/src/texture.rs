@@ -29,8 +29,251 @@ const DEFAULT_GRASS: [u8; 3] = [0x91, 0xBD, 0x59];
 const DEFAULT_FOLIAGE: [u8; 3] = [0x77, 0xAB, 0x2F];
 
 const GRASS_SIDE_OVERLAY: &str = "assets/minecraft/textures/blocks/grass_side_overlay.png";
+const GRASS_SIDE_OVERLAY_1_13: &str = "assets/minecraft/textures/block/grass_block_side_overlay.png";
 const GRASS_COLORMAP: &str = "assets/minecraft/textures/colormap/grass.png";
 const FOLIAGE_COLORMAP: &str = "assets/minecraft/textures/colormap/foliage.png";
+
+/// PBR atlas data built alongside the colour atlas when a resource pack provides
+/// `_n.png` (normal) and/or `_s.png` (specular/material) textures.
+#[derive(Debug, Clone, Default)]
+pub struct PbrAtlases {
+    /// Normal atlas (labPBR: RGB = tangent-space normal, A = height/AO).
+    pub normal: Option<(Vec<u8>, u32, u32)>,
+    /// Specular atlas (labPBR: R = smoothness, G = metallic, B = emissive).
+    pub specular: Option<(Vec<u8>, u32, u32)>,
+}
+
+/// Map a 1.8.9 block texture name to its 1.13+ (flattened) equivalent.
+/// Returns `None` when the name is unchanged across versions.
+fn name_1_8_to_1_13(name: &str) -> Option<&'static str> {
+    match name {
+        // planks_X → X_planks
+        "planks_oak" => Some("oak_planks"),
+        "planks_spruce" => Some("spruce_planks"),
+        "planks_birch" => Some("birch_planks"),
+        "planks_jungle" => Some("jungle_planks"),
+        "planks_acacia" => Some("acacia_planks"),
+        "planks_big_oak" => Some("dark_oak_planks"),
+        // log_X / log_X_top → X_log / X_log_top
+        "log_oak" => Some("oak_log"),
+        "log_oak_top" => Some("oak_log_top"),
+        "log_spruce" => Some("spruce_log"),
+        "log_spruce_top" => Some("spruce_log_top"),
+        "log_birch" => Some("birch_log"),
+        "log_birch_top" => Some("birch_log_top"),
+        "log_jungle" => Some("jungle_log"),
+        "log_jungle_top" => Some("jungle_log_top"),
+        "log_acacia" => Some("acacia_log"),
+        "log_acacia_top" => Some("acacia_log_top"),
+        "log_big_oak" => Some("dark_oak_log"),
+        "log_big_oak_top" => Some("dark_oak_log_top"),
+        // leaves_X → X_leaves
+        "leaves_oak" => Some("oak_leaves"),
+        "leaves_spruce" => Some("spruce_leaves"),
+        "leaves_birch" => Some("birch_leaves"),
+        "leaves_jungle" => Some("jungle_leaves"),
+        "leaves_big_oak" => Some("dark_oak_leaves"),
+        "leaves_acacia" => Some("acacia_leaves"),
+        // wool_colored_X → X_wool
+        "wool_colored_white" => Some("white_wool"),
+        "wool_colored_orange" => Some("orange_wool"),
+        "wool_colored_magenta" => Some("magenta_wool"),
+        "wool_colored_light_blue" => Some("light_blue_wool"),
+        "wool_colored_yellow" => Some("yellow_wool"),
+        "wool_colored_lime" => Some("lime_wool"),
+        "wool_colored_pink" => Some("pink_wool"),
+        "wool_colored_gray" => Some("gray_wool"),
+        "wool_colored_silver" => Some("light_gray_wool"),
+        "wool_colored_cyan" => Some("cyan_wool"),
+        "wool_colored_purple" => Some("purple_wool"),
+        "wool_colored_blue" => Some("blue_wool"),
+        "wool_colored_brown" => Some("brown_wool"),
+        "wool_colored_green" => Some("green_wool"),
+        "wool_colored_red" => Some("red_wool"),
+        "wool_colored_black" => Some("black_wool"),
+        // hardened_clay_stained_X → X_terracotta
+        "hardened_clay" => Some("terracotta"),
+        "hardened_clay_stained_white" => Some("white_terracotta"),
+        "hardened_clay_stained_orange" => Some("orange_terracotta"),
+        "hardened_clay_stained_magenta" => Some("magenta_terracotta"),
+        "hardened_clay_stained_light_blue" => Some("light_blue_terracotta"),
+        "hardened_clay_stained_yellow" => Some("yellow_terracotta"),
+        "hardened_clay_stained_lime" => Some("lime_terracotta"),
+        "hardened_clay_stained_pink" => Some("pink_terracotta"),
+        "hardened_clay_stained_gray" => Some("gray_terracotta"),
+        "hardened_clay_stained_silver" => Some("light_gray_terracotta"),
+        "hardened_clay_stained_cyan" => Some("cyan_terracotta"),
+        "hardened_clay_stained_purple" => Some("purple_terracotta"),
+        "hardened_clay_stained_blue" => Some("blue_terracotta"),
+        "hardened_clay_stained_brown" => Some("brown_terracotta"),
+        "hardened_clay_stained_green" => Some("green_terracotta"),
+        "hardened_clay_stained_red" => Some("red_terracotta"),
+        "hardened_clay_stained_black" => Some("black_terracotta"),
+        // glass_X → X_stained_glass
+        "glass_white" => Some("white_stained_glass"),
+        "glass_orange" => Some("orange_stained_glass"),
+        "glass_magenta" => Some("magenta_stained_glass"),
+        "glass_light_blue" => Some("light_blue_stained_glass"),
+        "glass_yellow" => Some("yellow_stained_glass"),
+        "glass_lime" => Some("lime_stained_glass"),
+        "glass_pink" => Some("pink_stained_glass"),
+        "glass_gray" => Some("gray_stained_glass"),
+        "glass_silver" => Some("light_gray_stained_glass"),
+        "glass_cyan" => Some("cyan_stained_glass"),
+        "glass_purple" => Some("purple_stained_glass"),
+        "glass_blue" => Some("blue_stained_glass"),
+        "glass_brown" => Some("brown_stained_glass"),
+        "glass_green" => Some("green_stained_glass"),
+        "glass_red" => Some("red_stained_glass"),
+        "glass_black" => Some("black_stained_glass"),
+        // door_X_lower/upper → X_door_bottom/top
+        "door_wood_lower" => Some("oak_door_bottom"),
+        "door_wood_upper" => Some("oak_door_top"),
+        "door_iron_lower" => Some("iron_door_bottom"),
+        "door_iron_upper" => Some("iron_door_top"),
+        "door_spruce_lower" => Some("spruce_door_bottom"),
+        "door_spruce_upper" => Some("spruce_door_top"),
+        "door_birch_lower" => Some("birch_door_bottom"),
+        "door_birch_upper" => Some("birch_door_top"),
+        "door_jungle_lower" => Some("jungle_door_bottom"),
+        "door_jungle_upper" => Some("jungle_door_top"),
+        "door_acacia_lower" => Some("acacia_door_bottom"),
+        "door_acacia_upper" => Some("acacia_door_top"),
+        "door_dark_oak_lower" => Some("dark_oak_door_bottom"),
+        "door_dark_oak_upper" => Some("dark_oak_door_top"),
+        // stone variants
+        "stone_granite" => Some("granite"),
+        "stone_granite_smooth" => Some("polished_granite"),
+        "stone_diorite" => Some("diorite"),
+        "stone_diorite_smooth" => Some("polished_diorite"),
+        "stone_andesite" => Some("andesite"),
+        "stone_andesite_smooth" => Some("polished_andesite"),
+        // stone bricks
+        "stonebrick" => Some("stone_bricks"),
+        "stonebrick_mossy" => Some("mossy_stone_bricks"),
+        "stonebrick_cracked" => Some("cracked_stone_bricks"),
+        "stonebrick_carved" => Some("chiseled_stone_bricks"),
+        "stone_slab_top" => Some("smooth_stone"),
+        // brick / nether brick
+        "brick" => Some("bricks"),
+        "nether_brick" => Some("nether_bricks"),
+        // cobblestone
+        "cobblestone_mossy" => Some("mossy_cobblestone"),
+        // sandstone
+        "sandstone_normal" => Some("sandstone"),
+        "sandstone_carved" => Some("chiseled_sandstone"),
+        "sandstone_smooth" => Some("cut_sandstone"),
+        "red_sandstone_normal" => Some("red_sandstone"),
+        "red_sandstone_carved" => Some("chiseled_red_sandstone"),
+        "red_sandstone_smooth" => Some("cut_red_sandstone"),
+        // quartz
+        "quartz_block_chiseled" => Some("chiseled_quartz_block"),
+        "quartz_block_chiseled_top" => Some("chiseled_quartz_block_top"),
+        "quartz_block_lines" => Some("quartz_pillar"),
+        "quartz_block_lines_top" => Some("quartz_pillar_top"),
+        // flowers
+        "flower_rose" => Some("poppy"),
+        "flower_dandelion" => Some("dandelion"),
+        "flower_allium" => Some("allium"),
+        "flower_blue_orchid" => Some("blue_orchid"),
+        "flower_houstonia" => Some("azure_bluet"),
+        "flower_oxeye_daisy" => Some("oxeye_daisy"),
+        "flower_tulip_red" => Some("red_tulip"),
+        "flower_tulip_orange" => Some("orange_tulip"),
+        "flower_tulip_white" => Some("white_tulip"),
+        "flower_tulip_pink" => Some("pink_tulip"),
+        // saplings
+        "sapling_oak" => Some("oak_sapling"),
+        "sapling_spruce" => Some("spruce_sapling"),
+        "sapling_birch" => Some("birch_sapling"),
+        "sapling_jungle" => Some("jungle_sapling"),
+        "sapling_acacia" => Some("acacia_sapling"),
+        "sapling_roofed_oak" => Some("dark_oak_sapling"),
+        // mushrooms
+        "mushroom_brown" => Some("brown_mushroom"),
+        "mushroom_red" => Some("red_mushroom"),
+        "mushroom_block_skin_brown" => Some("brown_mushroom_block"),
+        "mushroom_block_skin_red" => Some("red_mushroom_block"),
+        "mushroom_block_skin_stem" => Some("mushroom_stem"),
+        // grass / plants
+        "grass_top" => Some("grass_block_top"),
+        "grass_side" => Some("grass_block_side"),
+        "tallgrass" => Some("grass"),
+        "double_plant_grass_top" => Some("tall_grass_top"),
+        "deadbush" => Some("dead_bush"),
+        "reeds" => Some("sugar_cane"),
+        "waterlily" => Some("lily_pad"),
+        "dirt_podzol_top" => Some("podzol_top"),
+        "dirt_podzol_side" => Some("podzol_side"),
+        // misc renames
+        "torch_on" => Some("torch"),
+        "mob_spawner" => Some("spawner"),
+        "web" => Some("cobweb"),
+        "slime" => Some("slime_block"),
+        "ice_packed" => Some("packed_ice"),
+        "noteblock" => Some("note_block"),
+        "piston_top_normal" => Some("piston_top"),
+        "redstone_lamp_off" => Some("redstone_lamp"),
+        "farmland_dry" => Some("farmland"),
+        "prismarine_rough" => Some("prismarine"),
+        "prismarine_dark" => Some("dark_prismarine"),
+        // portals / fire
+        "portal" => Some("nether_portal"),
+        "fire_layer_0" => Some("fire_0"),
+        // end
+        "endframe_side" => Some("end_portal_frame_side"),
+        "endframe_top" => Some("end_portal_frame_top"),
+        // furnace
+        "furnace_front_on" => Some("furnace_front_on"),
+        // rails
+        "rail_normal" => Some("rail"),
+        "rail_normal_turned" => Some("rail_corner"),
+        "rail_golden" => Some("powered_rail"),
+        "rail_golden_powered" => Some("powered_rail_on"),
+        "rail_detector" => Some("detector_rail"),
+        "rail_detector_powered" => Some("detector_rail_on"),
+        "rail_activator" => Some("activator_rail"),
+        "rail_activator_powered" => Some("activator_rail_on"),
+        // anvil
+        "anvil_base" => Some("anvil"),
+        "anvil_top_damaged_0" => Some("anvil_top"),
+        "anvil_top_damaged_1" => Some("chipped_anvil_top"),
+        "anvil_top_damaged_2" => Some("damaged_anvil_top"),
+        _ => None,
+    }
+}
+
+/// Try loading a block texture from a read function, falling back through
+/// 1.8 path → 1.13+ mapped path.
+fn read_block_texture(
+    name: &str,
+    read: &mut dyn FnMut(&str) -> Option<DynamicImage>,
+) -> Option<DynamicImage> {
+    // 1.8 path: textures/blocks/
+    if !name.contains('/') {
+        let asset_1_8 = format!("assets/minecraft/textures/blocks/{name}.png");
+        if let Some(img) = read(&asset_1_8) {
+            return Some(img);
+        }
+        // 1.13+ path with same name: textures/block/
+        let asset_1_13 = format!("assets/minecraft/textures/block/{name}.png");
+        if let Some(img) = read(&asset_1_13) {
+            return Some(img);
+        }
+        // 1.13+ path with mapped name
+        if let Some(mapped) = name_1_8_to_1_13(name) {
+            let asset_mapped = format!("assets/minecraft/textures/block/{mapped}.png");
+            if let Some(img) = read(&asset_mapped) {
+                return Some(img);
+            }
+        }
+        None
+    } else {
+        // Items etc. keep their existing path logic
+        let asset = format!("assets/minecraft/textures/{name}.png");
+        read(&asset)
+    }
+}
 
 /// Maps texture base-names to atlas tile indices and yields UVs. Index 0 is the
 /// magenta "missing" tile, so unknown/missing textures are visually obvious.
@@ -136,12 +379,15 @@ pub struct TextureAtlasImage {
     rows: u32,
     /// Tile indices left as magenta placeholders (texture file not found).
     missing_indices: Vec<u32>,
+    /// PBR normal + specular atlases (only present when a resource pack provides them).
+    pub pbr: PbrAtlases,
 }
 
 #[derive(Debug, Clone)]
 pub enum TextureAtlasSource {
     Directory(PathBuf),
     Archive(PathBuf),
+    ResourcePack(PathBuf),
     Fallback,
 }
 
@@ -220,7 +466,7 @@ impl TextureAtlasImage {
         if loaded == 0 && !names.is_empty() {
             return Err("directory has no block textures".to_owned());
         }
-        Ok(Self::from_built(built, TextureAtlasSource::Directory(path)))
+        Ok(Self::from_built(built, TextureAtlasSource::Directory(path), PbrAtlases::default()))
     }
 
     fn from_asset_zip(path: PathBuf, names: &[String]) -> Result<Self, String> {
@@ -231,16 +477,127 @@ impl TextureAtlasImage {
         if loaded == 0 && !names.is_empty() {
             return Err("archive has no block textures".to_owned());
         }
-        Ok(Self::from_built(built, TextureAtlasSource::Archive(path)))
+        Ok(Self::from_built(built, TextureAtlasSource::Archive(path), PbrAtlases::default()))
     }
 
     fn fallback(names: &[String]) -> Self {
         let mut read = |_: &str| None;
         let (built, _) = build_atlas(names, &mut read);
-        Self::from_built(built, TextureAtlasSource::Fallback)
+        Self::from_built(built, TextureAtlasSource::Fallback, PbrAtlases::default())
     }
 
-    fn from_built(built: BuiltAtlas, source: TextureAtlasSource) -> Self {
+    /// Build the atlas using an optional resource pack overlaid on the base
+    /// 1.8 assets. When `pack_path` is `Some`, textures are loaded from the
+    /// pack first (with 1.13+ name mapping) and the base assets are used as
+    /// a fallback for any texture not found in the pack.
+    pub fn load_with_pack(pack_path: Option<PathBuf>) -> Self {
+        let pack_path = match pack_path {
+            Some(p) if p.exists() => Some(p),
+            _ => return Self::load_default(),
+        };
+        let pack_path = pack_path.unwrap();
+
+        let mut names = registry().all_texture_names();
+        for stage in 0..10 {
+            names.push(format!("destroy_stage_{stage}"));
+        }
+        names.push("glass_pane_top".to_owned());
+        for color in STAINED_COLORS {
+            names.push(format!("glass_pane_top_{color}"));
+        }
+        names.push("piston_inner".to_owned());
+        let mut seen = std::collections::HashSet::new();
+        for id in (256..432).chain(2256..2268) {
+            if let Some(name) = item_texture_name(id) {
+                if seen.insert(name) {
+                    names.push(format!("items/{name}"));
+                }
+            }
+        }
+
+        let result = if pack_path.is_dir() {
+            Self::from_pack_directory(pack_path.clone(), &names)
+        } else {
+            Self::from_pack_zip(pack_path.clone(), &names)
+        };
+
+        match result {
+            Ok(atlas) => atlas,
+            Err(err) => {
+                log::warn!("failed to load resource pack {}: {err}", pack_path.display());
+                Self::load_default()
+            }
+        }
+    }
+
+    fn from_pack_directory(pack_path: PathBuf, names: &[String]) -> Result<Self, String> {
+        // Read function: pack first, then base assets
+        let base_paths = candidate_asset_paths();
+        let mut read = |asset: &str| {
+            if let Some(img) = read_directory_image(&pack_path, asset) {
+                return Some(img);
+            }
+            for base in &base_paths {
+                let img = if base.is_dir() {
+                    read_directory_image(base, asset)
+                } else {
+                    File::open(base)
+                        .ok()
+                        .and_then(|file| ZipArchive::new(file).ok())
+                        .and_then(|mut zip| read_zip_image(&mut zip, asset))
+                };
+                if let Some(img) = img {
+                    return Some(img);
+                }
+            }
+            None
+        };
+        let (built, loaded) = build_atlas(names, &mut read);
+        if loaded == 0 && !names.is_empty() {
+            return Err("resource pack has no block textures".to_owned());
+        }
+        let pbr = build_pbr_atlases(names, &built.name_to_index, built.rows, &mut read);
+        Ok(Self::from_built(built, TextureAtlasSource::ResourcePack(pack_path), pbr))
+    }
+
+    fn from_pack_zip(pack_path: PathBuf, names: &[String]) -> Result<Self, String> {
+        let pack_file = File::open(&pack_path).map_err(|e| e.to_string())?;
+        let pack_zip = Arc::new(Mutex::new(
+            ZipArchive::new(pack_file).map_err(|e| e.to_string())?,
+        ));
+        let base_paths = candidate_asset_paths();
+        let mut read = |asset: &str| {
+            if let Some(img) = pack_zip
+                .lock()
+                .ok()
+                .and_then(|mut z| read_zip_image(&mut z, asset))
+            {
+                return Some(img);
+            }
+            for base in &base_paths {
+                let img = if base.is_dir() {
+                    read_directory_image(base, asset)
+                } else {
+                    File::open(base)
+                        .ok()
+                        .and_then(|file| ZipArchive::new(file).ok())
+                        .and_then(|mut zip| read_zip_image(&mut zip, asset))
+                };
+                if let Some(img) = img {
+                    return Some(img);
+                }
+            }
+            None
+        };
+        let (built, loaded) = build_atlas(names, &mut read);
+        if loaded == 0 && !names.is_empty() {
+            return Err("resource pack has no block textures".to_owned());
+        }
+        let pbr = build_pbr_atlases(names, &built.name_to_index, built.rows, &mut read);
+        Ok(Self::from_built(built, TextureAtlasSource::ResourcePack(pack_path), pbr))
+    }
+
+    fn from_built(built: BuiltAtlas, source: TextureAtlasSource, pbr: PbrAtlases) -> Self {
         Self {
             width: built.image.width(),
             height: built.image.height(),
@@ -251,6 +608,7 @@ impl TextureAtlasImage {
             name_to_index: built.name_to_index,
             rows: built.rows,
             missing_indices: built.missing_indices,
+            pbr,
         }
     }
 }
@@ -283,14 +641,7 @@ fn build_atlas(
     for (offset, name) in names.iter().enumerate() {
         let index = offset as u32 + 1;
         name_to_index.insert(name.clone(), index);
-        // Plain names live under textures/blocks/; names with a path (e.g.
-        // "items/diamond_sword") resolve relative to textures/.
-        let asset = if name.contains('/') {
-            format!("assets/minecraft/textures/{name}.png")
-        } else {
-            format!("assets/minecraft/textures/blocks/{name}.png")
-        };
-        if let Some(source) = read(&asset) {
+        if let Some(source) = read_block_texture(name, read) {
             copy_tile(&mut image, index, source);
             loaded += 1;
         } else {
@@ -317,9 +668,8 @@ fn build_atlas(
     let foliage = read(FOLIAGE_COLORMAP)
         .map(|img| sample_plains_color(&img))
         .unwrap_or(DEFAULT_FOLIAGE);
-    if let (Some(&index), Some(overlay)) =
-        (name_to_index.get("grass_side"), read(GRASS_SIDE_OVERLAY))
-    {
+    let overlay = read(GRASS_SIDE_OVERLAY).or_else(|| read(GRASS_SIDE_OVERLAY_1_13));
+    if let (Some(&index), Some(overlay)) = (name_to_index.get("grass_side"), overlay) {
         composite_grass_side(&mut image, index, &overlay, grass);
     }
 
@@ -824,6 +1174,13 @@ pub fn load_entity_image(name: &str) -> Option<RgbaImage> {
     load_asset_image(&format!("assets/minecraft/textures/entity/{name}.png"))
 }
 
+/// Load an armor layer texture (e.g. "iron_layer_1") from the models/armor dir.
+fn load_armor_image(name: &str) -> Option<RgbaImage> {
+    load_asset_image(&format!(
+        "assets/minecraft/textures/models/armor/{name}.png"
+    ))
+}
+
 /// Side length of the square sky atlas (sun + moon phases + a white star texel).
 pub const SKY_ATLAS_PX: u32 = 128;
 
@@ -935,7 +1292,7 @@ fn procedural_moon_phases() -> RgbaImage {
     image
 }
 
-pub(crate) fn load_asset_image(asset: &str) -> Option<RgbaImage> {
+pub fn load_asset_image(asset: &str) -> Option<RgbaImage> {
     for path in candidate_asset_paths() {
         let image = if path.is_dir() {
             read_directory_image(&path, asset)
@@ -980,7 +1337,7 @@ pub const ENTITY_SLOT_PX: u32 = 64;
 
 /// Number of fixed slots stacked at the top of the entity atlas (one per
 /// [`EntitySlot`], including the trailing guaranteed-white slot).
-pub const ENTITY_SLOT_COUNT: u32 = 25;
+pub const ENTITY_SLOT_COUNT: u32 = 35;
 
 /// Extra 64x64 rows reserved below the fixed slots for per-player downloaded
 /// skins, allocated at runtime by the skin loader.
@@ -1038,8 +1395,18 @@ pub enum EntitySlot {
     Blaze = 21,
     Ghast = 22,
     Silverfish = 23,
+    ArmorLeather1 = 24,
+    ArmorLeather2 = 25,
+    ArmorChain1 = 26,
+    ArmorChain2 = 27,
+    ArmorIron1 = 28,
+    ArmorIron2 = 29,
+    ArmorGold1 = 30,
+    ArmorGold2 = 31,
+    ArmorDiamond1 = 32,
+    ArmorDiamond2 = 33,
     /// Guaranteed opaque-white slot sampled by solid-color geometry.
-    White = 24,
+    White = 34,
 }
 
 /// Pixel origin (top-left corner) of an entity atlas slot.
@@ -1130,6 +1497,26 @@ impl EntityAtlasImage {
             };
             blit_slot(&mut atlas, slot, &image);
         }
+        let armor_assets: [(EntitySlot, &str, [u8; 3]); 10] = [
+            (EntitySlot::ArmorLeather1, "leather_layer_1", [139, 90, 43]),
+            (EntitySlot::ArmorLeather2, "leather_layer_2", [139, 90, 43]),
+            (EntitySlot::ArmorChain1, "chainmail_layer_1", [150, 150, 150]),
+            (EntitySlot::ArmorChain2, "chainmail_layer_2", [150, 150, 150]),
+            (EntitySlot::ArmorIron1, "iron_layer_1", [210, 210, 210]),
+            (EntitySlot::ArmorIron2, "iron_layer_2", [210, 210, 210]),
+            (EntitySlot::ArmorGold1, "gold_layer_1", [230, 200, 50]),
+            (EntitySlot::ArmorGold2, "gold_layer_2", [230, 200, 50]),
+            (EntitySlot::ArmorDiamond1, "diamond_layer_1", [80, 210, 210]),
+            (EntitySlot::ArmorDiamond2, "diamond_layer_2", [80, 210, 210]),
+        ];
+        for (slot, name, tint) in armor_assets {
+            let image = match load_armor_image(name) {
+                Some(image) => normalize_entity_texture(image),
+                None => procedural_armor_texture(tint),
+            };
+            blit_slot(&mut atlas, slot, &image);
+        }
+
         log::info!(
             "loaded {mob_textures_loaded}/{} mob entity textures",
             MOB_SLOT_ASSETS.len()
@@ -1196,6 +1583,16 @@ fn procedural_entity_texture(tint: [u8; 3]) -> RgbaImage {
         image.put_pixel(x, y + 1, eye);
     }
     image
+}
+
+/// Procedural stand-in for a missing armor texture: a solid tint filling the
+/// standard armor UV regions so the overlay reads as colored plates.
+fn procedural_armor_texture(tint: [u8; 3]) -> RgbaImage {
+    let base = Rgba([tint[0], tint[1], tint[2], 255]);
+    let clear = Rgba([0, 0, 0, 0]);
+    RgbaImage::from_fn(ENTITY_SLOT_PX, ENTITY_SLOT_PX / 2, |x, y| {
+        if y < 32 && x < 64 { base } else { clear }
+    })
 }
 
 /// Bring a player skin to the modern 64x64 layout: HD skins are downscaled
@@ -1334,6 +1731,176 @@ fn read_zip_image<R: Read + std::io::Seek>(
     image::load_from_memory(&bytes).ok()
 }
 
+/// Build PBR normal and specular atlases with the same tile layout as the
+/// colour atlas.  For each texture name, looks for `_n.png` (normal) and
+/// `_s.png` (specular) in both 1.8 and 1.13+ paths.
+fn build_pbr_atlases(
+    names: &[String],
+    name_to_index: &HashMap<String, u32>,
+    rows: u32,
+    read: &mut dyn FnMut(&str) -> Option<DynamicImage>,
+) -> PbrAtlases {
+    let w = ATLAS_COLUMNS * TILE_SIZE;
+    let h = rows * TILE_SIZE;
+    // Default normal: flat-up (128,128,255) with full AO (255)
+    let default_normal = Rgba([128, 128, 255, 255]);
+    // Default specular: rough (0), non-metallic (0), no emission (0)
+    let default_specular = Rgba([0, 0, 0, 255]);
+
+    let mut normal_image = RgbaImage::from_pixel(w, h, default_normal);
+    let mut specular_image = RgbaImage::from_pixel(w, h, default_specular);
+    let mut normal_count = 0u32;
+    let mut specular_count = 0u32;
+
+    for name in names {
+        if name.contains('/') {
+            continue; // skip items
+        }
+        let Some(&index) = name_to_index.get(name.as_str()) else {
+            continue;
+        };
+
+        // Try loading _n.png
+        if let Some(img) = read_pbr_texture(name, "_n", read) {
+            copy_tile(&mut normal_image, index, img);
+            normal_count += 1;
+        }
+        // Try loading _s.png
+        if let Some(img) = read_pbr_texture(name, "_s", read) {
+            copy_tile(&mut specular_image, index, img);
+            specular_count += 1;
+        }
+    }
+
+    if normal_count == 0 && specular_count == 0 {
+        log::info!("no PBR textures found in resource pack");
+        return PbrAtlases::default();
+    }
+    log::info!("loaded {normal_count} normal maps, {specular_count} specular maps");
+
+    PbrAtlases {
+        normal: Some((normal_image.into_raw(), w, h)),
+        specular: Some((specular_image.into_raw(), w, h)),
+    }
+}
+
+/// Try loading a PBR companion texture (e.g. `_n` or `_s` suffix) for a
+/// block texture name, trying 1.8 and 1.13+ paths.
+fn read_pbr_texture(
+    name: &str,
+    suffix: &str,
+    read: &mut dyn FnMut(&str) -> Option<DynamicImage>,
+) -> Option<DynamicImage> {
+    // 1.8 path
+    let asset = format!("assets/minecraft/textures/blocks/{name}{suffix}.png");
+    if let Some(img) = read(&asset) {
+        return Some(img);
+    }
+    // 1.13+ path with original name
+    let asset = format!("assets/minecraft/textures/block/{name}{suffix}.png");
+    if let Some(img) = read(&asset) {
+        return Some(img);
+    }
+    // 1.13+ path with mapped name
+    if let Some(mapped) = name_1_8_to_1_13(name) {
+        let asset = format!("assets/minecraft/textures/block/{mapped}{suffix}.png");
+        if let Some(img) = read(&asset) {
+            return Some(img);
+        }
+    }
+    None
+}
+
+/// Metadata from a resource pack's `pack.mcmeta` file.
+#[derive(Debug, Clone)]
+pub struct PackMeta {
+    pub pack_format: u32,
+    pub description: String,
+}
+
+/// Scan a directory for resource packs (zip files and subdirectories that
+/// contain a `pack.mcmeta`).  Returns `(name, path, metadata)` for each.
+pub fn discover_resource_packs(dir: &Path) -> Vec<(String, PathBuf, PackMeta)> {
+    let mut packs = Vec::new();
+    let Ok(entries) = fs::read_dir(dir) else {
+        return packs;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry
+            .file_name()
+            .to_string_lossy()
+            .into_owned();
+        if let Some(meta) = read_pack_meta(&path) {
+            packs.push((name, path, meta));
+        }
+    }
+    packs.sort_by(|a, b| a.0.cmp(&b.0));
+    packs
+}
+
+fn read_pack_meta(path: &Path) -> Option<PackMeta> {
+    let bytes = if path.is_dir() {
+        fs::read(path.join("pack.mcmeta")).ok()?
+    } else if path.extension().and_then(|e| e.to_str()) == Some("zip") {
+        let file = File::open(path).ok()?;
+        let mut zip = ZipArchive::new(file).ok()?;
+        let mut entry = zip.by_name("pack.mcmeta").ok()?;
+        let mut buf = Vec::new();
+        entry.read_to_end(&mut buf).ok()?;
+        buf
+    } else {
+        return None;
+    };
+    let json: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let pack = json.get("pack")?;
+    let pack_format = pack.get("pack_format")?.as_u64()? as u32;
+    let description = pack
+        .get("description")
+        .and_then(|d| d.as_str())
+        .unwrap_or("")
+        .to_owned();
+    Some(PackMeta {
+        pack_format,
+        description,
+    })
+}
+
+/// Preloaded screen-overlay textures (water/lava/fire). Missing assets fall
+/// back to solid-color rectangles in the GUI code.
+#[derive(Debug)]
+pub struct OverlayTextures {
+    pub lava: Option<Arc<RgbaImage>>,
+    pub fire: Option<Arc<RgbaImage>>,
+}
+
+impl OverlayTextures {
+    pub fn load() -> Self {
+        let lava = load_asset_image("assets/minecraft/textures/blocks/lava_still.png")
+            .or_else(|| load_asset_image("assets/minecraft/textures/block/lava_still.png"))
+            .map(|img| {
+                // Animated strip: take the first 16x16 frame.
+                if img.height() > TILE_SIZE {
+                    Arc::new(image::imageops::crop_imm(&img, 0, 0, TILE_SIZE, TILE_SIZE).to_image())
+                } else {
+                    Arc::new(img)
+                }
+            });
+
+        let fire = load_asset_image("assets/minecraft/textures/blocks/fire_layer_1.png")
+            .or_else(|| load_asset_image("assets/minecraft/textures/block/fire_1.png"))
+            .map(|img| {
+                if img.height() > TILE_SIZE {
+                    Arc::new(image::imageops::crop_imm(&img, 0, 0, TILE_SIZE, TILE_SIZE).to_image())
+                } else {
+                    Arc::new(img)
+                }
+            });
+
+        Self { lava, fire }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1419,6 +1986,16 @@ mod tests {
             EntitySlot::Blaze,
             EntitySlot::Ghast,
             EntitySlot::Silverfish,
+            EntitySlot::ArmorLeather1,
+            EntitySlot::ArmorLeather2,
+            EntitySlot::ArmorChain1,
+            EntitySlot::ArmorChain2,
+            EntitySlot::ArmorIron1,
+            EntitySlot::ArmorIron2,
+            EntitySlot::ArmorGold1,
+            EntitySlot::ArmorGold2,
+            EntitySlot::ArmorDiamond1,
+            EntitySlot::ArmorDiamond2,
             EntitySlot::White,
         ];
         let mut seen = std::collections::HashSet::new();

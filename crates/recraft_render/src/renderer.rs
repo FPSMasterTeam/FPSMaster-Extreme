@@ -545,6 +545,15 @@ pub struct Renderer<'window> {
     /// Block atlas bound once per mipmap level (index = active level); the
     /// "Mipmaps" option selects which to bind.
     texture_bind_groups: Vec<wgpu::BindGroup>,
+    /// Retained group(1) layout for rebuilding texture_bind_groups on atlas reload.
+    texture_layout: wgpu::BindGroupLayout,
+    /// Retained group(2) layout for rebuilding lighting_bind_group on atlas reload.
+    lighting_layout: wgpu::BindGroupLayout,
+    /// PBR normal/specular atlas views + sampler, for rebuilding lighting bind group.
+    pbr_normal_view: wgpu::TextureView,
+    pbr_specular_view: wgpu::TextureView,
+    pbr_sampler: wgpu::Sampler,
+    pbr_enabled: bool,
     /// Opaque (REPLACE-blend) water/glass pipeline for Graphics: Fast — skips
     /// the alpha-blend destination read.
     water_opaque_pipeline: wgpu::RenderPipeline,
@@ -575,6 +584,7 @@ pub struct Renderer<'window> {
     clouds_enabled: bool,
     /// Sun shadow-map target + the depth-only pipelines that fill it.
     shadow_view: wgpu::TextureView,
+    shadow_compare_sampler: wgpu::Sampler,
     shadow_solid_pipeline: wgpu::RenderPipeline,
     shadow_cutout_pipeline: wgpu::RenderPipeline,
     shadow_uniform_buffer: wgpu::Buffer,
@@ -909,8 +919,6 @@ impl<'window> Renderer<'window> {
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    // Vertex too: the water shader reads the enable flag + time
-                    // to displace the surface.
                     visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
@@ -935,6 +943,34 @@ impl<'window> Renderer<'window> {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
                     count: None,
                 },
+                // PBR textures (bindings 3-5): normal atlas, specular atlas, sampler.
+                // Default 1×1 textures when no resource pack provides PBR data.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
+                    count: None,
+                },
             ],
         });
         let lighting_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -943,24 +979,19 @@ impl<'window> Renderer<'window> {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let lighting_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("lighting-bind-group"),
-            layout: &lighting_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: lighting_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&shadow_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&shadow_compare_sampler),
-                },
-            ],
-        });
+        // Default PBR textures: 1×1 flat normal (pointing up) and zero specular.
+        let (pbr_normal_view, pbr_specular_view, pbr_sampler) =
+            create_default_pbr_textures(&device, &queue);
+        let lighting_bind_group = create_lighting_bind_group(
+            &device,
+            &lighting_layout,
+            &lighting_buffer,
+            &shadow_view,
+            &shadow_compare_sampler,
+            &pbr_normal_view,
+            &pbr_specular_view,
+            &pbr_sampler,
+        );
         // Chunk colour pipelines also bind the lighting group (group 2).
         let lit_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("chunk-lit-pipeline-layout"),
@@ -2062,6 +2093,12 @@ impl<'window> Renderer<'window> {
             depth_view,
             window_depth_view,
             texture_bind_groups,
+            texture_layout,
+            lighting_layout,
+            pbr_normal_view,
+            pbr_specular_view,
+            pbr_sampler,
+            pbr_enabled: false,
             water_opaque_pipeline,
             water_pipeline,
             start_time: Instant::now(),
@@ -2082,6 +2119,7 @@ impl<'window> Renderer<'window> {
             auto_exposure_enabled: false,
             clouds_enabled: false,
             shadow_view,
+            shadow_compare_sampler,
             shadow_solid_pipeline,
             shadow_cutout_pipeline,
             shadow_uniform_buffer,
@@ -2615,6 +2653,170 @@ impl<'window> Renderer<'window> {
         &self.atlas_uv
     }
 
+    /// Rebuild the block atlas from a resource pack (or default when `None`),
+    /// uploading new GPU textures and recreating the mesh worker pool.
+    /// Returns the new `AtlasUv` so the caller can update its own copy.
+    pub fn reload_atlas(&mut self, pack_path: Option<std::path::PathBuf>) -> AtlasUv {
+        let atlas = TextureAtlasImage::load_with_pack(pack_path);
+        let biome_colors = BiomeColors {
+            grass: atlas.grass_color,
+            foliage: atlas.foliage_color,
+        };
+        let atlas_uv = atlas.uv_table();
+
+        let mips =
+            crate::texture::build_atlas_mip_chain(&atlas.pixels, atlas.width, atlas.height);
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("block-atlas-texture"),
+            size: wgpu::Extent3d {
+                width: atlas.width,
+                height: atlas.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: mips.len() as u32,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        for (level, (data, mw, mh)) in mips.iter().enumerate() {
+            self.queue.write_texture(
+                wgpu::ImageCopyTexture {
+                    texture: &texture,
+                    mip_level: level as u32,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                data,
+                wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4 * mw),
+                    rows_per_image: Some(*mh),
+                },
+                wgpu::Extent3d {
+                    width: *mw,
+                    height: *mh,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let bind_groups: Vec<wgpu::BindGroup> = (0..crate::texture::ATLAS_MIP_LEVELS)
+            .map(|level| {
+                let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
+                    label: Some("block-atlas-sampler"),
+                    address_mode_u: wgpu::AddressMode::ClampToEdge,
+                    address_mode_v: wgpu::AddressMode::ClampToEdge,
+                    address_mode_w: wgpu::AddressMode::ClampToEdge,
+                    mag_filter: wgpu::FilterMode::Nearest,
+                    min_filter: wgpu::FilterMode::Nearest,
+                    mipmap_filter: wgpu::FilterMode::Linear,
+                    lod_max_clamp: level as f32,
+                    ..Default::default()
+                });
+                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("block-atlas-bind-group"),
+                    layout: &self.texture_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(&view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Sampler(&sampler),
+                        },
+                    ],
+                })
+            })
+            .collect();
+
+        self.texture_bind_groups = bind_groups;
+
+        // Upload PBR atlases if the pack provides them
+        let has_pbr = atlas.pbr.normal.is_some() || atlas.pbr.specular.is_some();
+        if has_pbr {
+            if let Some((data, w, h)) = &atlas.pbr.normal {
+                let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("pbr-normal-atlas"),
+                    size: wgpu::Extent3d { width: *w, height: *h, depth_or_array_layers: 1 },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                });
+                self.queue.write_texture(
+                    wgpu::ImageCopyTexture { texture: &tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                    data,
+                    wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(4 * w), rows_per_image: Some(*h) },
+                    wgpu::Extent3d { width: *w, height: *h, depth_or_array_layers: 1 },
+                );
+                self.pbr_normal_view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+            }
+            if let Some((data, w, h)) = &atlas.pbr.specular {
+                let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("pbr-specular-atlas"),
+                    size: wgpu::Extent3d { width: *w, height: *h, depth_or_array_layers: 1 },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                });
+                self.queue.write_texture(
+                    wgpu::ImageCopyTexture { texture: &tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                    data,
+                    wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(4 * w), rows_per_image: Some(*h) },
+                    wgpu::Extent3d { width: *w, height: *h, depth_or_array_layers: 1 },
+                );
+                self.pbr_specular_view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+            }
+            log::info!("PBR atlases uploaded (normal: {}, specular: {})",
+                atlas.pbr.normal.is_some(), atlas.pbr.specular.is_some());
+        } else {
+            // Reset to default 1×1 textures
+            let (nv, sv, _) = create_default_pbr_textures(&self.device, &self.queue);
+            self.pbr_normal_view = nv;
+            self.pbr_specular_view = sv;
+        }
+        self.pbr_enabled = has_pbr;
+
+        self.lighting_bind_group = create_lighting_bind_group(
+            &self.device,
+            &self.lighting_layout,
+            &self.lighting_buffer,
+            &self.shadow_view,
+            &self.shadow_compare_sampler,
+            &self.pbr_normal_view,
+            &self.pbr_specular_view,
+            &self.pbr_sampler,
+        );
+
+        let block_image = image::RgbaImage::from_raw(atlas.width, atlas.height, atlas.pixels);
+        self.gui_atlas = GuiAtlas::load(block_image, atlas_uv.clone());
+        self.biome_colors = biome_colors;
+        self.atlas_uv = atlas_uv.clone();
+
+        // Recreate mesh worker with new atlas data
+        self.mesh_worker = MeshWorker::new(atlas_uv.clone(), self.biome_colors);
+
+        // Clear all chunk meshes so they rebuild with the new atlas
+        self.chunk_solid.clear();
+        self.chunk_cutout.clear();
+        self.chunk_transparent.clear();
+        self.chunk_water.clear();
+        self.chunk_sections.clear();
+        self.chunk_mesh_generations.clear();
+
+        log::info!("atlas reloaded");
+        atlas_uv
+    }
+
     /// Replace the first-person held-item geometry (block-atlas textured
     /// `Vertex` data), drawn with the cutout pipeline after the world. Pass
     /// empty slices to hide it.
@@ -3052,7 +3254,7 @@ impl<'window> Renderer<'window> {
                     on(self.shaders_enabled && self.specular_enabled),
                     1.0 / SHADOW_DIM as f32,
                 ],
-                fog_color: [sky.horizon[0], sky.horizon[1], sky.horizon[2], 0.0],
+                fog_color: [sky.horizon[0], sky.horizon[1], sky.horizon[2], on(self.pbr_enabled)],
                 fog_params: [
                     camera.z_far * 0.45,
                     camera.z_far * 0.92,
@@ -4613,6 +4815,12 @@ fn create_texture_bind_group(
                 path.display()
             )
         }
+        TextureAtlasSource::ResourcePack(path) => {
+            log::info!(
+                "loaded block atlas from resource pack {}",
+                path.display()
+            )
+        }
         TextureAtlasSource::Fallback => {
             log::warn!("Minecraft 1.8.9 assets were not found; using fallback debug block atlas")
         }
@@ -4719,6 +4927,89 @@ fn create_texture_bind_group(
     // build instead of loading the atlas a second time).
     let block_image = image::RgbaImage::from_raw(atlas.width, atlas.height, atlas.pixels);
     (layout, bind_groups, biome_colors, atlas_uv, block_image)
+}
+
+fn create_default_pbr_textures(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) -> (wgpu::TextureView, wgpu::TextureView, wgpu::Sampler) {
+    let make_1x1 = |label: &str, pixel: [u8; 4]| {
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &pixel,
+            wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(4), rows_per_image: Some(1) },
+            wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+        );
+        tex.create_view(&wgpu::TextureViewDescriptor::default())
+    };
+    // Flat normal pointing up: (128,128,255) = (0,0,1) in tangent space; A=255 (no AO).
+    let normal_view = make_1x1("pbr-default-normal", [128, 128, 255, 255]);
+    // Zero specular: rough, non-metallic, no emissive.
+    let specular_view = make_1x1("pbr-default-specular", [0, 0, 0, 255]);
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("pbr-sampler"),
+        mag_filter: wgpu::FilterMode::Nearest,
+        min_filter: wgpu::FilterMode::Nearest,
+        ..Default::default()
+    });
+    (normal_view, specular_view, sampler)
+}
+
+fn create_lighting_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    lighting_buffer: &wgpu::Buffer,
+    shadow_view: &wgpu::TextureView,
+    shadow_compare_sampler: &wgpu::Sampler,
+    pbr_normal_view: &wgpu::TextureView,
+    pbr_specular_view: &wgpu::TextureView,
+    pbr_sampler: &wgpu::Sampler,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("lighting-bind-group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: lighting_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(shadow_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Sampler(shadow_compare_sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(pbr_normal_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::TextureView(pbr_specular_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: wgpu::BindingResource::Sampler(pbr_sampler),
+            },
+        ],
+    })
 }
 
 fn create_panorama_resources(

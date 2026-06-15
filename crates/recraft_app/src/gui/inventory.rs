@@ -105,7 +105,7 @@ impl GuiScreen for GuiContainer {
         let hovered = self.slot_at(ctx.mouse, container);
         for (i, slot) in container.slots().iter().enumerate() {
             let cell = UiRect::new(px + slot.x * scale, py + slot.y * scale, icon, icon);
-            if let Some(item) = container.slot_item(i, hud.inventory) {
+            if let Some(ref item) = container.slot_item(i, hud.inventory) {
                 draw_item_icon(ui, cell, item, scale.max(2), false);
             }
             if hovered == Some(i as i16) {
@@ -126,11 +126,11 @@ impl GuiScreen for GuiContainer {
             draw_item_icon(ui, cell, item, scale.max(2), true);
         } else if let Some(slot) = hovered {
             // Hovering an item with an empty cursor: show the vanilla tooltip.
-            if let Some(item) = container.slot_item(slot as usize, hud.inventory) {
-                let name = recraft_render::item_display_name(item.id, item.damage);
+            if let Some(ref item) = container.slot_item(slot as usize, hud.inventory) {
+                let lines = recraft_render::build_tooltip(item);
                 super::draw_tooltip(
                     ui,
-                    &[name],
+                    &lines,
                     ctx.mouse.0 as i32,
                     ctx.mouse.1 as i32,
                     ctx.width,

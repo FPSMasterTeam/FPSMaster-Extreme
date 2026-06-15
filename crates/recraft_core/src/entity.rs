@@ -78,6 +78,11 @@ pub struct EntityState {
     pub sneaking: bool,
     /// Ticks since the entity was first tracked, for the dropped-item bob/spin.
     pub age: u32,
+    /// Vanilla `hurtTime`: counts down from 10 to 0 after a damage animation,
+    /// driving the red overlay flash in the renderer.
+    pub hurt_time: u8,
+    /// Entity metadata index 0 bit 0x01: the entity is on fire.
+    pub on_fire: bool,
 }
 
 /// Vanilla `getArmSwingAnimationEnd` with no haste: a swing runs 6 ticks.
@@ -143,6 +148,8 @@ impl EntityState {
             is_swinging: false,
             sneaking: false,
             age: 0,
+            hurt_time: 0,
+            on_fire: false,
         }
     }
 
@@ -207,6 +214,12 @@ impl EntityState {
         self.had_head_look = true;
     }
 
+    /// Trigger the damage animation (S0B Animation 1 from the server):
+    /// sets `hurt_time` to 10 ticks, producing the red overlay flash.
+    pub fn start_hurt(&mut self) {
+        self.hurt_time = 10;
+    }
+
     /// Trigger the arm-swing animation (S0B Animation 0 from the server), the
     /// same restart gate vanilla uses so held swings flow into each other.
     pub fn start_swing(&mut self) {
@@ -252,6 +265,9 @@ impl EntityState {
         self.limb_swing_amount += (speed - self.limb_swing_amount) * 0.4;
         self.limb_swing += self.limb_swing_amount;
         self.tick_swing();
+        if self.hurt_time > 0 {
+            self.hurt_time -= 1;
+        }
     }
 
     /// Per-tick arm-swing stepping (vanilla `updateArmSwingProgress`).

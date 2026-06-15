@@ -6,16 +6,16 @@
 use std::time::Instant;
 
 use recraft_protocol::v1_8_9::packets::SlotItem;
-use recraft_render::{text_height, text_width, GuiTexture, RenderStats, UiColor, UiFrame, UiRect};
+use recraft_render::{text_height, text_width, GuiTexture, OverlayTextures, RenderStats, UiColor, UiFrame, UiRect};
 
 use crate::chat::{self, ChatState};
-use crate::game::TitleOverlay;
+use crate::game::{ScreenOverlay, TitleOverlay};
 use crate::gui::widgets::trim_to_tail;
 use crate::scoreboard::Scoreboard;
 use crate::text_input::TextInput;
 
 /// HUD data snapshot for one frame.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct HudState<'a> {
     pub health: f32,
     pub food: i32,
@@ -28,7 +28,7 @@ pub struct HudState<'a> {
     /// layout the container screen renders. `None` when no window is open.
     pub container: Option<&'a crate::container::Container>,
     /// The stack carried on the cursor in an open inventory (vanilla slot -1).
-    pub cursor_item: Option<SlotItem>,
+    pub cursor_item: Option<&'a SlotItem>,
     pub chat: &'a ChatState,
     pub scoreboard: &'a Scoreboard,
     /// Tab-list roster; drawn as the player-list overlay while `tab_open`.
@@ -36,6 +36,8 @@ pub struct HudState<'a> {
     /// Whether the Tab key is held (show the player-list overlay).
     pub tab_open: bool,
     pub title: Option<TitleOverlay<'a>>,
+    pub screen_overlay: ScreenOverlay,
+    pub overlay_textures: &'a OverlayTextures,
 }
 
 /// Data for the F3 debug overlay: the player feet position (world coords),
@@ -89,6 +91,9 @@ impl GuiIngame {
         debug: Option<&DebugInfo>,
     ) {
         let scale = gui_scale(width, height);
+
+        draw_screen_overlay(ui, width, height, hud.screen_overlay, hud.overlay_textures);
+
         // F3 replaces the small FPS readout with the full debug overlay.
         match debug {
             Some(info) => draw_debug_overlay(ui, width, scale, fps, chunk_count, info),
@@ -257,7 +262,7 @@ fn draw_hotbar(ui: &mut UiFrame, width: i32, height: i32, hud: &HudState) {
                 16 * scale,
                 16 * scale,
             );
-            draw_item_icon(ui, cell, *item, scale.max(2), false);
+            draw_item_icon(ui, cell, item, scale.max(2), false);
         }
     }
 
@@ -358,7 +363,7 @@ fn draw_status_bars(ui: &mut UiFrame, width: i32, height: i32, hud: &HudState) {
 pub(crate) fn draw_item_icon(
     ui: &mut UiFrame,
     rect: UiRect,
-    item: SlotItem,
+    item: &SlotItem,
     text_scale: i32,
     overlay: bool,
 ) {
@@ -700,4 +705,45 @@ fn split_nonempty(text: &str) -> Vec<&str> {
         return Vec::new();
     }
     text.split('\n').collect()
+}
+
+fn draw_screen_overlay(
+    ui: &mut UiFrame,
+    width: i32,
+    height: i32,
+    overlay: ScreenOverlay,
+    textures: &OverlayTextures,
+) {
+    let full = UiRect::new(0, 0, width, height);
+    match overlay {
+        ScreenOverlay::None => {}
+        ScreenOverlay::Water => {
+            // Vanilla renders misc/underwater.png tiled at ~10% alpha plus blue
+            // fog. A semi-transparent blue rect approximates the combined effect.
+            ui.rect(full, UiColor::rgba(0, 10, 40, 160));
+        }
+        ScreenOverlay::Lava => {
+            if let Some(tex) = &textures.lava {
+                ui.raw_image(full, tex.clone());
+            } else {
+                ui.rect(full, UiColor::rgba(207, 85, 0, 230));
+            }
+        }
+        ScreenOverlay::Fire => {
+            if let Some(tex) = &textures.fire {
+                // Two overlapping quads covering the lower ~60% of the screen,
+                // offset horizontally like vanilla's first-person fire.
+                let fire_h = height * 6 / 10;
+                let top = height - fire_h;
+                let off = width / 8;
+                ui.raw_image(UiRect::new(-off, top, width, fire_h), tex.clone());
+                ui.raw_image(UiRect::new(off, top, width, fire_h), tex.clone());
+            } else {
+                let fire_h = height * 6 / 10;
+                let top = height - fire_h;
+                let fire_rect = UiRect::new(0, top, width, fire_h);
+                ui.gradient_rect(fire_rect, UiColor::rgba(220, 130, 0, 180), UiColor::rgba(200, 60, 0, 220));
+            }
+        }
+    }
 }
