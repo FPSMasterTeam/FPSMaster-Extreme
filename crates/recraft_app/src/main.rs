@@ -223,7 +223,13 @@ fn main() -> anyhow::Result<()> {
     renderer.set_motion_blur_enabled(settings.post_motion_blur);
     renderer.set_auto_exposure_enabled(settings.post_auto_exposure);
     renderer.set_clouds_enabled(settings.volumetric_clouds);
-    apply_display(window, &settings);
+    // Fullscreen is deferred to after the window is visible: macOS's Spaces-based
+    // fullscreen transition cannot succeed on a hidden window, leaving the surface
+    // at the wrong size permanently. Non-fullscreen resolution is applied here so
+    // the window appears at the right size when revealed.
+    if !settings.fullscreen {
+        apply_display(window, &settings);
+    }
     // Atlas UV table snapshot for first-person item geometry (cheap clone of
     // the name→tile map, taken once).
     let atlas_uv = renderer.atlas_uv().clone();
@@ -720,6 +726,9 @@ fn main() -> anyhow::Result<()> {
                     window.set_visible(true);
                     window.focus_window();
                     window_shown = true;
+                    if app.settings.fullscreen {
+                        apply_display(window, &app.settings);
+                    }
                 }
 
                 // Keep the OS IME in sync with whichever field is focused: enable
