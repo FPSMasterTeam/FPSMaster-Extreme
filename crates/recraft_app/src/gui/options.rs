@@ -393,11 +393,11 @@ impl GuiScreen for GuiVideoSettings {
         }
         if self.resolution.as_ref().is_some_and(|b| b.clicked(x, y)) {
             ctx.settings.cycle_resolution();
-            return vec![GuiAction::SetResolution(ctx.settings.resolution)];
+            return vec![GuiAction::SetResolution];
         }
         if self.fullscreen.as_ref().is_some_and(|b| b.clicked(x, y)) {
             ctx.settings.fullscreen = !ctx.settings.fullscreen;
-            return vec![GuiAction::SetFullscreen(ctx.settings.fullscreen)];
+            return vec![GuiAction::SetFullscreen];
         }
         if self.shaders_btn.as_ref().is_some_and(|b| b.clicked(x, y)) {
             return vec![

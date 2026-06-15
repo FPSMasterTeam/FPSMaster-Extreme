@@ -122,6 +122,9 @@ pub struct PingInfo {
     pub motd: String,
     /// "online/max".
     pub players: String,
+    /// Server version name from the ping; parsed and kept but not surfaced yet
+    /// (vanilla only shows it on a protocol mismatch, which we don't flag).
+    #[allow(dead_code)]
     pub version: String,
     pub latency_ms: u32,
     /// Decoded RGBA favicon (vanilla `data:image/png;base64,...`), if any,

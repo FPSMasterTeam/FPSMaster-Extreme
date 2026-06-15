@@ -145,11 +145,11 @@ pub enum GuiAction {
     SetFancyGraphics(bool),
     /// Set the block-atlas mipmap level (0 = off .. MIPMAP_MAX).
     SetMipmapLevels(u32),
-    /// Apply the target physical resolution (None = native), resizing the
-    /// window/swapchain — the real present-cost lever on high-DPI screens.
-    SetResolution(Option<(u32, u32)>),
-    /// Toggle exclusive fullscreen at the chosen resolution.
-    SetFullscreen(bool),
+    /// Apply the resolution from settings, resizing the window/swapchain — the
+    /// real present-cost lever on high-DPI screens.
+    SetResolution,
+    /// Apply the fullscreen state from settings.
+    SetFullscreen,
     /// Shader-pack toggles: master lighting, sun shadows, specular.
     SetShaders(bool),
     SetShaderShadows(bool),

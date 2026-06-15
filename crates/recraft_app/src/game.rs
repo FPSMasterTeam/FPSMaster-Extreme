@@ -29,7 +29,7 @@ use recraft_protocol::v1_8_9::{
         TitleAction, UseEntityKind,
     },
 };
-use recraft_render::{held_item_frame, Camera, EntityAnim, HeldItemFrame, ModelMesh};
+use recraft_render::{held_item_frame, Camera, EntityAnim, ModelMesh};
 use winit::{
     event::{ElementState, KeyEvent},
     keyboard::{KeyCode, PhysicalKey},
