@@ -2092,36 +2092,26 @@ impl GameState {
         self.urgent_remesh.extend(sky_light);
     }
 
-    /// Mirror vanilla's client-side placement: the instant we send a block
-    /// placement, set the block locally so it shows without waiting for — or
-    /// depending on — a server BlockChange. Some servers never echo the player's
-    /// own placement, so without this the block would never appear.
-    ///
-    /// Predicts only when the outcome is unambiguous: a real block item, a
-    /// target that isn't being right-click-activated, a replaceable destination,
-    /// and a state we can orient correctly (so we never leave a phantom block a
-    /// no-echo server won't correct). Anything else just sends the packet and
-    /// waits for the server.
-    fn predict_placement(
-        &mut self,
+    /// Vanilla `ItemBlock.canPlaceBlockOnSide` → `World.canBlockBePlaced`:
+    /// resolve the oriented state and target cell for a placement, returning
+    /// `None` when it isn't allowed — we can't orient the block, the target cell
+    /// isn't replaceable, or the placed block's collision box would intersect the
+    /// player (`checkNoEntityCollision`, so you can't box yourself in at your
+    /// feet). Used both to gate the C08 packet and to drive the local prediction.
+    fn resolve_placement(
+        &self,
         x: i32,
         y: i32,
         z: i32,
         face: u8,
         cursor_y: u8,
-        held: Option<&SlotItem>,
-    ) -> bool {
-        let Some(item) = held else { return false };
-        if !self.input.sneak && is_interactable(self.world.block_at(x, y, z)) {
-            return false;
-        }
-        let Some(state) = placement_block_state(item, face, self.player.yaw, cursor_y) else {
-            return false;
-        };
+        item: &SlotItem,
+    ) -> Option<(BlockState, i32, i32, i32)> {
+        let state = placement_block_state(item, face, self.player.yaw, cursor_y)?;
         let (dx, dy, dz) = face_offset(face);
         let (px, py, pz) = (x + dx, y + dy, z + dz);
         if !is_replaceable(self.world.block_at(px, py, pz)) {
-            return false;
+            return None;
         }
         let pa = self.player.aabb;
         for b in state.collision_boxes().as_slice() {
@@ -2142,9 +2132,36 @@ impl GameState {
                 && pa.max.z > min.z
                 && pa.min.z < max.z
             {
-                return false;
+                return None;
             }
         }
+        Some((state, px, py, pz))
+    }
+
+    /// Mirror vanilla's client-side placement: the instant we send a block
+    /// placement, set the block locally so it shows without waiting for — or
+    /// depending on — a server BlockChange. Some servers never echo the player's
+    /// own placement, so without this the block would never appear.
+    ///
+    /// Predicts only when the outcome is unambiguous: a real block item, a
+    /// target that isn't being right-click-activated, a replaceable destination,
+    /// and a state we can orient correctly (so we never leave a phantom block a
+    /// no-echo server won't correct). Anything else just sends the packet and
+    /// waits for the server.
+    fn predict_placement(
+        &mut self,
+        x: i32,
+        y: i32,
+        z: i32,
+        face: u8,
+        cursor_y: u8,
+        held: Option<&SlotItem>,
+    ) -> bool {
+        let Some(item) = held else { return false };
+        let Some((state, px, py, pz)) = self.resolve_placement(x, y, z, face, cursor_y, item)
+        else {
+            return false;
+        };
         let old = self.world.block_at(px, py, pz);
         if self.world.set_block_if_chunk_loaded(px, py, pz, state) {
             self.mark_block_dirty_urgent(px, py, pz);
@@ -2238,6 +2255,20 @@ impl GameState {
         // onBlockActivated: an interactable block opens unless sneaking with an item.
         let activated =
             (!self.input.sneak || held.is_none()) && is_interactable(self.world.block_at(x, y, z));
+        // Vanilla gates the block placement on `canPlaceBlockOnSide`: if a block
+        // item can't actually be placed here (target not replaceable, or the block
+        // would intersect the player), onPlayerRightClick returns *before* sending
+        // C08 — the caller then falls through to sendUseItem. Without this gate we
+        // place at our own feet and box ourselves in.
+        if !activated {
+            if let Some(item) = held.as_ref() {
+                if is_block_item(item.id)
+                    && self.resolve_placement(x, y, z, face, cursor_y, item).is_none()
+                {
+                    return false;
+                }
+            }
+        }
         out.push(ServerboundPacket::PlayerBlockPlacement {
             x,
             y,
@@ -4482,6 +4513,27 @@ mod interaction_tests {
             gs.world.block_at(2, 0, 0).is_air(),
             "right-clicking a chest must not conjure a phantom block in front of it"
         );
+    }
+
+    #[test]
+    fn cannot_place_a_block_inside_the_player() {
+        let mut gs = GameState::empty_for_server(1.0);
+        gs.world.set_block(0, 0, 0, BlockState::STONE); // floor (also loads the chunk)
+        let stone = SlotItem::new(1, 64, 0);
+        // Standing on the floor (feet at y=1): clicking its top face would land a
+        // block at our feet — its 0.6×1.8 box covers cell (0,1,0).
+        gs.player.position = DVec3::new(0.5, 1.0, 0.5);
+        gs.player.sync_aabb_to_position();
+        assert!(
+            !gs.predict_placement(0, 0, 0, 1, 8, Some(&stone)),
+            "must not place a block where the player is standing"
+        );
+        assert!(gs.world.block_at(0, 1, 0).is_air());
+        // Jump clear (feet at y=2) and the cell frees up — placement now predicts.
+        gs.player.position = DVec3::new(0.5, 2.0, 0.5);
+        gs.player.sync_aabb_to_position();
+        assert!(gs.predict_placement(0, 0, 0, 1, 8, Some(&stone)));
+        assert_eq!(gs.world.block_at(0, 1, 0), BlockState::new(1, 0));
     }
 
     #[test]
