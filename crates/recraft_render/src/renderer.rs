@@ -461,8 +461,8 @@ struct DebugSkip {
     flat: bool,
 }
 
-pub struct Renderer<'window> {
-    surface: wgpu::Surface<'window>,
+pub struct Renderer {
+    surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
@@ -650,35 +650,29 @@ pub struct Renderer<'window> {
     debug_skip: DebugSkip,
 }
 
-impl<'window> Renderer<'window> {
-    pub async fn new(window: &'window Window) -> Result<Self, RendererError> {
+impl Renderer {
+    pub fn new(window: Arc<Window>) -> Result<Self, RendererError> {
         let size = window.inner_size();
         let instance = wgpu::Instance::default();
-        let surface = instance
-            .create_surface(window)
+        let surface = instance.create_surface(window)
             .map_err(|err| RendererError::Surface(err.to_string()))?;
-        // Prefer a real hardware GPU. When none is available (e.g. inside a VM
-        // without 3D acceleration), fall back to a software adapter (WARP on
-        // DX12) so the app still launches, just slowly.
-        let adapter = match instance
+        let adapter = match pollster::block_on(instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 compatible_surface: Some(&surface),
                 force_fallback_adapter: false,
-            })
-            .await
+            }))
         {
-            Some(adapter) => adapter,
-            None => {
+            Ok(adapter) => adapter,
+            Err(_) => {
                 log::warn!("no hardware GPU adapter found, falling back to software rendering");
-                instance
+                pollster::block_on(instance
                     .request_adapter(&wgpu::RequestAdapterOptions {
                         power_preference: wgpu::PowerPreference::LowPower,
                         compatible_surface: Some(&surface),
                         force_fallback_adapter: true,
-                    })
-                    .await
-                    .ok_or(RendererError::NoAdapter)?
+                    }))
+                    .map_err(|_| RendererError::NoAdapter)?
             }
         };
 
@@ -690,23 +684,22 @@ impl<'window> Renderer<'window> {
             info.backend
         );
 
-        // Request timestamp queries when the adapter supports them, for the
-        // occlusion-independent GPU-time profiler. Falls back cleanly otherwise.
         let optional_features = adapter.features()
-            & (wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::MULTI_DRAW_INDIRECT);
-        let (device, queue) = adapter
+            & (wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::MULTI_DRAW_INDIRECT_COUNT);
+        let (device, queue) = pollster::block_on(adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("recraft-device"),
                     required_features: optional_features,
                     required_limits: wgpu::Limits::default(),
+                    memory_hints: wgpu::MemoryHints::default(),
+                    trace: Default::default(),
+                    experimental_features: Default::default(),
                 },
-                None,
-            )
-            .await
+            ))
             .map_err(|err| RendererError::RequestDevice(err.to_string()))?;
         let timestamps_enabled = optional_features.contains(wgpu::Features::TIMESTAMP_QUERY);
-        let multi_draw = optional_features.contains(wgpu::Features::MULTI_DRAW_INDIRECT);
+        let multi_draw = optional_features.contains(wgpu::Features::MULTI_DRAW_INDIRECT_COUNT);
         log::info!("GPU timestamp queries: {timestamps_enabled}");
         log::info!("multi-draw-indirect: {multi_draw}");
 
@@ -876,13 +869,13 @@ impl<'window> Renderer<'window> {
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Nearest,
             min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("chunk-pipeline-layout"),
-            bind_group_layouts: &[&camera_layout, &texture_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&camera_layout), Some(&texture_layout)],
+            immediate_size: 0,
         });
         // Sun shadow map: a depth target rendered from the light's view and
         // sampled (comparison/PCF) by the chunk shader.
@@ -995,8 +988,8 @@ impl<'window> Renderer<'window> {
         // Chunk colour pipelines also bind the lighting group (group 2).
         let lit_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("chunk-lit-pipeline-layout"),
-            bind_group_layouts: &[&camera_layout, &texture_layout, &lighting_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&camera_layout), Some(&texture_layout), Some(&lighting_layout)],
+            immediate_size: 0,
         });
         // Water SSR group (3): copied opaque scene colour + sampler + world depth
         // + the post camera uniform (inv-VP / eye), for screen-space reflection.
@@ -1043,8 +1036,8 @@ impl<'window> Renderer<'window> {
         });
         let water_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("water-pipeline-layout"),
-            bind_group_layouts: &[&camera_layout, &texture_layout, &lighting_layout, &water_ssr_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&camera_layout), Some(&texture_layout), Some(&lighting_layout), Some(&water_ssr_layout)],
+            immediate_size: 0,
         });
         let (depth_tex, depth_view) = create_depth_view_sized(&device, config.width, config.height);
         let window_depth_view = create_depth_view(&device, &config);
@@ -1057,12 +1050,14 @@ impl<'window> Renderer<'window> {
             layout: Some(&lit_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
-                entry_point: "vs_main",
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
                 buffers: &[ChunkVertex::layout()],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: "fs_main",
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
                     blend: Some(wgpu::BlendState::REPLACE),
@@ -1080,13 +1075,14 @@ impl<'window> Renderer<'window> {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: DEPTH_FORMAT,
-                depth_write_enabled: false,
-                depth_compare: wgpu::CompareFunction::LessEqual,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+        cache: None,
+        multiview_mask: None,
         });
         // Flat-colour clone of the solid pipeline (no atlas fetch), used only by
         // the `--bench-passes` flat config to measure texture-read cost.
@@ -1095,12 +1091,14 @@ impl<'window> Renderer<'window> {
             layout: Some(&lit_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
-                entry_point: "vs_main",
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
                 buffers: &[ChunkVertex::layout()],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: "fs_flat",
+                entry_point: Some("fs_flat"),
+                compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
                     blend: Some(wgpu::BlendState::REPLACE),
@@ -1118,13 +1116,14 @@ impl<'window> Renderer<'window> {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: DEPTH_FORMAT,
-                depth_write_enabled: false,
-                depth_compare: wgpu::CompareFunction::LessEqual,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+        cache: None,
+        multiview_mask: None,
         });
         // Depth-only pre-pass for the solid layer: same geometry, colour writes
         // masked off so each visible solid pixel is shaded exactly once by the
@@ -1135,12 +1134,14 @@ impl<'window> Renderer<'window> {
             layout: Some(&lit_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
-                entry_point: "vs_main",
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
                 buffers: &[ChunkVertex::layout()],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: "fs_depth",
+                entry_point: Some("fs_depth"),
+                compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
                     blend: None,
@@ -1158,13 +1159,14 @@ impl<'window> Renderer<'window> {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: DEPTH_FORMAT,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+        cache: None,
+        multiview_mask: None,
         });
         // Cutout (leaves/glass): alpha-tested via fs_cutout, fully opaque where
         // kept, writes depth so it occludes correctly. Back-face culled like
@@ -1176,12 +1178,14 @@ impl<'window> Renderer<'window> {
             layout: Some(&lit_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
-                entry_point: "vs_main",
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
                 buffers: &[ChunkVertex::layout()],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: "fs_cutout",
+                entry_point: Some("fs_cutout"),
+                compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
                     blend: Some(wgpu::BlendState::REPLACE),
@@ -1199,13 +1203,14 @@ impl<'window> Renderer<'window> {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: DEPTH_FORMAT,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+        cache: None,
+        multiview_mask: None,
         });
         // The GUI block-icon cube pass reuses the cutout shader but must NOT
         // cull: its cubes are baked into clip space through the isometric GUI
@@ -1216,12 +1221,14 @@ impl<'window> Renderer<'window> {
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &overlay_shader,
-                entry_point: "vs_main",
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
                 buffers: &[Vertex::layout()],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &overlay_shader,
-                entry_point: "fs_cutout",
+                entry_point: Some("fs_cutout"),
+                compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: surface_format,
                     blend: Some(wgpu::BlendState::REPLACE),
@@ -1239,13 +1246,14 @@ impl<'window> Renderer<'window> {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: DEPTH_FORMAT,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+        cache: None,
+        multiview_mask: None,
         });
         // First-person item sprites use the same alpha test but keep vanilla's
         // item culling. Drawing both sides makes the far side of a 1px-thick
@@ -1255,12 +1263,14 @@ impl<'window> Renderer<'window> {
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &overlay_shader,
-                entry_point: "vs_main",
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
                 buffers: &[Vertex::layout()],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &overlay_shader,
-                entry_point: "fs_cutout",
+                entry_point: Some("fs_cutout"),
+                compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
                     blend: Some(wgpu::BlendState::REPLACE),
@@ -1278,13 +1288,14 @@ impl<'window> Renderer<'window> {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: DEPTH_FORMAT,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+        cache: None,
+        multiview_mask: None,
         });
         // First-person held item: same as the item pipeline but the depth test
         // always passes and writes no depth, so the hand item is never occluded
@@ -1295,12 +1306,14 @@ impl<'window> Renderer<'window> {
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &overlay_shader,
-                entry_point: "vs_main",
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
                 buffers: &[Vertex::layout()],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &overlay_shader,
-                entry_point: "fs_cutout",
+                entry_point: Some("fs_cutout"),
+                compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
                     blend: Some(wgpu::BlendState::REPLACE),
@@ -1318,13 +1331,14 @@ impl<'window> Renderer<'window> {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: DEPTH_FORMAT,
-                depth_write_enabled: false,
-                depth_compare: wgpu::CompareFunction::Always,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Always),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+        cache: None,
+        multiview_mask: None,
         });
         // Translucent (water/ice/stained glass): alpha-blended, tested against the
         // opaque depth buffer but not writing depth (so overlapping translucent
@@ -1337,12 +1351,14 @@ impl<'window> Renderer<'window> {
             layout: Some(&lit_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
-                entry_point: "vs_main",
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
                 buffers: &[ChunkVertex::layout()],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: "fs_main",
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
                     blend: Some(wgpu::BlendState::ALPHA_BLENDING),
@@ -1360,13 +1376,14 @@ impl<'window> Renderer<'window> {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: DEPTH_FORMAT,
-                depth_write_enabled: false,
-                depth_compare: wgpu::CompareFunction::Less,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Less),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+        cache: None,
+        multiview_mask: None,
         });
         // Graphics: Fast water/glass — opaque (REPLACE, no blend dst read) and
         // writes depth so it occludes properly. Saves the alpha-blend bandwidth.
@@ -1375,12 +1392,14 @@ impl<'window> Renderer<'window> {
             layout: Some(&lit_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
-                entry_point: "vs_main",
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
                 buffers: &[ChunkVertex::layout()],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: "fs_main",
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
                     blend: Some(wgpu::BlendState::REPLACE),
@@ -1398,13 +1417,14 @@ impl<'window> Renderer<'window> {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: DEPTH_FORMAT,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+        cache: None,
+        multiview_mask: None,
         });
         // Dedicated water surface: animated waves + Fresnel reflection. Alpha
         // blended, depth-tested but no depth write (like the translucent layer).
@@ -1413,12 +1433,14 @@ impl<'window> Renderer<'window> {
             layout: Some(&water_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &water_shader,
-                entry_point: "vs_main",
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
                 buffers: &[ChunkVertex::layout()],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &water_shader,
-                entry_point: "fs_main",
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
                     blend: Some(wgpu::BlendState::ALPHA_BLENDING),
@@ -1436,25 +1458,28 @@ impl<'window> Renderer<'window> {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: DEPTH_FORMAT,
-                depth_write_enabled: false,
-                depth_compare: wgpu::CompareFunction::Less,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Less),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+        cache: None,
+        multiview_mask: None,
         });
         let overlay_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("overlay-pipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &overlay_shader,
-                entry_point: "vs_main",
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
                 buffers: &[Vertex::layout()],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &overlay_shader,
-                entry_point: "fs_main",
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
                     blend: Some(wgpu::BlendState::ALPHA_BLENDING),
@@ -1472,13 +1497,14 @@ impl<'window> Renderer<'window> {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: DEPTH_FORMAT,
-                depth_write_enabled: false,
-                depth_compare: wgpu::CompareFunction::Less,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Less),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+        cache: None,
+        multiview_mask: None,
         });
         // Untextured colored geometry (entities, first-person hand). Uses only
         // the camera bind group; depth-tested against the world.
@@ -1489,20 +1515,22 @@ impl<'window> Renderer<'window> {
         let model_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("model-pipeline-layout"),
-                bind_group_layouts: &[&camera_layout, &entity_texture_layout],
-                push_constant_ranges: &[],
+                bind_group_layouts: &[Some(&camera_layout), Some(&entity_texture_layout)],
+                immediate_size: 0,
             });
         let model_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("model-pipeline"),
             layout: Some(&model_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &model_shader,
-                entry_point: "vs_main",
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
                 buffers: &[ModelVertex::layout()],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &model_shader,
-                entry_point: "fs_main",
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
                     blend: Some(wgpu::BlendState::ALPHA_BLENDING),
@@ -1520,31 +1548,34 @@ impl<'window> Renderer<'window> {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: DEPTH_FORMAT,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+        cache: None,
+        multiview_mask: None,
         });
 
         let sky_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("sky-pipeline-layout"),
-            bind_group_layouts: &[&sky_uniform_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&sky_uniform_layout)],
+        immediate_size: 0,
         });
         let sky_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("sky-pipeline"),
             layout: Some(&sky_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &sky_shader,
-                entry_point: "vs_main",
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
                 buffers: &[],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &sky_shader,
-                entry_point: "fs_main",
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
                     blend: Some(wgpu::BlendState::REPLACE),
@@ -1562,16 +1593,17 @@ impl<'window> Renderer<'window> {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: DEPTH_FORMAT,
-                depth_write_enabled: false,
+                depth_write_enabled: Some(false),
                 // Drawn after opaque terrain: the sky sits at the far plane
                 // (clip z = 1.0), so LessEqual passes only where no block wrote a
                 // nearer depth — i.e. the open sky.
-                depth_compare: wgpu::CompareFunction::LessEqual,
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+        cache: None,
+        multiview_mask: None,
         });
 
         let panorama = create_panorama_resources(&device, &queue, format);
@@ -1582,20 +1614,22 @@ impl<'window> Renderer<'window> {
         let celestial_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("celestial-pipeline-layout"),
-                bind_group_layouts: &[&celestial_uniform_layout, &texture_layout],
-                push_constant_ranges: &[],
+                bind_group_layouts: &[Some(&celestial_uniform_layout), Some(&texture_layout)],
+                immediate_size: 0,
             });
         let celestial_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("celestial-pipeline"),
             layout: Some(&celestial_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &celestial_shader,
-                entry_point: "vs_main",
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
                 buffers: &[Vertex::layout()],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &celestial_shader,
-                entry_point: "fs_main",
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
                     // Vanilla `renderSky` draws the sun/moon/stars additively
@@ -1629,22 +1663,23 @@ impl<'window> Renderer<'window> {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: DEPTH_FORMAT,
-                depth_write_enabled: false,
+                depth_write_enabled: Some(false),
                 // Pinned to the far plane in the shader and drawn after terrain,
                 // so LessEqual lets the world occlude the sun/moon/stars while
                 // they still fill the open sky.
-                depth_compare: wgpu::CompareFunction::LessEqual,
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+        cache: None,
+        multiview_mask: None,
         });
 
         let ui_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("ui-pipeline-layout"),
-            bind_group_layouts: &[&ui_bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&ui_bind_group_layout)],
+        immediate_size: 0,
         });
         // The UI draws in its own pass to the sRGB swapchain after the post pass.
         let ui_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1652,12 +1687,14 @@ impl<'window> Renderer<'window> {
             layout: Some(&ui_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &ui_shader,
-                entry_point: "vs_main",
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
                 buffers: &[],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &ui_shader,
-                entry_point: "fs_main",
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: surface_format,
                     blend: Some(wgpu::BlendState::ALPHA_BLENDING),
@@ -1675,13 +1712,14 @@ impl<'window> Renderer<'window> {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: DEPTH_FORMAT,
-                depth_write_enabled: false,
-                depth_compare: wgpu::CompareFunction::Always,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Always),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+        cache: None,
+        multiview_mask: None,
         });
 
         // Nametag text atlas: a small RGBA texture, rebuilt when names change.
@@ -1694,7 +1732,7 @@ impl<'window> Renderer<'window> {
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Nearest,
             min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
         let (nametag_texture, nametag_bind_group) =
@@ -1821,20 +1859,22 @@ impl<'window> Renderer<'window> {
         });
         let post_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("post-pipeline-layout"),
-            bind_group_layouts: &[&post_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&post_layout)],
+        immediate_size: 0,
         });
         let post_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("post-pipeline"),
             layout: Some(&post_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &post_shader,
-                entry_point: "vs_main",
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
                 buffers: &[],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &post_shader,
-                entry_point: "fs_main",
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: surface_format,
                     blend: None,
@@ -1844,7 +1884,8 @@ impl<'window> Renderer<'window> {
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+        cache: None,
+        multiview_mask: None,
         });
 
         // Auto-exposure: a 1x1 average-luminance target + reduction pipeline.
@@ -1912,20 +1953,22 @@ impl<'window> Renderer<'window> {
         });
         let lum_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("luminance-pipeline-layout"),
-            bind_group_layouts: &[&lum_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&lum_layout)],
+        immediate_size: 0,
         });
         let lum_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("luminance-pipeline"),
             layout: Some(&lum_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &lum_shader,
-                entry_point: "vs_main",
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
                 buffers: &[],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &lum_shader,
-                entry_point: "fs_main",
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: wgpu::TextureFormat::R32Float,
                     blend: None,
@@ -1935,7 +1978,8 @@ impl<'window> Renderer<'window> {
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+        cache: None,
+        multiview_mask: None,
         });
 
         // Sun shadow-map pass: render chunk depth from the light's view. Solid is
@@ -1974,22 +2018,23 @@ impl<'window> Renderer<'window> {
         });
         let shadow_depth_state = wgpu::DepthStencilState {
             format: SHADOW_FORMAT,
-            depth_write_enabled: true,
-            depth_compare: wgpu::CompareFunction::Less,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(wgpu::CompareFunction::Less),
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         };
         let shadow_solid_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("shadow-solid-layout"),
-            bind_group_layouts: &[&shadow_uniform_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&shadow_uniform_layout)],
+        immediate_size: 0,
         });
         let shadow_solid_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("shadow-solid-pipeline"),
             layout: Some(&shadow_solid_layout),
             vertex: wgpu::VertexState {
                 module: &shadow_shader,
-                entry_point: "vs_main",
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
                 buffers: &[ChunkVertex::layout()],
             },
             fragment: None,
@@ -1999,24 +2044,27 @@ impl<'window> Renderer<'window> {
             },
             depth_stencil: Some(shadow_depth_state.clone()),
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+        cache: None,
+        multiview_mask: None,
         });
         let shadow_cutout_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("shadow-cutout-layout"),
-            bind_group_layouts: &[&shadow_uniform_layout, &texture_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&shadow_uniform_layout), Some(&texture_layout)],
+            immediate_size: 0,
         });
         let shadow_cutout_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("shadow-cutout-pipeline"),
             layout: Some(&shadow_cutout_layout),
             vertex: wgpu::VertexState {
                 module: &shadow_shader,
-                entry_point: "vs_main",
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
                 buffers: &[ChunkVertex::layout()],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shadow_shader,
-                entry_point: "fs_cutout",
+                entry_point: Some("fs_cutout"),
+                compilation_options: Default::default(),
                 targets: &[],
             }),
             primitive: wgpu::PrimitiveState {
@@ -2025,7 +2073,8 @@ impl<'window> Renderer<'window> {
             },
             depth_stencil: Some(shadow_depth_state),
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+        cache: None,
+        multiview_mask: None,
         });
 
         let chunk_solid = ChunkLayer::new("mega-solid");
@@ -2682,14 +2731,14 @@ impl<'window> Renderer<'window> {
         });
         for (level, (data, mw, mh)) in mips.iter().enumerate() {
             self.queue.write_texture(
-                wgpu::ImageCopyTexture {
+                wgpu::TexelCopyTextureInfo {
                     texture: &texture,
                     mip_level: level as u32,
                     origin: wgpu::Origin3d::ZERO,
                     aspect: wgpu::TextureAspect::All,
                 },
                 data,
-                wgpu::ImageDataLayout {
+                wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(4 * mw),
                     rows_per_image: Some(*mh),
@@ -2712,7 +2761,7 @@ impl<'window> Renderer<'window> {
                     address_mode_w: wgpu::AddressMode::ClampToEdge,
                     mag_filter: wgpu::FilterMode::Nearest,
                     min_filter: wgpu::FilterMode::Nearest,
-                    mipmap_filter: wgpu::FilterMode::Linear,
+                    mipmap_filter: wgpu::MipmapFilterMode::Linear,
                     lod_max_clamp: level as f32,
                     ..Default::default()
                 });
@@ -2750,9 +2799,9 @@ impl<'window> Renderer<'window> {
                     view_formats: &[],
                 });
                 self.queue.write_texture(
-                    wgpu::ImageCopyTexture { texture: &tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                    wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
                     data,
-                    wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(4 * w), rows_per_image: Some(*h) },
+                    wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * w), rows_per_image: Some(*h) },
                     wgpu::Extent3d { width: *w, height: *h, depth_or_array_layers: 1 },
                 );
                 self.pbr_normal_view = tex.create_view(&wgpu::TextureViewDescriptor::default());
@@ -2769,9 +2818,9 @@ impl<'window> Renderer<'window> {
                     view_formats: &[],
                 });
                 self.queue.write_texture(
-                    wgpu::ImageCopyTexture { texture: &tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                    wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
                     data,
-                    wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(4 * w), rows_per_image: Some(*h) },
+                    wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * w), rows_per_image: Some(*h) },
                     wgpu::Extent3d { width: *w, height: *h, depth_or_array_layers: 1 },
                 );
                 self.pbr_specular_view = tex.create_view(&wgpu::TextureViewDescriptor::default());
@@ -2928,14 +2977,14 @@ impl<'window> Renderer<'window> {
         }
         let (x, y) = crate::texture::player_skin_row_origin(row);
         self.queue.write_texture(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: &self.entity_texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d { x, y, z: 0 },
                 aspect: wgpu::TextureAspect::All,
             },
             rgba,
-            wgpu::ImageDataLayout {
+            wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(4 * px),
                 rows_per_image: Some(px),
@@ -3030,14 +3079,14 @@ impl<'window> Renderer<'window> {
                 self.nametag_tex_size = (tex_w, tex_h);
             }
             self.queue.write_texture(
-                wgpu::ImageCopyTexture {
+                wgpu::TexelCopyTextureInfo {
                     texture: &self.nametag_texture,
                     mip_level: 0,
                     origin: wgpu::Origin3d::ZERO,
                     aspect: wgpu::TextureAspect::All,
                 },
                 &pixels,
-                wgpu::ImageDataLayout {
+                wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(4 * tex_w),
                     rows_per_image: Some(tex_h),
@@ -3127,7 +3176,7 @@ impl<'window> Renderer<'window> {
             return 0;
         }
         // Non-blocking poll so a completed map_async fires its callback.
-        self.device.poll(wgpu::Maintain::Poll);
+        let _ = self.device.poll(wgpu::PollType::Poll);
         let timer = self.gpu_timer.as_mut().expect("checked above");
         if timer.ready.swap(false, std::sync::atomic::Ordering::Acquire) {
             {
@@ -3290,13 +3339,17 @@ impl<'window> Renderer<'window> {
         // large acquire wait means the CPU is blocking on the GPU (GPU-bound).
         let t_acquire = Instant::now();
         let frame = match self.surface.get_current_texture() {
-            Ok(frame) => frame,
-            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+            wgpu::CurrentSurfaceTexture::Success(frame)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
+            wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
                 self.surface.configure(&self.device, &self.config);
                 return Ok(());
             }
-            Err(wgpu::SurfaceError::Timeout) => return Ok(()),
-            Err(err) => return Err(RendererError::Surface(err.to_string())),
+            wgpu::CurrentSurfaceTexture::Timeout
+            | wgpu::CurrentSurfaceTexture::Occluded => return Ok(()),
+            wgpu::CurrentSurfaceTexture::Validation => {
+                return Err(RendererError::Surface("validation error".to_string()));
+            }
         };
         let acquire_us = t_acquire.elapsed().as_micros() as u32;
 
@@ -3331,6 +3384,7 @@ impl<'window> Renderer<'window> {
                 }),
                 occlusion_query_set: None,
                 timestamp_writes: None,
+            multiview_mask: None,
             });
             sp.set_bind_group(0, &self.shadow_uniform_bind_group, &[]);
             // Solid casters (depth only), batched by page to minimise buffer rebinds.
@@ -3422,6 +3476,7 @@ impl<'window> Renderer<'window> {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view,
                     resolve_target: None,
+                    depth_slice: None,
                     ops: wgpu::Operations {
                         // The fullscreen sky gradient overwrites every pixel, so
                         // this clear is only a backstop; use the time-of-day
@@ -3452,6 +3507,7 @@ impl<'window> Renderer<'window> {
                 }),
                 occlusion_query_set: None,
                 timestamp_writes,
+                multiview_mask: None,
             });
 
             if panorama_active {
@@ -3765,13 +3821,13 @@ impl<'window> Renderer<'window> {
         if ssr_water && !water_draws.is_empty() && !self.debug_skip.water {
             let (w, h) = self.scaled_dims();
             encoder.copy_texture_to_texture(
-                wgpu::ImageCopyTexture {
+                wgpu::TexelCopyTextureInfo {
                     texture: self.offscreen_tex.as_ref().unwrap(),
                     mip_level: 0,
                     origin: wgpu::Origin3d::ZERO,
                     aspect: wgpu::TextureAspect::All,
                 },
-                wgpu::ImageCopyTexture {
+                wgpu::TexelCopyTextureInfo {
                     texture: self.scene_copy_tex.as_ref().unwrap(),
                     mip_level: 0,
                     origin: wgpu::Origin3d::ZERO,
@@ -3784,13 +3840,13 @@ impl<'window> Renderer<'window> {
                 },
             );
             encoder.copy_texture_to_texture(
-                wgpu::ImageCopyTexture {
+                wgpu::TexelCopyTextureInfo {
                     texture: &self.depth_tex,
                     mip_level: 0,
                     origin: wgpu::Origin3d::ZERO,
                     aspect: wgpu::TextureAspect::All,
                 },
-                wgpu::ImageCopyTexture {
+                wgpu::TexelCopyTextureInfo {
                     texture: self.depth_copy_tex.as_ref().unwrap(),
                     mip_level: 0,
                     origin: wgpu::Origin3d::ZERO,
@@ -3807,6 +3863,7 @@ impl<'window> Renderer<'window> {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view,
                     resolve_target: None,
+                    depth_slice: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Load,
                         store: wgpu::StoreOp::Store,
@@ -3822,6 +3879,7 @@ impl<'window> Renderer<'window> {
                 }),
                 occlusion_query_set: None,
                 timestamp_writes: None,
+            multiview_mask: None,
             });
             wp.set_pipeline(&self.water_pipeline);
             wp.set_bind_group(0, &self.camera_bind_group, &[]);
@@ -3847,6 +3905,7 @@ impl<'window> Renderer<'window> {
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                         view: &self.lum_view,
                         resolve_target: None,
+                        depth_slice: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                             store: wgpu::StoreOp::Store,
@@ -3855,6 +3914,7 @@ impl<'window> Renderer<'window> {
                     depth_stencil_attachment: None,
                     occlusion_query_set: None,
                     timestamp_writes: None,
+                multiview_mask: None,
                 });
                 lp.set_pipeline(&self.lum_pipeline);
                 lp.set_bind_group(0, lb, &[]);
@@ -3862,13 +3922,13 @@ impl<'window> Renderer<'window> {
                 drop(lp);
                 // Save this frame's adapted luminance as next frame's history.
                 encoder.copy_texture_to_texture(
-                    wgpu::ImageCopyTexture {
+                    wgpu::TexelCopyTextureInfo {
                         texture: &self.lum_tex,
                         mip_level: 0,
                         origin: wgpu::Origin3d::ZERO,
                         aspect: wgpu::TextureAspect::All,
                     },
-                    wgpu::ImageCopyTexture {
+                    wgpu::TexelCopyTextureInfo {
                         texture: &self.lum_history,
                         mip_level: 0,
                         origin: wgpu::Origin3d::ZERO,
@@ -3891,6 +3951,7 @@ impl<'window> Renderer<'window> {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &swapchain_view,
                     resolve_target: None,
+                    depth_slice: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                         store: wgpu::StoreOp::Store,
@@ -3899,6 +3960,7 @@ impl<'window> Renderer<'window> {
                 depth_stencil_attachment: None,
                 occlusion_query_set: None,
                 timestamp_writes: None,
+            multiview_mask: None,
             });
             post.set_pipeline(&self.post_pipeline);
             post.set_bind_group(0, bind, &[]);
@@ -3915,6 +3977,7 @@ impl<'window> Renderer<'window> {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &swapchain_view,
                     resolve_target: None,
+                    depth_slice: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Load,
                         store: wgpu::StoreOp::Store,
@@ -3930,6 +3993,7 @@ impl<'window> Renderer<'window> {
                 }),
                 occlusion_query_set: None,
                 timestamp_writes: None,
+            multiview_mask: None,
             });
             // UI background layer (under the 3D block icons).
             if let Some(cache) = &self.ui_cache {
@@ -4134,14 +4198,14 @@ fn prepare_ui_layer(
 
     let pixels = UiFrame::rasterize(commands, width, height, divisor, gui);
     queue.write_texture(
-        wgpu::ImageCopyTexture {
+        wgpu::TexelCopyTextureInfo {
             texture: &cache.texture,
             mip_level: 0,
             origin: wgpu::Origin3d::ZERO,
             aspect: wgpu::TextureAspect::All,
         },
         &pixels,
-        wgpu::ImageDataLayout {
+        wgpu::TexelCopyBufferLayout {
             offset: 0,
             bytes_per_row: Some(4 * width),
             rows_per_image: Some(height),
@@ -4395,14 +4459,14 @@ fn create_sky_atlas_bind_group(
         view_formats: &[],
     });
     queue.write_texture(
-        wgpu::ImageCopyTexture {
+        wgpu::TexelCopyTextureInfo {
             texture: &texture,
             mip_level: 0,
             origin: wgpu::Origin3d::ZERO,
             aspect: wgpu::TextureAspect::All,
         },
         &atlas.pixels,
-        wgpu::ImageDataLayout {
+        wgpu::TexelCopyBufferLayout {
             offset: 0,
             bytes_per_row: Some(4 * atlas.width),
             rows_per_image: Some(atlas.height),
@@ -4421,7 +4485,7 @@ fn create_sky_atlas_bind_group(
         address_mode_w: wgpu::AddressMode::ClampToEdge,
         mag_filter: wgpu::FilterMode::Nearest,
         min_filter: wgpu::FilterMode::Nearest,
-        mipmap_filter: wgpu::FilterMode::Nearest,
+        mipmap_filter: wgpu::MipmapFilterMode::Nearest,
         ..Default::default()
     });
     device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -4623,14 +4687,14 @@ fn create_entity_texture_bind_group(
         view_formats: &[],
     });
     queue.write_texture(
-        wgpu::ImageCopyTexture {
+        wgpu::TexelCopyTextureInfo {
             texture: &texture,
             mip_level: 0,
             origin: wgpu::Origin3d::ZERO,
             aspect: wgpu::TextureAspect::All,
         },
         &atlas.pixels,
-        wgpu::ImageDataLayout {
+        wgpu::TexelCopyBufferLayout {
             offset: 0,
             bytes_per_row: Some(4 * atlas.width),
             rows_per_image: Some(atlas.height),
@@ -4649,7 +4713,7 @@ fn create_entity_texture_bind_group(
         address_mode_w: wgpu::AddressMode::ClampToEdge,
         mag_filter: wgpu::FilterMode::Nearest,
         min_filter: wgpu::FilterMode::Nearest,
-        mipmap_filter: wgpu::FilterMode::Nearest,
+        mipmap_filter: wgpu::MipmapFilterMode::Nearest,
         ..Default::default()
     });
     let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -4847,14 +4911,14 @@ fn create_texture_bind_group(
     });
     for (level, (data, mw, mh)) in mips.iter().enumerate() {
         queue.write_texture(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: &texture,
                 mip_level: level as u32,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
             data,
-            wgpu::ImageDataLayout {
+            wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(4 * mw),
                 rows_per_image: Some(*mh),
@@ -4902,7 +4966,7 @@ fn create_texture_bind_group(
                 address_mode_w: wgpu::AddressMode::ClampToEdge,
                 mag_filter: wgpu::FilterMode::Nearest,
                 min_filter: wgpu::FilterMode::Nearest,
-                mipmap_filter: wgpu::FilterMode::Linear,
+                mipmap_filter: wgpu::MipmapFilterMode::Linear,
                 lod_max_clamp: level as f32,
                 ..Default::default()
             });
@@ -4945,14 +5009,14 @@ fn create_default_pbr_textures(
             view_formats: &[],
         });
         queue.write_texture(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: &tex,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
             &pixel,
-            wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(4), rows_per_image: Some(1) },
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4), rows_per_image: Some(1) },
             wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
         );
         tex.create_view(&wgpu::TextureViewDescriptor::default())
@@ -5038,14 +5102,14 @@ fn create_panorama_resources(
 
     for (i, face) in faces.iter().enumerate() {
         queue.write_texture(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: &texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d { x: 0, y: 0, z: i as u32 },
                 aspect: wgpu::TextureAspect::All,
             },
             face,
-            wgpu::ImageDataLayout {
+            wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(4 * face_w),
                 rows_per_image: Some(face_h),
@@ -5129,8 +5193,8 @@ fn create_panorama_resources(
 
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("panorama-pipeline-layout"),
-        bind_group_layouts: &[&bind_group_layout],
-        push_constant_ranges: &[],
+        bind_group_layouts: &[Some(&bind_group_layout)],
+    immediate_size: 0,
     });
 
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -5143,12 +5207,14 @@ fn create_panorama_resources(
         layout: Some(&pipeline_layout),
         vertex: wgpu::VertexState {
             module: &shader,
-            entry_point: "vs_main",
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
             buffers: &[],
         },
         fragment: Some(wgpu::FragmentState {
             module: &shader,
-            entry_point: "fs_main",
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format: surface_format,
                 blend: Some(wgpu::BlendState::REPLACE),
@@ -5164,13 +5230,14 @@ fn create_panorama_resources(
         // fullscreen backdrop: always pass, never write depth.
         depth_stencil: Some(wgpu::DepthStencilState {
             format: DEPTH_FORMAT,
-            depth_write_enabled: false,
-            depth_compare: wgpu::CompareFunction::Always,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(wgpu::CompareFunction::Always),
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         }),
         multisample: wgpu::MultisampleState::default(),
-        multiview: None,
+    cache: None,
+    multiview_mask: None,
     });
 
     log::info!("panorama loaded ({face_w}x{face_h}, 6 faces)");

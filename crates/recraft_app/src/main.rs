@@ -48,12 +48,14 @@ use settings::{FpsCounter, Settings};
 const MESH_SUBMITS_PER_FRAME: usize = 40;
 /// Finished background section meshes uploaded to the GPU each frame.
 const MESH_UPLOADS_PER_FRAME: usize = 48;
+use std::sync::Arc;
 use winit::{
+    application::ApplicationHandler,
     dpi::{LogicalSize, PhysicalPosition, PhysicalSize},
-    event::{DeviceEvent, ElementState, Event, MouseButton, WindowEvent},
-    event_loop::{ControlFlow, EventLoop},
+    event::{DeviceEvent, ElementState, MouseButton, WindowEvent},
+    event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::{KeyCode, ModifiersState, PhysicalKey},
-    window::{CursorGrabMode, WindowBuilder},
+    window::{CursorGrabMode, Window},
 };
 
 struct LaunchConfig {
@@ -160,9 +162,604 @@ impl App {
     }
 }
 
+/// Holds all runtime state that lives across the event loop. Initialized in
+/// `resumed()` once the OS hands us a surface we can render to.
+struct WinitApp {
+    config: LaunchConfig,
+    // Initialized in resumed():
+    window: Option<Arc<Window>>,
+    renderer: Option<Renderer>,
+    app: Option<App>,
+    atlas_uv: recraft_render::AtlasUv,
+    overlay_textures: recraft_render::OverlayTextures,
+    // Input state:
+    cursor_captured: bool,
+    cursor_position: (f64, f64),
+    modifiers: ModifiersState,
+    ime_enabled: bool,
+    last_ime_area: Option<(i32, i32, i32, i32)>,
+    mouse_down_left: bool,
+    mouse_down_right: bool,
+    left_held: bool,
+    right_held: bool,
+    attack_pressed: bool,
+    use_pressed: bool,
+    slot_select: Option<i32>,
+    slot_scroll: i32,
+    was_dead: bool,
+    f3_debug: bool,
+    // Timing:
+    last_frame: Instant,
+    last_sim: Instant,
+    app_start: Instant,
+    fps_counter: FpsCounter,
+    tick_accumulator: f32,
+    // Scripted smoke / benchmarks:
+    scripted_smoke_seconds: Option<f32>,
+    scripted_smoke_static: bool,
+    scripted_smoke_done: bool,
+    smoke_profile: Option<SmokeProfile>,
+    pass_bench: Option<PassBench>,
+    window_shown: bool,
+}
+
+impl WinitApp {
+    fn new(config: LaunchConfig) -> Self {
+        let now = Instant::now();
+        let scripted_smoke_seconds =
+            config.scripted_smoke_seconds.or(config.bench_passes_seconds);
+        let scripted_smoke_static = matches!(
+            config.demo_kind,
+            game::DemoKind::ChunkStress | game::DemoKind::Terrain | game::DemoKind::SingleCube
+        );
+        let smoke_profile = config.scripted_smoke_seconds.map(|_| SmokeProfile::new(now));
+        let pass_bench = config
+            .bench_passes_seconds
+            .map(|secs| PassBench::new(now, secs));
+        Self {
+            config,
+            window: None,
+            renderer: None,
+            app: None,
+            atlas_uv: Default::default(),
+            overlay_textures: recraft_render::OverlayTextures::load(),
+            cursor_captured: false,
+            cursor_position: (0.0, 0.0),
+            modifiers: ModifiersState::empty(),
+            ime_enabled: false,
+            last_ime_area: None,
+            mouse_down_left: false,
+            mouse_down_right: false,
+            left_held: false,
+            right_held: false,
+            attack_pressed: false,
+            use_pressed: false,
+            slot_select: None,
+            slot_scroll: 0,
+            was_dead: false,
+            f3_debug: false,
+            last_frame: now,
+            last_sim: now,
+            app_start: now,
+            fps_counter: FpsCounter::new(now),
+            tick_accumulator: 0.0,
+            scripted_smoke_seconds,
+            scripted_smoke_static,
+            scripted_smoke_done: false,
+            smoke_profile,
+            pass_bench,
+            window_shown: false,
+        }
+    }
+}
+
+impl ApplicationHandler for WinitApp {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.window.is_some() {
+            return;
+        }
+        let initial_size: winit::dpi::Size = match self.config.window_size {
+            Some((w, h)) => winit::dpi::PhysicalSize::new(w, h).into(),
+            None => LogicalSize::new(1280.0, 720.0).into(),
+        };
+        let attrs = Window::default_attributes()
+            .with_title("ReCraft - Rust Minecraft Client")
+            .with_inner_size(initial_size)
+            .with_visible(false);
+        let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
+        release_cursor(&window);
+
+        let mut renderer = Renderer::new(window.clone()).expect("create renderer");
+        let mut settings = Settings::load();
+        let auto_play = self.config.scripted_smoke_seconds
+            .or(self.config.bench_passes_seconds)
+            .is_some();
+        if auto_play {
+            settings.vsync = false;
+            settings.fps_cap = u32::MAX;
+        }
+        renderer.set_vsync(settings.vsync);
+        renderer.set_fancy_graphics(settings.fancy_graphics);
+        renderer.set_mipmap_levels(settings.mipmap_levels);
+        renderer.set_render_scale(settings.render_scale);
+        renderer.set_shaders_enabled(settings.shaders);
+        renderer.set_shadows_enabled(settings.shader_shadows);
+        renderer.set_specular_enabled(settings.shader_specular);
+        renderer.set_fog_enabled(settings.shader_fog);
+        renderer.set_bloom_enabled(settings.shader_bloom);
+        renderer.set_brightness(settings.brightness);
+        renderer.set_vignette_enabled(settings.post_vignette);
+        renderer.set_chromatic_enabled(settings.post_chromatic);
+        renderer.set_dof_enabled(settings.post_dof);
+        renderer.set_motion_blur_enabled(settings.post_motion_blur);
+        renderer.set_auto_exposure_enabled(settings.post_auto_exposure);
+        renderer.set_clouds_enabled(settings.volumetric_clouds);
+        if !settings.fullscreen {
+            apply_display(&window, &settings);
+        }
+        if let Some(ref pack_name) = settings.resource_pack {
+            let pack_path = std::path::PathBuf::from("resourcepacks").join(pack_name);
+            if pack_path.exists() {
+                renderer.reload_atlas(Some(pack_path));
+            }
+        }
+        self.atlas_uv = renderer.atlas_uv().clone();
+
+        let auto_connect = self.config.server.clone();
+        let auto_demo = auto_play && auto_connect.is_none();
+        let username = self.config.username.clone();
+
+        let app = App {
+            game: if auto_demo {
+                GameState::demo(self.config.demo_kind, renderer.aspect())
+            } else {
+                GameState::empty_for_server(renderer.aspect())
+            },
+            network: auto_connect.as_ref().map(|(host, port)| {
+                log::info!("connecting to {host}:{port} as {username}");
+                NetworkHandle::connect_offline_1_8_9(host.clone(), *port, username.clone())
+            }),
+            screen: match &auto_connect {
+                Some((host, port)) => Some(Box::new(GuiConnecting {
+                    host: host.clone(),
+                    port: *port,
+                })),
+                None if auto_demo => None,
+                None => Some(Box::new(GuiMainMenu::new())),
+            },
+            in_world: auto_demo,
+            connecting: auto_connect.is_some(),
+            settings,
+            ms_session: None,
+            auth_rx: None,
+            accounts: auth::AccountStore::load(),
+            clipboard: arboard::Clipboard::new().ok(),
+            username,
+            tab_open: false,
+            skin_manager: skin::SkinManager::new(),
+            local_server: None,
+            panorama_timer: 0.0,
+            entity_model: recraft_render::ModelMesh::new(),
+            quit: false,
+        };
+        renderer.upload_world(&app.game.world);
+
+        self.window = Some(window);
+        self.renderer = Some(renderer);
+        self.app = Some(app);
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        _window_id: winit::window::WindowId,
+        event: WindowEvent,
+    ) {
+        let (Some(window), Some(renderer), Some(app)) =
+            (self.window.as_ref(), self.renderer.as_mut(), self.app.as_mut())
+        else {
+            return;
+        };
+
+        match event {
+            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Resized(size) => {
+                renderer.resize(size);
+                app.game.set_aspect(renderer.aspect());
+            }
+            WindowEvent::ModifiersChanged(state) => {
+                self.modifiers = state.state();
+            }
+            WindowEvent::Ime(ime) => {
+                if let Some(input) = app
+                    .screen
+                    .as_mut()
+                    .and_then(|screen| screen.focused_text_input())
+                {
+                    input.handle_ime(&ime);
+                }
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                if event.state == ElementState::Pressed
+                    && !event.repeat
+                    && matches!(event.physical_key, PhysicalKey::Code(KeyCode::F3))
+                    && app.in_world
+                    && app
+                        .screen
+                        .as_ref()
+                        .is_none_or(|screen| screen.chat_input().is_none())
+                {
+                    self.f3_debug = !self.f3_debug;
+                }
+                if app.screen.is_some() {
+                    let mut taken = app.screen.take();
+                    let actions = if let Some(screen) = taken.as_mut() {
+                        let mut ctx = ScreenCtx {
+                            game: &mut app.game,
+                            settings: &mut app.settings,
+                            clipboard: app.clipboard.as_mut(),
+                            modifiers: self.modifiers,
+                            mouse: self.cursor_position,
+                        };
+                        screen.key_pressed(&event, &mut ctx)
+                    } else {
+                        Vec::new()
+                    };
+                    app.screen = taken;
+                    handle_actions(app, renderer, window, actions, &mut self.atlas_uv);
+                } else if app.in_world {
+                    let pressed = event.state == ElementState::Pressed;
+                    if pressed
+                        && matches!(event.physical_key, PhysicalKey::Code(KeyCode::Escape))
+                    {
+                        app.suspend_gameplay_input(&mut self.left_held, &mut self.right_held);
+                        app.screen = Some(Box::new(GuiIngameMenu::new()));
+                    } else if pressed
+                        && matches!(event.physical_key, PhysicalKey::Code(KeyCode::KeyE))
+                    {
+                        app.suspend_gameplay_input(&mut self.left_held, &mut self.right_held);
+                        app.game.open_player_inventory();
+                        app.screen = Some(Box::new(GuiContainer::new()));
+                    } else if let Some(prefill) = chat_open_key(&event) {
+                        app.suspend_gameplay_input(&mut self.left_held, &mut self.right_held);
+                        app.game.chat.reset_recall();
+                        app.screen = Some(Box::new(GuiChat::new(prefill)));
+                    } else if let Some(slot) = hotbar_slot_key(&event) {
+                        self.slot_select = Some(slot);
+                    } else if matches!(
+                        event.physical_key,
+                        PhysicalKey::Code(KeyCode::Tab)
+                    ) {
+                        app.tab_open = pressed;
+                    } else {
+                        app.game.input.handle_key(event);
+                    }
+                }
+                sync_cursor(window, &mut self.cursor_captured, app);
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let steps = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(_, y) => y,
+                    winit::event::MouseScrollDelta::PixelDelta(pos) => pos.y as f32,
+                };
+                if let Some(screen) = app.screen.as_mut() {
+                    screen.mouse_scrolled(steps);
+                } else if app.in_world {
+                    self.slot_scroll += -steps.signum() as i32;
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor_position = (position.x, position.y);
+                if self.mouse_down_left || self.mouse_down_right {
+                    let mut taken = app.screen.take();
+                    if let Some(screen) = taken.as_mut() {
+                        let mut ctx = ScreenCtx {
+                            game: &mut app.game,
+                            settings: &mut app.settings,
+                            clipboard: app.clipboard.as_mut(),
+                            modifiers: self.modifiers,
+                            mouse: self.cursor_position,
+                        };
+                        screen.mouse_dragged(position.x, position.y, &mut ctx);
+                    }
+                    app.screen = taken;
+                }
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                let is_left = button == MouseButton::Left;
+                let is_right = button == MouseButton::Right;
+                let is_middle = button == MouseButton::Middle;
+                if state == ElementState::Released {
+                    if is_left {
+                        self.mouse_down_left = false;
+                        self.left_held = false;
+                    }
+                    if is_right {
+                        self.mouse_down_right = false;
+                        self.right_held = false;
+                    }
+                    if app.screen.is_some() && (is_left || is_right) {
+                        let mut taken = app.screen.take();
+                        let actions = if let Some(screen) = taken.as_mut() {
+                            let mut ctx = ScreenCtx {
+                                game: &mut app.game,
+                                settings: &mut app.settings,
+                                clipboard: app.clipboard.as_mut(),
+                                modifiers: self.modifiers,
+                                mouse: self.cursor_position,
+                            };
+                            screen.mouse_released(
+                                self.cursor_position.0,
+                                self.cursor_position.1,
+                                is_right,
+                                &mut ctx,
+                            )
+                        } else {
+                            Vec::new()
+                        };
+                        app.screen = taken;
+                        handle_actions(app, renderer, window, actions, &mut self.atlas_uv);
+                    }
+                } else if app.screen.is_some() {
+                    if is_left || is_right || is_middle {
+                        if is_left {
+                            self.mouse_down_left = true;
+                        } else if is_right {
+                            self.mouse_down_right = true;
+                        }
+                        let mut taken = app.screen.take();
+                        let actions = if let Some(screen) = taken.as_mut() {
+                            let mut ctx = ScreenCtx {
+                                game: &mut app.game,
+                                settings: &mut app.settings,
+                                clipboard: app.clipboard.as_mut(),
+                                modifiers: self.modifiers,
+                                mouse: self.cursor_position,
+                            };
+                            let (mx, my) = self.cursor_position;
+                            if is_left {
+                                screen.mouse_clicked(mx, my, &mut ctx)
+                            } else if is_right {
+                                screen.mouse_right_clicked(mx, my, &mut ctx)
+                            } else {
+                                screen.mouse_middle_clicked(mx, my, &mut ctx)
+                            }
+                        } else {
+                            Vec::new()
+                        };
+                        app.screen = taken;
+                        handle_actions(app, renderer, window, actions, &mut self.atlas_uv);
+                        sync_cursor(window, &mut self.cursor_captured, app);
+                    }
+                } else if app.in_world {
+                    match button {
+                        MouseButton::Left => {
+                            self.mouse_down_left = true;
+                            self.left_held = true;
+                            self.attack_pressed = true;
+                        }
+                        MouseButton::Right => {
+                            self.right_held = true;
+                            self.use_pressed = true;
+                        }
+                        _ => {}
+                    }
+                    sync_cursor(window, &mut self.cursor_captured, app);
+                }
+            }
+            WindowEvent::RedrawRequested => {}
+            _ => {}
+        }
+    }
+
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _device_id: winit::event::DeviceId,
+        event: DeviceEvent,
+    ) {
+        let Some(app) = self.app.as_mut() else { return };
+        if let DeviceEvent::MouseMotion { delta } = event {
+            if app.in_world && app.screen.is_none() {
+                app.game.rotate_view(
+                    delta.0 as f32,
+                    delta.1 as f32,
+                    app.settings.clone().mouse_factor(),
+                );
+            }
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        event_loop.set_control_flow(ControlFlow::Poll);
+
+        let (Some(window), Some(renderer), Some(app)) =
+            (self.window.as_ref(), self.renderer.as_mut(), self.app.as_mut())
+        else {
+            return;
+        };
+
+        poll_auth_events(app);
+        pump_network(app, window, &mut self.cursor_captured);
+
+        if app.game.take_window_open() {
+            app.suspend_gameplay_input(&mut self.left_held, &mut self.right_held);
+            app.screen = Some(Box::new(GuiContainer::new()));
+        }
+        if app.game.take_window_close() {
+            app.screen = None;
+        }
+
+        let mut taken = app.screen.take();
+        let actions = if let Some(screen) = taken.as_mut() {
+            let mut ctx = ScreenCtx {
+                game: &mut app.game,
+                settings: &mut app.settings,
+                clipboard: app.clipboard.as_mut(),
+                modifiers: self.modifiers,
+                mouse: self.cursor_position,
+            };
+            screen.update(&mut ctx)
+        } else {
+            Vec::new()
+        };
+        app.screen = taken;
+        handle_actions(app, renderer, window, actions, &mut self.atlas_uv);
+
+        if self.scripted_smoke_seconds.is_some() && app.game.is_dead() {
+            app.game.request_respawn();
+        }
+
+        let dead = app.in_world && app.game.is_dead();
+        if dead && !self.was_dead {
+            let interruptible = app
+                .screen
+                .as_ref()
+                .is_none_or(|screen| screen.chat_input().is_some());
+            if interruptible {
+                app.screen = Some(Box::new(GuiGameOver::new()));
+            }
+        }
+        self.was_dead = dead;
+
+        if app.game.take_respawn_request() {
+            if let Some(network) = &app.network {
+                network.send_packet(ServerboundPacket::ClientStatus { action: 0 });
+            }
+        }
+
+        let _ = app.game.take_position_confirm();
+
+        let now = Instant::now();
+        let sim_dt = (now - self.last_sim).as_secs_f32().min(0.25);
+        self.last_sim = now;
+        if let Some(seconds) = self.scripted_smoke_seconds {
+            if !self.scripted_smoke_static && self.pass_bench.is_none() {
+                app.game
+                    .apply_scripted_smoke_input((now - self.app_start).as_secs_f32(), seconds);
+            }
+        }
+        if app.in_world {
+            self.tick_accumulator += sim_dt;
+            while self.tick_accumulator >= 0.05 {
+                app.game.set_pending_actions(game::TickActions {
+                    slot_select: self.slot_select,
+                    slot_scroll: self.slot_scroll,
+                    attack_pressed: self.attack_pressed,
+                    use_pressed: self.use_pressed,
+                    left_held: self.left_held,
+                    right_held: self.right_held,
+                });
+                if let Some((actions, movement)) = app.game.tick(0.05) {
+                    self.slot_select = None;
+                    self.slot_scroll = 0;
+                    self.attack_pressed = false;
+                    self.use_pressed = false;
+                    let abilities = app.game.take_abilities_packet();
+                    if let Some(network) = &app.network {
+                        if app.game.can_send_movement_packets() {
+                            for packet in actions {
+                                network.send_packet(packet);
+                            }
+                            if let Some(abilities) = abilities {
+                                network.send_packet(abilities);
+                            }
+                            network.send_movement(movement);
+                        }
+                    }
+                }
+                self.tick_accumulator -= 0.05;
+            }
+        }
+        if !self.scripted_smoke_done
+            && self.scripted_smoke_seconds
+                .is_some_and(|seconds| (now - self.app_start).as_secs_f32() >= seconds)
+        {
+            self.scripted_smoke_done = true;
+            if let Some(profile) = self.smoke_profile.as_mut() {
+                profile.flush(now);
+            }
+            if let Some(bench) = self.pass_bench.as_ref() {
+                bench.report();
+            }
+            log::info!("scripted smoke complete");
+            event_loop.exit();
+        }
+
+        if app.quit {
+            event_loop.exit();
+        }
+        sync_cursor(window, &mut self.cursor_captured, app);
+
+        if self.pass_bench.is_none() {
+            if let Some(cap) = app.settings.clone().fps_limit() {
+                let deadline = self.last_frame + Duration::from_secs_f64(1.0 / cap as f64);
+                let now = Instant::now();
+                if now < deadline {
+                    std::thread::sleep(deadline - now);
+                }
+            }
+        }
+        if let Some(bench) = self.pass_bench.as_mut() {
+            let (sky, water, ui, flat) = bench.config_for_frame();
+            renderer.set_pass_skip(sky, water, ui, flat);
+        }
+        render_frame(
+            renderer,
+            app,
+            window,
+            &self.atlas_uv,
+            &self.overlay_textures,
+            &mut self.fps_counter,
+            &mut self.last_frame,
+            self.tick_accumulator,
+            self.cursor_position,
+            self.mouse_down_left,
+            self.f3_debug,
+            self.smoke_profile.is_some() || self.pass_bench.is_some(),
+        );
+        if let Some(profile) = self.smoke_profile.as_mut() {
+            profile.record(renderer.last_stats(), Instant::now());
+        }
+        if let Some(bench) = self.pass_bench.as_mut() {
+            bench.record(renderer.last_stats(), Instant::now());
+        }
+        if !self.window_shown {
+            window.set_visible(true);
+            window.focus_window();
+            self.window_shown = true;
+            if app.settings.fullscreen {
+                apply_display(window, &app.settings);
+            }
+        }
+
+        let focused_caret = app
+            .screen
+            .as_mut()
+            .and_then(|screen| screen.focused_text_input())
+            .map(|input| input.caret_area());
+        let want_ime = focused_caret.is_some();
+        if want_ime != self.ime_enabled {
+            window.set_ime_allowed(want_ime);
+            self.ime_enabled = want_ime;
+            if !want_ime {
+                self.last_ime_area = None;
+            }
+        }
+        if let Some(area) = focused_caret.flatten() {
+            if self.last_ime_area != Some(area) {
+                self.last_ime_area = Some(area);
+                let (cx, cy, cw, ch) = area;
+                window.set_ime_cursor_area(
+                    PhysicalPosition::new(cx as f64, cy as f64),
+                    PhysicalSize::new(cw.max(1) as f64, ch.max(1) as f64),
+                );
+            }
+        }
+    }
+}
+
 fn main() -> anyhow::Result<()> {
-    // Default to showing info-level logs so diagnostics are visible without
-    // having to set RUST_LOG; still overridable via RUST_LOG.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let config = LaunchConfig::from_args();
     if let Some(path) = &config.assets {
@@ -177,601 +774,8 @@ fn main() -> anyhow::Result<()> {
     }
 
     let event_loop = EventLoop::new().context("create event loop")?;
-    // `--window WxH` forces a physical-pixel window size (bypasses the OS
-    // high-DPI scaling that otherwise doubles the swapchain on 200% displays);
-    // used to isolate present/composite cost from world-render cost.
-    let initial_size: winit::dpi::Size = match config.window_size {
-        Some((w, h)) => winit::dpi::PhysicalSize::new(w, h).into(),
-        None => LogicalSize::new(1280.0, 720.0).into(),
-    };
-    let window = WindowBuilder::new()
-        .with_title("ReCraft - Rust Minecraft Client")
-        .with_inner_size(initial_size)
-        // Start hidden so the OS never shows an empty white window while the
-        // renderer loads textures; revealed after the first frame is drawn.
-        .with_visible(false)
-        .build(&event_loop)
-        .context("create window")?;
-    let window: &'static winit::window::Window = Box::leak(Box::new(window));
-    release_cursor(window);
-
-    let mut renderer = pollster::block_on(Renderer::new(window)).context("create renderer")?;
-    let mut settings = Settings::load();
-    // Both scripted-smoke and the pass benchmark auto-load the demo world and run
-    // unthrottled.
-    let auto_play = config
-        .scripted_smoke_seconds
-        .or(config.bench_passes_seconds)
-        .is_some();
-    if auto_play {
-        settings.vsync = false;
-        settings.fps_cap = u32::MAX;
-    }
-    renderer.set_vsync(settings.vsync);
-    renderer.set_fancy_graphics(settings.fancy_graphics);
-    renderer.set_mipmap_levels(settings.mipmap_levels);
-    renderer.set_render_scale(settings.render_scale);
-    renderer.set_shaders_enabled(settings.shaders);
-    renderer.set_shadows_enabled(settings.shader_shadows);
-    renderer.set_specular_enabled(settings.shader_specular);
-    renderer.set_fog_enabled(settings.shader_fog);
-    renderer.set_bloom_enabled(settings.shader_bloom);
-    renderer.set_brightness(settings.brightness);
-    renderer.set_vignette_enabled(settings.post_vignette);
-    renderer.set_chromatic_enabled(settings.post_chromatic);
-    renderer.set_dof_enabled(settings.post_dof);
-    renderer.set_motion_blur_enabled(settings.post_motion_blur);
-    renderer.set_auto_exposure_enabled(settings.post_auto_exposure);
-    renderer.set_clouds_enabled(settings.volumetric_clouds);
-    // Fullscreen is deferred to after the window is visible: macOS's Spaces-based
-    // fullscreen transition cannot succeed on a hidden window, leaving the surface
-    // at the wrong size permanently. Non-fullscreen resolution is applied here so
-    // the window appears at the right size when revealed.
-    if !settings.fullscreen {
-        apply_display(window, &settings);
-    }
-    // Load saved resource pack (if any) before taking the atlas snapshot.
-    if let Some(ref pack_name) = settings.resource_pack {
-        let pack_path = std::path::PathBuf::from("resourcepacks").join(pack_name);
-        if pack_path.exists() {
-            renderer.reload_atlas(Some(pack_path));
-        }
-    }
-    let mut atlas_uv = renderer.atlas_uv().clone();
-    let overlay_textures = recraft_render::OverlayTextures::load();
-
-    let auto_connect = config.server.clone();
-    let auto_demo = auto_play && auto_connect.is_none();
-    let username = config.username.clone();
-
-    let mut app = App {
-        // The demo world is only built when actually entering it; menus run
-        // over an empty world (hidden behind the dirt background anyway).
-        game: if auto_demo {
-            GameState::demo(config.demo_kind, renderer.aspect())
-        } else {
-            GameState::empty_for_server(renderer.aspect())
-        },
-        network: auto_connect.as_ref().map(|(host, port)| {
-            log::info!("connecting to {host}:{port} as {username}");
-            NetworkHandle::connect_offline_1_8_9(host.clone(), *port, username.clone())
-        }),
-        screen: match &auto_connect {
-            Some((host, port)) => Some(Box::new(GuiConnecting {
-                host: host.clone(),
-                port: *port,
-            })),
-            None if auto_demo => None,
-            None => Some(Box::new(GuiMainMenu::new())),
-        },
-        in_world: auto_demo,
-        connecting: auto_connect.is_some(),
-        settings,
-        ms_session: None,
-        auth_rx: None,
-        accounts: auth::AccountStore::load(),
-        clipboard: arboard::Clipboard::new().ok(),
-        username,
-        tab_open: false,
-        skin_manager: skin::SkinManager::new(),
-        local_server: None,
-        panorama_timer: 0.0,
-        entity_model: recraft_render::ModelMesh::new(),
-        quit: false,
-    };
-    renderer.upload_world(&app.game.world);
-
-    let mut cursor_captured = false;
-    let mut cursor_position = (0.0f64, 0.0f64);
-    // Held modifier keys (for text-field shortcuts like Ctrl/Cmd+V).
-    let mut modifiers = ModifiersState::empty();
-    // Whether IME input is currently enabled on the window. We turn it on only
-    // while a text field is focused, so gameplay keys stay raw and no candidate
-    // window pops up mid-game. `last_ime_area` avoids redundant area updates.
-    let mut ime_enabled = false;
-    let mut last_ime_area: Option<(i32, i32, i32, i32)> = None;
-    let mut mouse_down_left = false;
-    // Right button held over a screen, for right-button inventory paint-drag.
-    let mut mouse_down_right = false;
-    // Whether the left mouse button is held in gameplay (continuous mining).
-    let mut left_held = false;
-    // Whether the right mouse button is held in gameplay (sword blocking holds
-    // the item in use until released).
-    let mut right_held = false;
-    // Per-tick input intents. Frame events only RECORD intent here; the tick loop
-    // turns them into packets in vanilla order (held-item, then click actions, then
-    // the flying packet) using that tick's player state — exactly how vanilla's
-    // runTick processes input before onUpdateWalkingPlayer sends movement. This is
-    // why interactions never land in Grim's "post-flying" window.
-    let mut attack_pressed = false;
-    let mut use_pressed = false;
-    let mut slot_select: Option<i32> = None;
-    let mut slot_scroll = 0i32;
-    let mut was_dead = false;
-    // F3 debug overlay (coords, chunk info, render profiler).
-    let mut f3_debug = false;
-
-    let mut last_frame = Instant::now();
-    // The physics/network simulation advances on its own wall-clock so it runs
-    // at a fixed 20 Hz regardless of how often the window actually redraws.
-    let mut last_sim = Instant::now();
-    let app_start = Instant::now();
-    let mut fps_counter = FpsCounter::new(app_start);
-    let mut tick_accumulator = 0.0f32;
-    // Both scripted-smoke and the pass benchmark drive the scripted camera and
-    // auto-exit, so combine them for those two purposes.
-    let scripted_smoke_seconds = config.scripted_smoke_seconds.or(config.bench_passes_seconds);
-    let scripted_smoke_static = matches!(
-        config.demo_kind,
-        game::DemoKind::ChunkStress | game::DemoKind::Terrain | game::DemoKind::SingleCube
-    );
-    let mut scripted_smoke_done = false;
-    // During a scripted-smoke run, aggregate RenderStats over ~1s windows and log
-    // the breakdown so headed benchmark runs print readable profiler numbers to
-    // the terminal (instead of only the on-screen F3 overlay).
-    let mut smoke_profile = config.scripted_smoke_seconds.map(|_| SmokeProfile::new(app_start));
-    // In-process per-pass A/B benchmark (interleaves skip configs frame by frame).
-    let mut pass_bench = config
-        .bench_passes_seconds
-        .map(|secs| PassBench::new(app_start, secs));
-    // The window starts hidden; revealed after the first frame is presented so
-    // the user never sees an empty white window during renderer/asset load.
-    let mut window_shown = false;
-
-    event_loop.run(move |event, target| {
-        target.set_control_flow(ControlFlow::Poll);
-
-        // ── Poll auth events ────────────────────────────────────────────────
-        poll_auth_events(&mut app);
-
-        match event {
-            Event::WindowEvent { event, window_id } if window_id == window.id() => match event {
-                WindowEvent::CloseRequested => target.exit(),
-                WindowEvent::Resized(size) => {
-                    renderer.resize(size);
-                    app.game.set_aspect(renderer.aspect());
-                }
-                WindowEvent::ModifiersChanged(state) => {
-                    modifiers = state.state();
-                }
-                WindowEvent::Ime(ime) => {
-                    // Route IME composition/commit to the focused text field.
-                    if let Some(input) = app
-                        .screen
-                        .as_mut()
-                        .and_then(|screen| screen.focused_text_input())
-                    {
-                        input.handle_ime(&ime);
-                    }
-                }
-                WindowEvent::KeyboardInput { event, .. } => {
-                    // F3 toggles the debug overlay in-world, regardless of any
-                    // open screen, but not while typing in a chat field.
-                    if event.state == ElementState::Pressed
-                        && !event.repeat
-                        && matches!(event.physical_key, PhysicalKey::Code(KeyCode::F3))
-                        && app.in_world
-                        && app
-                            .screen
-                            .as_ref()
-                            .is_none_or(|screen| screen.chat_input().is_none())
-                    {
-                        f3_debug = !f3_debug;
-                    }
-                    if app.screen.is_some() {
-                        // Screen input: route through the screen, collect actions.
-                        let mut taken = app.screen.take();
-                        let actions = if let Some(screen) = taken.as_mut() {
-                            let mut ctx = ScreenCtx {
-                                game: &mut app.game,
-                                settings: &mut app.settings,
-                                clipboard: app.clipboard.as_mut(),
-                                modifiers,
-                                mouse: cursor_position,
-                            };
-                            screen.key_pressed(&event, &mut ctx)
-                        } else {
-                            Vec::new()
-                        };
-                        app.screen = taken;
-                        handle_actions(&mut app, &mut renderer, window, actions, &mut atlas_uv);
-                    } else if app.in_world {
-                        // Gameplay input.
-                        let pressed = event.state == ElementState::Pressed;
-                        if pressed
-                            && matches!(event.physical_key, PhysicalKey::Code(KeyCode::Escape))
-                        {
-                            app.suspend_gameplay_input(&mut left_held, &mut right_held);
-                            app.screen = Some(Box::new(GuiIngameMenu::new()));
-                        } else if pressed
-                            && matches!(event.physical_key, PhysicalKey::Code(KeyCode::KeyE))
-                        {
-                            app.suspend_gameplay_input(&mut left_held, &mut right_held);
-                            app.game.open_player_inventory();
-                            app.screen = Some(Box::new(GuiContainer::new()));
-                        } else if let Some(prefill) = chat_open_key(&event) {
-                            app.suspend_gameplay_input(&mut left_held, &mut right_held);
-                            app.game.chat.reset_recall();
-                            app.screen = Some(Box::new(GuiChat::new(prefill)));
-                        } else if let Some(slot) = hotbar_slot_key(&event) {
-                            slot_select = Some(slot);
-                        } else if matches!(
-                            event.physical_key,
-                            PhysicalKey::Code(KeyCode::Tab)
-                        ) {
-                            // Hold Tab to show the player-list overlay.
-                            app.tab_open = pressed;
-                        } else {
-                            app.game.input.handle_key(event);
-                        }
-                    }
-                    sync_cursor(window, &mut cursor_captured, &app);
-                }
-                WindowEvent::MouseWheel { delta, .. } => {
-                    let steps = match delta {
-                        winit::event::MouseScrollDelta::LineDelta(_, y) => y,
-                        winit::event::MouseScrollDelta::PixelDelta(pos) => pos.y as f32,
-                    };
-                    if let Some(screen) = app.screen.as_mut() {
-                        screen.mouse_scrolled(steps);
-                    } else if app.in_world {
-                        // Scroll wheel cycles the hotbar (down = next slot); the
-                        // packet is sent inside the tick.
-                        slot_scroll += -steps.signum() as i32;
-                    }
-                }
-                WindowEvent::CursorMoved { position, .. } => {
-                    cursor_position = (position.x, position.y);
-                    if mouse_down_left || mouse_down_right {
-                        let mut taken = app.screen.take();
-                        if let Some(screen) = taken.as_mut() {
-                            let mut ctx = ScreenCtx {
-                                game: &mut app.game,
-                                settings: &mut app.settings,
-                                clipboard: app.clipboard.as_mut(),
-                                modifiers,
-                                mouse: cursor_position,
-                            };
-                            screen.mouse_dragged(position.x, position.y, &mut ctx);
-                        }
-                        app.screen = taken;
-                    }
-                }
-                WindowEvent::MouseInput { state, button, .. } => {
-                    let is_left = button == MouseButton::Left;
-                    let is_right = button == MouseButton::Right;
-                    let is_middle = button == MouseButton::Middle;
-                    if state == ElementState::Released {
-                        if is_left {
-                            mouse_down_left = false;
-                            left_held = false;
-                        }
-                        if is_right {
-                            mouse_down_right = false;
-                            right_held = false;
-                        }
-                        if app.screen.is_some() && (is_left || is_right) {
-                            // Route the release to the screen (commits an
-                            // inventory paint-drag, or collapses it to a click).
-                            let mut taken = app.screen.take();
-                            let actions = if let Some(screen) = taken.as_mut() {
-                                let mut ctx = ScreenCtx {
-                                    game: &mut app.game,
-                                    settings: &mut app.settings,
-                                    clipboard: app.clipboard.as_mut(),
-                                    modifiers,
-                                    mouse: cursor_position,
-                                };
-                                screen.mouse_released(
-                                    cursor_position.0,
-                                    cursor_position.1,
-                                    is_right,
-                                    &mut ctx,
-                                )
-                            } else {
-                                Vec::new()
-                            };
-                            app.screen = taken;
-                            handle_actions(&mut app, &mut renderer, window, actions, &mut atlas_uv);
-                        }
-                    } else if app.screen.is_some() {
-                        if is_left || is_right || is_middle {
-                            if is_left {
-                                mouse_down_left = true;
-                            } else if is_right {
-                                mouse_down_right = true;
-                            }
-                            let mut taken = app.screen.take();
-                            let actions = if let Some(screen) = taken.as_mut() {
-                                let mut ctx = ScreenCtx {
-                                    game: &mut app.game,
-                                    settings: &mut app.settings,
-                                    clipboard: app.clipboard.as_mut(),
-                                    modifiers,
-                                    mouse: cursor_position,
-                                };
-                                let (mx, my) = cursor_position;
-                                if is_left {
-                                    screen.mouse_clicked(mx, my, &mut ctx)
-                                } else if is_right {
-                                    screen.mouse_right_clicked(mx, my, &mut ctx)
-                                } else {
-                                    screen.mouse_middle_clicked(mx, my, &mut ctx)
-                                }
-                            } else {
-                                Vec::new()
-                            };
-                            app.screen = taken;
-                            handle_actions(&mut app, &mut renderer, window, actions, &mut atlas_uv);
-                            sync_cursor(window, &mut cursor_captured, &app);
-                        }
-                    } else if app.in_world {
-                        // Record the click edge; the tick turns it into the
-                        // dig/use packets in vanilla order.
-                        match button {
-                            MouseButton::Left => {
-                                mouse_down_left = true;
-                                left_held = true;
-                                attack_pressed = true;
-                            }
-                            MouseButton::Right => {
-                                right_held = true;
-                                use_pressed = true;
-                            }
-                            _ => {}
-                        }
-                        sync_cursor(window, &mut cursor_captured, &app);
-                    }
-                }
-                WindowEvent::RedrawRequested => {
-                    // Rendering is driven from AboutToWait (see `render_frame`).
-                }
-                _ => {}
-            },
-            Event::DeviceEvent {
-                event: DeviceEvent::MouseMotion { delta },
-                ..
-            } if app.in_world && app.screen.is_none() => app.game.rotate_view(
-                delta.0 as f32,
-                delta.1 as f32,
-                app.settings.clone().mouse_factor(),
-            ),
-            Event::AboutToWait => {
-                // --- Network event pump (bounded per iteration). ---
-                pump_network(&mut app, window, &mut cursor_captured);
-
-                // The server opened (S2D) or force-closed (S2E) a window: push or
-                // pop the container screen to match.
-                if app.game.take_window_open() {
-                    app.suspend_gameplay_input(&mut left_held, &mut right_held);
-                    app.screen = Some(Box::new(GuiContainer::new()));
-                }
-                if app.game.take_window_close() {
-                    app.screen = None;
-                }
-
-                // Per-frame screen upkeep (ping results, auto-close).
-                let mut taken = app.screen.take();
-                let actions = if let Some(screen) = taken.as_mut() {
-                    let mut ctx = ScreenCtx {
-                        game: &mut app.game,
-                        settings: &mut app.settings,
-                        clipboard: app.clipboard.as_mut(),
-                        modifiers,
-                        mouse: cursor_position,
-                    };
-                    screen.update(&mut ctx)
-                } else {
-                    Vec::new()
-                };
-                app.screen = taken;
-                handle_actions(&mut app, &mut renderer, window, actions, &mut atlas_uv);
-
-                // Scripted runs auto-respawn so the smoke driver keeps moving.
-                if scripted_smoke_seconds.is_some() && app.game.is_dead() {
-                    app.game.request_respawn();
-                }
-
-                // Death screen on the rising edge (gameplay or chat overlay).
-                let dead = app.in_world && app.game.is_dead();
-                if dead && !was_dead {
-                    let interruptible = app
-                        .screen
-                        .as_ref()
-                        .is_none_or(|screen| screen.chat_input().is_some());
-                    if interruptible {
-                        app.screen = Some(Box::new(GuiGameOver::new()));
-                    }
-                }
-                was_dead = dead;
-
-                // If we asked to respawn, tell the server — a dead player is
-                // frozen server-side and cannot move until it respawns.
-                if app.game.take_respawn_request() {
-                    if let Some(network) = &app.network {
-                        network.send_packet(ServerboundPacket::ClientStatus { action: 0 });
-                    }
-                }
-
-                // Teleport acks are sent synchronously by the network thread;
-                // just drain the game-side pending flag.
-                let _ = app.game.take_position_confirm();
-
-                let now = Instant::now();
-                let sim_dt = (now - last_sim).as_secs_f32().min(0.25);
-                last_sim = now;
-                if let Some(seconds) = scripted_smoke_seconds {
-                    // The pass benchmark keeps the camera still so every config
-                    // renders an identical frame — otherwise scene-to-scene
-                    // variance from a moving camera swamps the per-pass deltas.
-                    if !scripted_smoke_static && pass_bench.is_none() {
-                        app.game
-                            .apply_scripted_smoke_input((now - app_start).as_secs_f32(), seconds);
-                    }
-                }
-                // The world keeps ticking (and reporting movement) while any
-                // overlay screen is open, exactly like vanilla multiplayer.
-                if app.in_world {
-                    tick_accumulator += sim_dt;
-                    while tick_accumulator >= 0.05 {
-                        // Stage this tick's input intents; the tick resolves them
-                        // (in vanilla order) BEFORE the move, so a sprint-attack or
-                        // sword-block slowdown lands on this tick's flying packet.
-                        app.game.set_pending_actions(game::TickActions {
-                            slot_select,
-                            slot_scroll,
-                            attack_pressed,
-                            use_pressed,
-                            left_held,
-                            right_held,
-                        });
-                        // `None` on the teleport-ack tick: hold, send no movement
-                        // and keep the intents for the next tick.
-                        if let Some((actions, movement)) = app.game.tick(0.05) {
-                            slot_select = None;
-                            slot_scroll = 0;
-                            attack_pressed = false;
-                            use_pressed = false;
-                            // Abilities echo (C13) goes out after the click
-                            // actions and before the flying packet, matching
-                            // vanilla's runTick → onLivingUpdate →
-                            // onUpdateWalkingPlayer ordering.
-                            let abilities = app.game.take_abilities_packet();
-                            if let Some(network) = &app.network {
-                                if app.game.can_send_movement_packets() {
-                                    for packet in actions {
-                                        network.send_packet(packet);
-                                    }
-                                    if let Some(abilities) = abilities {
-                                        network.send_packet(abilities);
-                                    }
-                                    network.send_movement(movement);
-                                }
-                            }
-                        }
-                        tick_accumulator -= 0.05;
-                    }
-                }
-                if !scripted_smoke_done
-                    && scripted_smoke_seconds
-                        .is_some_and(|seconds| (now - app_start).as_secs_f32() >= seconds)
-                {
-                    scripted_smoke_done = true;
-                    if let Some(profile) = smoke_profile.as_mut() {
-                        profile.flush(now);
-                    }
-                    if let Some(bench) = pass_bench.as_ref() {
-                        bench.report();
-                    }
-                    log::info!("scripted smoke complete");
-                    target.exit();
-                }
-
-                if app.quit {
-                    target.exit();
-                }
-                sync_cursor(window, &mut cursor_captured, &app);
-
-                // --- Render + pacing. ---
-                // The pass benchmark runs uncapped so the frame time reflects GPU
-                // cost (a cap would just turn saved GPU time into sleep).
-                if pass_bench.is_none() {
-                    if let Some(cap) = app.settings.clone().fps_limit() {
-                        let deadline = last_frame + Duration::from_secs_f64(1.0 / cap as f64);
-                        let now = Instant::now();
-                        if now < deadline {
-                            std::thread::sleep(deadline - now);
-                        }
-                    }
-                }
-                if let Some(bench) = pass_bench.as_mut() {
-                    let (sky, water, ui, flat) = bench.config_for_frame();
-                    renderer.set_pass_skip(sky, water, ui, flat);
-                }
-                render_frame(
-                    &mut renderer,
-                    &mut app,
-                    window,
-                    &atlas_uv,
-                    &overlay_textures,
-                    &mut fps_counter,
-                    &mut last_frame,
-                    tick_accumulator,
-                    cursor_position,
-                    mouse_down_left,
-                    f3_debug,
-                    smoke_profile.is_some() || pass_bench.is_some(),
-                );
-                if let Some(profile) = smoke_profile.as_mut() {
-                    profile.record(renderer.last_stats(), Instant::now());
-                }
-                if let Some(bench) = pass_bench.as_mut() {
-                    bench.record(renderer.last_stats(), Instant::now());
-                }
-                // Reveal the window once the first frame has actually been drawn.
-                if !window_shown {
-                    window.set_visible(true);
-                    window.focus_window();
-                    window_shown = true;
-                    if app.settings.fullscreen {
-                        apply_display(window, &app.settings);
-                    }
-                }
-
-                // Keep the OS IME in sync with whichever field is focused: enable
-                // it only while editing text (so gameplay keys stay raw and no
-                // candidate window pops up mid-game), and pin the candidate
-                // window to the caret recorded during this frame's draw.
-                let focused_caret = app
-                    .screen
-                    .as_mut()
-                    .and_then(|screen| screen.focused_text_input())
-                    .map(|input| input.caret_area());
-                let want_ime = focused_caret.is_some();
-                if want_ime != ime_enabled {
-                    window.set_ime_allowed(want_ime);
-                    ime_enabled = want_ime;
-                    if !want_ime {
-                        last_ime_area = None;
-                    }
-                }
-                if let Some(area) = focused_caret.flatten() {
-                    if last_ime_area != Some(area) {
-                        last_ime_area = Some(area);
-                        let (cx, cy, cw, ch) = area;
-                        window.set_ime_cursor_area(
-                            PhysicalPosition::new(cx as f64, cy as f64),
-                            PhysicalSize::new(cw.max(1) as f64, ch.max(1) as f64),
-                        );
-                    }
-                }
-
-                target.set_control_flow(ControlFlow::Poll);
-            }
-            _ => {}
-        }
-    })?;
-    #[allow(unreachable_code)]
+    let mut winit_app = WinitApp::new(config);
+    event_loop.run_app(&mut winit_app)?;
     Ok(())
 }
 
@@ -1386,6 +1390,7 @@ fn render_frame(
     let hud = HudState {
         health: game.health(),
         food: game.food(),
+        armor: game.armor(),
         xp_bar: game.xp_bar(),
         xp_level: game.xp_level(),
         selected_slot: game.selected_slot(),

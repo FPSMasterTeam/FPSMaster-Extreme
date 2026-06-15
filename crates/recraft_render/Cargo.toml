@@ -11,6 +11,7 @@ font8x8.workspace = true
 glam.workspace = true
 image.workspace = true
 log.workspace = true
+pollster.workspace = true
 recraft_core = { path = "../recraft_core" }
 recraft_protocol = { path = "../recraft_protocol" }
 serde_json.workspace = true
@@ -20,4 +21,4 @@ winit.workspace = true
 zip.workspace = true
 
 [dev-dependencies]
-pollster = "0.3"
+pollster = "0.4"

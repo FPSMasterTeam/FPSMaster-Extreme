@@ -29,9 +29,10 @@ use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
 use wgpu::util::DeviceExt;
 use winit::{
-    event::{Event, WindowEvent},
-    event_loop::{ControlFlow, EventLoop},
-    window::WindowBuilder,
+    application::ApplicationHandler,
+    event::WindowEvent,
+    event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
+    window::Window,
 };
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -207,8 +208,8 @@ fn build_scene(device: &wgpu::Device, format: wgpu::TextureFormat) -> Scene {
     });
     let cube_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("cube-layout"),
-        bind_group_layouts: &[&bind_layout],
-        push_constant_ranges: &[],
+        bind_group_layouts: &[Some(&bind_layout)],
+        immediate_size: 0,
     });
     let vertex_layout = wgpu::VertexBufferLayout {
         array_stride: std::mem::size_of::<Vertex>() as u64,
@@ -220,12 +221,14 @@ fn build_scene(device: &wgpu::Device, format: wgpu::TextureFormat) -> Scene {
         layout: Some(&cube_layout),
         vertex: wgpu::VertexState {
             module: &shader,
-            entry_point: "vs",
+            entry_point: Some("vs"),
+            compilation_options: Default::default(),
             buffers: &[vertex_layout],
         },
         fragment: Some(wgpu::FragmentState {
             module: &shader,
-            entry_point: "fs",
+            entry_point: Some("fs"),
+            compilation_options: Default::default(),
             targets: &[Some(format.into())],
         }),
         primitive: wgpu::PrimitiveState {
@@ -234,30 +237,33 @@ fn build_scene(device: &wgpu::Device, format: wgpu::TextureFormat) -> Scene {
         },
         depth_stencil: Some(wgpu::DepthStencilState {
             format: DEPTH_FORMAT,
-            depth_write_enabled: true,
-            depth_compare: wgpu::CompareFunction::Less,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(wgpu::CompareFunction::Less),
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         }),
         multisample: wgpu::MultisampleState::default(),
-        multiview: None,
+        cache: None,
+        multiview_mask: None,
     });
     let fill_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("fill-layout"),
         bind_group_layouts: &[],
-        push_constant_ranges: &[],
+        immediate_size: 0,
     });
     let fill_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("fill-pipeline"),
         layout: Some(&fill_layout),
         vertex: wgpu::VertexState {
             module: &shader,
-            entry_point: "vfill",
+            entry_point: Some("vfill"),
+            compilation_options: Default::default(),
             buffers: &[],
         },
         fragment: Some(wgpu::FragmentState {
             module: &shader,
-            entry_point: "ffill",
+            entry_point: Some("ffill"),
+            compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format,
                 blend: None,
@@ -267,13 +273,14 @@ fn build_scene(device: &wgpu::Device, format: wgpu::TextureFormat) -> Scene {
         primitive: wgpu::PrimitiveState::default(),
         depth_stencil: Some(wgpu::DepthStencilState {
             format: DEPTH_FORMAT,
-            depth_write_enabled: false,
-            depth_compare: wgpu::CompareFunction::Always,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(wgpu::CompareFunction::Always),
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         }),
         multisample: wgpu::MultisampleState::default(),
-        multiview: None,
+        cache: None,
+        multiview_mask: None,
     });
     Scene {
         cube_pipeline,
@@ -324,6 +331,7 @@ fn record_frame(
         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
             view: color,
             resolve_target: None,
+            depth_slice: None,
             ops: wgpu::Operations {
                 load: wgpu::LoadOp::Clear(wgpu::Color {
                     r: 0.05,
@@ -344,6 +352,7 @@ fn record_frame(
         }),
         occlusion_query_set: None,
         timestamp_writes: None,
+    multiview_mask: None,
     });
     pass.set_pipeline(&scene.cube_pipeline);
     pass.set_bind_group(0, &scene.bind_group, &[]);
@@ -373,8 +382,10 @@ fn request_device(adapter: &wgpu::Adapter) -> (wgpu::Device, wgpu::Queue) {
             label: Some("gfx_bench-device"),
             required_features: wgpu::Features::empty(),
             required_limits: wgpu::Limits::default(),
+            memory_hints: wgpu::MemoryHints::default(),
+            trace: Default::default(),
+            experimental_features: Default::default(),
         },
-        None,
     ))
     .expect("device")
 }
@@ -385,7 +396,10 @@ fn main() {
     println!("requested backends: {backends:?}");
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends,
-        ..Default::default()
+        flags: wgpu::InstanceFlags::default(),
+        memory_budget_thresholds: Default::default(),
+        backend_options: wgpu::BackendOptions::default(),
+        display: None,
     });
     if args.headless {
         run_headless(&instance, &args);
@@ -442,7 +456,7 @@ fn run_headless(instance: &wgpu::Instance, args: &Args) {
         });
         record_frame(&mut encoder, &scene, &color, &depth, args.fill);
         queue.submit(Some(encoder.finish()));
-        device.poll(wgpu::Maintain::Wait);
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
 
         window_frames += 1;
         total_frames += 1;
@@ -466,117 +480,188 @@ fn run_headless(instance: &wgpu::Instance, args: &Args) {
     }
 }
 
+struct BenchApp {
+    instance: wgpu::Instance,
+    args: Args,
+    // Initialized in resumed():
+    window: Option<Arc<Window>>,
+    surface: Option<wgpu::Surface<'static>>,
+    device: Option<wgpu::Device>,
+    queue: Option<wgpu::Queue>,
+    scene: Option<Scene>,
+    config: Option<wgpu::SurfaceConfiguration>,
+    depth_view: Option<wgpu::TextureView>,
+    start: Instant,
+    window_start: Instant,
+    window_frames: u32,
+    total_frames: u64,
+    finished: bool,
+}
+
+impl BenchApp {
+    fn new(instance: wgpu::Instance, args: Args) -> Self {
+        let now = Instant::now();
+        Self {
+            instance,
+            args,
+            window: None,
+            surface: None,
+            device: None,
+            queue: None,
+            scene: None,
+            config: None,
+            depth_view: None,
+            start: now,
+            window_start: now,
+            window_frames: 0,
+            total_frames: 0,
+            finished: false,
+        }
+    }
+}
+
+impl ApplicationHandler for BenchApp {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.window.is_some() {
+            return;
+        }
+        let attrs = Window::default_attributes().with_title("gfx_bench — pure cube");
+        let window = Arc::new(event_loop.create_window(attrs).expect("window"));
+        let surface = self.instance.create_surface(window.clone()).expect("surface");
+        let adapter = request_adapter(&self.instance, Some(&surface));
+        let info = adapter.get_info();
+        println!(
+            "GPU adapter: {} ({:?}, {:?})",
+            info.name, info.device_type, info.backend
+        );
+        let (device, queue) = request_device(&adapter);
+
+        let caps = surface.get_capabilities(&adapter);
+        let format = caps.formats[0];
+        let present_mode = if self.args.vsync {
+            wgpu::PresentMode::Fifo
+        } else if caps.present_modes.contains(&wgpu::PresentMode::Immediate) {
+            wgpu::PresentMode::Immediate
+        } else {
+            caps.present_modes[0]
+        };
+        println!(
+            "present mode: {present_mode:?} | fill passes/frame: {}",
+            self.args.fill
+        );
+
+        let size = window.inner_size();
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format,
+            width: size.width.max(1),
+            height: size.height.max(1),
+            present_mode,
+            alpha_mode: caps.alpha_modes[0],
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+        };
+        surface.configure(&device, &config);
+        let depth_view = create_depth(&device, config.width, config.height);
+        let scene = build_scene(&device, format);
+
+        self.start = Instant::now();
+        self.window_start = self.start;
+        self.depth_view = Some(depth_view);
+        self.config = Some(config);
+        self.scene = Some(scene);
+        self.device = Some(device);
+        self.queue = Some(queue);
+        self.surface = Some(surface);
+        self.window = Some(window);
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        _window_id: winit::window::WindowId,
+        event: WindowEvent,
+    ) {
+        let (Some(device), Some(surface), Some(config)) =
+            (self.device.as_ref(), self.surface.as_ref(), self.config.as_mut())
+        else {
+            return;
+        };
+        match event {
+            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Resized(new_size) => {
+                config.width = new_size.width.max(1);
+                config.height = new_size.height.max(1);
+                surface.configure(device, config);
+                self.depth_view = Some(create_depth(device, config.width, config.height));
+            }
+            _ => {}
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        event_loop.set_control_flow(ControlFlow::Poll);
+
+        let (Some(device), Some(queue), Some(surface), Some(config), Some(scene), Some(depth_view)) = (
+            self.device.as_ref(),
+            self.queue.as_ref(),
+            self.surface.as_ref(),
+            self.config.as_mut(),
+            self.scene.as_ref(),
+            self.depth_view.as_ref(),
+        ) else {
+            return;
+        };
+
+        let now = Instant::now();
+        let t = (now - self.start).as_secs_f32();
+        let aspect = config.width as f32 / config.height as f32;
+        update_mvp(queue, &scene.ubuf, t, aspect);
+
+        let frame = match surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(f)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
+            wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
+                surface.configure(device, config);
+                return;
+            }
+            _ => return,
+        };
+        let view_tex = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("frame"),
+        });
+        record_frame(&mut encoder, scene, &view_tex, depth_view, self.args.fill);
+        queue.submit(Some(encoder.finish()));
+        frame.present();
+
+        self.window_frames += 1;
+        self.total_frames += 1;
+        let elapsed = (now - self.window_start).as_secs_f32();
+        if elapsed >= 1.0 {
+            let fps = self.window_frames as f32 / elapsed;
+            println!("{fps:.0} fps ({:.3} ms/frame)", 1000.0 / fps.max(1.0));
+            self.window_frames = 0;
+            self.window_start = now;
+        }
+        if let Some(limit) = self.args.seconds {
+            if t >= limit && !self.finished {
+                self.finished = true;
+                let avg = self.total_frames as f32 / t.max(0.001);
+                println!(
+                    "=== average over {t:.1}s: {avg:.0} fps ({:.3} ms/frame) ===",
+                    1000.0 / avg.max(1.0)
+                );
+                event_loop.exit();
+            }
+        }
+    }
+}
+
 fn run_headed(instance: wgpu::Instance, args: Args) {
     let event_loop = EventLoop::new().expect("event loop");
-    let window = Arc::new(
-        WindowBuilder::new()
-            .with_title("gfx_bench — pure cube")
-            .build(&event_loop)
-            .expect("window"),
-    );
-    let surface = instance.create_surface(window.clone()).expect("surface");
-    let adapter = request_adapter(&instance, Some(&surface));
-    let info = adapter.get_info();
-    println!(
-        "GPU adapter: {} ({:?}, {:?})",
-        info.name, info.device_type, info.backend
-    );
-    let (device, queue) = request_device(&adapter);
-
-    let caps = surface.get_capabilities(&adapter);
-    let format = caps.formats[0];
-    let present_mode = if args.vsync {
-        wgpu::PresentMode::Fifo
-    } else if caps.present_modes.contains(&wgpu::PresentMode::Immediate) {
-        wgpu::PresentMode::Immediate
-    } else {
-        caps.present_modes[0]
-    };
-    println!("present mode: {present_mode:?} | fill passes/frame: {}", args.fill);
-
-    let size = window.inner_size();
-    let mut config = wgpu::SurfaceConfiguration {
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-        format,
-        width: size.width.max(1),
-        height: size.height.max(1),
-        present_mode,
-        alpha_mode: caps.alpha_modes[0],
-        view_formats: vec![],
-        desired_maximum_frame_latency: 2,
-    };
-    surface.configure(&device, &config);
-    let mut depth_view = create_depth(&device, config.width, config.height);
-    let scene = build_scene(&device, format);
-
-    let start = Instant::now();
-    let mut window_start = start;
-    let mut window_frames = 0u32;
-    let mut total_frames = 0u64;
-    let mut finished = false;
-
-    event_loop
-        .run(move |event, target| {
-            target.set_control_flow(ControlFlow::Poll);
-            match event {
-                Event::WindowEvent { event, .. } => match event {
-                    WindowEvent::CloseRequested => target.exit(),
-                    WindowEvent::Resized(new_size) => {
-                        config.width = new_size.width.max(1);
-                        config.height = new_size.height.max(1);
-                        surface.configure(&device, &config);
-                        depth_view = create_depth(&device, config.width, config.height);
-                    }
-                    _ => {}
-                },
-                Event::AboutToWait => {
-                    let now = Instant::now();
-                    let t = (now - start).as_secs_f32();
-                    let aspect = config.width as f32 / config.height as f32;
-                    update_mvp(&queue, &scene.ubuf, t, aspect);
-
-                    let frame = match surface.get_current_texture() {
-                        Ok(f) => f,
-                        Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
-                            surface.configure(&device, &config);
-                            return;
-                        }
-                        Err(_) => return,
-                    };
-                    let view_tex = frame
-                        .texture
-                        .create_view(&wgpu::TextureViewDescriptor::default());
-                    let mut encoder =
-                        device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                            label: Some("frame"),
-                        });
-                    record_frame(&mut encoder, &scene, &view_tex, &depth_view, args.fill);
-                    queue.submit(Some(encoder.finish()));
-                    frame.present();
-
-                    window_frames += 1;
-                    total_frames += 1;
-                    let elapsed = (now - window_start).as_secs_f32();
-                    if elapsed >= 1.0 {
-                        let fps = window_frames as f32 / elapsed;
-                        println!("{fps:.0} fps ({:.3} ms/frame)", 1000.0 / fps.max(1.0));
-                        window_frames = 0;
-                        window_start = now;
-                    }
-                    if let Some(limit) = args.seconds {
-                        if t >= limit && !finished {
-                            finished = true;
-                            let avg = total_frames as f32 / t.max(0.001);
-                            println!(
-                                "=== average over {t:.1}s: {avg:.0} fps ({:.3} ms/frame) ===",
-                                1000.0 / avg.max(1.0)
-                            );
-                            target.exit();
-                        }
-                    }
-                }
-                _ => {}
-            }
-        })
-        .expect("run");
+    let mut bench_app = BenchApp::new(instance, args);
+    event_loop.run_app(&mut bench_app).expect("run");
 }
