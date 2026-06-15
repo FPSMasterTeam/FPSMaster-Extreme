@@ -2429,8 +2429,13 @@ impl Renderer {
     /// Master toggle for the shader-pack lighting (directional sun + ambient).
     /// Also gates every post effect (refresh their params).
     pub fn set_shaders_enabled(&mut self, on: bool) {
+        let changed = self.shaders_enabled != on;
         self.shaders_enabled = on;
         self.update_post_params();
+        // Allocate (or free) the shaders-only SSR scene/depth copies.
+        if changed {
+            self.rebuild_scaled_targets();
+        }
     }
 
     pub fn set_shadows_enabled(&mut self, on: bool) {
@@ -2586,6 +2591,10 @@ impl Renderer {
             view_formats: &[],
         });
         let view = color.create_view(&wgpu::TextureViewDescriptor::default());
+        // The SSR scene/depth copies are sampled only by the shaders-on water pass,
+        // so skip those two full-screen textures (~25MB at 1080p) and their bind
+        // group when shaders are off — the SSR pass guards on scene_copy_tex.
+        if self.shaders_enabled {
         // Copy of the opaque scene the water pass samples for SSR.
         let scene_copy = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("scene-copy-hdr"),
@@ -2644,6 +2653,12 @@ impl Renderer {
         self.scene_copy_tex = Some(scene_copy);
         self.depth_copy_view = Some(depth_copy_view);
         self.depth_copy_tex = Some(depth_copy);
+        } else {
+            self.water_ssr_bind_group = None;
+            self.scene_copy_tex = None;
+            self.depth_copy_view = None;
+            self.depth_copy_tex = None;
+        }
         // Half-resolution volumetric in-scatter target + its bind group (reads the
         // final world depth and the sun shadow map). Half-res keeps the raymarch
         // cheap; the post pass upsamples it with the linear sampler.

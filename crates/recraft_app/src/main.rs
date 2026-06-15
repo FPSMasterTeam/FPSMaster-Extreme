@@ -202,6 +202,13 @@ struct WinitApp {
     app_start: Instant,
     fps_counter: FpsCounter,
     tick_accumulator: f32,
+    // Adaptive resolution: smoothed GPU frame time + the current auto scale, with
+    // a cooldown so the scale steps at most once a second (each step reallocates
+    // the offscreen targets).
+    adaptive_gpu_ms: f32,
+    adaptive_scale: f32,
+    adaptive_last_adjust: Instant,
+    adaptive_was_on: bool,
     // Scripted smoke / benchmarks:
     scripted_smoke_seconds: Option<f32>,
     scripted_smoke_static: bool,
@@ -251,6 +258,10 @@ impl WinitApp {
             app_start: now,
             fps_counter: FpsCounter::new(now),
             tick_accumulator: 0.0,
+            adaptive_gpu_ms: 0.0,
+            adaptive_scale: 1.0,
+            adaptive_last_adjust: now,
+            adaptive_was_on: false,
             scripted_smoke_seconds,
             scripted_smoke_static,
             scripted_smoke_done: false,
@@ -735,6 +746,50 @@ impl ApplicationHandler for WinitApp {
         if let Some(bench) = self.pass_bench.as_mut() {
             bench.record(renderer.last_stats(), Instant::now());
         }
+        // Adaptive resolution: drive the world render scale off the occlusion-proof
+        // GPU frame time toward the target budget. Steps by 0.05 at most once a
+        // second (each change reallocates the offscreen targets), within
+        // [RENDER_SCALE_MIN, the user's render_scale] so it only ever scales down.
+        if app.settings.adaptive_resolution && app.in_world {
+            // Rising edge: start auto-scaling from the user's render_scale (its max).
+            if !self.adaptive_was_on {
+                self.adaptive_was_on = true;
+                self.adaptive_scale = app.settings.render_scale;
+                self.adaptive_gpu_ms = 0.0;
+                self.adaptive_last_adjust = Instant::now();
+            }
+            // Fold only valid samples: gpu_us reads 0 when no timestamp readback is
+            // ready that frame, and averaging those in would drag the estimate down
+            // and bounce the scale back up.
+            let gpu_ms = renderer.last_stats().gpu_us as f32 / 1000.0;
+            if gpu_ms > 0.0 {
+                self.adaptive_gpu_ms = if self.adaptive_gpu_ms <= 0.0 {
+                    gpu_ms
+                } else {
+                    self.adaptive_gpu_ms * 0.9 + gpu_ms * 0.1
+                };
+            }
+            let now = Instant::now();
+            if self.adaptive_gpu_ms > 0.0 && (now - self.adaptive_last_adjust).as_secs_f32() >= 1.0 {
+                let target_fps = app.settings.clone().fps_limit().unwrap_or(60).min(120) as f32;
+                let budget = 1000.0 / target_fps;
+                let max_scale = app.settings.render_scale;
+                let new_scale = if self.adaptive_gpu_ms > budget * 0.95 {
+                    (self.adaptive_scale - 0.05).max(settings::RENDER_SCALE_MIN)
+                } else if self.adaptive_gpu_ms < budget * 0.6 {
+                    (self.adaptive_scale + 0.05).min(max_scale)
+                } else {
+                    self.adaptive_scale
+                };
+                if (new_scale - self.adaptive_scale).abs() > 1e-3 {
+                    self.adaptive_scale = new_scale;
+                    renderer.set_render_scale(new_scale);
+                    self.adaptive_last_adjust = now;
+                }
+            }
+        } else {
+            self.adaptive_was_on = false;
+        }
         if !self.window_shown {
             window.set_visible(true);
             window.focus_window();
@@ -955,6 +1010,13 @@ fn handle_actions(
             GuiAction::SetVsync(on) => renderer.set_vsync(on),
             GuiAction::SetRenderScale(scale) => renderer.set_render_scale(scale),
             GuiAction::SetRenderDistance(chunks) => renderer.set_render_distance(chunks),
+            GuiAction::SetAdaptiveResolution(on) => {
+                // Turning it off restores the user's manual render scale; the loop
+                // takes over (from that scale) when it's on.
+                if !on {
+                    renderer.set_render_scale(app.settings.render_scale);
+                }
+            }
             GuiAction::SetFancyGraphics(on) => {
                 renderer.set_fancy_graphics(on);
                 // Leaf geometry depends on Fast/Fancy, so re-mesh the world (the
@@ -1295,7 +1357,7 @@ fn render_frame(
 
     // The GPU-time readback costs ~0.04 ms/frame, so only measure it when its
     // number is actually shown: the F3 overlay, or a scripted benchmark run.
-    renderer.set_gpu_timing(f3_debug || smoke_active);
+    renderer.set_gpu_timing(f3_debug || smoke_active || app.settings.adaptive_resolution);
 
     // Local block prediction gets submitted to the background mesher first, but
     // never rebuilt on the render thread; placing/breaking must not stall a

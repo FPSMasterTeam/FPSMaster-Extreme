@@ -259,6 +259,7 @@ pub struct GuiVideoSettings {
     render_scale_rect: UiRect,
     render_distance_rect: UiRect,
     vsync: Option<GuiButton>,
+    adaptive: Option<GuiButton>,
     graphics: Option<GuiButton>,
     mipmaps: Option<GuiButton>,
     resolution: Option<GuiButton>,
@@ -293,7 +294,8 @@ impl GuiVideoSettings {
         self.fps_rect = UiRect::new(x, top, 200 * s, BUTTON_HEIGHT * s);
         self.render_scale_rect = UiRect::new(x, top + 24 * s, 200 * s, BUTTON_HEIGHT * s);
         self.render_distance_rect = UiRect::new(x, top + 48 * s, 200 * s, BUTTON_HEIGHT * s);
-        self.vsync = Some(GuiButton::at_px(x, top + 72 * s, 200 * s, s, ""));
+        self.vsync = Some(GuiButton::at_px(x, top + 72 * s, 98 * s, s, ""));
+        self.adaptive = Some(GuiButton::at_px(x + 102 * s, top + 72 * s, 98 * s, s, ""));
         self.graphics = Some(GuiButton::at_px(x, top + 96 * s, 98 * s, s, ""));
         self.mipmaps = Some(GuiButton::at_px(x + 102 * s, top + 96 * s, 98 * s, s, ""));
         self.resolution = Some(GuiButton::at_px(x, top + 120 * s, 98 * s, s, ""));
@@ -351,6 +353,13 @@ impl GuiScreen for GuiVideoSettings {
             vsync.label = format!("VSync: {}", if ctx.settings.vsync { "ON" } else { "OFF" });
             vsync.draw(ui, s, ctx.mouse, ctx.mouse_down);
         }
+        if let Some(adaptive) = &mut self.adaptive {
+            adaptive.label = format!(
+                "Auto Res: {}",
+                if ctx.settings.adaptive_resolution { "ON" } else { "OFF" }
+            );
+            adaptive.draw(ui, s, ctx.mouse, ctx.mouse_down);
+        }
         if let Some(graphics) = &mut self.graphics {
             graphics.label = format!(
                 "Graphics: {}",
@@ -400,6 +409,10 @@ impl GuiScreen for GuiVideoSettings {
         if self.vsync.as_ref().is_some_and(|b| b.clicked(x, y)) {
             ctx.settings.vsync = !ctx.settings.vsync;
             return vec![GuiAction::SetVsync(ctx.settings.vsync)];
+        }
+        if self.adaptive.as_ref().is_some_and(|b| b.clicked(x, y)) {
+            ctx.settings.adaptive_resolution = !ctx.settings.adaptive_resolution;
+            return vec![GuiAction::SetAdaptiveResolution(ctx.settings.adaptive_resolution)];
         }
         if self.graphics.as_ref().is_some_and(|b| b.clicked(x, y)) {
             ctx.settings.fancy_graphics = !ctx.settings.fancy_graphics;

@@ -25,6 +25,10 @@ pub struct Settings {
     /// draw-call and meshing cost together. The server still controls how much is
     /// loaded; this only bounds what is drawn.
     pub render_distance: u32,
+    /// Auto-lower the render scale (within `RENDER_SCALE_MIN..=render_scale`) to keep
+    /// the GPU frame time under the target budget on weak hardware — "it just runs"
+    /// without manual tuning. Driven by the occlusion-proof GPU timestamp.
+    pub adaptive_resolution: bool,
     /// Fancy graphics: sky gradient + see-through (alpha-blended) water. Off =
     /// flat horizon sky + opaque water, skipping the heaviest per-pixel work.
     pub fancy_graphics: bool,
@@ -81,7 +85,7 @@ pub const RESOLUTION_PRESETS: [Option<(u32, u32)>; 6] = [
 const FPS_MIN: u32 = 30;
 const FPS_MAX: u32 = 260;
 const FPS_STEP: u32 = 10;
-const RENDER_SCALE_MIN: f32 = 0.5;
+pub const RENDER_SCALE_MIN: f32 = 0.5;
 /// Render-distance bounds in chunks (vanilla spans 2..32; we cap lower to keep
 /// the square cull cheap and the default modest for weak hardware).
 pub const RENDER_DIST_MIN: u32 = 2;
@@ -102,6 +106,7 @@ impl Default for Settings {
             fps_cap: 120,
             render_scale: 1.0,
             render_distance: 12,
+            adaptive_resolution: false,
             fancy_graphics: true,
             mipmap_levels: MIPMAP_MAX,
             resolution: None,
@@ -167,6 +172,11 @@ impl Settings {
                 "render_distance" => {
                     if let Ok(v) = val.parse() {
                         s.render_distance = v;
+                    }
+                }
+                "adaptive_resolution" => {
+                    if let Ok(v) = val.parse() {
+                        s.adaptive_resolution = v;
                     }
                 }
                 "fancy_graphics" => {
@@ -290,12 +300,13 @@ impl Settings {
     fn save_to(&self, path: &std::path::Path) {
         let (res_w, res_h) = self.resolution.unwrap_or((0, 0));
         let text = format!(
-            "sensitivity={}\nvsync={}\nfps_cap={}\nrender_scale={}\nrender_distance={}\nfancy_graphics={}\nmipmap_levels={}\nresolution_w={}\nresolution_h={}\nfullscreen={}\nshaders={}\nshader_shadows={}\nshader_specular={}\nshader_fog={}\nshader_bloom={}\nbrightness={}\npost_vignette={}\npost_chromatic={}\npost_dof={}\npost_motion_blur={}\npost_auto_exposure={}\nvolumetric_clouds={}\nvolumetric_light={}\nresource_pack={}\n",
+            "sensitivity={}\nvsync={}\nfps_cap={}\nrender_scale={}\nrender_distance={}\nadaptive_resolution={}\nfancy_graphics={}\nmipmap_levels={}\nresolution_w={}\nresolution_h={}\nfullscreen={}\nshaders={}\nshader_shadows={}\nshader_specular={}\nshader_fog={}\nshader_bloom={}\nbrightness={}\npost_vignette={}\npost_chromatic={}\npost_dof={}\npost_motion_blur={}\npost_auto_exposure={}\nvolumetric_clouds={}\nvolumetric_light={}\nresource_pack={}\n",
             self.sensitivity,
             self.vsync,
             self.fps_cap,
             self.render_scale,
             self.render_distance,
+            self.adaptive_resolution,
             self.fancy_graphics,
             self.mipmap_levels,
             res_w,

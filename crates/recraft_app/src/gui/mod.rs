@@ -143,6 +143,8 @@ pub enum GuiAction {
     SetRenderScale(f32),
     /// Apply the max chunk render distance (square cull around the camera).
     SetRenderDistance(u32),
+    /// Toggle adaptive resolution (auto-scale to hold the GPU frame budget).
+    SetAdaptiveResolution(bool),
     /// Toggle fancy graphics (sky gradient + transparent water).
     SetFancyGraphics(bool),
     /// Set the block-atlas mipmap level (0 = off .. MIPMAP_MAX).
