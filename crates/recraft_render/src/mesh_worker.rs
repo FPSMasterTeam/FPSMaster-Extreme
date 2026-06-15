@@ -31,6 +31,8 @@ pub struct MeshWorker {
     /// Fast-graphics leaves: read by every worker per job, flipped by the render
     /// thread on a graphics-mode toggle (the toggle also re-dirties all chunks).
     fast_leaves: Arc<AtomicBool>,
+    /// Flat (greedy, smooth-lighting-off) meshing: same per-job read + toggle.
+    flat: Arc<AtomicBool>,
 }
 
 impl MeshWorker {
@@ -41,6 +43,7 @@ impl MeshWorker {
         let atlas = Arc::new(atlas);
         let job_rx = Arc::new(Mutex::new(job_rx));
         let fast_leaves = Arc::new(AtomicBool::new(false));
+        let flat = Arc::new(AtomicBool::new(false));
 
         let threads = thread::available_parallelism()
             .map(|n| n.get().saturating_sub(2))
@@ -51,6 +54,7 @@ impl MeshWorker {
             let result_tx = result_tx.clone();
             let atlas = Arc::clone(&atlas);
             let fast_leaves = Arc::clone(&fast_leaves);
+            let flat = Arc::clone(&flat);
             let _ = thread::Builder::new()
                 .name(format!("mesh-worker-{index}"))
                 .spawn(move || {
@@ -69,6 +73,7 @@ impl MeshWorker {
                             &atlas,
                             biome,
                             fast_leaves.load(Ordering::Relaxed),
+                            flat.load(Ordering::Relaxed),
                         );
                         if result_tx.send((pos, job.generation, mesh)).is_err() {
                             break;
@@ -81,6 +86,7 @@ impl MeshWorker {
             job_tx,
             result_rx,
             fast_leaves,
+            flat,
         }
     }
 
@@ -88,6 +94,12 @@ impl MeshWorker {
     /// the loaded sections for the change to reach already-built meshes.
     pub fn set_fast_leaves(&self, on: bool) {
         self.fast_leaves.store(on, Ordering::Relaxed);
+    }
+
+    /// Set the flat (greedy) meshing flag future jobs read. Like `set_fast_leaves`,
+    /// the caller must re-queue loaded sections to rebuild existing meshes.
+    pub fn set_flat(&self, on: bool) {
+        self.flat.store(on, Ordering::Relaxed);
     }
 
     /// Queue one section of a column snapshot for meshing.

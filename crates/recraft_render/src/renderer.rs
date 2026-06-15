@@ -38,16 +38,18 @@ struct CameraUniform {
     sky_brightness: f32,
     /// Seconds since startup, for animated effects (water waves).
     time: f32,
-    _pad: [f32; 2],
+    /// Atlas tile size `(du, dv)` — the greedy shader wraps `fract(repeat_uv)`
+    /// within a tile. Unused by the smooth shader (it reads absolute UVs).
+    tile_size: [f32; 2],
 }
 
 impl CameraUniform {
-    fn new(view_proj: [[f32; 4]; 4], sky_brightness: f32, time: f32) -> Self {
+    fn new(view_proj: [[f32; 4]; 4], sky_brightness: f32, time: f32, tile_size: [f32; 2]) -> Self {
         Self {
             view_proj,
             sky_brightness,
             time,
-            _pad: [0.0; 2],
+            tile_size,
         }
     }
 }
@@ -490,6 +492,12 @@ pub struct Renderer {
     /// Solid pipeline that writes depth itself, used when the pre-pass is skipped
     /// (shaders off) so cheap fragments don't pay for doubled geometry submission.
     solid_depthwrite_pipeline: wgpu::RenderPipeline,
+    /// Flat-lighting greedy pipelines (smooth lighting off): draw the merged-cube
+    /// meshes via the greedy vertex layout + tile-wrapping shader.
+    greedy_solid_pipeline: wgpu::RenderPipeline,
+    greedy_cutout_pipeline: wgpu::RenderPipeline,
+    greedy_transparent_pipeline: wgpu::RenderPipeline,
+    greedy_water_pipeline: wgpu::RenderPipeline,
     /// Flat-colour solid pipeline (no atlas fetch) for the texture-cost benchmark.
     flat_pipeline: wgpu::RenderPipeline,
     cutout_pipeline: wgpu::RenderPipeline,
@@ -585,6 +593,10 @@ pub struct Renderer {
     /// camera (square/Chebyshev distance in chunks) are skipped before frustum
     /// culling. The biggest fill/vertex/draw-call saving on weak hardware.
     render_distance: u32,
+    /// Flat (greedy, smooth-lighting-off) meshing: cube faces merge into big quads
+    /// and the greedy pipelines/shader draw them. The biggest geometry saving on
+    /// open terrain; trades away ambient occlusion + per-vertex light gradients.
+    flat_meshing: bool,
     fancy_graphics: bool,
     mipmap_levels: u32,
     /// Shader-pack lighting uniform + bind group (chunk group 2), and which
@@ -767,7 +779,8 @@ impl Renderer {
         };
         surface.configure(&device, &config);
 
-        let camera_uniform = CameraUniform::new(Mat4::IDENTITY.to_cols_array_2d(), 1.0, 0.0);
+        let camera_uniform =
+            CameraUniform::new(Mat4::IDENTITY.to_cols_array_2d(), 1.0, 0.0, [0.0, 0.0]);
         let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("camera-buffer"),
             contents: bytemuck::bytes_of(&camera_uniform),
@@ -805,6 +818,7 @@ impl Renderer {
                 Mat4::IDENTITY.to_cols_array_2d(),
                 1.0,
                 0.0,
+                [0.0, 0.0],
             )),
             usage: wgpu::BufferUsages::UNIFORM,
         });
@@ -1542,6 +1556,69 @@ impl Renderer {
         cache: None,
         multiview_mask: None,
         });
+        // Greedy (flat-lighting) chunk pipelines: same lit layout + world target,
+        // but the greedy vertex layout (repeat-uv + tile origin) and shader. Used
+        // for the merged-cube meshes when smooth lighting is off.
+        let greedy_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("chunk-greedy-shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shader/chunk_greedy.wgsl").into()),
+        });
+        let mk_greedy = |label: &str,
+                         entry: &str,
+                         blend: Option<wgpu::BlendState>,
+                         depth_write: bool| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&lit_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &greedy_shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[ChunkVertex::greedy_layout()],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &greedy_shader,
+                    entry_point: Some(entry),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: Some(wgpu::Face::Back),
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: Some(depth_write),
+                    depth_compare: Some(wgpu::CompareFunction::Less),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                cache: None,
+                multiview_mask: None,
+            })
+        };
+        let greedy_solid_pipeline =
+            mk_greedy("greedy-solid", "fs_main", Some(wgpu::BlendState::REPLACE), true);
+        let greedy_cutout_pipeline =
+            mk_greedy("greedy-cutout", "fs_cutout", Some(wgpu::BlendState::REPLACE), true);
+        let greedy_transparent_pipeline = mk_greedy(
+            "greedy-transparent",
+            "fs_main",
+            Some(wgpu::BlendState::ALPHA_BLENDING),
+            false,
+        );
+        let greedy_water_pipeline =
+            mk_greedy("greedy-water", "fs_main", Some(wgpu::BlendState::REPLACE), true);
         let overlay_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("overlay-pipeline"),
             layout: Some(&pipeline_layout),
@@ -2271,6 +2348,10 @@ impl Renderer {
             pipeline,
             depth_prepass_pipeline,
             solid_depthwrite_pipeline,
+            greedy_solid_pipeline,
+            greedy_cutout_pipeline,
+            greedy_transparent_pipeline,
+            greedy_water_pipeline,
             flat_pipeline,
             cutout_pipeline,
             gui_cube_pipeline,
@@ -2327,6 +2408,7 @@ impl Renderer {
             start_time: Instant::now(),
             render_scale: 1.0,
             render_distance: 12,
+            flat_meshing: false,
             fancy_graphics: true,
             mipmap_levels: crate::texture::ATLAS_MIP_LEVELS - 1,
             lighting_buffer,
@@ -2517,6 +2599,14 @@ impl Renderer {
     /// — it only narrows the per-frame visible set, allocating nothing.
     pub fn set_render_distance(&mut self, chunks: u32) {
         self.render_distance = chunks.max(2);
+    }
+
+    /// Smooth lighting: ON = per-vertex light + AO (default). OFF = flat per-face
+    /// light with greedy-merged cube faces (the big geometry win on weak hardware).
+    /// The caller re-meshes the loaded world so the change reaches built sections.
+    pub fn set_smooth_lighting(&mut self, on: bool) {
+        self.flat_meshing = !on;
+        self.mesh_worker.set_flat(!on);
     }
 
     pub fn set_pass_skip(&mut self, sky: bool, water: bool, ui: bool, flat: bool) {
@@ -2854,6 +2944,7 @@ impl Renderer {
                 &self.atlas_uv,
                 self.biome_colors,
                 !self.fancy_graphics,
+                self.flat_meshing,
             );
             self.upload_chunk_mesh(pos, &mesh);
         }
@@ -3119,8 +3210,13 @@ impl Renderer {
         self.biome_colors = biome_colors;
         self.atlas_uv = atlas_uv.clone();
 
-        // Recreate mesh worker with new atlas data
+        // Recreate mesh worker with new atlas data. A fresh worker defaults its
+        // meshing flags off, so re-apply the current graphics modes — otherwise a
+        // reload (e.g. a resource pack at startup) would silently mesh in the wrong
+        // mode (flat geometry drawn by the greedy pipeline → garbage UVs).
         self.mesh_worker = MeshWorker::new(atlas_uv.clone(), self.biome_colors);
+        self.mesh_worker.set_flat(self.flat_meshing);
+        self.mesh_worker.set_fast_leaves(!self.fancy_graphics);
 
         // Clear all chunk meshes so they rebuild with the new atlas
         self.chunk_solid.clear();
@@ -3497,6 +3593,7 @@ impl Renderer {
                 view_proj.to_cols_array_2d(),
                 sky.sun_brightness,
                 time,
+                self.atlas_uv.tile_size(),
             )),
         );
         // Post-pass camera (depth-aware DoF / motion blur): unproject depth and
@@ -3952,7 +4049,9 @@ impl Renderer {
                 }
 
                 if !solid_batches.is_empty() {
-                    let solid_pipeline = if self.debug_skip.flat {
+                    let solid_pipeline = if self.flat_meshing {
+                        &self.greedy_solid_pipeline
+                    } else if self.debug_skip.flat {
                         &self.flat_pipeline
                     } else if use_prepass {
                         &self.pipeline
@@ -3978,7 +4077,11 @@ impl Renderer {
                 }
 
                 if !cutout_batches.is_empty() {
-                    pass.set_pipeline(&self.cutout_pipeline);
+                    pass.set_pipeline(if self.flat_meshing {
+                        &self.greedy_cutout_pipeline
+                    } else {
+                        &self.cutout_pipeline
+                    });
                     for batch in &cutout_batches {
                         let page = &self.chunk_cutout.pages[batch.page];
                         pass.set_vertex_buffer(0, page.vertex_buf.slice(..));
@@ -4031,7 +4134,13 @@ impl Renderer {
                 );
                 pass.set_bind_group(2, &self.lighting_bind_group, &[]);
                 // Graphics: Fast renders water/glass opaque (no blend dst read).
-                pass.set_pipeline(if self.fancy_graphics {
+                pass.set_pipeline(if self.flat_meshing {
+                    if self.fancy_graphics {
+                        &self.greedy_transparent_pipeline
+                    } else {
+                        &self.greedy_water_pipeline
+                    }
+                } else if self.fancy_graphics {
                     &self.transparent_pipeline
                 } else {
                     &self.water_opaque_pipeline
@@ -4120,7 +4229,13 @@ impl Renderer {
                 pass.set_bind_group(0, &self.camera_bind_group, &[]);
                 pass.set_bind_group(1, &self.texture_bind_groups[self.mipmap_levels as usize], &[]);
                 pass.set_bind_group(2, &self.lighting_bind_group, &[]);
-                pass.set_pipeline(if self.fancy_graphics {
+                pass.set_pipeline(if self.flat_meshing {
+                    if self.fancy_graphics {
+                        &self.greedy_transparent_pipeline
+                    } else {
+                        &self.greedy_water_pipeline
+                    }
+                } else if self.fancy_graphics {
                     &self.transparent_pipeline
                 } else {
                     &self.water_opaque_pipeline

@@ -308,6 +308,13 @@ impl AtlasUv {
         index == 0 || self.missing.contains(&index)
     }
 
+    /// Normalized size of one atlas tile `(du, dv)` — uniform across all tiles.
+    /// The greedy shader needs it to wrap `fract(repeat_uv)` within a tile.
+    pub fn tile_size(&self) -> [f32; 2] {
+        let r = self.tile_rect(None);
+        [r[2], r[3]]
+    }
+
     /// Normalized `(u0, v0, width, height)` of a tile, for sub-tile UV
     /// mapping (partial-block faces crop the texture by their box extent).
     pub fn tile_rect(&self, name: Option<&str>) -> [f32; 4] {

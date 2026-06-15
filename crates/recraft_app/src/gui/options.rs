@@ -265,6 +265,7 @@ pub struct GuiVideoSettings {
     resolution: Option<GuiButton>,
     fullscreen: Option<GuiButton>,
     shaders_btn: Option<GuiButton>,
+    smooth_light: Option<GuiButton>,
     done: Option<GuiButton>,
     dragging: Option<VideoSlider>,
     from_main_menu: bool,
@@ -300,7 +301,8 @@ impl GuiVideoSettings {
         self.mipmaps = Some(GuiButton::at_px(x + 102 * s, top + 96 * s, 98 * s, s, ""));
         self.resolution = Some(GuiButton::at_px(x, top + 120 * s, 98 * s, s, ""));
         self.fullscreen = Some(GuiButton::at_px(x + 102 * s, top + 120 * s, 98 * s, s, ""));
-        self.shaders_btn = Some(GuiButton::at_px(x, top + 144 * s, 200 * s, s, "Shaders..."));
+        self.shaders_btn = Some(GuiButton::at_px(x, top + 144 * s, 98 * s, s, "Shaders..."));
+        self.smooth_light = Some(GuiButton::at_px(x + 102 * s, top + 144 * s, 98 * s, s, ""));
         // A gap above Done, echoing vanilla's separated bottom button.
         self.done = Some(GuiButton::at_px(x, top + 180 * s, 200 * s, s, "Done"));
     }
@@ -385,6 +387,13 @@ impl GuiScreen for GuiVideoSettings {
         if let Some(b) = &self.shaders_btn {
             b.draw(ui, s, ctx.mouse, ctx.mouse_down);
         }
+        if let Some(smooth) = &mut self.smooth_light {
+            smooth.label = format!(
+                "Smooth Light: {}",
+                if ctx.settings.smooth_lighting { "ON" } else { "OFF" }
+            );
+            smooth.draw(ui, s, ctx.mouse, ctx.mouse_down);
+        }
         if let Some(done) = &self.done {
             done.draw(ui, s, ctx.mouse, ctx.mouse_down);
         }
@@ -435,6 +444,10 @@ impl GuiScreen for GuiVideoSettings {
                 GuiAction::SaveSettings,
                 GuiAction::SetScreen(Box::new(super::shaders::GuiShaders::new(self.from_main_menu))),
             ];
+        }
+        if self.smooth_light.as_ref().is_some_and(|b| b.clicked(x, y)) {
+            ctx.settings.smooth_lighting = !ctx.settings.smooth_lighting;
+            return vec![GuiAction::SetSmoothLighting(ctx.settings.smooth_lighting)];
         }
         if self.done.as_ref().is_some_and(|b| b.clicked(x, y)) {
             return vec![GuiAction::SaveSettings, GuiAction::SetScreen(self.back_screen())];

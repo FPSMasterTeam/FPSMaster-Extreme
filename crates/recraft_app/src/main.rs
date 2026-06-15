@@ -302,6 +302,7 @@ impl ApplicationHandler for WinitApp {
         renderer.set_mipmap_levels(settings.mipmap_levels);
         renderer.set_render_scale(settings.render_scale);
         renderer.set_render_distance(settings.render_distance);
+        renderer.set_smooth_lighting(settings.smooth_lighting);
         renderer.set_shaders_enabled(settings.shaders);
         renderer.set_shadows_enabled(settings.shader_shadows);
         renderer.set_specular_enabled(settings.shader_specular);
@@ -1016,6 +1017,12 @@ fn handle_actions(
                 if !on {
                     renderer.set_render_scale(app.settings.render_scale);
                 }
+            }
+            GuiAction::SetSmoothLighting(on) => {
+                // Cube meshing differs (greedy/flat vs per-block/smooth), so re-mesh
+                // the loaded world; the worker now reads the new flag.
+                renderer.set_smooth_lighting(on);
+                app.game.mark_all_sections_dirty();
             }
             GuiAction::SetFancyGraphics(on) => {
                 renderer.set_fancy_graphics(on);
