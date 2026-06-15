@@ -57,7 +57,10 @@ impl GuiShaders {
         self.shaders = Some(GuiButton::at_px(x, row(0), cw, s, ""));
         self.shadows = Some(GuiButton::at_px(x, row(1), cw, s, "").disabled(off));
         self.specular = Some(GuiButton::at_px(x, row(2), cw, s, "").disabled(off));
-        self.fog = Some(GuiButton::at_px(x, row(3), cw, s, "").disabled(off));
+        // Fog is a plain distance fade to the horizon — it works with shaders off
+        // (and is the knob that makes a low render distance look acceptable), so
+        // it stays enabled even when the master shader toggle is off.
+        self.fog = Some(GuiButton::at_px(x, row(3), cw, s, ""));
         self.bloom = Some(GuiButton::at_px(x, row(4), cw, s, "").disabled(off));
         self.volumetric = Some(GuiButton::at_px(x, row(5), cw, s, "").disabled(off));
         self.vignette = Some(GuiButton::at_px(xr, row(0), cw, s, "").disabled(off));

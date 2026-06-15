@@ -2415,6 +2415,9 @@ impl Renderer {
     /// water (cheaper per pixel).
     pub fn set_fancy_graphics(&mut self, on: bool) {
         self.fancy_graphics = on;
+        // Fast graphics merges adjacent leaf faces in the mesher; the caller
+        // re-meshes loaded chunks so the change reaches already-built sections.
+        self.mesh_worker.set_fast_leaves(!on);
     }
 
     /// Select the block-atlas mipmap level (0 = off; clamped to the built chain).
@@ -2830,7 +2833,13 @@ impl Renderer {
     {
         for pos in sections {
             self.invalidate_chunk_mesh_jobs(pos);
-            let mesh = build_section_mesh(world, pos, &self.atlas_uv, self.biome_colors);
+            let mesh = build_section_mesh(
+                world,
+                pos,
+                &self.atlas_uv,
+                self.biome_colors,
+                !self.fancy_graphics,
+            );
             self.upload_chunk_mesh(pos, &mesh);
         }
     }
@@ -3568,9 +3577,13 @@ impl Renderer {
                 ],
                 fog_color: [sky.horizon[0], sky.horizon[1], sky.horizon[2], on(self.pbr_enabled)],
                 fog_params: [
-                    camera.z_far * 0.45,
-                    camera.z_far * 0.92,
-                    on(self.shaders_enabled && self.fog_enabled),
+                    // Tie fog to the render-distance boundary so it reaches the
+                    // horizon colour just before the square cull — hiding the
+                    // pop-in and letting a low render distance look acceptable.
+                    // Independent of the master shader toggle (works shaders-off).
+                    self.render_distance as f32 * 16.0 * 0.55,
+                    self.render_distance as f32 * 16.0 * 0.90,
+                    on(self.fog_enabled),
                     self.brightness,
                 ],
             }),
@@ -3813,7 +3826,7 @@ impl Renderer {
                 let cam_cx = (camera.position.x / 16.0).floor() as i32;
                 let cam_cz = (camera.position.z / 16.0).floor() as i32;
                 let rd = self.render_distance as i32;
-                let visible: Vec<SectionPos> = self
+                let mut visible: Vec<SectionPos> = self
                     .chunk_sections
                     .iter()
                     .copied()
@@ -3825,17 +3838,31 @@ impl Renderer {
                     .collect();
                 visible_chunks = visible.len() as u32;
 
+                // Sort front-to-back so the opaque solid/cutout passes get early-z
+                // overdraw rejection (the solid pass writes depth with shaders off,
+                // since the pre-pass is skipped there). The transparent layers draw
+                // the reverse (back-to-front) so alpha blends in the right order.
+                let cam = camera.position;
+                let dist2 = |p: &SectionPos| {
+                    let dx = (p.x * 16 + 8) as f32 - cam.x;
+                    let dy = (p.y * 16 + 8) as f32 - cam.y;
+                    let dz = (p.z * 16 + 8) as f32 - cam.z;
+                    dx * dx + dy * dy + dz * dz
+                };
+                visible.sort_by(|a, b| dist2(a).total_cmp(&dist2(b)));
+                let visible_far: Vec<SectionPos> = visible.iter().rev().copied().collect();
+
                 // Collect per-page indirect commands for each layer.
                 let solid_batches =
                     collect_layer_batches(&self.chunk_solid, &visible, &mut chunk_indices);
                 let cutout_batches =
                     collect_layer_batches(&self.chunk_cutout, &visible, &mut chunk_indices);
                 let trans_batches =
-                    collect_layer_batches(&self.chunk_transparent, &visible, &mut chunk_indices);
+                    collect_layer_batches(&self.chunk_transparent, &visible_far, &mut chunk_indices);
                 // Water is drawn in its own later pass (SSR), not via the shared
                 // indirect buffer — capture its draws here.
                 let water_batches =
-                    collect_layer_batches(&self.chunk_water, &visible, &mut chunk_indices);
+                    collect_layer_batches(&self.chunk_water, &visible_far, &mut chunk_indices);
                 for b in &water_batches {
                     for c in &b.cmds {
                         water_draws.push((b.page, *c));

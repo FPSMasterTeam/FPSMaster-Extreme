@@ -1,4 +1,5 @@
 use std::sync::{
+    atomic::{AtomicBool, Ordering},
     mpsc::{channel, Receiver, Sender},
     Arc, Mutex,
 };
@@ -27,6 +28,9 @@ struct Job {
 pub struct MeshWorker {
     job_tx: Sender<Job>,
     result_rx: Receiver<(SectionPos, u64, ChunkMesh)>,
+    /// Fast-graphics leaves: read by every worker per job, flipped by the render
+    /// thread on a graphics-mode toggle (the toggle also re-dirties all chunks).
+    fast_leaves: Arc<AtomicBool>,
 }
 
 impl MeshWorker {
@@ -36,6 +40,7 @@ impl MeshWorker {
         // The atlas is read-only and shared by every worker.
         let atlas = Arc::new(atlas);
         let job_rx = Arc::new(Mutex::new(job_rx));
+        let fast_leaves = Arc::new(AtomicBool::new(false));
 
         let threads = thread::available_parallelism()
             .map(|n| n.get().saturating_sub(2))
@@ -45,6 +50,7 @@ impl MeshWorker {
             let job_rx = Arc::clone(&job_rx);
             let result_tx = result_tx.clone();
             let atlas = Arc::clone(&atlas);
+            let fast_leaves = Arc::clone(&fast_leaves);
             let _ = thread::Builder::new()
                 .name(format!("mesh-worker-{index}"))
                 .spawn(move || {
@@ -62,6 +68,7 @@ impl MeshWorker {
                             job.section_y,
                             &atlas,
                             biome,
+                            fast_leaves.load(Ordering::Relaxed),
                         );
                         if result_tx.send((pos, job.generation, mesh)).is_err() {
                             break;
@@ -70,7 +77,17 @@ impl MeshWorker {
                 });
         }
 
-        Self { job_tx, result_rx }
+        Self {
+            job_tx,
+            result_rx,
+            fast_leaves,
+        }
+    }
+
+    /// Set the Fast-leaves flag future mesh jobs read. The caller must re-queue
+    /// the loaded sections for the change to reach already-built meshes.
+    pub fn set_fast_leaves(&self, on: bool) {
+        self.fast_leaves.store(on, Ordering::Relaxed);
     }
 
     /// Queue one section of a column snapshot for meshing.

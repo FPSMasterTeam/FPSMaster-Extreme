@@ -48,6 +48,10 @@ use settings::{FpsCounter, Settings};
 const MESH_SUBMITS_PER_FRAME: usize = 40;
 /// Finished background section meshes uploaded to the GPU each frame.
 const MESH_UPLOADS_PER_FRAME: usize = 48;
+/// Entities are culled at the terrain render distance but never beyond this many
+/// chunks — distant mobs add per-frame articulated-mesh cost for little visual
+/// gain, so the crowd is dropped well before the terrain horizon.
+const ENTITY_RENDER_CHUNKS: u32 = 8;
 use std::sync::Arc;
 use winit::{
     application::ApplicationHandler,
@@ -951,7 +955,12 @@ fn handle_actions(
             GuiAction::SetVsync(on) => renderer.set_vsync(on),
             GuiAction::SetRenderScale(scale) => renderer.set_render_scale(scale),
             GuiAction::SetRenderDistance(chunks) => renderer.set_render_distance(chunks),
-            GuiAction::SetFancyGraphics(on) => renderer.set_fancy_graphics(on),
+            GuiAction::SetFancyGraphics(on) => {
+                renderer.set_fancy_graphics(on);
+                // Leaf geometry depends on Fast/Fancy, so re-mesh the world (the
+                // worker now reads the new flag); spread over frames by the budget.
+                app.game.mark_all_sections_dirty();
+            }
             GuiAction::SetMipmapLevels(levels) => renderer.set_mipmap_levels(levels),
             GuiAction::SetResolution => apply_display(window, &app.settings),
             GuiAction::SetFullscreen => apply_display(window, &app.settings),
@@ -1328,11 +1337,16 @@ fn render_frame(
         // when nothing that feeds them changed since last frame — the renderer
         // keeps the previously uploaded mesh. Saves the per-frame vertex generation
         // (the dominant entity cost) and upload in crowded-but-idle scenes.
+        // Cull mobs shorter than terrain (capped at ENTITY_RENDER_CHUNKS) so weak
+        // machines skip the distant crowd's per-frame articulated build.
+        let entity_chunks = app.settings.render_distance.min(ENTITY_RENDER_CHUNKS);
+        let entity_max_dist_sq = (entity_chunks as f64 * 16.0).powi(2);
         let entity_key = app.game.entity_render_fingerprint(
             tick_alpha,
             app.settings.brightness,
             hud_visible,
             app.skin_manager.rows(),
+            entity_max_dist_sq,
         );
         if app.last_entity_key != Some(entity_key) {
             app.last_entity_key = Some(entity_key);
@@ -1342,6 +1356,7 @@ fn render_frame(
                 tick_alpha,
                 app.settings.brightness,
                 app.skin_manager.rows(),
+                entity_max_dist_sq,
             );
             if hud_visible {
                 // Light the first-person hand + held item by the lightmap at the eye,

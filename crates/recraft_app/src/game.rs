@@ -1433,6 +1433,7 @@ impl GameState {
         tick_alpha: f32,
         brightness: f32,
         skin_rows: &std::collections::HashMap<[u8; 16], u32>,
+        max_dist_sq: f64,
     ) {
         mesh.clear();
         let sun_b = recraft_render::sky::sun_brightness(self.world_time(tick_alpha));
@@ -1447,6 +1448,13 @@ impl GameState {
             // Item entities (object type 2) are drawn as item geometry in the
             // separate world-item pass, not as a placeholder box.
             if entity.kind == EntityKind::Object(2) {
+                continue;
+            }
+            // Distance cull: distant mobs aren't worth the per-frame articulated
+            // build (cull shorter than the terrain so weak machines skip the mob
+            // crowd). Mirrored in entity_render_fingerprint so they don't churn
+            // the cache either.
+            if entity_dist_sq(entity, &self.camera, tick_alpha) > max_dist_sq {
                 continue;
             }
             // Resolve the player's downloaded-skin row through its uuid, if any.
@@ -1636,6 +1644,7 @@ impl GameState {
         brightness: f32,
         hud_visible: bool,
         skin_rows: &std::collections::HashMap<[u8; 16], u32>,
+        max_dist_sq: f64,
     ) -> u64 {
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
         let mut mix = |v: u64| h = (h ^ v).wrapping_mul(0x0000_0100_0000_01b3);
@@ -1680,6 +1689,11 @@ impl GameState {
         // skip rules so the fingerprint changes exactly when its output would).
         for e in self.world.entities() {
             if e.id == self.player.id || e.kind == EntityKind::Object(2) {
+                continue;
+            }
+            // Same distance cull as build_entity_model: distant mobs are neither
+            // built nor folded into the key, so they don't force a rebuild.
+            if entity_dist_sq(e, &self.camera, tick_alpha) > max_dist_sq {
                 continue;
             }
             mix(e.id.0 as u32 as u64);
@@ -3158,6 +3172,24 @@ impl GameState {
         all
     }
 
+    /// Mark every loaded section dirty so the whole world re-meshes — used when a
+    /// setting that changes geometry (e.g. Fast/Fancy leaves) is toggled. The
+    /// per-frame dirty budget spreads the rebuild over a few frames, so the toggle
+    /// doesn't stall; until each section is rebuilt it keeps its old geometry.
+    pub fn mark_all_sections_dirty(&mut self) {
+        let sections: Vec<SectionPos> = self
+            .world
+            .chunks()
+            .flat_map(|chunk| {
+                let pos = chunk.position;
+                chunk
+                    .sections()
+                    .map(move |section| SectionPos::new(pos.x, section.y(), pos.z))
+            })
+            .collect();
+        self.dirty_chunks.extend(sections);
+    }
+
     /// Drain locally predicted sections so the renderer can queue them before
     /// ordinary dirty sections. They are removed from the regular queue to avoid
     /// submitting duplicate mesh jobs in the same frame.
@@ -3334,6 +3366,16 @@ fn to_render_vec3(position: DVec3) -> Vec3 {
 /// (day/night-scaled skylight vs. block light) with a small floor, run through
 /// the same brightness-gamma the chunk shader uses. Keeps models in step with
 /// the terrain's brightness, including the Brightness option and time of day.
+/// Squared distance from the camera eye to an entity's interpolated position,
+/// for the per-frame entity distance cull (shared by the build and its cache key).
+fn entity_dist_sq(entity: &EntityState, camera: &Camera, tick_alpha: f32) -> f64 {
+    let p = entity.render_position(tick_alpha as f64);
+    let dx = p.x - camera.position.x as f64;
+    let dy = p.y - camera.position.y as f64;
+    let dz = p.z - camera.position.z as f64;
+    dx * dx + dy * dy + dz * dz
+}
+
 fn entity_light(world: &World, pos: Vec3, sun_brightness: f32, brightness: f32) -> f32 {
     let (block_l, sky_l) = world.light_at(
         pos.x.floor() as i32,
@@ -5005,7 +5047,7 @@ mod interaction_tests {
         // The invisible stand contributes no model geometry…
         let mut mesh = ModelMesh::new();
         let skins = std::collections::HashMap::new();
-        g.build_entity_model(&mut mesh, 1.0, 1.0, &skins);
+        g.build_entity_model(&mut mesh, 1.0, 1.0, &skins, f64::INFINITY);
         assert!(mesh.is_empty(), "invisible entity must not render a model");
 
         // …but its floating-text plate is still emitted.
@@ -5041,7 +5083,7 @@ mod interaction_tests {
 
         // Bare invisible player: nothing renders.
         let mut bare = ModelMesh::new();
-        g.build_entity_model(&mut bare, 1.0, 1.0, &skins);
+        g.build_entity_model(&mut bare, 1.0, 1.0, &skins, f64::INFINITY);
         assert!(bare.is_empty(), "invisible player with no armor renders nothing");
 
         // Give it an iron helmet (slot 4, id 306): the worn armor still shows.
@@ -5051,7 +5093,7 @@ mod interaction_tests {
             item: Some(SlotItem::new(306, 1, 0)),
         });
         let mut armored = ModelMesh::new();
-        g.build_entity_model(&mut armored, 1.0, 1.0, &skins);
+        g.build_entity_model(&mut armored, 1.0, 1.0, &skins, f64::INFINITY);
         assert!(!armored.is_empty(), "invisible player must still show worn armor");
     }
 
