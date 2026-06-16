@@ -1555,21 +1555,19 @@ impl GameState {
             // already baked in the vertex colour.
             let center = Vec3::new(feet.x, feet.y + height as f32 * 0.5, feet.z);
             let factor = entity_light(&self.world, center, sun_b, brightness);
-            // Vanilla damage flash: when hurtTime > 0, the entity is tinted red.
-            // The intensity fades with the remaining hurt ticks (10 → 0).
-            let hurt_flash = if entity.hurt_time > 0 {
-                entity.hurt_time as f32 / 10.0
-            } else {
-                0.0
-            };
+            // Vanilla damage flash (RendererLivingEntity.setBrightness): while
+            // hurtTime > 0 the model colour is lerped toward pure red at a
+            // constant 0.3 strength (GL_INTERPOLATE with (1,0,0,0.3)) — held for
+            // the whole hurt animation, not faded, then snapped off.
+            let hurt = entity.hurt_time > 0;
             for v in &mut mesh.vertices[start..] {
                 v.color[0] *= factor;
                 v.color[1] *= factor;
                 v.color[2] *= factor;
-                if hurt_flash > 0.0 {
-                    v.color[0] = v.color[0] + (1.0 - v.color[0]) * hurt_flash * 0.5;
-                    v.color[1] *= 1.0 - hurt_flash * 0.4;
-                    v.color[2] *= 1.0 - hurt_flash * 0.4;
+                if hurt {
+                    v.color[0] = v.color[0] * 0.7 + 0.3;
+                    v.color[1] *= 0.7;
+                    v.color[2] *= 0.7;
                 }
             }
         }
