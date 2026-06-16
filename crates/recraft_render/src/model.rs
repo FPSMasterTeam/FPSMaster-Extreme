@@ -1265,6 +1265,109 @@ pub fn held_item_frame(feet: Vec3, yaw_degrees: f32, anim: &EntityAnim) -> HeldI
     HeldItemFrame { hand, arm_dir, forward, right }
 }
 
+// ─── Chest block-entity ───────────────────────────────────────────────────────
+
+/// Which chest texture a chest block-entity uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChestKind {
+    Normal,
+    Trapped,
+    Ender,
+}
+
+impl ChestKind {
+    fn slot(self) -> EntitySlot {
+        match self {
+            ChestKind::Normal => EntitySlot::ChestNormal,
+            ChestKind::Trapped => EntitySlot::ChestTrapped,
+            ChestKind::Ender => EntitySlot::ChestEnder,
+        }
+    }
+}
+
+/// Vanilla `ModelChest` box, in model pixels: the rotation point, the `addBox`
+/// offset, the box size and the texture-offset, plus whether the lid rotation
+/// applies to it. The chest model space is 16 px per block (like every entity
+/// model) and the boxes are placed by the chest renderer's transform.
+struct ChestBox {
+    rp: [f32; 3],
+    off: [f32; 3],
+    size: [f32; 3],
+    tex: [f32; 2],
+    lid: bool,
+}
+
+/// The three `ModelChest` parts: the lid (rotates), the latch knob (rotates with
+/// the lid) and the static base. Ported 1:1 from vanilla `ModelChest`.
+const CHEST_BOXES: [ChestBox; 3] = [
+    // chestLid: tex(0,0), addBox(0,-5,-14, 14,5,14), rp(1,7,15)
+    ChestBox { rp: [1.0, 7.0, 15.0], off: [0.0, -5.0, -14.0], size: [14.0, 5.0, 14.0], tex: [0.0, 0.0], lid: true },
+    // chestKnob: tex(0,0), addBox(-1,-2,-15, 2,4,1), rp(8,7,15)
+    ChestBox { rp: [8.0, 7.0, 15.0], off: [-1.0, -2.0, -15.0], size: [2.0, 4.0, 1.0], tex: [0.0, 0.0], lid: true },
+    // chestBelow: tex(0,19), addBox(0,0,0, 14,10,14), rp(1,6,1)
+    ChestBox { rp: [1.0, 6.0, 1.0], off: [0.0, 0.0, 0.0], size: [14.0, 10.0, 14.0], tex: [0.0, 19.0], lid: false },
+];
+
+/// Lid model pixel rotation point (`chestLid.rotationPoint`), scaled to blocks.
+const CHEST_LID_PIVOT_PX: [f32; 3] = [1.0, 7.0, 15.0];
+
+/// Yaw (degrees) a chest's block metadata 2..5 rotates the model by, matching the
+/// `j` in `TileEntityChestRenderer` (2→180, 3→0, 4→90, 5→-90; other meta → 0).
+fn chest_yaw_degrees(meta: u8) -> f32 {
+    match meta {
+        2 => 180.0,
+        4 => 90.0,
+        5 => -90.0,
+        _ => 0.0, // 3 (south) and any unexpected meta
+    }
+}
+
+impl ModelMesh {
+    /// Append a chest block-entity at world cell `(cell_x, cell_y, cell_z)`
+    /// (the integer block coordinates), oriented by its block `meta` and with
+    /// the lid opened by `lid_angle` (0 = closed .. 1 = fully open). Ports
+    /// vanilla `ModelChest` + `TileEntityChestRenderer`'s placement transform:
+    /// the model is built in 1/16-block model space, the lid (and its knob)
+    /// rotate about the rear-top hinge by `-(eased * PI/2)`, then the chest GL
+    /// chain (`scale(1,-1,-1)`, centre, yaw, recentre) places it in the cell.
+    pub fn push_chest(&mut self, cell: [i32; 3], meta: u8, lid_angle: f32, kind: ChestKind) {
+        // Vanilla lid easing: f = 1 - (1 - lidAngle)^3, then rotateAngleX = -(f*PI/2).
+        let f = 1.0 - (1.0 - lid_angle.clamp(0.0, 1.0)).powi(3);
+        let lid_rot = -(f * std::f32::consts::FRAC_PI_2);
+        let (slr, clr) = lid_rot.sin_cos();
+        let pivot = Vec3::from(CHEST_LID_PIVOT_PX) * 0.0625;
+
+        let yaw = chest_yaw_degrees(meta).to_radians();
+        let (sy, cy) = yaw.sin_cos();
+        let base = Vec3::new(cell[0] as f32, cell[1] as f32, cell[2] as f32);
+
+        let (ox, oy) = entity_slot_origin(kind.slot());
+        let origin = [ox as f32, oy as f32];
+
+        for b in &CHEST_BOXES {
+            // Axis-aligned box bounds in 1/16-block model space.
+            let rp = Vec3::from(b.rp);
+            let lo = (rp + Vec3::from(b.off)) * 0.0625;
+            let hi = (rp + Vec3::from(b.off) + Vec3::from(b.size)) * 0.0625;
+            let region = box_region(b.tex[0], b.tex[1], b.size[0], b.size[1], b.size[2]);
+            let lid = b.lid;
+            self.push_textured_box(lo, hi, &region, origin, 1.0, &|m| {
+                // Lid parts hinge about the rear-top pivot (X rotation).
+                let m = if lid {
+                    rotate_x(m - pivot, slr, clr) + pivot
+                } else {
+                    m
+                };
+                // Chest renderer GL chain: recentre, yaw about Y, then
+                // scale(1,-1,-1) and place at (cell_x, cell_y+1, cell_z+1).
+                let a = m - Vec3::splat(0.5);
+                let r = rotate_y(a, sy, cy) + Vec3::splat(0.5);
+                base + Vec3::new(r.x, 1.0 - r.y, 1.0 - r.z)
+            });
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1572,6 +1675,69 @@ mod tests {
                     .iter()
                     .all(|v| (v0 - 1e-6..=v1 + 1e-6).contains(&v.uv[1])),
                 "mob {id} sampled outside its slot"
+            );
+        }
+    }
+
+    /// The chest block-entity emits three well-formed, textured boxes (lid,
+    /// knob, base) sampling its own atlas slot, sized to a single block cell.
+    #[test]
+    fn chest_emits_three_boxes_in_its_cell() {
+        let mut mesh = ModelMesh::new();
+        mesh.push_chest([10, 64, -7], 3, 0.0, ChestKind::Normal);
+        // 3 parts × 6 faces × 4 verts; same in indices terms.
+        assert_eq!(mesh.vertices.len(), 72);
+        assert_eq!(mesh.indices.len(), 108);
+        assert_well_formed(&mesh);
+        // Textured from the chest-normal slot (not the white texel).
+        assert!(mesh.vertices.iter().any(|v| v.uv != ENTITY_WHITE_UV));
+        let (v0, v1) = slot_v_range(EntitySlot::ChestNormal);
+        assert!(
+            mesh.vertices.iter().all(|v| (v0 - 1e-6..=v1 + 1e-6).contains(&v.uv[1])),
+            "chest sampled outside its slot"
+        );
+        // Every vertex sits within the 14/16-tall chest inside the block cell.
+        for v in &mesh.vertices {
+            assert!((10.0..=11.0).contains(&v.position[0]));
+            assert!((64.0..=65.0).contains(&v.position[1]));
+            assert!((-7.0..=-6.0).contains(&v.position[2]));
+        }
+    }
+
+    /// Opening the lid rotates the lid/knob boxes (raising their top) while the
+    /// base stays put, and the three chest kinds sample disjoint atlas slots.
+    #[test]
+    fn chest_lid_opens_and_kinds_use_distinct_slots() {
+        let build = |angle: f32, kind: ChestKind| {
+            let mut mesh = ModelMesh::new();
+            mesh.push_chest([0, 0, 0], 3, angle, kind);
+            mesh
+        };
+        let closed = build(0.0, ChestKind::Normal);
+        let open = build(1.0, ChestKind::Normal);
+        // The lid is the first part (verts 0..24); opening it changes its geometry.
+        let moved = closed.vertices[0..24]
+            .iter()
+            .zip(&open.vertices[0..24])
+            .any(|(a, b)| (Vec3::from(a.position) - Vec3::from(b.position)).length() > 1e-3);
+        assert!(moved, "opening the lid must move the lid geometry");
+        // The base (verts 48..72) is static.
+        let base_still = closed.vertices[48..72]
+            .iter()
+            .zip(&open.vertices[48..72])
+            .all(|(a, b)| (Vec3::from(a.position) - Vec3::from(b.position)).length() < 1e-6);
+        assert!(base_still, "the base must not move when the lid opens");
+        // Each kind samples its own slot's V range.
+        for (kind, slot) in [
+            (ChestKind::Normal, EntitySlot::ChestNormal),
+            (ChestKind::Trapped, EntitySlot::ChestTrapped),
+            (ChestKind::Ender, EntitySlot::ChestEnder),
+        ] {
+            let mesh = build(0.0, kind);
+            let (v0, v1) = slot_v_range(slot);
+            assert!(
+                mesh.vertices.iter().all(|v| (v0 - 1e-6..=v1 + 1e-6).contains(&v.uv[1])),
+                "chest kind sampled outside its slot"
             );
         }
     }

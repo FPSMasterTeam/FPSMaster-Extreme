@@ -1436,6 +1436,13 @@ fn render_frame(
                 app.skin_manager.rows(),
                 entity_max_dist_sq,
             );
+            // Chest block-entities draw in the same model pass (entity atlas).
+            app.game.build_chest_models(
+                &mut app.entity_model,
+                app.settings.brightness,
+                tick_alpha,
+                entity_max_dist_sq,
+            );
             if hud_visible {
                 // Light the first-person hand + held item by the lightmap at the eye,
                 // so they darken at night/in caves like the rest of the scene.
