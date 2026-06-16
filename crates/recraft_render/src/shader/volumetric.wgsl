@@ -20,7 +20,7 @@ struct Vol {
 @group(0) @binding(2) var shadow_sampler: sampler_comparison;
 @group(0) @binding(3) var<uniform> vol: Vol;
 
-const STEPS: i32 = 32;
+const STEPS: i32 = 20;
 const PI: f32 = 3.14159265;
 
 struct VsOut {

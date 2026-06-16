@@ -28,6 +28,7 @@ struct PostCamera {
 @group(0) @binding(4) var<uniform> cam: PostCamera;
 @group(0) @binding(5) var lum_tex: texture_2d<f32>;
 @group(0) @binding(6) var vol_tex: texture_2d<f32>;
+@group(0) @binding(7) var bloom_tex: texture_2d<f32>;
 
 // Reconstruct world position from a screen UV + non-linear depth.
 fn world_from_depth(uv: vec2<f32>, depth: f32) -> vec3<f32> {
@@ -140,23 +141,9 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     }
 
     if (params.q.w > 0.5) {
-        // Bright-pass bloom: a 7x7 Gaussian disk, keeping only the energy above
-        // the threshold (meaningful now that the scene is HDR).
-        let texel = params.p.zw;
-        var bloom = vec3<f32>(0.0);
-        var wsum = 0.0;
-        for (var i = -3; i <= 3; i = i + 1) {
-            for (var j = -3; j <= 3; j = j + 1) {
-                let o = vec2<f32>(f32(i), f32(j));
-                let w = exp(-dot(o, o) / 8.0);
-                let s = textureSample(scene_tex, scene_sampler, in.uv + o * texel).rgb;
-                let lum = dot(s, vec3<f32>(0.2126, 0.7152, 0.0722));
-                let bright = max(lum - params.p.x, 0.0);
-                bloom += s * (bright / max(lum, 0.0001)) * w;
-                wsum += w;
-            }
-        }
-        color += bloom / wsum * params.p.y;
+        // Bloom is prefiltered + blurred at quarter res in its own pass; just
+        // upsample (linear) and add it, scaled by intensity.
+        color += textureSampleLevel(bloom_tex, scene_sampler, in.uv, 0.0).rgb * params.p.y;
     }
 
     // Volumetric light (god rays): add the half-res sun-shaft in-scatter, upsampled

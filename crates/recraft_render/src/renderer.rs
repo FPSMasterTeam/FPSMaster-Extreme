@@ -525,15 +525,10 @@ pub struct Renderer {
     panorama: Option<PanoramaResources>,
     sky_uniform_buffer: wgpu::Buffer,
     sky_bind_group: wgpu::BindGroup,
-    /// Volumetric clouds: half-res raymarch into `cloud_tex` from a 3D noise
-    /// texture; the sky pass samples `sky_cloud_bind_group` to composite it.
-    cloud_pipeline: wgpu::RenderPipeline,
+    /// 2D procedural clouds: the sky shader samples this tileable 3D noise (group 1)
+    /// to draw a flat lit cloud layer — no raymarch pass, no half-res buffer.
     _cloud_noise_texture: wgpu::Texture,
     cloud_noise_bind_group: wgpu::BindGroup,
-    cloud_sample_layout: wgpu::BindGroupLayout,
-    cloud_tex: Option<wgpu::Texture>,
-    cloud_view: Option<wgpu::TextureView>,
-    sky_cloud_bind_group: Option<wgpu::BindGroup>,
     /// Sun/moon/stars pass: textured quads at infinity drawn after the gradient.
     celestial_pipeline: wgpu::RenderPipeline,
     celestial_uniform_buffer: wgpu::Buffer,
@@ -596,6 +591,10 @@ pub struct Renderer {
     water_pipeline: wgpu::RenderPipeline,
     /// Startup instant, for animated effects (water).
     start_time: Instant,
+    /// Shadow re-render throttle: the map is rebuilt every other frame and the
+    /// cached light matrix reused in between (sampling uses the cached matrix too).
+    shadow_tick: u32,
+    cached_light_view_proj: Mat4,
     /// Settings: 3D render-resolution scale, fancy graphics, mipmap level.
     render_scale: f32,
     /// Max horizontal chunk render distance: sections farther than this from the
@@ -655,6 +654,18 @@ pub struct Renderer {
     bloom_enabled: bool,
     post_pipeline: wgpu::RenderPipeline,
     post_layout: wgpu::BindGroupLayout,
+    /// Two-pass bloom: bright-pass + downsample the HDR scene to eighth-res
+    /// (`bloom_a`), then a wide blur on that small target (`bloom_b`); the post
+    /// pass samples `bloom_b`. Keeps the full-res scene reads to ~4/pixel.
+    bloom_bright_pipeline: wgpu::RenderPipeline,
+    bloom_blur_pipeline: wgpu::RenderPipeline,
+    bloom_layout: wgpu::BindGroupLayout,
+    bloom_a_tex: Option<wgpu::Texture>,
+    bloom_a_view: Option<wgpu::TextureView>,
+    bloom_b_tex: Option<wgpu::Texture>,
+    bloom_b_view: Option<wgpu::TextureView>,
+    bloom_bright_bind_group: Option<wgpu::BindGroup>,
+    bloom_blur_bind_group: Option<wgpu::BindGroup>,
     post_sampler: wgpu::Sampler,
     post_params_buffer: wgpu::Buffer,
     /// Camera uniform for the post pass's depth-aware effects (DoF / motion blur).
@@ -975,62 +986,6 @@ impl Renderer {
                     resource: wgpu::BindingResource::Sampler(&noise_sampler),
                 },
             ],
-        });
-        // Layout for the sky pass's group(1): the half-res cloud result + sampler.
-        let cloud_sample_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("cloud-sample-layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
-        let cloud_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("cloud-shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shader/cloud.wgsl").into()),
-        });
-        let cloud_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("cloud-pipeline-layout"),
-            bind_group_layouts: &[Some(&sky_uniform_layout), Some(&noise_layout)],
-            immediate_size: 0,
-        });
-        let cloud_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("cloud-pipeline"),
-            layout: Some(&cloud_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &cloud_shader,
-                entry_point: Some("vs_main"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &cloud_shader,
-                entry_point: Some("fs_main"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: HDR_FORMAT,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            cache: None,
-            multiview_mask: None,
         });
 
         // Celestial pass (sun/moon/stars): a rotation-only view-projection at
@@ -1864,7 +1819,7 @@ impl Renderer {
 
         let sky_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("sky-pipeline-layout"),
-            bind_group_layouts: &[Some(&sky_uniform_layout), Some(&cloud_sample_layout)],
+            bind_group_layouts: &[Some(&sky_uniform_layout), Some(&noise_layout)],
         immediate_size: 0,
         });
         let sky_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -2153,6 +2108,17 @@ impl Renderer {
                     },
                     count: None,
                 },
+                // Prefiltered quarter-res bloom (added in the post pass).
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
         let post_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -2203,6 +2169,78 @@ impl Renderer {
         cache: None,
         multiview_mask: None,
         });
+
+        // Bloom prefilter: bright-pass + wide blur of the HDR scene at quarter res
+        // (its own pass), which the post pass then upsamples + adds.
+        let bloom_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("bloom-shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shader/bloom.wgsl").into()),
+        });
+        let bloom_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("bloom-layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let bloom_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("bloom-pipeline-layout"),
+            bind_group_layouts: &[Some(&bloom_layout)],
+            immediate_size: 0,
+        });
+        let mk_bloom = |label: &str, entry: &str| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&bloom_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &bloom_shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &bloom_shader,
+                    entry_point: Some(entry),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: HDR_FORMAT,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                cache: None,
+                multiview_mask: None,
+            })
+        };
+        let bloom_bright_pipeline = mk_bloom("bloom-bright-pipeline", "fs_bright");
+        let bloom_blur_pipeline = mk_bloom("bloom-blur-pipeline", "fs_blur");
 
         // Auto-exposure: a 1x1 average-luminance target + reduction pipeline.
         let lum_desc = wgpu::TextureDescriptor {
@@ -2523,13 +2561,8 @@ impl Renderer {
             panorama,
             sky_uniform_buffer,
             sky_bind_group,
-            cloud_pipeline,
             _cloud_noise_texture: noise_texture,
             cloud_noise_bind_group: noise_bind_group,
-            cloud_sample_layout,
-            cloud_tex: None,
-            cloud_view: None,
-            sky_cloud_bind_group: None,
             celestial_pipeline,
             celestial_uniform_buffer,
             celestial_uniform_bind_group,
@@ -2565,6 +2598,8 @@ impl Renderer {
             water_opaque_pipeline,
             water_pipeline,
             start_time: Instant::now(),
+            shadow_tick: 0,
+            cached_light_view_proj: Mat4::IDENTITY,
             render_scale: 1.0,
             render_distance: 12,
             smooth_lighting: true,
@@ -2600,6 +2635,15 @@ impl Renderer {
             bloom_enabled: false,
             post_pipeline,
             post_layout,
+            bloom_bright_pipeline,
+            bloom_blur_pipeline,
+            bloom_layout,
+            bloom_a_tex: None,
+            bloom_a_view: None,
+            bloom_b_tex: None,
+            bloom_b_view: None,
+            bloom_bright_bind_group: None,
+            bloom_blur_bind_group: None,
             post_sampler,
             post_params_buffer,
             post_camera_buffer,
@@ -2933,7 +2977,9 @@ impl Renderer {
         // Half-resolution volumetric in-scatter target + its bind group (reads the
         // final world depth and the sun shadow map). Half-res keeps the raymarch
         // cheap; the post pass upsamples it with the linear sampler.
-        let (vw, vh) = ((w / 2).max(1), (h / 2).max(1));
+        // Volumetric light + clouds are low-frequency → quarter-res (with dithered
+        // raymarch starts in the shaders) keeps the look at ~4× fewer pixels.
+        let (vw, vh) = ((w / 4).max(1), (h / 4).max(1));
         let vol = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("volumetric-halfres-hdr"),
             size: wgpu::Extent3d {
@@ -2949,6 +2995,51 @@ impl Renderer {
             view_formats: &[],
         });
         let vol_view = vol.create_view(&wgpu::TextureViewDescriptor::default());
+        // Two eighth-res bloom targets: bright/downsample → bloom_a, wide blur →
+        // bloom_b. The blur reads the small bloom_a (cheap), not the full-res scene.
+        let (bw, bh) = ((w / 8).max(1), (h / 8).max(1));
+        let make_bloom = |label: &str| {
+            self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width: bw,
+                    height: bh,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: HDR_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+        };
+        let bloom_a = make_bloom("bloom-a");
+        let bloom_b = make_bloom("bloom-b");
+        let bloom_a_view = bloom_a.create_view(&wgpu::TextureViewDescriptor::default());
+        let bloom_b_view = bloom_b.create_view(&wgpu::TextureViewDescriptor::default());
+        let bloom_bg = |label: &str, input: &wgpu::TextureView| {
+            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(label),
+                layout: &self.bloom_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(input),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.post_sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: self.post_params_buffer.as_entire_binding(),
+                    },
+                ],
+            })
+        };
+        self.bloom_bright_bind_group = Some(bloom_bg("bloom-bright-bg", &view));
+        self.bloom_blur_bind_group = Some(bloom_bg("bloom-blur-bg", &bloom_a_view));
         self.vol_bind_group = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("volumetric-bind-group"),
             layout: &self.vol_layout,
@@ -3003,42 +3094,18 @@ impl Renderer {
                     binding: 6,
                     resource: wgpu::BindingResource::TextureView(&vol_view),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::TextureView(&bloom_b_view),
+                },
             ],
         }));
         self.vol_tex = Some(vol);
         self.vol_view = Some(vol_view);
-        // Half-resolution cloud target + the sky pass's bind group that samples it.
-        let cloud = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("cloud-halfres-hdr"),
-            size: wgpu::Extent3d {
-                width: vw,
-                height: vh,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: HDR_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        let cloud_view = cloud.create_view(&wgpu::TextureViewDescriptor::default());
-        self.sky_cloud_bind_group = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("sky-cloud-bind-group"),
-            layout: &self.cloud_sample_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&cloud_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.post_sampler),
-                },
-            ],
-        }));
-        self.cloud_tex = Some(cloud);
-        self.cloud_view = Some(cloud_view);
+        self.bloom_a_tex = Some(bloom_a);
+        self.bloom_a_view = Some(bloom_a_view);
+        self.bloom_b_tex = Some(bloom_b);
+        self.bloom_b_view = Some(bloom_b_view);
         // Auto-exposure reduction reads the (full) off-screen scene.
         self.lum_bind_group = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("luminance-bind-group"),
@@ -3836,9 +3903,18 @@ impl Renderer {
         // terrain shadows or the volumetric pass is active.
         let render_shadow_map =
             self.shaders_enabled && (self.shadows_enabled || self.volumetric_enabled);
+        // Re-render the shadow map every other frame and reuse the cached light
+        // matrix in between (the sun moves slowly; this halves the shadow geometry
+        // pass). The cached matrix is also what we sample with, so map + projection
+        // always match (the frustum just lags one frame at the very edges).
+        let redraw_shadow = render_shadow_map && self.shadow_tick % 2 == 0;
+        if render_shadow_map {
+            self.shadow_tick = self.shadow_tick.wrapping_add(1);
+        }
         // Orthographic light frustum centred just ahead of the camera, viewed
         // from the sun direction — covers the near scene the player actually sees.
-        let light_view_proj = if render_shadow_map {
+        if redraw_shadow {
+            self.cached_light_view_proj = {
             // Keep the shadow camera off the horizon. At sunset the real sun grazes
             // y≈0, which stretches shadows toward infinity and makes the fixed-size
             // ortho frustum badly undersample them (aliased, shimmering edges).
@@ -3877,6 +3953,10 @@ impl Renderer {
                 SHADOW_RADIUS * 5.0,
             );
             proj * view
+            };
+        }
+        let light_view_proj = if render_shadow_map {
+            self.cached_light_view_proj
         } else {
             Mat4::IDENTITY
         };
@@ -3987,7 +4067,7 @@ impl Renderer {
         // Sun shadow pass: render chunk-section depth from the light's view,
         // culled to the light frustum — sections outside the shadow map's
         // coverage contribute nothing, so there's no need to draw them all.
-        if render_shadow_map {
+        if redraw_shadow {
             let light_frustum = Frustum::from_view_projection(light_view_proj);
             let mut sp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("shadow-pass"),
@@ -4086,33 +4166,6 @@ impl Renderer {
                 0,
                 bytemuck::bytes_of(&[yaw, pitch, 0.0_f32, 0.0_f32]),
             );
-        }
-
-        // Half-resolution cloud pass: raymarch the cloud slab into cloud_tex; the
-        // sky pass below upsamples + composites it. Runs only when clouds are on.
-        if self.shaders_enabled && self.clouds_enabled && !panorama_active {
-            if let Some(cv) = &self.cloud_view {
-                let mut cp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("cloud-pass"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: cv,
-                        resolve_target: None,
-                        depth_slice: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: None,
-                    occlusion_query_set: None,
-                    timestamp_writes: None,
-                    multiview_mask: None,
-                });
-                cp.set_pipeline(&self.cloud_pipeline);
-                cp.set_bind_group(0, &self.sky_bind_group, &[]);
-                cp.set_bind_group(1, &self.cloud_noise_bind_group, &[]);
-                cp.draw(0..3, 0..1);
-            }
         }
 
         {
@@ -4351,9 +4404,7 @@ impl Renderer {
             if !self.debug_skip.sky && self.fancy_graphics {
             pass.set_pipeline(&self.sky_pipeline);
             pass.set_bind_group(0, &self.sky_bind_group, &[]);
-            if let Some(scb) = &self.sky_cloud_bind_group {
-                pass.set_bind_group(1, scb, &[]);
-            }
+            pass.set_bind_group(1, &self.cloud_noise_bind_group, &[]);
             pass.draw(0..3, 0..1);
             if let Some(mesh) = self.celestial_mesh.as_ref().filter(|m| m.index_count > 0) {
                 pass.set_pipeline(&self.celestial_pipeline);
@@ -4671,6 +4722,44 @@ impl Renderer {
                         depth_or_array_layers: 1,
                     },
                 );
+            }
+        }
+
+        // Bloom: bright-pass + downsample the HDR scene to bloom_a (eighth res),
+        // then a wide blur on that small target into bloom_b, which the post pass
+        // adds back. The blur reads bloom_a, not the full-res scene — cheap.
+        if self.shaders_enabled && self.bloom_enabled {
+            if let (Some(av), Some(abg), Some(bv), Some(bbg)) = (
+                &self.bloom_a_view,
+                &self.bloom_bright_bind_group,
+                &self.bloom_b_view,
+                &self.bloom_blur_bind_group,
+            ) {
+                let mut bloom_pass = |target: &wgpu::TextureView,
+                                      pipeline: &wgpu::RenderPipeline,
+                                      bind: &wgpu::BindGroup| {
+                    let mut bp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("bloom-pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: target,
+                            resolve_target: None,
+                            depth_slice: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        occlusion_query_set: None,
+                        timestamp_writes: None,
+                        multiview_mask: None,
+                    });
+                    bp.set_pipeline(pipeline);
+                    bp.set_bind_group(0, bind, &[]);
+                    bp.draw(0..3, 0..1);
+                };
+                bloom_pass(av, &self.bloom_bright_pipeline, abg);
+                bloom_pass(bv, &self.bloom_blur_pipeline, bbg);
             }
         }
 
@@ -5139,7 +5228,7 @@ const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 /// tone-map highlights (sun/specular/bloom) above 1.0 instead of clipping.
 const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 /// Sun shadow map resolution and format (quality-first; cheap on a dGPU).
-const SHADOW_DIM: u32 = 2048;
+const SHADOW_DIM: u32 = 1024;
 const SHADOW_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 /// World-space half-extent of the shadow frustum centred near the camera.
 const SHADOW_RADIUS: f32 = 96.0;

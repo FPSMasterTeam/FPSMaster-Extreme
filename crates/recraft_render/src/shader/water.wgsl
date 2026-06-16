@@ -47,10 +47,12 @@ struct PostCamera {
 fn screen_space_reflection(origin: vec3<f32>, dir: vec3<f32>) -> vec4<f32> {
     let dims = vec2<f32>(textureDimensions(depth_tex));
     var p = origin;
-    var step = 0.4;
-    for (var i = 0; i < 28; i = i + 1) {
+    // Fewer steps that grow a touch faster — keeps most of the reflection range at
+    // ~35% less marching cost (reflections are rough, so coarser steps are fine).
+    var step = 0.5;
+    for (var i = 0; i < 18; i = i + 1) {
         p = p + dir * step;
-        step = step * 1.16;
+        step = step * 1.22;
         let clip = camera.view_proj * vec4<f32>(p, 1.0);
         if (clip.w <= 0.0) {
             break;
