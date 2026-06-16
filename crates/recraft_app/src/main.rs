@@ -5,6 +5,7 @@ mod game;
 mod gui;
 mod item_renderer;
 mod network;
+mod particle;
 mod player_list;
 mod scoreboard;
 mod singleplayer;
@@ -1477,11 +1478,18 @@ fn render_frame(
         item_vertices.extend(held_v);
         item_indices.extend(held_i.iter().map(|i| i + base));
         renderer.set_world_items(&item_vertices, &item_indices);
+        // Particle billboards (rebuilt every frame; not cached by entity_key
+        // since particles move/age continuously).
+        let particles = app.game.particle_billboards(tick_alpha);
+        let (particle_v, particle_i) =
+            recraft_render::build_particle_mesh(&app.game.camera, &particles);
+        renderer.set_particles(&particle_v, &particle_i);
     } else {
         app.last_entity_key = None;
         renderer.upload_model(&recraft_render::ModelMesh::new());
         renderer.set_first_person_item(&[], &[]);
         renderer.set_world_items(&[], &[]);
+        renderer.set_particles(&[], &[]);
         renderer.set_nametags(&app.game.camera, &[]);
     }
     // Mining crack overlay (vanilla destroy_stage_N textures over the dig target).

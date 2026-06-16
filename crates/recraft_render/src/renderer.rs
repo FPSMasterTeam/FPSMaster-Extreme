@@ -517,6 +517,11 @@ pub struct Renderer {
     /// Crack overlay over the block being mined (vanilla destroy_stage_N).
     break_overlay: Option<DynamicMesh>,
     last_break_overlay: Option<(i32, i32, i32, u8)>,
+    /// Camera-facing particle billboards (vanilla EntityFX), rebuilt each frame.
+    particles: Option<DynamicMesh>,
+    /// `particles.png` texture+sampler, bound at group 1 (same layout as the
+    /// block atlas) so the overlay pipeline samples it for the particle draw.
+    particle_bind_group: wgpu::BindGroup,
     entity_bind_group: wgpu::BindGroup,
     /// The entity atlas texture, retained so downloaded player skins can be
     /// written into their rows at runtime (the bind group references it by view).
@@ -1007,6 +1012,8 @@ impl Renderer {
             }],
         });
         let sky_atlas_bind_group = create_sky_atlas_bind_group(&device, &queue, &texture_layout);
+        let particle_bind_group =
+            create_particle_bind_group(&device, &queue, &texture_layout);
         let star_quads = sky_geometry::generate_stars();
 
         let ui_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -2555,6 +2562,8 @@ impl Renderer {
             world_items: None,
             break_overlay: None,
             last_break_overlay: None,
+            particles: None,
+            particle_bind_group,
             entity_bind_group,
             entity_texture,
             sky_pipeline,
@@ -3539,6 +3548,21 @@ impl Renderer {
         );
     }
 
+    /// Replace this frame's particle billboards (textured from `particles.png`).
+    /// Drawn alpha-blended in the world right after the dropped items. Pass empty
+    /// slices to clear.
+    pub fn set_particles(&mut self, vertices: &[Vertex], indices: &[u32]) {
+        fill_dynamic_mesh(
+            &self.device,
+            &self.queue,
+            &mut self.particles,
+            bytemuck::cast_slice(vertices),
+            bytemuck::cast_slice(indices),
+            indices.len() as u32,
+            "particles",
+        );
+    }
+
     /// Set the world time in ticks (vanilla 0..24000 per day), which drives the
     /// day/night sky and the world lightmap. Called each frame with partial-tick
     /// interpolation; until the server sends a time update it stays at noon.
@@ -4510,6 +4534,20 @@ impl Renderer {
                 draw_calls += 1;
             }
 
+            // Particle billboards, sampled from particles.png. The item pipeline
+            // is cutout-only (REPLACE blend), so particles use the overlay
+            // pipeline (alpha-blended, depth-tested, no depth write) like the
+            // mining crack — semi-transparent smoke/flame then blends correctly.
+            if let Some(particles) = self.particles.as_ref().filter(|m| m.index_count > 0) {
+                pass.set_pipeline(&self.overlay_pipeline);
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                pass.set_bind_group(1, &self.particle_bind_group, &[]);
+                pass.set_vertex_buffer(0, particles.vertex_buffer.slice(..));
+                pass.set_index_buffer(particles.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..particles.index_count, 0, 0..1);
+                draw_calls += 1;
+            }
+
             // Water in the main pass when SSR isn't used (shaders off, or Fast
             // graphics) — avoids a separate pass and keeping the depth buffer.
             // Drawn AFTER the opaque entities/dropped items so translucent (Fancy)
@@ -5310,6 +5348,86 @@ fn create_sky_atlas_bind_group(
     });
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("sky-atlas-bind-group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(&sampler),
+            },
+        ],
+    })
+}
+
+/// Upload `particles.png` (the 16×16 particle sprite sheet) and build a
+/// texture+sampler bind group the particle draw samples at group 1. Reuses the
+/// block-atlas layout so the overlay pipeline accepts it. Falls back to a single
+/// transparent texel if the asset is missing, so particles simply don't show
+/// rather than crashing. Nearest filtering keeps the pixel sprites crisp.
+fn create_particle_bind_group(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    layout: &wgpu::BindGroupLayout,
+) -> wgpu::BindGroup {
+    let image = crate::texture::load_asset_image(
+        "assets/minecraft/textures/particle/particles.png",
+    );
+    let (width, height, pixels) = match image {
+        Some(img) => (img.width(), img.height(), img.into_raw()),
+        None => {
+            log::warn!("particles.png not found; particles will be invisible");
+            (1, 1, vec![0u8, 0, 0, 0])
+        }
+    };
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("particle-texture"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &pixels,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(4 * width),
+            rows_per_image: Some(height),
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("particle-sampler"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Nearest,
+        min_filter: wgpu::FilterMode::Nearest,
+        mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+        ..Default::default()
+    });
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("particle-bind-group"),
         layout,
         entries: &[
             wgpu::BindGroupEntry {

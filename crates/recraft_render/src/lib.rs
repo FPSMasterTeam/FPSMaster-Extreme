@@ -5,6 +5,7 @@ pub mod gui_item;
 pub mod item_names;
 mod mesh_worker;
 pub mod model;
+pub mod particle;
 pub mod renderer;
 pub mod sky;
 pub mod texture;
@@ -18,6 +19,7 @@ pub use chunk_mesh::{
 pub use font::char_width;
 pub use item_names::{build_tooltip, item_display_name};
 pub use model::{held_item_frame, EntityAnim, HeldItemFrame, ModelMesh, ModelVertex};
+pub use particle::{build_particle_mesh, ParticleBillboard};
 pub use renderer::{RenderStats, Renderer, RendererError};
 pub use texture::{AtlasUv, OverlayTextures, PackMeta, PbrAtlases, TextureAtlasImage, discover_resource_packs};
 pub use ui::{

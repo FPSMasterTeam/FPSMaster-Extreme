@@ -469,6 +469,21 @@ pub enum ClientboundPlayPacket {
         sky_light_sent: bool,
         chunks: Vec<BulkChunkData>,
     },
+    /// S2A SpawnParticle: a client-side particle effect at a world position with
+    /// a spread box, a per-particle speed and a count. `args` carries the extra
+    /// VarInts some particle types need (e.g. block/item id for *_CRACK / DUST).
+    SpawnParticle {
+        particle_id: i32,
+        x: f32,
+        y: f32,
+        z: f32,
+        offset_x: f32,
+        offset_y: f32,
+        offset_z: f32,
+        speed: f32,
+        count: i32,
+        args: Vec<i32>,
+    },
     Disconnect {
         reason_json: String,
     },
@@ -1017,6 +1032,41 @@ impl ClientboundPlayPacket {
                 let (x, y, z) = read_block_pos(&mut body)?;
                 let (id, meta) = decode_legacy_block_state_id(body.read_var_i32()?)?;
                 Ok(Self::BlockChange { x, y, z, id, meta })
+            }
+            0x2a => {
+                let particle_id = body.read_i32()?;
+                let _long_distance = body.read_bool()?;
+                let x = body.read_f32()?;
+                let y = body.read_f32()?;
+                let z = body.read_f32()?;
+                let offset_x = body.read_f32()?;
+                let offset_y = body.read_f32()?;
+                let offset_z = body.read_f32()?;
+                let speed = body.read_f32()?;
+                let count = body.read_i32()?;
+                // Extra VarInts: 2 for ITEM_CRACK (36), 1 for BLOCK_CRACK (37) /
+                // BLOCK_DUST (38), none otherwise (EnumParticleTypes.argumentCount).
+                let arg_count = match particle_id {
+                    36 => 2,
+                    37 | 38 => 1,
+                    _ => 0,
+                };
+                let mut args = Vec::with_capacity(arg_count);
+                for _ in 0..arg_count {
+                    args.push(body.read_var_i32()?);
+                }
+                Ok(Self::SpawnParticle {
+                    particle_id,
+                    x,
+                    y,
+                    z,
+                    offset_x,
+                    offset_y,
+                    offset_z,
+                    speed,
+                    count,
+                    args,
+                })
             }
             0x26 => {
                 let sky_light_sent = body.read_bool()?;

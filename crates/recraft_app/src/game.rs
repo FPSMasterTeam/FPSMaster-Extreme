@@ -38,6 +38,7 @@ use winit::{
 use crate::chat::{self, ChatState};
 use crate::container::{max_stack, stackable, Container};
 use crate::item_renderer::{DroppedItem, PlayerHeldItem};
+use crate::particle::ParticleSystem;
 use crate::player_list::PlayerList;
 use crate::scoreboard::Scoreboard;
 
@@ -529,6 +530,9 @@ pub struct GameState {
     /// nametags and skin lookups.
     pub player_list: PlayerList,
     title: TitleState,
+    /// Client-side particle effects (S2A SpawnParticle + local block breaks),
+    /// simulated here and drawn as billboards by the renderer.
+    particles: ParticleSystem,
 }
 
 /// In-progress survival block break: the target cell, the face the dig started
@@ -718,6 +722,7 @@ impl GameState {
             scoreboard: Scoreboard::default(),
             player_list: PlayerList::default(),
             title: TitleState::default(),
+            particles: ParticleSystem::new(),
         }
     }
 
@@ -1175,6 +1180,9 @@ impl GameState {
         if self.daylight_cycle {
             self.world_time += self.time_rate;
         }
+        // Advance particle effects once per tick (before any early return), so
+        // smoke/flame age and move at the vanilla 20 Hz.
+        self.particles.tick();
         self.previous_player_position = self.player.position;
         let turn_speed = 110.0 * dt;
         if self.input.turn_left {
@@ -1608,6 +1616,12 @@ impl GameState {
             });
         }
         items
+    }
+
+    /// This frame's particle billboards (interpolated by `tick_alpha`), for the
+    /// renderer to build into camera-facing quads.
+    pub fn particle_billboards(&self, tick_alpha: f32) -> Vec<recraft_render::ParticleBillboard> {
+        self.particles.billboards(tick_alpha)
     }
 
     /// Held items of remote players, each with the arm's world-space reference
@@ -2222,6 +2236,11 @@ impl GameState {
         {
             self.mark_block_dirty_urgent(x, y, z);
             self.relight_after_edit(x, y, z, old);
+            // Block-break debris puff (vanilla addBlockDestroyEffects), unless
+            // the broken block was already air.
+            if !old.is_air() {
+                self.particles.spawn_block_break(x, y, z);
+            }
         }
     }
 
@@ -2668,6 +2687,28 @@ impl GameState {
             }
             ClientboundPlayPacket::BlockChange { x, y, z, id, meta } => {
                 self.apply_block_change(x, y, z, id, meta)
+            }
+            ClientboundPlayPacket::SpawnParticle {
+                particle_id,
+                x,
+                y,
+                z,
+                offset_x,
+                offset_y,
+                offset_z,
+                speed,
+                count,
+                args,
+            } => {
+                self.particles.spawn(
+                    particle_id,
+                    Vec3::new(x, y, z),
+                    Vec3::new(offset_x, offset_y, offset_z),
+                    speed,
+                    count,
+                    &args,
+                );
+                false
             }
             ClientboundPlayPacket::ChunkBulk {
                 sky_light_sent,
