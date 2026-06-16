@@ -10,6 +10,7 @@ pub mod accounts;
 pub mod chat_screen;
 pub mod demo_select;
 pub mod edit_server;
+pub mod enchant;
 pub mod game_over;
 pub mod ingame;
 pub mod ingame_menu;
