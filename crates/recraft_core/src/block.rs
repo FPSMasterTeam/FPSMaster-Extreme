@@ -80,6 +80,10 @@ impl BlockState {
         if self.is_water() || self.is_lava() {
             return RenderShape::Fluid;
         }
+        // Fire is tall crossed planes plus faces clinging to adjacent walls.
+        if self.id == 51 {
+            return RenderShape::Fire;
+        }
         match self.shape() {
             Shape::Cross => RenderShape::Cross,
             Shape::Rail => RenderShape::Rail,
@@ -358,6 +362,8 @@ pub enum RenderShape {
     Torch,
     /// Water/lava: a surface whose height depends on the fluid level (meta).
     Fluid,
+    /// Fire: tall crossed planes (floor) plus planes against adjacent walls.
+    Fire,
 }
 
 /// An axis-aligned box in unit (0..1) block space.

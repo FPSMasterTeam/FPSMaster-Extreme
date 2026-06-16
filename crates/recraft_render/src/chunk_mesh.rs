@@ -575,6 +575,74 @@ fn append_block<S: BlockSource>(
         RenderShape::PistonHead => append_piston_head(mesh, ctx, x, y, z, block),
         RenderShape::Torch => append_torch(mesh, ctx, x, y, z, block),
         RenderShape::Fluid => append_fluid(mesh, ctx, x, y, z, block),
+        RenderShape::Fire => append_fire(mesh, ctx, x, y, z, block),
+    }
+}
+
+/// Fire (`BlockFire`): tall crossed diagonal planes on the floor, plus a plane
+/// clinging to each adjacent solid wall (fire climbing it). 1.4 blocks tall,
+/// double-sided, full-bright. Frame animation (fire_layer_0/1 flicker) needs a
+/// texture-atlas animation clock the chunk shader doesn't have yet — deferred,
+/// so this renders a static (but correctly shaped, wall-aware) flame ⚠️.
+fn append_fire<S: BlockSource>(
+    mesh: &mut ChunkMesh,
+    ctx: &BlockCtx<S>,
+    x: i32,
+    y: i32,
+    z: i32,
+    block: BlockState,
+) {
+    let texture = block.texture_name(BlockFace::Side);
+    warn_if_missing(ctx.atlas, block, "its fire texture", texture);
+    let rect = ctx.atlas.tile_rect(texture);
+    let uv = [
+        [rect[0], rect[1]],
+        [rect[0] + rect[2], rect[1]],
+        [rect[0] + rect[2], rect[1] + rect[3]],
+        [rect[0], rect[1] + rect[3]],
+    ];
+    // Fire emits light; render near full-bright using its own cell light.
+    let light = face_light(ctx, x, y, z);
+    let color = [1.0, 1.0, 1.0, 1.0];
+    let (fx, fy, fz) = (x as f32, y as f32, z as f32);
+    const H: f32 = 1.4; // vanilla fire is 22.4px ≈ 1.4 blocks tall
+
+    let quad = |a: [f32; 3], b: [f32; 3]| {
+        // A vertical quad from ground edge (a→b) up to height H.
+        [
+            [fx + a[0], fy, fz + a[2]],
+            [fx + b[0], fy, fz + b[2]],
+            [fx + b[0], fy + H, fz + b[2]],
+            [fx + a[0], fy + H, fz + a[2]],
+        ]
+    };
+
+    let opaque = |dx: i32, dy: i32, dz: i32| neighbor_block(ctx, x + dx, y + dy, z + dz).is_opaque_cube();
+
+    // Planes clinging to adjacent solid walls.
+    let mut any_wall = false;
+    if opaque(-1, 0, 0) {
+        any_wall = true;
+        emit_double_sided(mesh, ctx, block, quad([0.05, 0.0, 0.0], [0.05, 0.0, 1.0]), uv, color, light);
+    }
+    if opaque(1, 0, 0) {
+        any_wall = true;
+        emit_double_sided(mesh, ctx, block, quad([0.95, 0.0, 1.0], [0.95, 0.0, 0.0]), uv, color, light);
+    }
+    if opaque(0, 0, -1) {
+        any_wall = true;
+        emit_double_sided(mesh, ctx, block, quad([1.0, 0.0, 0.05], [0.0, 0.0, 0.05]), uv, color, light);
+    }
+    if opaque(0, 0, 1) {
+        any_wall = true;
+        emit_double_sided(mesh, ctx, block, quad([0.0, 0.0, 0.95], [1.0, 0.0, 0.95]), uv, color, light);
+    }
+
+    // Floor fire (crossed diagonal planes) when sitting on a solid block or when
+    // there's no wall to cling to (so airborne fire still shows something).
+    if opaque(0, -1, 0) || !any_wall {
+        emit_double_sided(mesh, ctx, block, quad([0.1, 0.0, 0.1], [0.9, 0.0, 0.9]), uv, color, light);
+        emit_double_sided(mesh, ctx, block, quad([0.9, 0.0, 0.1], [0.1, 0.0, 0.9]), uv, color, light);
     }
 }
 
