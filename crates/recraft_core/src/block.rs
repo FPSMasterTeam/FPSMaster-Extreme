@@ -85,6 +85,7 @@ impl BlockState {
             Shape::Door => RenderShape::Door,
             Shape::Piston => RenderShape::Piston,
             Shape::PistonHead => RenderShape::PistonHead,
+            Shape::Torch => RenderShape::Torch,
             _ => RenderShape::Boxes,
         }
     }
@@ -293,6 +294,8 @@ impl BlockState {
             }
             // Pistons collide as full cubes (the head's gaps are non-walkable).
             Shape::Piston | Shape::PistonHead => CollisionBoxes::one(FULL_CUBE),
+            // Torches have no collision; the mesher builds the leaning post.
+            Shape::Torch => CollisionBoxes::none(),
         }
     }
 }
@@ -347,6 +350,8 @@ pub enum RenderShape {
     Door,
     Piston,
     PistonHead,
+    /// Torch / redstone torch: a thin post, floor-standing or wall-leaning.
+    Torch,
 }
 
 /// An axis-aligned box in unit (0..1) block space.

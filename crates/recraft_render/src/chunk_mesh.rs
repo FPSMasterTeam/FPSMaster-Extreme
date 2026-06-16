@@ -573,6 +573,7 @@ fn append_block<S: BlockSource>(
         RenderShape::Door => append_door(mesh, ctx, x, y, z, block),
         RenderShape::Piston => append_piston(mesh, ctx, x, y, z, block),
         RenderShape::PistonHead => append_piston_head(mesh, ctx, x, y, z, block),
+        RenderShape::Torch => append_torch(mesh, ctx, x, y, z, block),
     }
 }
 
@@ -988,6 +989,71 @@ fn append_rail<S: BlockSource>(
     // Double-sided so the track is visible from above and (through a glass
     // floor) below, under back-face culling.
     emit_double_sided(mesh, ctx, block, corners, uvs, color, light);
+}
+
+/// Torch / redstone torch (`BlockTorch`): a thin 2px post with the torch
+/// texture's centre column on its sides and the flame on its top. Floor torches
+/// (meta 0/5) stand vertical and centred; wall torches lean outward from the
+/// mounting wall chosen by meta 1-4 (EAST/WEST/SOUTH/NORTH). The lean is a
+/// faithful approximation of vanilla `renderTorchAtAngle` (exact angle ⚠️
+/// pixel-level); the position/wall side and the centre-column UV are exact.
+fn append_torch<S: BlockSource>(
+    mesh: &mut ChunkMesh,
+    ctx: &BlockCtx<S>,
+    x: i32,
+    y: i32,
+    z: i32,
+    block: BlockState,
+) {
+    let texture = block.texture_name(BlockFace::Side);
+    warn_if_missing(ctx.atlas, block, "its torch texture", texture);
+    let rect = ctx.atlas.tile_rect(texture);
+    // Sub-tile UV by pixel (16px tile): u for the centre column 7..9, v top→down.
+    let u = |px: f32| rect[0] + (px / 16.0) * rect[2];
+    let v = |px: f32| rect[1] + (px / 16.0) * rect[3];
+
+    // Torches are self-lit; render near full-bright (block-light 14 ≈ sky-less).
+    let light = face_light(ctx, x, y + 1, z);
+    let color = [1.0, 1.0, 1.0, block.render_alpha()];
+
+    // Bottom- and top-centre of the post in unit block space. Wall torches sit
+    // low against the wall and lean toward the cell centre as they rise.
+    let (bc, tc): ([f32; 3], [f32; 3]) = match block.meta & 7 {
+        1 => ([0.1, 0.2, 0.5], [0.5, 0.8, 0.5]), // EAST  → on -X wall, lean +x
+        2 => ([0.9, 0.2, 0.5], [0.5, 0.8, 0.5]), // WEST  → on +X wall, lean -x
+        3 => ([0.5, 0.2, 0.1], [0.5, 0.8, 0.5]), // SOUTH → on -Z wall, lean +z
+        4 => ([0.5, 0.2, 0.9], [0.5, 0.8, 0.5]), // NORTH → on +Z wall, lean -z
+        _ => ([0.5, 0.0, 0.5], [0.5, 0.625, 0.5]), // floor: vertical, 10/16 tall
+    };
+    let (fx, fy, fz) = (x as f32, y as f32, z as f32);
+    let hw = 1.0 / 16.0; // half the 2px post width
+    // Bottom and top square corners (NW, NE, SE, SW) around the centres.
+    let square = |c: [f32; 3]| {
+        [
+            [fx + c[0] - hw, fy + c[1], fz + c[2] - hw],
+            [fx + c[0] + hw, fy + c[1], fz + c[2] - hw],
+            [fx + c[0] + hw, fy + c[1], fz + c[2] + hw],
+            [fx + c[0] - hw, fy + c[1], fz + c[2] + hw],
+        ]
+    };
+    let b = square(bc);
+    let t = square(tc);
+
+    // Side faces sample the centre column (u 7..9), full height (v 0..16).
+    let side_uv = [[u(9.0), v(0.0)], [u(7.0), v(0.0)], [u(7.0), v(16.0)], [u(9.0), v(16.0)]];
+    // Four side quads (top edge from `t`, bottom edge from `b`), each wound CCW.
+    let sides = [
+        [t[0], t[3], b[3], b[0]], // -X
+        [t[2], t[1], b[1], b[2]], // +X
+        [t[1], t[0], b[0], b[1]], // -Z
+        [t[3], t[2], b[2], b[3]], // +Z
+    ];
+    for corners in sides {
+        emit_double_sided(mesh, ctx, block, corners, side_uv, color, light);
+    }
+    // Top face: the flame nub (u 7..9, v 6..8).
+    let top_uv = [[u(7.0), v(6.0)], [u(9.0), v(6.0)], [u(9.0), v(8.0)], [u(7.0), v(8.0)]];
+    emit_double_sided(mesh, ctx, block, [t[0], t[1], t[2], t[3]], top_uv, color, light);
 }
 
 fn append_ladder<S: BlockSource>(

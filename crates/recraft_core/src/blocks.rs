@@ -56,6 +56,9 @@ pub enum Shape {
     Piston,
     /// Extended piston head/arm (block 34): facing + sticky from meta.
     PistonHead,
+    /// Torch / redstone torch: a thin post, standing on the floor or leaning
+    /// against a wall depending on meta (`BlockTorch` FACING).
+    Torch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -385,6 +388,7 @@ fn parse_shape(value: &str) -> Shape {
         "door" => Shape::Door,
         "piston" => Shape::Piston,
         "piston_head" => Shape::PistonHead,
+        "torch" => Shape::Torch,
         _ => Shape::Cube,
     }
 }
