@@ -4286,10 +4286,10 @@ mod interaction_tests {
             leash: false,
         });
         g.tick(0.05);
-        // The rider snaps onto the vehicle (height 1.9 × 0.75 mount offset).
+        // The rider snaps onto the vehicle (pig height 0.9 × 0.75 mount offset).
         assert!((g.player.position.x - 10.0).abs() < 1.0e-6);
         assert!((g.player.position.z + 5.0).abs() < 1.0e-6);
-        assert!((g.player.position.y - (64.0 + 1.9 * 0.75)).abs() < 1.0e-6);
+        assert!((g.player.position.y - (64.0 + 0.9 * 0.75)).abs() < 1.0e-6);
 
         // Detaching (vehicle_id -1) clears the mount so physics resumes.
         g.apply_play_packet(ClientboundPlayPacket::AttachEntity {
