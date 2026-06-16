@@ -40,6 +40,7 @@ use crate::container::{max_stack, stackable, Container};
 use crate::item_renderer::{DroppedItem, PlayerHeldItem};
 use crate::player_list::PlayerList;
 use crate::scoreboard::Scoreboard;
+use crate::settings::{GameAction, Keybinds};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScreenOverlay {
@@ -93,22 +94,30 @@ pub struct InputState {
 }
 
 impl InputState {
-    pub fn handle_key(&mut self, event: KeyEvent) {
+    pub fn handle_key(&mut self, event: KeyEvent, keybinds: &Keybinds) {
         let pressed = event.state == ElementState::Pressed;
-        match event.physical_key {
-            PhysicalKey::Code(KeyCode::KeyW) => self.forward = pressed,
-            PhysicalKey::Code(KeyCode::KeyS) => self.backward = pressed,
-            PhysicalKey::Code(KeyCode::KeyA) => self.left = pressed,
-            PhysicalKey::Code(KeyCode::KeyD) => self.right = pressed,
-            PhysicalKey::Code(KeyCode::Space) => self.jump = pressed,
-            PhysicalKey::Code(KeyCode::ShiftLeft) => self.sneak = pressed,
+        let PhysicalKey::Code(code) = event.physical_key else {
+            return;
+        };
+        // Arrow-key view turning is a recraft extra (not a vanilla rebindable
+        // control), so it stays on the fixed arrow keys.
+        match code {
+            KeyCode::ArrowLeft => return self.turn_left = pressed,
+            KeyCode::ArrowRight => return self.turn_right = pressed,
+            KeyCode::ArrowUp => return self.look_up = pressed,
+            KeyCode::ArrowDown => return self.look_down = pressed,
+            _ => {}
+        }
+        match keybinds.action_for(code) {
+            Some(GameAction::Forward) => self.forward = pressed,
+            Some(GameAction::Back) => self.backward = pressed,
+            Some(GameAction::Left) => self.left = pressed,
+            Some(GameAction::Right) => self.right = pressed,
+            Some(GameAction::Jump) => self.jump = pressed,
+            Some(GameAction::Sneak) => self.sneak = pressed,
             // Sprint is a toggle (not hold): each press of the sprint key flips
             // the intent. It is cleared by the wall-cancel and by sneaking.
-            PhysicalKey::Code(KeyCode::ControlLeft) if pressed => self.sprint = !self.sprint,
-            PhysicalKey::Code(KeyCode::ArrowLeft) => self.turn_left = pressed,
-            PhysicalKey::Code(KeyCode::ArrowRight) => self.turn_right = pressed,
-            PhysicalKey::Code(KeyCode::ArrowUp) => self.look_up = pressed,
-            PhysicalKey::Code(KeyCode::ArrowDown) => self.look_down = pressed,
+            Some(GameAction::Sprint) if pressed => self.sprint = !self.sprint,
             _ => {}
         }
     }

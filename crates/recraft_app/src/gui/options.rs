@@ -91,6 +91,7 @@ pub struct GuiOptions {
     sensitivity_rect: UiRect,
     brightness_rect: UiRect,
     video_btn: Option<GuiButton>,
+    controls_btn: Option<GuiButton>,
     resource_packs_btn: Option<GuiButton>,
     done: Option<GuiButton>,
     dragging: Option<Slider>,
@@ -118,7 +119,8 @@ impl GuiOptions {
         let top = ctx.height / 4 - 16 * s;
         self.sensitivity_rect = UiRect::new(x, top, 200 * s, BUTTON_HEIGHT * s);
         self.brightness_rect = UiRect::new(x, top + 24 * s, 200 * s, BUTTON_HEIGHT * s);
-        self.video_btn = Some(GuiButton::at_px(x, top + 48 * s, 200 * s, s, "Video Settings..."));
+        self.video_btn = Some(GuiButton::at_px(x, top + 48 * s, 98 * s, s, "Video Settings..."));
+        self.controls_btn = Some(GuiButton::at_px(x + 102 * s, top + 48 * s, 98 * s, s, "Controls..."));
         self.resource_packs_btn =
             Some(GuiButton::at_px(x, top + 72 * s, 200 * s, s, "Resource Packs..."));
         // A gap above Done, echoing vanilla's separated bottom button.
@@ -162,6 +164,9 @@ impl GuiScreen for GuiOptions {
         if let Some(b) = &self.video_btn {
             b.draw(ui, s, ctx.mouse, ctx.mouse_down);
         }
+        if let Some(b) = &self.controls_btn {
+            b.draw(ui, s, ctx.mouse, ctx.mouse_down);
+        }
         if let Some(b) = &self.resource_packs_btn {
             b.draw(ui, s, ctx.mouse, ctx.mouse_down);
         }
@@ -185,6 +190,14 @@ impl GuiScreen for GuiOptions {
             return vec![
                 GuiAction::SaveSettings,
                 GuiAction::SetScreen(Box::new(GuiVideoSettings::new(self.from_main_menu))),
+            ];
+        }
+        if self.controls_btn.as_ref().is_some_and(|b| b.clicked(x, y)) {
+            return vec![
+                GuiAction::SaveSettings,
+                GuiAction::SetScreen(Box::new(super::controls::GuiControls::new(
+                    self.from_main_menu,
+                ))),
             ];
         }
         if self.resource_packs_btn.as_ref().is_some_and(|b| b.clicked(x, y)) {

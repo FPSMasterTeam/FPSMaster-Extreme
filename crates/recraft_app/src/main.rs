@@ -39,7 +39,7 @@ use item_renderer::ItemRenderer;
 use network::{NetworkEvent, NetworkHandle};
 use recraft_protocol::{net::PremiumSession, v1_8_9::packets::ServerboundPacket};
 use recraft_render::{RenderStats, Renderer};
-use settings::{FpsCounter, Settings};
+use settings::{FpsCounter, GameAction, Keybinds, Settings};
 
 /// Dirty sections snapshotted and handed to the background mesher each frame.
 /// Sections of the same column share one snapshot clone (the only main-thread
@@ -405,7 +405,8 @@ impl ApplicationHandler for WinitApp {
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state == ElementState::Pressed
                     && !event.repeat
-                    && matches!(event.physical_key, PhysicalKey::Code(KeyCode::F3))
+                    && matches!(event.physical_key, PhysicalKey::Code(code)
+                        if app.settings.keybinds.action_for(code) == Some(GameAction::Debug))
                     && app.in_world
                     && app
                         .screen
@@ -432,30 +433,29 @@ impl ApplicationHandler for WinitApp {
                     handle_actions(app, renderer, window, actions, &mut self.atlas_uv);
                 } else if app.in_world {
                     let pressed = event.state == ElementState::Pressed;
+                    let action = match event.physical_key {
+                        PhysicalKey::Code(code) => app.settings.keybinds.action_for(code),
+                        _ => None,
+                    };
                     if pressed
                         && matches!(event.physical_key, PhysicalKey::Code(KeyCode::Escape))
                     {
                         app.suspend_gameplay_input(&mut self.left_held, &mut self.right_held);
                         app.screen = Some(Box::new(GuiIngameMenu::new()));
-                    } else if pressed
-                        && matches!(event.physical_key, PhysicalKey::Code(KeyCode::KeyE))
-                    {
+                    } else if pressed && action == Some(GameAction::Inventory) {
                         app.suspend_gameplay_input(&mut self.left_held, &mut self.right_held);
                         app.game.open_player_inventory();
                         app.screen = Some(Box::new(GuiContainer::new()));
-                    } else if let Some(prefill) = chat_open_key(&event) {
+                    } else if let Some(prefill) = chat_open_key(&event, &app.settings.keybinds) {
                         app.suspend_gameplay_input(&mut self.left_held, &mut self.right_held);
                         app.game.chat.reset_recall();
                         app.screen = Some(Box::new(GuiChat::new(prefill)));
-                    } else if let Some(slot) = hotbar_slot_key(&event) {
+                    } else if let Some(slot) = hotbar_slot_key(&event, &app.settings.keybinds) {
                         self.slot_select = Some(slot);
-                    } else if matches!(
-                        event.physical_key,
-                        PhysicalKey::Code(KeyCode::Tab)
-                    ) {
+                    } else if action == Some(GameAction::PlayerList) {
                         app.tab_open = pressed;
                     } else {
-                        app.game.input.handle_key(event);
+                        app.game.input.handle_key(event, &app.settings.keybinds);
                     }
                 }
                 sync_cursor(window, &mut self.cursor_captured, app);
@@ -1899,34 +1899,40 @@ fn run_headless_smoke(config: &LaunchConfig, seconds: f32) -> anyhow::Result<()>
     }
 }
 
-/// Map a number-row key (1-9) to a 0-based hotbar slot.
-fn hotbar_slot_key(event: &winit::event::KeyEvent) -> Option<i32> {
+/// Map a hotbar key (defaults 1-9) to a 0-based hotbar slot via the keybinds.
+fn hotbar_slot_key(event: &winit::event::KeyEvent, keybinds: &Keybinds) -> Option<i32> {
     if event.state != ElementState::Pressed {
         return None;
     }
-    match event.physical_key {
-        PhysicalKey::Code(KeyCode::Digit1) => Some(0),
-        PhysicalKey::Code(KeyCode::Digit2) => Some(1),
-        PhysicalKey::Code(KeyCode::Digit3) => Some(2),
-        PhysicalKey::Code(KeyCode::Digit4) => Some(3),
-        PhysicalKey::Code(KeyCode::Digit5) => Some(4),
-        PhysicalKey::Code(KeyCode::Digit6) => Some(5),
-        PhysicalKey::Code(KeyCode::Digit7) => Some(6),
-        PhysicalKey::Code(KeyCode::Digit8) => Some(7),
-        PhysicalKey::Code(KeyCode::Digit9) => Some(8),
+    let PhysicalKey::Code(code) = event.physical_key else {
+        return None;
+    };
+    match keybinds.action_for(code) {
+        Some(GameAction::Hotbar1) => Some(0),
+        Some(GameAction::Hotbar2) => Some(1),
+        Some(GameAction::Hotbar3) => Some(2),
+        Some(GameAction::Hotbar4) => Some(3),
+        Some(GameAction::Hotbar5) => Some(4),
+        Some(GameAction::Hotbar6) => Some(5),
+        Some(GameAction::Hotbar7) => Some(6),
+        Some(GameAction::Hotbar8) => Some(7),
+        Some(GameAction::Hotbar9) => Some(8),
         _ => None,
     }
 }
 
 /// If this key press opens the chat box, the text to pre-fill it with:
-/// T opens empty, '/' opens with a leading slash for commands.
-fn chat_open_key(event: &winit::event::KeyEvent) -> Option<String> {
+/// the Chat bind opens empty, the Command bind opens with a leading slash.
+fn chat_open_key(event: &winit::event::KeyEvent, keybinds: &Keybinds) -> Option<String> {
     if event.state != ElementState::Pressed {
         return None;
     }
-    match event.physical_key {
-        PhysicalKey::Code(KeyCode::KeyT) => Some(String::new()),
-        PhysicalKey::Code(KeyCode::Slash) => Some("/".to_owned()),
+    let PhysicalKey::Code(code) = event.physical_key else {
+        return None;
+    };
+    match keybinds.action_for(code) {
+        Some(GameAction::Chat) => Some(String::new()),
+        Some(GameAction::Command) => Some("/".to_owned()),
         _ => None,
     }
 }

@@ -8,6 +8,7 @@
 
 pub mod accounts;
 pub mod chat_screen;
+pub mod controls;
 pub mod demo_select;
 pub mod edit_server;
 pub mod game_over;

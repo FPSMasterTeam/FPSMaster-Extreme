@@ -2,6 +2,8 @@
 
 use std::time::Instant;
 
+use winit::keyboard::KeyCode;
+
 /// Where persisted options live (key=value text, next to the working directory,
 /// like vanilla's options.txt).
 const SETTINGS_FILE: &str = "recraft_options.txt";
@@ -74,6 +76,9 @@ pub struct Settings {
     /// Active resource pack name (subdirectory or zip filename under
     /// `resourcepacks/`), or `None` for default 1.8 textures.
     pub resource_pack: Option<String>,
+    /// Customizable key bindings (vanilla "Controls"). Maps each rebindable
+    /// [`GameAction`] to a physical [`KeyCode`].
+    pub keybinds: Keybinds,
 }
 
 /// Selectable resolutions (None = native). Common 16:9 modes most panels scale.
@@ -130,6 +135,7 @@ impl Default for Settings {
             volumetric_clouds: true,
             volumetric_light: true,
             resource_pack: None,
+            keybinds: Keybinds::default(),
         }
     }
 }
@@ -284,7 +290,16 @@ impl Settings {
                         s.resource_pack = Some(val.to_owned());
                     }
                 }
-                _ => {}
+                k => {
+                    // Key bindings: `key.<action>=<KeyCode name>`.
+                    if let Some(action_name) = k.strip_prefix("key.") {
+                        if let (Some(action), Some(code)) =
+                            (GameAction::from_name(action_name), keycode_from_name(val))
+                        {
+                            s.keybinds.set(action, code);
+                        }
+                    }
+                }
             }
         }
         s.sensitivity = s.sensitivity.clamp(0.0, 1.0);
@@ -309,7 +324,7 @@ impl Settings {
 
     fn save_to(&self, path: &std::path::Path) {
         let (res_w, res_h) = self.resolution.unwrap_or((0, 0));
-        let text = format!(
+        let mut text = format!(
             "sensitivity={}\nvsync={}\nfps_cap={}\nrender_scale={}\nrender_distance={}\nadaptive_resolution={}\nsmooth_lighting={}\nfancy_graphics={}\nmipmap_levels={}\nresolution_w={}\nresolution_h={}\nfullscreen={}\nshaders={}\nshader_shadows={}\nshader_specular={}\nshader_fog={}\nshader_bloom={}\nbrightness={}\npost_vignette={}\npost_chromatic={}\npost_dof={}\npost_motion_blur={}\npost_auto_exposure={}\nvolumetric_clouds={}\nvolumetric_light={}\nresource_pack={}\n",
             self.sensitivity,
             self.vsync,
@@ -338,6 +353,13 @@ impl Settings {
             self.volumetric_light,
             self.resource_pack.as_deref().unwrap_or(""),
         );
+        for &(action, code) in self.keybinds.iter() {
+            text.push_str(&format!(
+                "key.{}={}\n",
+                action.name(),
+                keycode_name(code)
+            ));
+        }
         if let Err(err) = std::fs::write(path, text) {
             log::warn!("failed to save settings to {}: {err}", path.display());
         }
@@ -462,6 +484,342 @@ impl Settings {
     }
 }
 
+// ─── Key bindings (vanilla "Controls") ───────────────────────────────────────
+
+/// A rebindable in-game control. The variants cover the movement keys, the
+/// inventory/chat/hotbar set recraft actually uses, plus the vanilla controls
+/// recraft does not yet act on (drop, swap-hands, screenshot, perspective) so
+/// the binding can be configured ahead of the feature landing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GameAction {
+    Forward,
+    Back,
+    Left,
+    Right,
+    Jump,
+    Sneak,
+    Sprint,
+    Attack,
+    Use,
+    Inventory,
+    Chat,
+    Command,
+    PlayerList,
+    Drop,
+    SwapHands,
+    Hotbar1,
+    Hotbar2,
+    Hotbar3,
+    Hotbar4,
+    Hotbar5,
+    Hotbar6,
+    Hotbar7,
+    Hotbar8,
+    Hotbar9,
+    Screenshot,
+    TogglePerspective,
+    Debug,
+}
+
+impl GameAction {
+    /// Every action in display/serialization order (also the order the controls
+    /// screen lists them in).
+    pub const ALL: [GameAction; 27] = [
+        GameAction::Forward,
+        GameAction::Back,
+        GameAction::Left,
+        GameAction::Right,
+        GameAction::Jump,
+        GameAction::Sneak,
+        GameAction::Sprint,
+        GameAction::Attack,
+        GameAction::Use,
+        GameAction::Inventory,
+        GameAction::Chat,
+        GameAction::Command,
+        GameAction::PlayerList,
+        GameAction::Drop,
+        GameAction::SwapHands,
+        GameAction::Hotbar1,
+        GameAction::Hotbar2,
+        GameAction::Hotbar3,
+        GameAction::Hotbar4,
+        GameAction::Hotbar5,
+        GameAction::Hotbar6,
+        GameAction::Hotbar7,
+        GameAction::Hotbar8,
+        GameAction::Hotbar9,
+        GameAction::Screenshot,
+        GameAction::TogglePerspective,
+        GameAction::Debug,
+    ];
+
+    /// Stable identifier used in the options file (`key.<name>=…`).
+    pub fn name(self) -> &'static str {
+        match self {
+            GameAction::Forward => "forward",
+            GameAction::Back => "back",
+            GameAction::Left => "left",
+            GameAction::Right => "right",
+            GameAction::Jump => "jump",
+            GameAction::Sneak => "sneak",
+            GameAction::Sprint => "sprint",
+            GameAction::Attack => "attack",
+            GameAction::Use => "use",
+            GameAction::Inventory => "inventory",
+            GameAction::Chat => "chat",
+            GameAction::Command => "command",
+            GameAction::PlayerList => "playerlist",
+            GameAction::Drop => "drop",
+            GameAction::SwapHands => "swaphands",
+            GameAction::Hotbar1 => "hotbar.1",
+            GameAction::Hotbar2 => "hotbar.2",
+            GameAction::Hotbar3 => "hotbar.3",
+            GameAction::Hotbar4 => "hotbar.4",
+            GameAction::Hotbar5 => "hotbar.5",
+            GameAction::Hotbar6 => "hotbar.6",
+            GameAction::Hotbar7 => "hotbar.7",
+            GameAction::Hotbar8 => "hotbar.8",
+            GameAction::Hotbar9 => "hotbar.9",
+            GameAction::Screenshot => "screenshot",
+            GameAction::TogglePerspective => "perspective",
+            GameAction::Debug => "debug",
+        }
+    }
+
+    fn from_name(name: &str) -> Option<GameAction> {
+        GameAction::ALL.into_iter().find(|a| a.name() == name)
+    }
+
+    /// Human-readable label for the controls screen.
+    pub fn label(self) -> &'static str {
+        match self {
+            GameAction::Forward => "Walk Forwards",
+            GameAction::Back => "Walk Backwards",
+            GameAction::Left => "Strafe Left",
+            GameAction::Right => "Strafe Right",
+            GameAction::Jump => "Jump",
+            GameAction::Sneak => "Sneak",
+            GameAction::Sprint => "Sprint",
+            GameAction::Attack => "Attack/Destroy",
+            GameAction::Use => "Use Item/Place",
+            GameAction::Inventory => "Open Inventory",
+            GameAction::Chat => "Open Chat",
+            GameAction::Command => "Open Command",
+            GameAction::PlayerList => "List Players",
+            GameAction::Drop => "Drop Item",
+            GameAction::SwapHands => "Swap Item In Hands",
+            GameAction::Hotbar1 => "Hotbar Slot 1",
+            GameAction::Hotbar2 => "Hotbar Slot 2",
+            GameAction::Hotbar3 => "Hotbar Slot 3",
+            GameAction::Hotbar4 => "Hotbar Slot 4",
+            GameAction::Hotbar5 => "Hotbar Slot 5",
+            GameAction::Hotbar6 => "Hotbar Slot 6",
+            GameAction::Hotbar7 => "Hotbar Slot 7",
+            GameAction::Hotbar8 => "Hotbar Slot 8",
+            GameAction::Hotbar9 => "Hotbar Slot 9",
+            GameAction::Screenshot => "Take Screenshot",
+            GameAction::TogglePerspective => "Toggle Perspective",
+            GameAction::Debug => "Debug Info",
+        }
+    }
+
+    fn default_key(self) -> KeyCode {
+        match self {
+            GameAction::Forward => KeyCode::KeyW,
+            GameAction::Back => KeyCode::KeyS,
+            GameAction::Left => KeyCode::KeyA,
+            GameAction::Right => KeyCode::KeyD,
+            GameAction::Jump => KeyCode::Space,
+            GameAction::Sneak => KeyCode::ShiftLeft,
+            GameAction::Sprint => KeyCode::ControlLeft,
+            // Attack/Use are mouse buttons in vanilla; recraft drives them from
+            // the mouse, so these keyboard defaults are unused (configurable,
+            // not yet acted on). Kept distinct from Drop's Q to avoid a default
+            // conflict.
+            GameAction::Attack => KeyCode::KeyZ,
+            GameAction::Use => KeyCode::KeyX,
+            GameAction::Inventory => KeyCode::KeyE,
+            GameAction::Chat => KeyCode::KeyT,
+            GameAction::Command => KeyCode::Slash,
+            GameAction::PlayerList => KeyCode::Tab,
+            GameAction::Drop => KeyCode::KeyQ,
+            GameAction::SwapHands => KeyCode::KeyF,
+            GameAction::Hotbar1 => KeyCode::Digit1,
+            GameAction::Hotbar2 => KeyCode::Digit2,
+            GameAction::Hotbar3 => KeyCode::Digit3,
+            GameAction::Hotbar4 => KeyCode::Digit4,
+            GameAction::Hotbar5 => KeyCode::Digit5,
+            GameAction::Hotbar6 => KeyCode::Digit6,
+            GameAction::Hotbar7 => KeyCode::Digit7,
+            GameAction::Hotbar8 => KeyCode::Digit8,
+            GameAction::Hotbar9 => KeyCode::Digit9,
+            GameAction::Screenshot => KeyCode::F2,
+            GameAction::TogglePerspective => KeyCode::F5,
+            GameAction::Debug => KeyCode::F3,
+        }
+    }
+}
+
+/// The action → key map, with vanilla defaults. Stored as an ordered list so
+/// the controls screen and the options file are deterministic.
+#[derive(Debug, Clone)]
+pub struct Keybinds {
+    binds: Vec<(GameAction, KeyCode)>,
+}
+
+impl Default for Keybinds {
+    fn default() -> Self {
+        Self {
+            binds: GameAction::ALL
+                .into_iter()
+                .map(|a| (a, a.default_key()))
+                .collect(),
+        }
+    }
+}
+
+impl Keybinds {
+    /// The key currently bound to `action`.
+    pub fn key_for(&self, action: GameAction) -> KeyCode {
+        self.binds
+            .iter()
+            .find(|(a, _)| *a == action)
+            .map(|(_, k)| *k)
+            .unwrap_or_else(|| action.default_key())
+    }
+
+    /// The action a pressed key triggers, if any. On a conflict the first action
+    /// in [`GameAction::ALL`] order wins (matching the list display order).
+    pub fn action_for(&self, code: KeyCode) -> Option<GameAction> {
+        self.binds
+            .iter()
+            .find(|(_, k)| *k == code)
+            .map(|(a, _)| *a)
+    }
+
+    /// Rebind `action` to `code` (replacing any prior binding for it). The same
+    /// key may end up on two actions; [`conflict`](Self::conflict) reports that.
+    pub fn set(&mut self, action: GameAction, code: KeyCode) {
+        if let Some(slot) = self.binds.iter_mut().find(|(a, _)| *a == action) {
+            slot.1 = code;
+        } else {
+            self.binds.push((action, code));
+        }
+    }
+
+    /// Whether the key bound to `action` is also bound to a different action.
+    pub fn conflict(&self, action: GameAction) -> bool {
+        let key = self.key_for(action);
+        self.binds
+            .iter()
+            .filter(|(_, k)| *k == key)
+            .nth(1)
+            .is_some()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &(GameAction, KeyCode)> {
+        self.binds.iter()
+    }
+}
+
+/// `KeyCode` → stable serialization/display name. Uses the winit variant name
+/// directly so the file is self-describing. Unlisted keys (rare on a keyboard)
+/// fall back to their `Debug` rendering, which is the variant name in winit.
+pub fn keycode_name(code: KeyCode) -> String {
+    format!("{code:?}")
+}
+
+/// Parse a [`keycode_name`] back into a [`KeyCode`]. Returns `None` for an
+/// unknown name (a hand-edited typo) so the default binding is kept.
+pub fn keycode_from_name(name: &str) -> Option<KeyCode> {
+    KEYCODE_NAMES
+        .iter()
+        .find(|(_, n)| *n == name)
+        .map(|(c, _)| *c)
+}
+
+/// The keys recraft can bind, paired with their `Debug`/serialization name. This
+/// covers the full set a user could reasonably rebind to (letters, digits,
+/// function keys, modifiers, arrows and the common punctuation/control keys).
+const KEYCODE_NAMES: &[(KeyCode, &str)] = &[
+    (KeyCode::KeyA, "KeyA"),
+    (KeyCode::KeyB, "KeyB"),
+    (KeyCode::KeyC, "KeyC"),
+    (KeyCode::KeyD, "KeyD"),
+    (KeyCode::KeyE, "KeyE"),
+    (KeyCode::KeyF, "KeyF"),
+    (KeyCode::KeyG, "KeyG"),
+    (KeyCode::KeyH, "KeyH"),
+    (KeyCode::KeyI, "KeyI"),
+    (KeyCode::KeyJ, "KeyJ"),
+    (KeyCode::KeyK, "KeyK"),
+    (KeyCode::KeyL, "KeyL"),
+    (KeyCode::KeyM, "KeyM"),
+    (KeyCode::KeyN, "KeyN"),
+    (KeyCode::KeyO, "KeyO"),
+    (KeyCode::KeyP, "KeyP"),
+    (KeyCode::KeyQ, "KeyQ"),
+    (KeyCode::KeyR, "KeyR"),
+    (KeyCode::KeyS, "KeyS"),
+    (KeyCode::KeyT, "KeyT"),
+    (KeyCode::KeyU, "KeyU"),
+    (KeyCode::KeyV, "KeyV"),
+    (KeyCode::KeyW, "KeyW"),
+    (KeyCode::KeyX, "KeyX"),
+    (KeyCode::KeyY, "KeyY"),
+    (KeyCode::KeyZ, "KeyZ"),
+    (KeyCode::Digit0, "Digit0"),
+    (KeyCode::Digit1, "Digit1"),
+    (KeyCode::Digit2, "Digit2"),
+    (KeyCode::Digit3, "Digit3"),
+    (KeyCode::Digit4, "Digit4"),
+    (KeyCode::Digit5, "Digit5"),
+    (KeyCode::Digit6, "Digit6"),
+    (KeyCode::Digit7, "Digit7"),
+    (KeyCode::Digit8, "Digit8"),
+    (KeyCode::Digit9, "Digit9"),
+    (KeyCode::F1, "F1"),
+    (KeyCode::F2, "F2"),
+    (KeyCode::F3, "F3"),
+    (KeyCode::F4, "F4"),
+    (KeyCode::F5, "F5"),
+    (KeyCode::F6, "F6"),
+    (KeyCode::F7, "F7"),
+    (KeyCode::F8, "F8"),
+    (KeyCode::F9, "F9"),
+    (KeyCode::F10, "F10"),
+    (KeyCode::F11, "F11"),
+    (KeyCode::F12, "F12"),
+    (KeyCode::Space, "Space"),
+    (KeyCode::Enter, "Enter"),
+    (KeyCode::Tab, "Tab"),
+    (KeyCode::Backspace, "Backspace"),
+    (KeyCode::ShiftLeft, "ShiftLeft"),
+    (KeyCode::ShiftRight, "ShiftRight"),
+    (KeyCode::ControlLeft, "ControlLeft"),
+    (KeyCode::ControlRight, "ControlRight"),
+    (KeyCode::AltLeft, "AltLeft"),
+    (KeyCode::AltRight, "AltRight"),
+    (KeyCode::SuperLeft, "SuperLeft"),
+    (KeyCode::SuperRight, "SuperRight"),
+    (KeyCode::ArrowLeft, "ArrowLeft"),
+    (KeyCode::ArrowRight, "ArrowRight"),
+    (KeyCode::ArrowUp, "ArrowUp"),
+    (KeyCode::ArrowDown, "ArrowDown"),
+    (KeyCode::Minus, "Minus"),
+    (KeyCode::Equal, "Equal"),
+    (KeyCode::BracketLeft, "BracketLeft"),
+    (KeyCode::BracketRight, "BracketRight"),
+    (KeyCode::Backslash, "Backslash"),
+    (KeyCode::Semicolon, "Semicolon"),
+    (KeyCode::Quote, "Quote"),
+    (KeyCode::Backquote, "Backquote"),
+    (KeyCode::Comma, "Comma"),
+    (KeyCode::Period, "Period"),
+    (KeyCode::Slash, "Slash"),
+];
+
 #[derive(Debug)]
 pub struct FpsCounter {
     frames: u32,
@@ -543,6 +901,92 @@ mod tests {
         assert!(loaded.render_scale <= 1.0);
         assert!(loaded.mipmap_levels <= MIPMAP_MAX);
         assert!(loaded.fps_cap >= FPS_MIN);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn keybinds_default_lookup() {
+        let binds = Keybinds::default();
+        // Every action resolves to its vanilla default key both ways.
+        assert_eq!(binds.key_for(GameAction::Forward), KeyCode::KeyW);
+        assert_eq!(binds.key_for(GameAction::Inventory), KeyCode::KeyE);
+        assert_eq!(binds.key_for(GameAction::Hotbar1), KeyCode::Digit1);
+        assert_eq!(binds.action_for(KeyCode::KeyW), Some(GameAction::Forward));
+        assert_eq!(binds.action_for(KeyCode::Tab), Some(GameAction::PlayerList));
+        // An unbound key resolves to nothing.
+        assert_eq!(binds.action_for(KeyCode::KeyB), None);
+    }
+
+    #[test]
+    fn keybinds_no_default_conflicts() {
+        let binds = Keybinds::default();
+        for action in GameAction::ALL {
+            assert!(
+                !binds.conflict(action),
+                "default bind for {:?} conflicts",
+                action
+            );
+        }
+    }
+
+    #[test]
+    fn keybinds_rebind_moves_the_key() {
+        let mut binds = Keybinds::default();
+        binds.set(GameAction::Forward, KeyCode::ArrowUp);
+        assert_eq!(binds.key_for(GameAction::Forward), KeyCode::ArrowUp);
+        // The old key is now unbound, the new key resolves to the action.
+        assert_eq!(binds.action_for(KeyCode::KeyW), None);
+        assert_eq!(binds.action_for(KeyCode::ArrowUp), Some(GameAction::Forward));
+    }
+
+    #[test]
+    fn keybinds_conflict_detection() {
+        let mut binds = Keybinds::default();
+        // Bind Jump to W, which Forward already holds.
+        binds.set(GameAction::Jump, KeyCode::KeyW);
+        assert!(binds.conflict(GameAction::Forward));
+        assert!(binds.conflict(GameAction::Jump));
+        // A non-conflicting action is unaffected.
+        assert!(!binds.conflict(GameAction::Sneak));
+    }
+
+    #[test]
+    fn keycode_name_round_trip() {
+        for &(code, _) in KEYCODE_NAMES {
+            assert_eq!(
+                keycode_from_name(&keycode_name(code)),
+                Some(code),
+                "round-trip failed for {code:?}"
+            );
+        }
+        // An unknown name yields None rather than a wrong key.
+        assert_eq!(keycode_from_name("NotAKey"), None);
+    }
+
+    #[test]
+    fn action_name_round_trip() {
+        for action in GameAction::ALL {
+            assert_eq!(GameAction::from_name(action.name()), Some(action));
+        }
+        assert_eq!(GameAction::from_name("nope"), None);
+    }
+
+    #[test]
+    fn keybinds_persist_through_disk() {
+        let path = std::env::temp_dir().join("recraft_settings_keybinds.txt");
+        let _ = std::fs::remove_file(&path);
+
+        let mut original = Settings::default();
+        original.keybinds.set(GameAction::Forward, KeyCode::ArrowUp);
+        original.keybinds.set(GameAction::Inventory, KeyCode::KeyI);
+        original.save_to(&path);
+
+        let loaded = Settings::load_from(&path);
+        assert_eq!(loaded.keybinds.key_for(GameAction::Forward), KeyCode::ArrowUp);
+        assert_eq!(loaded.keybinds.key_for(GameAction::Inventory), KeyCode::KeyI);
+        // Untouched binds keep their defaults.
+        assert_eq!(loaded.keybinds.key_for(GameAction::Jump), KeyCode::Space);
+
         let _ = std::fs::remove_file(&path);
     }
 }
