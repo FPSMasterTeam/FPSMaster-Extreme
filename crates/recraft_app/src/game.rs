@@ -1196,11 +1196,32 @@ impl GameState {
         self.update_render_arm();
 
         // Advance remote-entity interpolation: one lerp step per tick toward
-        // the latest server target (vanilla newPosRotationIncrements).
+        // the latest server target (vanilla newPosRotationIncrements). Dropped
+        // items with no pending server correction run local EntityItem physics
+        // instead, so a freshly-dropped item arcs immediately rather than
+        // stalling in the air until the next position packet (T7).
         let player_id = self.player.id;
         for entity in self.world.entities_mut() {
-            if entity.id != player_id {
+            let item_simulating =
+                entity.kind == EntityKind::Object(2) && entity.position_increments == 0;
+            if entity.id != player_id && !item_simulating {
                 entity.tick_interpolation();
+            }
+        }
+        let simulating_items: Vec<EntityId> = self
+            .world
+            .entities()
+            .filter(|e| {
+                e.id != player_id
+                    && e.kind == EntityKind::Object(2)
+                    && e.position_increments == 0
+            })
+            .map(|e| e.id)
+            .collect();
+        for id in simulating_items {
+            if let Some(mut item) = self.world.entity(id).cloned() {
+                recraft_core::physics::tick_item(&self.world, &mut item);
+                self.world.upsert_entity(item);
             }
         }
 

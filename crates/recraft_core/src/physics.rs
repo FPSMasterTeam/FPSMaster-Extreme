@@ -695,6 +695,41 @@ fn web_aware_move(
     result
 }
 
+/// Vanilla `EntityItem.onUpdate` physics for a dropped item (object type 2).
+/// Apply gravity (`-0.04`), move with world collision (no step-up), then
+/// horizontal drag (`0.98`, scaled by the supporting block's slipperiness on
+/// the ground), vertical drag (`0.98`) and the `-0.5` ground bounce. Running
+/// this client-side each tick makes a freshly-dropped item arc immediately
+/// instead of freezing at its spawn height until the next server position
+/// packet; server updates still correct the position via the normal lerp path.
+///
+/// Advances `previous_position`/`age` like `tick_interpolation` so the render
+/// interpolation and the dropped-item bob/spin stay continuous.
+pub fn tick_item(world: &World, item: &mut EntityState) {
+    item.previous_position = item.position;
+    item.age = item.age.wrapping_add(1);
+
+    // Gravity is applied before the move in vanilla.
+    item.velocity.y -= 0.04;
+    let result = move_with_collisions(world, item.aabb, item.velocity, 0.0, item.on_ground);
+    item.position = result.feet;
+    item.on_ground = result.on_ground;
+    item.velocity = result.velocity;
+
+    let horizontal = if item.on_ground {
+        block_below_slipperiness(world, item.position, item.aabb) as f64 * 0.98
+    } else {
+        0.98
+    };
+    item.velocity.x *= horizontal;
+    item.velocity.y *= 0.98;
+    item.velocity.z *= horizontal;
+    if item.on_ground {
+        item.velocity.y *= -0.5;
+    }
+    item.sync_aabb_to_position();
+}
+
 /// Slipperiness of the block supporting the player. Vanilla samples one block
 /// below `floor(boundingBox.minY)` in the feet column.
 fn block_below_slipperiness(world: &World, position: DVec3, aabb: Aabb) -> f32 {
@@ -922,7 +957,7 @@ mod tests {
     use glam::DVec3;
 
     use super::*;
-    use crate::{BlockState, EntityId};
+    use crate::{BlockState, EntityId, EntityKind};
 
     #[test]
     fn falling_player_lands_on_solid_block() {
@@ -935,6 +970,40 @@ mod tests {
 
         assert!(player.on_ground);
         assert!((player.position.y - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn dropped_item_falls_under_gravity_and_settles_on_ground() {
+        let mut world = World::new();
+        world.set_block(0, 0, 0, BlockState::STONE);
+        let mut item =
+            EntityState::new_remote(EntityId(7), EntityKind::Object(2), DVec3::new(0.5, 4.0, 0.5), 0.0, 0.0);
+
+        // One tick applies gravity and moves the item down (no stall).
+        let start_y = item.position.y;
+        tick_item(&world, &mut item);
+        assert!(item.position.y < start_y, "item should start falling immediately");
+        assert!(item.velocity.y < 0.0, "downward velocity accumulates");
+        assert_eq!(item.previous_position.y, start_y, "render-interp prev tracks last tick");
+
+        // It eventually rests on top of the block (box bottom at y=1).
+        for _ in 0..200 {
+            tick_item(&world, &mut item);
+        }
+        assert!(item.on_ground, "item should land");
+        assert!((item.position.y - 1.0).abs() < 0.05, "rests on the block top: {}", item.position.y);
+    }
+
+    #[test]
+    fn dropped_item_keeps_horizontal_motion_with_drag() {
+        let world = World::new(); // empty: item flies freely
+        let mut item =
+            EntityState::new_remote(EntityId(8), EntityKind::Object(2), DVec3::new(0.0, 64.0, 0.0), 0.0, 0.0);
+        item.velocity = DVec3::new(0.5, 0.0, 0.0);
+        tick_item(&world, &mut item);
+        assert!(item.position.x > 0.0, "horizontal velocity carries the item");
+        // Air drag 0.98 reduces horizontal speed below the initial 0.5.
+        assert!(item.velocity.x < 0.5 && item.velocity.x > 0.45);
     }
 
     #[test]
