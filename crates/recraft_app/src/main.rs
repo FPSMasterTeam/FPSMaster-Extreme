@@ -1464,6 +1464,7 @@ fn render_frame(
                 app.settings.brightness,
                 app.skin_manager.rows(),
                 entity_max_dist_sq,
+                app.settings.old_animations,
             );
             // Chest block-entities draw in the same model pass (entity atlas).
             app.game.build_chest_models(
@@ -1487,19 +1488,22 @@ fn render_frame(
                     v.color[1] *= hand_light;
                     v.color[2] *= hand_light;
                 }
-                let (mut vertices, indices) =
+                let mut held =
                     ItemRenderer::build_held_item(&app.game.camera, &first_person, atlas_uv);
-                for v in &mut vertices {
+                for v in &mut held.vertices {
                     v.color[0] *= hand_light;
                     v.color[1] *= hand_light;
                     v.color[2] *= hand_light;
                 }
-                renderer.set_first_person_item(&vertices, &indices);
+                renderer.set_first_person_item(&held.vertices, &held.indices);
+                renderer
+                    .set_first_person_item_glint(&held.glint_vertices, &held.glint_indices);
                 // 3D world-space player nametags (billboarded, depth-occluded).
                 let nametags = app.game.player_nametags(tick_alpha);
                 renderer.set_nametags(&app.game.camera, &nametags);
             } else {
                 renderer.set_first_person_item(&[], &[]);
+                renderer.set_first_person_item_glint(&[], &[]);
                 renderer.set_nametags(&app.game.camera, &[]);
             }
             renderer.upload_model(&app.entity_model);
@@ -1509,21 +1513,19 @@ fn render_frame(
         // the dropped-item sprite path mapped to an item id.
         let mut dropped = app.game.dropped_items(tick_alpha);
         dropped.extend(app.game.projectiles(tick_alpha));
-        let (mut item_vertices, mut item_indices) =
+        let mut world_items =
             ItemRenderer::build_world_items(&app.game.camera, &dropped, atlas_uv);
         let falling = app.game.falling_block_cubes(tick_alpha);
         append_mesh(
-            &mut item_vertices,
-            &mut item_indices,
+            &mut world_items.vertices,
+            &mut world_items.indices,
             ItemRenderer::build_falling_blocks(&falling, atlas_uv),
         );
-        let held = app.game.player_held_items(tick_alpha);
-        append_mesh(
-            &mut item_vertices,
-            &mut item_indices,
-            ItemRenderer::build_player_held_items(&held, atlas_uv),
-        );
-        renderer.set_world_items(&item_vertices, &item_indices);
+        let held = app.game.player_held_items(tick_alpha, app.settings.old_animations);
+        world_items.extend(ItemRenderer::build_player_held_items(&held, atlas_uv));
+        renderer.set_world_items(&world_items.vertices, &world_items.indices);
+        renderer
+            .set_world_items_glint(&world_items.glint_vertices, &world_items.glint_indices);
         // Particle billboards (rebuilt every frame; not cached by entity_key
         // since particles move/age continuously).
         let particles = app.game.particle_billboards(tick_alpha);
@@ -1539,7 +1541,9 @@ fn render_frame(
         app.last_entity_key = None;
         renderer.upload_model(&recraft_render::ModelMesh::new());
         renderer.set_first_person_item(&[], &[]);
+        renderer.set_first_person_item_glint(&[], &[]);
         renderer.set_world_items(&[], &[]);
+        renderer.set_world_items_glint(&[], &[]);
         renderer.set_particles(&[], &[]);
         renderer.set_xp_orbs(&[], &[]);
         renderer.set_nametags(&app.game.camera, &[]);

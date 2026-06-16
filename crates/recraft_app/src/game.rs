@@ -1554,6 +1554,7 @@ impl GameState {
         brightness: f32,
         skin_rows: &std::collections::HashMap<[u8; 16], u32>,
         max_dist_sq: f64,
+        old_animations: bool,
     ) {
         mesh.clear();
         let sun_b = recraft_render::sky::sun_brightness(self.world_time(tick_alpha));
@@ -1624,6 +1625,7 @@ impl GameState {
                 head_pitch: entity.render_pitch(tick_alpha),
                 swing_progress: entity.render_swing(tick_alpha),
                 sneaking: entity.sneaking,
+                old_animations,
             };
             let start = mesh.vertices.len();
             // Invisible entities (metadata flag 0x20) render no body model — but
@@ -1941,7 +1943,7 @@ impl GameState {
 
     /// Held items of remote players, each with the arm's world-space reference
     /// frame so the item renderer can orient the model correctly in the hand.
-    pub fn player_held_items(&self, tick_alpha: f32) -> Vec<PlayerHeldItem> {
+    pub fn player_held_items(&self, tick_alpha: f32, old_animations: bool) -> Vec<PlayerHeldItem> {
         let mut items = Vec::new();
         for entity in self.world.entities() {
             if entity.kind != EntityKind::RemotePlayer || entity.id == self.player.id {
@@ -1965,6 +1967,7 @@ impl GameState {
                 head_pitch: entity.render_pitch(tick_alpha),
                 swing_progress: entity.render_swing(tick_alpha),
                 sneaking: entity.sneaking,
+                old_animations,
             };
             let frame = held_item_frame(feet, body_yaw, &anim);
             let (block_l, sky_l) = self.world.light_at(
@@ -5687,7 +5690,7 @@ mod interaction_tests {
         // The invisible stand contributes no model geometry…
         let mut mesh = ModelMesh::new();
         let skins = std::collections::HashMap::new();
-        g.build_entity_model(&mut mesh, 1.0, 1.0, &skins, f64::INFINITY);
+        g.build_entity_model(&mut mesh, 1.0, 1.0, &skins, f64::INFINITY, false);
         assert!(mesh.is_empty(), "invisible entity must not render a model");
 
         // …but its floating-text plate is still emitted.
@@ -5723,7 +5726,7 @@ mod interaction_tests {
 
         // Bare invisible player: nothing renders.
         let mut bare = ModelMesh::new();
-        g.build_entity_model(&mut bare, 1.0, 1.0, &skins, f64::INFINITY);
+        g.build_entity_model(&mut bare, 1.0, 1.0, &skins, f64::INFINITY, false);
         assert!(bare.is_empty(), "invisible player with no armor renders nothing");
 
         // Give it an iron helmet (slot 4, id 306): the worn armor still shows.
@@ -5733,7 +5736,7 @@ mod interaction_tests {
             item: Some(SlotItem::new(306, 1, 0)),
         });
         let mut armored = ModelMesh::new();
-        g.build_entity_model(&mut armored, 1.0, 1.0, &skins, f64::INFINITY);
+        g.build_entity_model(&mut armored, 1.0, 1.0, &skins, f64::INFINITY, false);
         assert!(!armored.is_empty(), "invisible player must still show worn armor");
     }
 

@@ -124,6 +124,24 @@ struct CelestialUniform {
     view_proj: [[f32; 4]; 4],
 }
 
+/// Uniform for the enchantment-glint pass: the scroll offset (in glint-texture
+/// space) advanced each frame so the purple sheen travels across the item.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct GlintUniform {
+    scroll: f32,
+    _pad: [f32; 3],
+}
+
+/// The glint scroll offset in glint-texture space for a given wall-clock time
+/// (seconds). Vanilla advances the glint texture matrix by `(time%3000)/3000`
+/// scaled by 8 per second of texture travel; folding that to a continuous ramp
+/// gives `time/4 * 8 = time*2` texels/s, which the fragment shader adds to the
+/// scaled UV. Continuous (not wrapped) is fine since the texture is REPEAT.
+pub fn glint_scroll(time_secs: f32) -> f32 {
+    time_secs * 2.0
+}
+
 /// A vertex+index buffer pair that persists across frames and is refilled in
 /// place with `queue.write_buffer`, only reallocating when the geometry outgrows
 /// the current capacity. Used for the per-frame entity/hand geometry so a moving
@@ -514,6 +532,17 @@ pub struct Renderer {
     first_person_item: Option<DynamicMesh>,
     /// Dropped-item entities in the world (block-atlas textured), per frame.
     world_items: Option<DynamicMesh>,
+    /// Enchantment glint: re-draws the enchanted held / world item geometry
+    /// additively with the scrolling glint texture (vanilla `renderEffect`).
+    glint_pipeline: wgpu::RenderPipeline,
+    /// `enchanted_item_glint.png` texture+sampler, sampled (REPEAT) at group 3.
+    glint_bind_group: wgpu::BindGroup,
+    /// Per-frame scroll offset uniform driving the glint sheen (group 2).
+    glint_uniform_buffer: wgpu::Buffer,
+    glint_uniform_bind_group: wgpu::BindGroup,
+    /// Glint geometry (a subset of the held / world items that are enchanted).
+    first_person_item_glint: Option<DynamicMesh>,
+    world_items_glint: Option<DynamicMesh>,
     /// Crack overlay over the block being mined (vanilla destroy_stage_N).
     break_overlay: Option<DynamicMesh>,
     last_break_overlay: Option<(i32, i32, i32, u8)>,
@@ -889,6 +918,10 @@ impl Renderer {
             label: Some("sky-shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader/sky.wgsl").into()),
         });
+        let glint_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("glint-shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shader/glint.wgsl").into()),
+        });
         let celestial_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("celestial-shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader/celestial.wgsl").into()),
@@ -1017,6 +1050,29 @@ impl Renderer {
             }],
         });
         let sky_atlas_bind_group = create_sky_atlas_bind_group(&device, &queue, &texture_layout);
+
+        // Enchantment glint: a scroll-offset uniform at group 2 and the
+        // (REPEAT-wrapped) glint texture at group 3. Groups 0/1 are the shared
+        // camera + block-atlas, so the same enchanted item geometry re-draws
+        // through this pipeline.
+        let glint_uniform_layout =
+            create_uniform_layout(&device, "glint-uniform-layout", wgpu::ShaderStages::FRAGMENT);
+        let glint_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("glint-uniform"),
+            size: std::mem::size_of::<GlintUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let glint_uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("glint-uniform-bind-group"),
+            layout: &glint_uniform_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: glint_uniform_buffer.as_entire_binding(),
+            }],
+        });
+        let glint_bind_group = create_glint_bind_group(&device, &queue, &texture_layout);
+
         let particle_bind_group =
             create_particle_bind_group(&device, &queue, &texture_layout);
         let xp_orb_bind_group = create_asset_texture_bind_group(
@@ -1954,6 +2010,74 @@ impl Renderer {
         multiview_mask: None,
         });
 
+        // Enchantment glint: re-draws the enchanted item geometry additively.
+        // Group 0 camera, group 1 block atlas (for the silhouette cutout), group
+        // 2 the scroll uniform, group 3 the glint texture. Additive blend like
+        // the celestial pass, depth-tested but no depth write so it lays over the
+        // already-drawn item without fighting it. Drawn with no culling so block
+        // cubes and both sprite faces receive the sheen.
+        let glint_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("glint-pipeline-layout"),
+                bind_group_layouts: &[
+                    Some(&camera_layout),
+                    Some(&texture_layout),
+                    Some(&glint_uniform_layout),
+                    Some(&texture_layout),
+                ],
+                immediate_size: 0,
+            });
+        let glint_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("glint-pipeline"),
+            layout: Some(&glint_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &glint_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[Vertex::layout()],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &glint_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::SrcAlpha,
+                            dst_factor: wgpu::BlendFactor::One,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                        alpha: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::One,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                    }),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            cache: None,
+            multiview_mask: None,
+        });
+
         let ui_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("ui-pipeline-layout"),
             bind_group_layouts: &[Some(&ui_bind_group_layout)],
@@ -2572,6 +2696,12 @@ impl Renderer {
             model_mesh: None,
             first_person_item: None,
             world_items: None,
+            glint_pipeline,
+            glint_bind_group,
+            glint_uniform_buffer,
+            glint_uniform_bind_group,
+            first_person_item_glint: None,
+            world_items_glint: None,
             break_overlay: None,
             last_break_overlay: None,
             particles: None,
@@ -3562,6 +3692,37 @@ impl Renderer {
         );
     }
 
+    /// Replace this frame's first-person held-item glint geometry — the subset
+    /// of the held item that is enchanted, re-drawn additively with the glint
+    /// texture right after the item. Pass empty slices when the held item isn't
+    /// enchanted.
+    pub fn set_first_person_item_glint(&mut self, vertices: &[Vertex], indices: &[u32]) {
+        fill_dynamic_mesh(
+            &self.device,
+            &self.queue,
+            &mut self.first_person_item_glint,
+            bytemuck::cast_slice(vertices),
+            bytemuck::cast_slice(indices),
+            indices.len() as u32,
+            "first-person-item-glint",
+        );
+    }
+
+    /// Replace this frame's world-item glint geometry (the enchanted dropped /
+    /// third-person held items), drawn additively after the world items. Pass
+    /// empty slices to clear.
+    pub fn set_world_items_glint(&mut self, vertices: &[Vertex], indices: &[u32]) {
+        fill_dynamic_mesh(
+            &self.device,
+            &self.queue,
+            &mut self.world_items_glint,
+            bytemuck::cast_slice(vertices),
+            bytemuck::cast_slice(indices),
+            indices.len() as u32,
+            "world-items-glint",
+        );
+    }
+
     /// Replace this frame's particle billboards (textured from `particles.png`).
     /// Drawn alpha-blended in the world right after the dropped items. Pass empty
     /// slices to clear.
@@ -3928,6 +4089,15 @@ impl Renderer {
                 time,
                 self.atlas_uv.tile_size(),
             )),
+        );
+        // Enchantment glint scroll for this frame (drives the travelling sheen).
+        self.queue.write_buffer(
+            &self.glint_uniform_buffer,
+            0,
+            bytemuck::bytes_of(&GlintUniform {
+                scroll: glint_scroll(time),
+                _pad: [0.0; 3],
+            }),
         );
         // Post-pass camera (depth-aware DoF / motion blur): unproject depth and
         // reproject into last frame. Updated before prev is overwritten.
@@ -4563,6 +4733,24 @@ impl Renderer {
                 draw_calls += 1;
             }
 
+            // Enchantment glint over the enchanted world items, re-drawn with
+            // the scrolling glint texture additively (vanilla `renderEffect`).
+            if let Some(glint) = self.world_items_glint.as_ref().filter(|m| m.index_count > 0) {
+                pass.set_pipeline(&self.glint_pipeline);
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                pass.set_bind_group(
+                    1,
+                    &self.texture_bind_groups[self.mipmap_levels as usize],
+                    &[],
+                );
+                pass.set_bind_group(2, &self.glint_uniform_bind_group, &[]);
+                pass.set_bind_group(3, &self.glint_bind_group, &[]);
+                pass.set_vertex_buffer(0, glint.vertex_buffer.slice(..));
+                pass.set_index_buffer(glint.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..glint.index_count, 0, 0..1);
+                draw_calls += 1;
+            }
+
             // Particle billboards, sampled from particles.png. The item pipeline
             // is cutout-only (REPLACE blend), so particles use the overlay
             // pipeline (alpha-blended, depth-tested, no depth write) like the
@@ -4636,6 +4824,28 @@ impl Renderer {
                 pass.set_index_buffer(item.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..item.index_count, 0, 0..1);
                 draw_calls += 1;
+
+                // Glint over the held item if it is enchanted (same geometry,
+                // additive glint pipeline). Drawn right after so the sheen lays
+                // over the hand item; the hand sits near the camera, so the
+                // glint's depth test passes over the world like the item itself.
+                if let Some(glint) =
+                    self.first_person_item_glint.as_ref().filter(|m| m.index_count > 0)
+                {
+                    pass.set_pipeline(&self.glint_pipeline);
+                    pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                    pass.set_bind_group(
+                        1,
+                        &self.texture_bind_groups[self.mipmap_levels as usize],
+                        &[],
+                    );
+                    pass.set_bind_group(2, &self.glint_uniform_bind_group, &[]);
+                    pass.set_bind_group(3, &self.glint_bind_group, &[]);
+                    pass.set_vertex_buffer(0, glint.vertex_buffer.slice(..));
+                    pass.set_index_buffer(glint.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(0..glint.index_count, 0, 0..1);
+                    draw_calls += 1;
+                }
             }
             } // else (non-panorama sky + world content)
         }
@@ -5502,6 +5712,87 @@ fn create_asset_texture_bind_group(
     })
 }
 
+/// Upload `enchanted_item_glint.png` and build a REPEAT-wrapped texture+sampler
+/// bind group on the block-atlas layout (so the glint pipeline can sample it at
+/// group 3). The glint UV is scaled past 1.0 and scrolled, so the texture must
+/// tile; linear filtering keeps the streaks smooth as they travel. Falls back to
+/// a single transparent texel if the asset is missing, so the glint is simply
+/// absent rather than crashing.
+fn create_glint_bind_group(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    layout: &wgpu::BindGroupLayout,
+) -> wgpu::BindGroup {
+    let image = crate::texture::load_asset_image(
+        "assets/minecraft/textures/misc/enchanted_item_glint.png",
+    );
+    let (width, height, pixels) = match image {
+        Some(img) => (img.width(), img.height(), img.into_raw()),
+        None => {
+            log::warn!("enchanted_item_glint.png not found; the glint will be absent");
+            (1, 1, vec![0u8, 0, 0, 0])
+        }
+    };
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("glint-texture"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &pixels,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(4 * width),
+            rows_per_image: Some(height),
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("glint-sampler"),
+        address_mode_u: wgpu::AddressMode::Repeat,
+        address_mode_v: wgpu::AddressMode::Repeat,
+        address_mode_w: wgpu::AddressMode::Repeat,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+        ..Default::default()
+    });
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("glint-bind-group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(&sampler),
+            },
+        ],
+    })
+}
+
 /// Sun/moon/star geometry for the celestial pass. Sun and moon are vanilla
 /// `renderSky` quads; stars are a fixed random field. All are authored in the
 /// celestial-local frame and rotated by `celestial_rotation` here so the pass
@@ -6244,4 +6535,21 @@ fn create_panorama_resources(
         bind_group,
         uniform_buffer,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::glint_scroll;
+
+    #[test]
+    fn glint_scroll_advances_over_time() {
+        // The sheen must move: a later time gives a different (larger) offset, so
+        // the scrolling-UV sample changes frame to frame.
+        let t0 = glint_scroll(0.0);
+        let t1 = glint_scroll(0.5);
+        let t2 = glint_scroll(2.0);
+        assert_eq!(t0, 0.0);
+        assert!(t1 > t0);
+        assert!(t2 > t1);
+    }
 }

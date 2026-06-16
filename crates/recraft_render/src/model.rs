@@ -90,6 +90,10 @@ pub struct EntityAnim {
     pub swing_progress: f32,
     /// Whether the entity is crouching (drives the sneak pose).
     pub sneaking: bool,
+    /// Use the 1.7-style attack-swing curve (the "OldAnimations" setting). 1.8
+    /// eases the arm with a quartic `f⁴`; 1.7 used a cubic `f³`, which snaps the
+    /// arm forward faster. Only affects the attack swing, not the walk cycle.
+    pub old_animations: bool,
 }
 
 /// Articulation for one model part: a primary rotation about `pivot`, plus an
@@ -680,8 +684,16 @@ fn humanoid_poses(anim: &EntityAnim) -> [PartPose; 7] {
     let mut body_y = 0.0;
     if anim.swing_progress > 0.0 {
         let sp = anim.swing_progress;
-        let mut f = 1.0 - sp;
-        f = 1.0 - f * f * f;
+        // Vanilla `ModelBiped`: ease the attack swing, then take the sine.
+        // 1.8 uses a quartic (`f = (1-sp)²; f = f²`); 1.7 (OldAnimations) used a
+        // cubic (`f = (1-sp)³`), which throws the arm forward more sharply.
+        let f0 = 1.0 - sp;
+        let f = if anim.old_animations {
+            1.0 - f0 * f0 * f0
+        } else {
+            let q = f0 * f0;
+            1.0 - q * q
+        };
         let f1 = (f * PI).sin();
         let f2 = (sp * PI).sin() * -(head_x - 0.7) * 0.75;
         arm_r_x -= f1 * 1.2 + f2;
@@ -1863,6 +1875,7 @@ mod tests {
     // Humanoid part vertex ranges (24 verts/part, in push order).
     const RIGHT_LEG: std::ops::Range<usize> = 0..24;
     const BODY: std::ops::Range<usize> = 48..72;
+    const RIGHT_ARM: std::ops::Range<usize> = 72..96;
     const HEAD: std::ops::Range<usize> = 120..144;
 
     fn max_y(mesh: &ModelMesh, range: std::ops::Range<usize>) -> f32 {
@@ -1971,6 +1984,35 @@ mod tests {
         assert!(
             !parts_differ(&rest, &sneaking, RIGHT_LEG),
             "sneak keeps the legs planted"
+        );
+    }
+
+    #[test]
+    fn old_animations_change_the_attack_swing_arm() {
+        // Mid-swing the right arm sits at a different angle under the 1.7 cubic
+        // curve than the 1.8 quartic one (other parts are unaffected by the flag).
+        let new_anim = player_mesh(&EntityAnim {
+            swing_progress: 0.5,
+            ..EntityAnim::default()
+        });
+        let old_anim = player_mesh(&EntityAnim {
+            swing_progress: 0.5,
+            old_animations: true,
+            ..EntityAnim::default()
+        });
+        assert!(
+            parts_differ(&new_anim, &old_anim, RIGHT_ARM),
+            "the 1.7 swing curve must move the attacking arm differently"
+        );
+        // The flag only retimes the swing — a non-swinging arm is identical.
+        let rest_new = player_mesh(&EntityAnim::default());
+        let rest_old = player_mesh(&EntityAnim {
+            old_animations: true,
+            ..EntityAnim::default()
+        });
+        assert!(
+            !parts_differ(&rest_new, &rest_old, RIGHT_ARM),
+            "with no swing the arm pose is the same regardless of the flag"
         );
     }
 

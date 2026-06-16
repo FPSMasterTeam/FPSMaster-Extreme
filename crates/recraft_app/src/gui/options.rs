@@ -280,6 +280,7 @@ pub struct GuiVideoSettings {
     shaders_btn: Option<GuiButton>,
     smooth_light: Option<GuiButton>,
     show_fps: Option<GuiButton>,
+    old_animations: Option<GuiButton>,
     done: Option<GuiButton>,
     dragging: Option<VideoSlider>,
     from_main_menu: bool,
@@ -317,7 +318,9 @@ impl GuiVideoSettings {
         self.fullscreen = Some(GuiButton::at_px(x + 102 * s, top + 120 * s, 98 * s, s, ""));
         self.shaders_btn = Some(GuiButton::at_px(x, top + 144 * s, 98 * s, s, "Shaders..."));
         self.smooth_light = Some(GuiButton::at_px(x + 102 * s, top + 144 * s, 98 * s, s, ""));
-        self.show_fps = Some(GuiButton::at_px(x, top + 168 * s, 200 * s, s, ""));
+        self.show_fps = Some(GuiButton::at_px(x, top + 168 * s, 98 * s, s, ""));
+        self.old_animations =
+            Some(GuiButton::at_px(x + 102 * s, top + 168 * s, 98 * s, s, ""));
         // A gap above Done, echoing vanilla's separated bottom button.
         self.done = Some(GuiButton::at_px(x, top + 192 * s, 200 * s, s, "Done"));
     }
@@ -416,6 +419,13 @@ impl GuiScreen for GuiVideoSettings {
             );
             show_fps.draw(ui, s, ctx.mouse, ctx.mouse_down);
         }
+        if let Some(old_anim) = &mut self.old_animations {
+            old_anim.label = format!(
+                "Old Animations: {}",
+                if ctx.settings.old_animations { "ON" } else { "OFF" }
+            );
+            old_anim.draw(ui, s, ctx.mouse, ctx.mouse_down);
+        }
         if let Some(done) = &self.done {
             done.draw(ui, s, ctx.mouse, ctx.mouse_down);
         }
@@ -473,6 +483,10 @@ impl GuiScreen for GuiVideoSettings {
         }
         if self.show_fps.as_ref().is_some_and(|b| b.clicked(x, y)) {
             ctx.settings.show_fps = !ctx.settings.show_fps;
+            return vec![GuiAction::SaveSettings];
+        }
+        if self.old_animations.as_ref().is_some_and(|b| b.clicked(x, y)) {
+            ctx.settings.old_animations = !ctx.settings.old_animations;
             return vec![GuiAction::SaveSettings];
         }
         if self.done.as_ref().is_some_and(|b| b.clicked(x, y)) {

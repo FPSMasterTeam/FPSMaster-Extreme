@@ -76,6 +76,10 @@ pub struct Settings {
     /// Show a small FPS readout in the top-left during gameplay (vanilla-style
     /// "Show FPS"). Off by default; the full F3 debug overlay is independent.
     pub show_fps: bool,
+    /// Use the 1.7-style hand/arm animations (the "OldAnimations" mod): the
+    /// older attack-swing curve and the 1.7 sword-block pose. Off by default
+    /// (the 1.8 animations match the rest of the client).
+    pub old_animations: bool,
     /// Active resource pack name (subdirectory or zip filename under
     /// `resourcepacks/`), or `None` for default 1.8 textures.
     pub resource_pack: Option<String>,
@@ -138,6 +142,7 @@ impl Default for Settings {
             volumetric_clouds: true,
             volumetric_light: true,
             show_fps: false,
+            old_animations: false,
             resource_pack: None,
             keybinds: Keybinds::default(),
         }
@@ -294,6 +299,11 @@ impl Settings {
                         s.show_fps = v;
                     }
                 }
+                "old_animations" => {
+                    if let Ok(v) = val.parse() {
+                        s.old_animations = v;
+                    }
+                }
                 "resource_pack" => {
                     if !val.is_empty() {
                         s.resource_pack = Some(val.to_owned());
@@ -334,7 +344,7 @@ impl Settings {
     fn save_to(&self, path: &std::path::Path) {
         let (res_w, res_h) = self.resolution.unwrap_or((0, 0));
         let mut text = format!(
-            "sensitivity={}\nvsync={}\nfps_cap={}\nrender_scale={}\nrender_distance={}\nadaptive_resolution={}\nsmooth_lighting={}\nfancy_graphics={}\nmipmap_levels={}\nresolution_w={}\nresolution_h={}\nfullscreen={}\nshaders={}\nshader_shadows={}\nshader_specular={}\nshader_fog={}\nshader_bloom={}\nbrightness={}\npost_vignette={}\npost_chromatic={}\npost_dof={}\npost_motion_blur={}\npost_auto_exposure={}\nvolumetric_clouds={}\nvolumetric_light={}\nshow_fps={}\nresource_pack={}\n",
+            "sensitivity={}\nvsync={}\nfps_cap={}\nrender_scale={}\nrender_distance={}\nadaptive_resolution={}\nsmooth_lighting={}\nfancy_graphics={}\nmipmap_levels={}\nresolution_w={}\nresolution_h={}\nfullscreen={}\nshaders={}\nshader_shadows={}\nshader_specular={}\nshader_fog={}\nshader_bloom={}\nbrightness={}\npost_vignette={}\npost_chromatic={}\npost_dof={}\npost_motion_blur={}\npost_auto_exposure={}\nvolumetric_clouds={}\nvolumetric_light={}\nshow_fps={}\nold_animations={}\nresource_pack={}\n",
             self.sensitivity,
             self.vsync,
             self.fps_cap,
@@ -361,6 +371,7 @@ impl Settings {
             self.volumetric_clouds,
             self.volumetric_light,
             self.show_fps,
+            self.old_animations,
             self.resource_pack.as_deref().unwrap_or(""),
         );
         for &(action, code) in self.keybinds.iter() {
@@ -878,6 +889,7 @@ mod tests {
         original.fancy_graphics = false;
         original.mipmap_levels = 2;
         original.brightness = 0.55;
+        original.old_animations = true;
         original.save_to(&path);
 
         let loaded = Settings::load_from(&path);
@@ -888,6 +900,7 @@ mod tests {
         assert!(!loaded.fancy_graphics);
         assert_eq!(loaded.mipmap_levels, 2);
         assert!((loaded.brightness - 0.55).abs() < 1e-6);
+        assert!(loaded.old_animations);
 
         let _ = std::fs::remove_file(&path);
     }

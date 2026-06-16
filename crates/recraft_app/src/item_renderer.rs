@@ -51,6 +51,64 @@ pub struct PlayerHeldItem {
     pub light: [f32; 2],
 }
 
+/// Built item geometry for one frame: the normal textured `Vertex` data plus
+/// the glint subset (geometry belonging to enchanted items only), which the
+/// renderer re-draws additively with the scrolling glint texture. The glint
+/// geometry is identical to the item geometry — only the pipeline/shader differ
+/// — so an enchanted item's vertices are pushed to both `vertices` and `glint`.
+#[derive(Default)]
+pub struct ItemGeometry {
+    pub vertices: Vec<Vertex>,
+    pub indices: Vec<u32>,
+    pub glint_vertices: Vec<Vertex>,
+    pub glint_indices: Vec<u32>,
+}
+
+impl ItemGeometry {
+    /// Append `(verts, idx)` to the normal output, and additionally to the glint
+    /// output when `enchanted`. Re-indexes against the destination's length.
+    fn push(&mut self, verts: Vec<Vertex>, idx: Vec<u32>, enchanted: bool) {
+        if enchanted {
+            let base = self.glint_vertices.len() as u32;
+            self.glint_vertices.extend(verts.iter().copied());
+            self.glint_indices.extend(idx.iter().map(|i| i + base));
+        }
+        let base = self.vertices.len() as u32;
+        self.vertices.extend(verts);
+        self.indices.extend(idx.into_iter().map(|i| i + base));
+    }
+
+    /// Merge another built geometry into this one, re-indexing both the normal
+    /// and glint streams (used to fold falling blocks and third-person held
+    /// items into the shared world-item buffers).
+    pub fn extend(&mut self, other: ItemGeometry) {
+        let vbase = self.vertices.len() as u32;
+        self.vertices.extend(other.vertices);
+        self.indices.extend(other.indices.into_iter().map(|i| i + vbase));
+        let gbase = self.glint_vertices.len() as u32;
+        self.glint_vertices.extend(other.glint_vertices);
+        self.glint_indices
+            .extend(other.glint_indices.into_iter().map(|i| i + gbase));
+    }
+}
+
+/// Whether a stack should render with the enchantment glint. Vanilla
+/// `ItemStack.hasEffect`: true when the item carries a non-empty `ench` tag, and
+/// always for the enchanted book (id 403) regardless of its `StoredEnchantments`
+/// (`ItemEnchantedBook.hasEffect` is unconditional). The book's stored list is
+/// also honoured so a book whose `ench` is absent still glints.
+pub fn is_enchanted(item: &SlotItem) -> bool {
+    if item.id == 403 {
+        return true;
+    }
+    let Some(nbt) = item.nbt.as_ref() else {
+        return false;
+    };
+    let non_empty_list =
+        |key: &str| nbt.get(key).and_then(|t| t.as_list()).is_some_and(|l| !l.is_empty());
+    non_empty_list("ench") || non_empty_list("StoredEnchantments")
+}
+
 pub struct ItemRenderer;
 
 impl ItemRenderer {
@@ -67,16 +125,18 @@ impl ItemRenderer {
         );
     }
 
-    /// Build the held item's first-person geometry for this frame.
+    /// Build the held item's first-person geometry for this frame. The whole
+    /// item also feeds the glint output when it is enchanted.
     pub fn build_held_item(
         camera: &Camera,
         view: &FirstPersonView,
         atlas: &AtlasUv,
-    ) -> (Vec<Vertex>, Vec<u32>) {
+    ) -> ItemGeometry {
+        let mut out = ItemGeometry::default();
         let mut vertices = Vec::new();
         let mut indices = Vec::new();
         let Some(ref item) = view.item else {
-            return (vertices, indices);
+            return out;
         };
 
         // Common head of the chain: swing translation and the base
@@ -105,7 +165,7 @@ impl ItemRenderer {
         if (0..256).contains(&item.id) {
             let block = BlockState::new(item.id as u16, (item.damage.max(0) & 15) as u8);
             if block.is_air() || block.render_shape() == RenderShape::None {
-                return (vertices, indices);
+                return out;
             }
             match block.render_shape() {
                 // Flat blocks (torches, flowers, rails, ladders) use generated
@@ -146,7 +206,8 @@ impl ItemRenderer {
                 recraft_render::FULLBRIGHT,
             );
         }
-        (vertices, indices)
+        out.push(vertices, indices, is_enchanted(item));
+        out
     }
 
     /// Build geometry for every dropped item in the world this frame: block
@@ -156,9 +217,8 @@ impl ItemRenderer {
         camera: &Camera,
         items: &[DroppedItem],
         atlas: &AtlasUv,
-    ) -> (Vec<Vertex>, Vec<u32>) {
-        let mut vertices = Vec::new();
-        let mut indices = Vec::new();
+    ) -> ItemGeometry {
+        let mut out = ItemGeometry::default();
         // Camera basis so sprite items face the viewer.
         let forward = camera.direction();
         let right = forward.cross(Vec3::Y).normalize_or_zero();
@@ -179,6 +239,10 @@ impl ItemRenderer {
                 }
             };
 
+            // Build this item into its own buffer so an enchanted item's whole
+            // geometry can be routed to the glint output.
+            let mut v = Vec::new();
+            let mut i = Vec::new();
             let item = &d.item;
             if (0..256).contains(&item.id) {
                 let block = BlockState::new(item.id as u16, (item.damage.max(0) & 15) as u8);
@@ -190,8 +254,8 @@ impl ItemRenderer {
                         let name = block.texture_name(BlockFace::Side).map(str::to_owned);
                         let tint = tint3(block.tint(BlockFace::Side));
                         push_sprite(
-                            &mut vertices,
-                            &mut indices,
+                            &mut v,
+                            &mut i,
                             &sprite_to_world(0.25),
                             name.as_deref(),
                             atlas,
@@ -203,18 +267,18 @@ impl ItemRenderer {
                         // Spinning cube about Y: vanilla rotates at (age+partial)/20 rad/tick.
                         let (s, c) = (d.phase * 0.05).sin_cos();
                         let size = 0.25;
-                        let spin_to_world = |v: Vec3| {
-                            let p = (v - Vec3::splat(0.5)) * size;
+                        let spin_to_world = |corner: Vec3| {
+                            let p = (corner - Vec3::splat(0.5)) * size;
                             base + Vec3::new(p.x * c - p.z * s, p.y, p.x * s + p.z * c)
                         };
-                        push_block_cube(&mut vertices, &mut indices, &spin_to_world, block, atlas, d.light);
+                        push_block_cube(&mut v, &mut i, &spin_to_world, block, atlas, d.light);
                     }
                 }
             } else if let Some(name) = item_texture_name(item.id) {
                 let name = format!("items/{name}");
                 push_sprite(
-                    &mut vertices,
-                    &mut indices,
+                    &mut v,
+                    &mut i,
                     &sprite_to_world(0.25),
                     Some(&name),
                     atlas,
@@ -222,8 +286,9 @@ impl ItemRenderer {
                     d.light,
                 );
             }
+            out.push(v, i, is_enchanted(item));
         }
-        (vertices, indices)
+        out
     }
 
     /// Build full terrain-textured cubes for the falling-block entities this
@@ -255,13 +320,14 @@ impl ItemRenderer {
     pub fn build_player_held_items(
         held: &[PlayerHeldItem],
         atlas: &AtlasUv,
-    ) -> (Vec<Vertex>, Vec<u32>) {
-        let mut vertices = Vec::new();
-        let mut indices = Vec::new();
+    ) -> ItemGeometry {
+        let mut out = ItemGeometry::default();
 
         for h in held {
             let f = &h.frame;
             let item = &h.item;
+            let mut vertices = Vec::new();
+            let mut indices = Vec::new();
             // The item extends along the arm direction, centered at the hand.
             // `arm_dir` points shoulder→hand (roughly downward at rest),
             // `forward` is the body's front, `right` is the lateral axis.
@@ -324,8 +390,9 @@ impl ItemRenderer {
                     h.light,
                 );
             }
+            out.push(vertices, indices, is_enchanted(item));
         }
-        (vertices, indices)
+        out
     }
 }
 
@@ -699,6 +766,7 @@ fn push_sprite(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use recraft_protocol::nbt::NbtTag;
     use recraft_protocol::v1_8_9::packets::SlotItem;
     use recraft_render::TextureAtlasImage;
 
@@ -724,45 +792,79 @@ mod tests {
 
     #[test]
     fn block_items_build_a_textured_cube() {
-        let (vertices, indices) =
-            ItemRenderer::build_held_item(&camera(), &view(Some(1)), &atlas());
-        assert_eq!(vertices.len(), 24);
-        assert_eq!(indices.len(), 36);
+        let g = ItemRenderer::build_held_item(&camera(), &view(Some(1)), &atlas());
+        assert_eq!(g.vertices.len(), 24);
+        assert_eq!(g.indices.len(), 36);
+        // A plain stone block is not enchanted → no glint geometry.
+        assert!(g.glint_vertices.is_empty() && g.glint_indices.is_empty());
     }
 
     #[test]
     fn sprite_items_build_extruded_geometry() {
         let uv = atlas();
-        let (vertices, indices) =
-            ItemRenderer::build_held_item(&camera(), &view(Some(276)), &uv);
+        let g = ItemRenderer::build_held_item(&camera(), &view(Some(276)), &uv);
         // Front + back quads (8 verts) plus extruded silhouette edges; every
         // face is a quad, so verts are a multiple of 4 and indices = 6/quad.
-        assert!(vertices.len() >= 8, "at least the front/back faces");
-        assert_eq!(vertices.len() % 4, 0);
-        assert_eq!(indices.len(), vertices.len() / 4 * 6);
+        assert!(g.vertices.len() >= 8, "at least the front/back faces");
+        assert_eq!(g.vertices.len() % 4, 0);
+        assert_eq!(g.indices.len(), g.vertices.len() / 4 * 6);
         assert!(!uv.is_missing_tile(Some("items/diamond_sword")));
     }
 
     #[test]
     fn flat_blocks_hold_as_sprites() {
-        let (vertices, _) = ItemRenderer::build_held_item(&camera(), &view(Some(50)), &atlas());
+        let g = ItemRenderer::build_held_item(&camera(), &view(Some(50)), &atlas());
         assert!(
-            vertices.len() >= 8 && vertices.len() % 4 == 0,
+            g.vertices.len() >= 8 && g.vertices.len() % 4 == 0,
             "torch should render as an extruded sprite"
         );
     }
 
     #[test]
     fn barrier_item_builds_nothing() {
-        let (vertices, indices) =
-            ItemRenderer::build_held_item(&camera(), &view(Some(166)), &atlas());
-        assert!(vertices.is_empty() && indices.is_empty());
+        let g = ItemRenderer::build_held_item(&camera(), &view(Some(166)), &atlas());
+        assert!(g.vertices.is_empty() && g.indices.is_empty());
     }
 
     #[test]
     fn empty_hand_builds_nothing() {
-        let (vertices, indices) = ItemRenderer::build_held_item(&camera(), &view(None), &atlas());
-        assert!(vertices.is_empty() && indices.is_empty());
+        let g = ItemRenderer::build_held_item(&camera(), &view(None), &atlas());
+        assert!(g.vertices.is_empty() && g.indices.is_empty());
+    }
+
+    #[test]
+    fn enchanted_item_emits_matching_glint_geometry() {
+        // An enchanted sword (a non-empty `ench` tag) re-draws its full geometry
+        // through the glint output.
+        let mut item = SlotItem::new(276, 1, 0);
+        let mut ench = std::collections::HashMap::new();
+        ench.insert("id".to_string(), NbtTag::Short(16));
+        ench.insert("lvl".to_string(), NbtTag::Short(5));
+        item.nbt = Some(std::collections::HashMap::from([(
+            "ench".to_string(),
+            NbtTag::List(vec![NbtTag::Compound(ench)]),
+        )]));
+        let v = FirstPersonView {
+            item: Some(item),
+            equip_progress: 0.0,
+            swing_progress: 0.0,
+            arm_lag_pitch: 0.0,
+            arm_lag_yaw: 0.0,
+            use_action: crate::game::ItemUseAction::None,
+            use_ticks: 0.0,
+        };
+        let g = ItemRenderer::build_held_item(&camera(), &v, &atlas());
+        assert_eq!(g.glint_vertices.len(), g.vertices.len());
+        assert_eq!(g.glint_indices.len(), g.indices.len());
+        assert!(!g.glint_vertices.is_empty());
+    }
+
+    #[test]
+    fn enchanted_book_always_glints_without_nbt() {
+        // Enchanted book (id 403) glows unconditionally (vanilla hasEffect).
+        assert!(is_enchanted(&SlotItem::new(403, 1, 0)));
+        // A plain item with no NBT does not.
+        assert!(!is_enchanted(&SlotItem::new(276, 1, 0)));
     }
 
     fn dropped(id: i16) -> DroppedItem {
@@ -776,29 +878,27 @@ mod tests {
 
     #[test]
     fn dropped_block_builds_a_spinning_cube() {
-        let (vertices, indices) =
-            ItemRenderer::build_world_items(&camera(), &[dropped(1)], &atlas());
-        assert_eq!(vertices.len(), 24); // one cube
-        assert_eq!(indices.len(), 36);
+        let g = ItemRenderer::build_world_items(&camera(), &[dropped(1)], &atlas());
+        assert_eq!(g.vertices.len(), 24); // one cube
+        assert_eq!(g.indices.len(), 36);
         // The cube sits roughly at the item's world position (bobbed up a little).
         let centroid: Vec3 =
-            vertices.iter().map(|v| Vec3::from(v.position)).sum::<Vec3>() / vertices.len() as f32;
+            g.vertices.iter().map(|v| Vec3::from(v.position)).sum::<Vec3>() / g.vertices.len() as f32;
         assert!((centroid - Vec3::new(0.0, 64.0, -3.0)).length() < 1.0);
     }
 
     #[test]
     fn dropped_sprite_billboards_toward_the_camera() {
-        let (vertices, indices) =
-            ItemRenderer::build_world_items(&camera(), &[dropped(276)], &atlas());
-        assert!(vertices.len() >= 8);
-        assert_eq!(vertices.len() % 4, 0);
-        assert_eq!(indices.len(), vertices.len() / 4 * 6);
+        let g = ItemRenderer::build_world_items(&camera(), &[dropped(276)], &atlas());
+        assert!(g.vertices.len() >= 8);
+        assert_eq!(g.vertices.len() % 4, 0);
+        assert_eq!(g.indices.len(), g.vertices.len() / 4 * 6);
     }
 
     #[test]
     fn no_dropped_items_builds_nothing() {
-        let (vertices, indices) = ItemRenderer::build_world_items(&camera(), &[], &atlas());
-        assert!(vertices.is_empty() && indices.is_empty());
+        let g = ItemRenderer::build_world_items(&camera(), &[], &atlas());
+        assert!(g.vertices.is_empty() && g.indices.is_empty());
     }
 
     #[test]
