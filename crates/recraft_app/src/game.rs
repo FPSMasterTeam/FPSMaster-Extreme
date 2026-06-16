@@ -469,6 +469,9 @@ pub struct GameState {
     /// (fully closed) are pruned. The open target is driven by S24 BlockAction
     /// (viewer count); see [`GameState::tick_chest_lids`].
     chest_lid_angles: std::collections::HashMap<[i32; 3], f32>,
+    /// Per-chest lid-open TARGET (1 while a viewer has it open, 0 otherwise),
+    /// set by the S24 BlockAction viewer count; `chest_lid_angles` eases toward it.
+    chest_open_targets: std::collections::HashMap<[i32; 3], f32>,
     // Smoothed 0..1 view-state amounts, advanced once per physics tick so the
     // sneak camera dip and sprint FOV widen ease in/out instead of snapping.
     sneak_amount: f32,
@@ -712,6 +715,7 @@ impl GameState {
             urgent_remesh: HashSet::new(),
             pending_block_changes: std::collections::HashMap::new(),
             chest_lid_angles: std::collections::HashMap::new(),
+            chest_open_targets: std::collections::HashMap::new(),
             sneak_amount: 0.0,
             previous_sneak_amount: 0.0,
             sprint_amount: 0.0,
@@ -1719,12 +1723,16 @@ impl GameState {
     /// BlockAction handler inserts. Run once per simulation tick from
     /// [`Self::advance_view_state`].
     fn tick_chest_lids(&mut self) {
-        self.chest_lid_angles.retain(|_, angle| {
-            // Targets aren't tracked yet (no BlockAction), so ease toward closed;
-            // a BlockAction handler would set the entry to its open target first.
-            *angle += (0.0 - *angle) * 0.1;
-            *angle > 0.001
+        let targets = &self.chest_open_targets;
+        self.chest_lid_angles.retain(|pos, angle| {
+            let target = targets.get(pos).copied().unwrap_or(0.0);
+            // Vanilla TileEntityChest eases the lid at 0.1/tick toward the target.
+            *angle += (target - *angle) * 0.1;
+            // Keep entries that are open, opening, or still closing.
+            *angle > 0.001 || target > 0.0
         });
+        // Drop closed targets so the maps don't grow unbounded.
+        self.chest_open_targets.retain(|_, t| *t > 0.0);
     }
 
     /// World-light factor (0..1) for a model drawn at `pos`, matching the chunk
@@ -3475,6 +3483,24 @@ impl GameState {
                     let above = Vec3::new(x as f32 + 0.5, y as f32 + 1.2, z as f32 + 0.5);
                     self.particles
                         .spawn(23, above, Vec3::new(note as f32 / 24.0, 0.0, 0.0), 0.0, 1, &[]);
+                } else if matches!(block_type, 54 | 130 | 146) && action_id == 1 {
+                    // Chest/ender/trapped lid: action_param is the viewer count.
+                    // Drive the lid-open target and play the open/close sound on
+                    // the 0↔viewers transition (vanilla random.chestopen/closed).
+                    let pos = [x, y, z];
+                    let was_open = self.chest_open_targets.get(&pos).copied().unwrap_or(0.0) > 0.0;
+                    let now_open = action_param > 0;
+                    if now_open {
+                        self.chest_open_targets.insert(pos, 1.0);
+                        self.chest_lid_angles.entry(pos).or_insert(0.0);
+                    } else {
+                        self.chest_open_targets.insert(pos, 0.0);
+                    }
+                    if now_open != was_open {
+                        let center = Vec3::new(x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5);
+                        let event = if now_open { "random.chestopen" } else { "random.chestclosed" };
+                        self.queue_sound(event.to_string(), center, 0.5, 1.0);
+                    }
                 }
                 false
             }
@@ -5801,9 +5827,10 @@ mod interaction_tests {
     }
 
     #[test]
-    fn block_action_for_non_note_block_is_ignored() {
+    fn chest_block_action_opens_the_lid_and_plays_the_sound() {
         let mut g = GameState::empty_for_server(1.0);
-        // A chest open (block type 54) carries no client sound here.
+        // A chest open (block type 54, action 1, viewers=1) arms the lid target
+        // and plays random.chestopen once.
         g.apply_play_packet(ClientboundPlayPacket::BlockAction {
             x: 0,
             y: 0,
@@ -5811,6 +5838,36 @@ mod interaction_tests {
             action_id: 1,
             action_param: 1,
             block_type: 54,
+        });
+        let sounds = g.take_sounds();
+        assert_eq!(sounds.len(), 1);
+        assert_eq!(sounds[0].event, "random.chestopen");
+        assert!(g.chest_open_targets.get(&[0, 0, 0]).copied().unwrap_or(0.0) > 0.0);
+        // Closing (viewers=0) plays the close sound and clears the target.
+        g.apply_play_packet(ClientboundPlayPacket::BlockAction {
+            x: 0,
+            y: 0,
+            z: 0,
+            action_id: 1,
+            action_param: 0,
+            block_type: 54,
+        });
+        let sounds = g.take_sounds();
+        assert_eq!(sounds.len(), 1);
+        assert_eq!(sounds[0].event, "random.chestclosed");
+    }
+
+    #[test]
+    fn piston_block_action_is_ignored() {
+        let mut g = GameState::empty_for_server(1.0);
+        // A piston extend (block type 33) carries no client sound/lid here.
+        g.apply_play_packet(ClientboundPlayPacket::BlockAction {
+            x: 0,
+            y: 0,
+            z: 0,
+            action_id: 0,
+            action_param: 1,
+            block_type: 33,
         });
         assert!(g.take_sounds().is_empty());
     }
