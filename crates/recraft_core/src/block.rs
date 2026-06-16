@@ -76,6 +76,10 @@ impl BlockState {
         if self.id == 166 {
             return RenderShape::None;
         }
+        // Water/lava render as a level-dependent fluid surface, not a full cube.
+        if self.is_water() || self.is_lava() {
+            return RenderShape::Fluid;
+        }
         match self.shape() {
             Shape::Cross => RenderShape::Cross,
             Shape::Rail => RenderShape::Rail,
@@ -352,6 +356,8 @@ pub enum RenderShape {
     PistonHead,
     /// Torch / redstone torch: a thin post, floor-standing or wall-leaning.
     Torch,
+    /// Water/lava: a surface whose height depends on the fluid level (meta).
+    Fluid,
 }
 
 /// An axis-aligned box in unit (0..1) block space.

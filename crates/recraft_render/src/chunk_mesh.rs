@@ -574,6 +574,96 @@ fn append_block<S: BlockSource>(
         RenderShape::Piston => append_piston(mesh, ctx, x, y, z, block),
         RenderShape::PistonHead => append_piston_head(mesh, ctx, x, y, z, block),
         RenderShape::Torch => append_torch(mesh, ctx, x, y, z, block),
+        RenderShape::Fluid => append_fluid(mesh, ctx, x, y, z, block),
+    }
+}
+
+/// Vanilla `BlockLiquid` surface height for a fluid level (meta). Source (0) and
+/// falling (>=8) sit near the top; flowing levels 1-7 step down. (`1 -
+/// (level+1)/9`, the `getLiquidHeightPercent` shape, flattened per-block — the
+/// smooth four-corner slope from `BlockFluidRenderer.getFluidHeight` is a
+/// follow-up; flow-direction UV rotation is likewise omitted ⚠️.)
+fn fluid_surface_height(meta: u8) -> f32 {
+    let level = if meta >= 8 { 0 } else { meta };
+    1.0 - (level as f32 + 1.0) / 9.0
+}
+
+/// Water/lava (`BlockLiquid`): a box whose top sits at the level-derived surface
+/// height, so flowing fluid renders as the stepped "incomplete" blocks rather
+/// than full cubes. Faces cull against opaque neighbours; a same-fluid neighbour
+/// hides the shared part (a taller block still shows its exposed upper strip).
+fn append_fluid<S: BlockSource>(
+    mesh: &mut ChunkMesh,
+    ctx: &BlockCtx<S>,
+    x: i32,
+    y: i32,
+    z: i32,
+    block: BlockState,
+) {
+    let same_fluid = |b: BlockState| {
+        (block.is_water() && b.is_water()) || (block.is_lava() && b.is_lava())
+    };
+    // A continuous column (same fluid above) renders full height.
+    let above = neighbor_block(ctx, x, y + 1, z);
+    let height = if same_fluid(above) {
+        1.0
+    } else {
+        fluid_surface_height(block.meta)
+    };
+    let alpha = block.render_alpha();
+    let buffer = buffer_for(mesh, block);
+    for face in &FACES {
+        let (nx, ny, nz) = (x + face.normal[0], y + face.normal[1], z + face.normal[2]);
+        let neighbor = neighbor_block(ctx, nx, ny, nz);
+        if neighbor.is_opaque_cube() {
+            continue;
+        }
+        let mut mn = [0.0f32; 3];
+        let mx = [1.0f32, height, 1.0f32];
+        match face.normal {
+            [0, 1, 0] => {
+                // Top surface — hidden when the column continues upward.
+                if same_fluid(above) {
+                    continue;
+                }
+            }
+            [0, -1, 0] => {
+                // Bottom — hidden when fluid continues below.
+                if same_fluid(neighbor) {
+                    continue;
+                }
+            }
+            _ => {
+                if same_fluid(neighbor) {
+                    let n_above = neighbor_block(ctx, nx, ny + 1, nz);
+                    let n_height = if same_fluid(n_above) {
+                        1.0
+                    } else {
+                        fluid_surface_height(neighbor.meta)
+                    };
+                    if n_height >= height {
+                        continue; // fully hidden by an equal/taller neighbour
+                    }
+                    mn[1] = n_height; // only the exposed strip above the neighbour
+                }
+            }
+        }
+        emit_face(
+            buffer,
+            ctx,
+            face,
+            x,
+            y,
+            z,
+            mn,
+            mx,
+            block.texture_name(face.face),
+            block,
+            alpha,
+            nx,
+            ny,
+            nz,
+        );
     }
 }
 
