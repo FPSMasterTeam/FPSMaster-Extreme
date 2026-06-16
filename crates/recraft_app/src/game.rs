@@ -409,6 +409,20 @@ pub struct GameState {
     health: f32,
     /// Last server-reported food level.
     food: i32,
+    /// Last server-reported food saturation (drives the hunger-bar jiggle).
+    saturation: f32,
+    /// Set once UpdateHealth has been received, so the first server health value
+    /// (the spawn value) plays no hurt sound and seeds no heart highlight.
+    health_received: bool,
+    /// Vanilla `GuiIngame.updateCounter`: a free-running client-tick counter that
+    /// seeds the heart-shake RNG and the heart/hunger blink timing.
+    hud_update_counter: i32,
+    /// Vanilla `GuiIngame.healthUpdateCounter`: the tick (in `hud_update_counter`
+    /// units) until which the heart row draws its blinking highlight frame.
+    health_update_counter: i64,
+    /// Vanilla `GuiIngame.lastPlayerHealth` (`j`): the health snapshot drawn in the
+    /// highlight frame while the row blinks after a health change.
+    last_player_health: i32,
     /// Experience bar fill (0..1) and level, from SetExperience.
     xp_bar: f32,
     xp_level: i32,
@@ -693,6 +707,11 @@ impl GameState {
             needs_respawn: false,
             health: 20.0,
             food: 20,
+            saturation: 5.0,
+            health_received: false,
+            hud_update_counter: 0,
+            health_update_counter: 0,
+            last_player_health: 20,
             xp_bar: 0.0,
             xp_level: 0,
             is_dead: false,
@@ -861,6 +880,24 @@ impl GameState {
 
     pub fn food(&self) -> i32 {
         self.food
+    }
+
+    /// Heart/hunger HUD animation state (vanilla `renderPlayerStats`): the live
+    /// food saturation plus the tick counters that drive the heart-shake RNG and
+    /// the heart-row blink/highlight.
+    pub fn hud_vitals(&self) -> crate::gui::ingame::HudVitals {
+        crate::gui::ingame::HudVitals {
+            saturation: self.saturation,
+            // Absorption and max-health are not plumbed: the server carries
+            // absorption only in EntityProperties/metadata (not parsed for the
+            // local player), and UpdateHealth has no absorption field. Default to
+            // the vanilla base 20 HP / 0 absorption.
+            max_health: 20.0,
+            absorption: 0.0,
+            update_counter: self.hud_update_counter,
+            health_update_counter: self.health_update_counter,
+            last_player_health: self.last_player_health,
+        }
     }
 
     /// World time of day in ticks, interpolated by `tick_alpha` (0..1) for a
@@ -1224,6 +1261,9 @@ impl GameState {
     /// teleport ack (already sent via [`take_position_confirm`]) and resumes
     /// movement next tick. The caller must not send a movement packet on `None`.
     pub fn tick(&mut self, dt: f32) -> Option<(Vec<ServerboundPacket>, MovementSnapshot)> {
+        // Vanilla GuiIngame.updateTick: a free-running tick counter that drives the
+        // heart-shake RNG and the heart/hunger blink timing.
+        self.hud_update_counter = self.hud_update_counter.wrapping_add(1);
         self.title.tick();
         // Advance the day/night clock one tick (vanilla ticks world time forward
         // locally between server updates), unless daylight cycle is off.
@@ -2867,9 +2907,33 @@ impl GameState {
                 self.world.upsert_entity(self.player.clone());
                 false
             }
-            ClientboundPlayPacket::UpdateHealth { health, food, .. } => {
+            ClientboundPlayPacket::UpdateHealth {
+                health,
+                food,
+                food_saturation,
+            } => {
+                // Vanilla seeds the heart-row highlight from the local player's
+                // hurtResistantTime, which the client does not simulate here. The
+                // server's UpdateHealth is the change signal instead: on a health
+                // change, blink the row (20 ticks on damage, 10 on heal) and record
+                // the pre-change health drawn in the highlight frame (vanilla `j`).
+                // The very first value is the spawn health, so it seeds no blink.
+                // The hurt *sound* is played from the EntityStatus(2) path (vanilla
+                // EntityPlayer.handleStatusUpdate), not from UpdateHealth.
+                if self.health_received {
+                    let old = self.health.ceil() as i32;
+                    let new = health.ceil() as i32;
+                    if let Some(window) = crate::gui::ingame::health_blink_window(old, new) {
+                        self.last_player_health = old;
+                        self.health_update_counter = (self.hud_update_counter + window) as i64;
+                    }
+                } else {
+                    self.last_player_health = health.ceil() as i32;
+                }
+                self.health_received = true;
                 self.health = health;
                 self.food = food;
+                self.saturation = food_saturation;
                 // A dead player is frozen by the server until it respawns. We no
                 // longer auto-respawn — the UI shows a death screen and the player
                 // clicks "respawn" (which sets needs_respawn via request_respawn).
@@ -3398,6 +3462,14 @@ impl GameState {
                 if status == 2 {
                     if let Some(entity) = self.world.entity_mut(EntityId(entity_id)) {
                         entity.start_hurt();
+                    }
+                    // The local player's own hurt animation also plays the hurt
+                    // sound (vanilla EntityPlayer.handleStatusUpdate → playHurtSound).
+                    // UpdateHealth covers damage that changes health, but EntityStatus
+                    // fires on every hit (incl. absorbed/blocked), so play it here too.
+                    if EntityId(entity_id) == self.player.id {
+                        let pos = self.camera.position;
+                        self.queue_sound("game.player.hurt", pos, 1.0, 1.0);
                     }
                 }
                 false

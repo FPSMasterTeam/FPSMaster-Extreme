@@ -1565,6 +1565,7 @@ fn render_frame(
     let hud = HudState {
         health: game.health(),
         food: game.food(),
+        vitals: game.hud_vitals(),
         armor: game.armor(),
         xp_bar: game.xp_bar(),
         xp_level: game.xp_level(),
