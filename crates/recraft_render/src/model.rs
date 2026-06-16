@@ -3,7 +3,7 @@ use glam::Vec3;
 use recraft_core::EntityKind;
 
 use crate::texture::{
-    entity_slot_origin, EntitySlot, ENTITY_ATLAS_HEIGHT, ENTITY_ATLAS_WIDTH, ENTITY_SLOT_PX,
+    entity_slot_origin, slot_grid_origin, EntitySlot, ENTITY_ATLAS_HEIGHT, ENTITY_ATLAS_WIDTH,
     ENTITY_WHITE_UV, PLAYER_SKIN_BASE_ROW,
 };
 
@@ -295,25 +295,50 @@ impl ModelMesh {
             MobModel::Insect { slot } => {
                 self.push_parts(&insect_parts(), &insect_poses(anim), slot as u32, feet, yaw);
             }
+            MobModel::IronGolem => {
+                self.push_parts(&iron_golem_parts(), &iron_golem_poses(anim), EntitySlot::IronGolem as u32, feet, yaw);
+            }
+            MobModel::Horse => {
+                self.push_parts(&horse_parts(), &horse_poses(anim), EntitySlot::Horse as u32, feet, yaw);
+            }
+            MobModel::Witch => {
+                self.push_parts(&witch_parts(), &witch_poses(anim), EntitySlot::Witch as u32, feet, yaw);
+            }
+            MobModel::Guardian => {
+                self.push_parts(&guardian_parts(), &guardian_poses(anim), EntitySlot::Guardian as u32, feet, yaw);
+            }
+            MobModel::Wither => {
+                self.push_parts(&wither_parts(), &wither_poses(anim), EntitySlot::Wither as u32, feet, yaw);
+            }
+            MobModel::Rabbit => {
+                self.push_parts(&rabbit_parts(), &rabbit_poses(anim), EntitySlot::Rabbit as u32, feet, yaw);
+            }
+            MobModel::Floating { blaze: false } => {
+                self.push_parts(&ghast_parts(), &[], EntitySlot::Ghast as u32, feet, yaw);
+            }
+            MobModel::Floating { blaze: true } => {
+                self.push_parts(&blaze_parts(), &blaze_poses(anim), EntitySlot::Blaze as u32, feet, yaw);
+            }
         }
     }
 
     /// Build a model from px-space parts (feet at y=0, +y up, +z front): scale
     /// px→world by [`MODEL_SCALE`], rotate every part about the vertical axis
     /// through `feet` by `yaw_degrees`, and sample each face's texture rect
-    /// inside `slot` of the entity atlas.
+    /// inside the atlas slot at flat grid index `slot_index`.
     fn push_parts(
         &mut self,
         parts: &[Part],
         poses: &[PartPose],
-        slot_row: u32,
+        slot_index: u32,
         feet: Vec3,
         yaw_degrees: f32,
     ) {
         let scale = MODEL_SCALE;
         let yaw = yaw_degrees.to_radians();
         let (sin, cos) = (yaw.sin(), yaw.cos());
-        let origin = [0.0, (slot_row * ENTITY_SLOT_PX) as f32];
+        let (ox, oy) = slot_grid_origin(slot_index);
+        let origin = [ox as f32, oy as f32];
         // Box bounds stay in model px; the per-part closure articulates each
         // box about its pivot, scales px→world, then rotates by the body yaw.
         for (i, (min_px, max_px, region)) in parts.iter().enumerate() {
@@ -384,11 +409,20 @@ enum MobModel {
     Bat,
     /// A small ground crawler (silverfish / endermite).
     Insect { slot: EntitySlot },
+    IronGolem,
+    Horse,
+    Witch,
+    Guardian,
+    Wither,
+    Rabbit,
+    /// Ghast (cube body + dangling tentacles) / blaze (head + rods). `blaze`
+    /// switches the part list and slot.
+    Floating { blaze: bool },
 }
 
 /// 1.8 SpawnMob type ids -> model archetype. Ids without a model return None and
-/// are drawn as a solid colored box (wither, ender dragon, guardian, witch,
-/// iron golem, horse, ghast, blaze — texture too large or model not yet built).
+/// are hidden. The ender dragon (63) is intentionally left unmodelled: its
+/// multi-segment animated model is out of scope for a single box-archetype.
 fn mob_model(id: u8) -> Option<MobModel> {
     use EntitySlot::*;
     Some(match id {
@@ -414,6 +448,14 @@ fn mob_model(id: u8) -> Option<MobModel> {
         65 => MobModel::Bat,
         60 => MobModel::Insect { slot: Silverfish },
         67 => MobModel::Insect { slot: Silverfish }, // endermite (silverfish stand-in)
+        99 => MobModel::IronGolem,
+        100 => MobModel::Horse,
+        66 => MobModel::Witch,
+        56 => MobModel::Floating { blaze: false }, // ghast
+        61 => MobModel::Floating { blaze: true },  // blaze
+        68 => MobModel::Guardian,
+        64 => MobModel::Wither,
+        101 => MobModel::Rabbit,
         _ => return None,
     })
 }
@@ -432,11 +474,14 @@ fn box_region(u: f32, v: f32, w: f32, h: f32, d: f32) -> [[f32; 4]; 6] {
     ]
 }
 
-/// The six humanoid parts with the standard 1.8 skin layout. With
+/// The seven humanoid parts with the standard 1.8 skin layout. With
 /// `separate_left_limbs` (64x64 player skins) the left arm/leg use their own
 /// regions; without it (64x32 mob skins: zombie/skeleton/villager slots) the
-/// left limbs mirror the right-limb regions.
-fn humanoid_parts(separate_left_limbs: bool) -> [Part; 6] {
+/// left limbs mirror the right-limb regions. The seventh part is the hat
+/// overlay (vanilla `ModelBiped.bipedHeadwear`): an inflated head box sampling
+/// the head-overlay UV region at (32,0); on legacy 64x32 skins that region is
+/// transparent so the overlay simply adds nothing.
+fn humanoid_parts(separate_left_limbs: bool) -> [Part; 7] {
     let head = box_region(0.0, 0.0, 8.0, 8.0, 8.0);
     let body = box_region(16.0, 16.0, 8.0, 12.0, 4.0);
     let arm_r = box_region(40.0, 16.0, 4.0, 12.0, 4.0);
@@ -451,6 +496,9 @@ fn humanoid_parts(separate_left_limbs: bool) -> [Part; 6] {
     } else {
         leg_r
     };
+    // Hat overlay grown 0.5px on every axis, same head box, UV at (32,0).
+    // Vanilla bipedHeadwear: rp(0,0,0), addBox(-4,-8,-4, 8,8,8, scale+0.5).
+    let hat = vbox([0.0, 0.0, 0.0], [-4.0, -8.0, -4.0], [8.0, 8.0, 8.0], [32.0, 0.0], 0.5);
     [
         ([-4.0, 0.0, -2.0], [0.0, 12.0, 2.0], leg_r), // right leg
         ([0.0, 0.0, -2.0], [4.0, 12.0, 2.0], leg_l),  // left leg
@@ -458,6 +506,7 @@ fn humanoid_parts(separate_left_limbs: bool) -> [Part; 6] {
         ([-8.0, 12.0, -2.0], [-4.0, 24.0, 2.0], arm_r), // right arm
         ([4.0, 12.0, -2.0], [8.0, 24.0, 2.0], arm_l), // left arm
         ([-4.0, 24.0, -4.0], [4.0, 32.0, 4.0], head), // head
+        hat,                                          // hat overlay
     ]
 }
 
@@ -614,8 +663,8 @@ fn swing(limb_swing: f32, amount: f32, phase: f32, scale: f32) -> f32 {
 /// Humanoid (player / biped mob) articulation: opposite-phase leg/arm swing,
 /// head yaw+pitch, the attack arm-swing on the right arm, and the sneak crouch.
 /// Order matches [`humanoid_parts`]: right leg, left leg, body, right arm, left
-/// arm, head.
-fn humanoid_poses(anim: &EntityAnim) -> [PartPose; 6] {
+/// arm, head, hat (the hat tracks the head).
+fn humanoid_poses(anim: &EntityAnim) -> [PartPose; 7] {
     use std::f32::consts::PI;
     let (s, a) = (anim.limb_swing, anim.limb_swing_amount);
     let head_y = anim.net_head_yaw.to_radians();
@@ -665,6 +714,7 @@ fn humanoid_poses(anim: &EntityAnim) -> [PartPose; 6] {
             Vec3::new(arm_l_x + arm_extra, 0.0, 0.0),
         ),
         grouped(Vec3::new(0.0, 24.0, 0.0), Vec3::new(head_x, head_y, 0.0)),
+        grouped(Vec3::new(0.0, 24.0, 0.0), Vec3::new(head_x, head_y, 0.0)), // hat tracks the head
     ]
 }
 
@@ -1061,6 +1111,278 @@ fn insect_poses(anim: &EntityAnim) -> [PartPose; 3] {
     [PartPose::still(), PartPose::still(), PartPose::still()]
 }
 
+/// Iron golem (`ModelIronGolem`, iron_golem.png 128x128): a tall head with a
+/// nose, a wide blocky body with a hanging waist, two long arms and two thick
+/// legs. Vanilla offsets the head/body/legs by -7px (`p_i46362_2_`), which is
+/// folded into each rotation point here. Order: head, nose, body, waist, right
+/// arm, left arm, right leg, left leg.
+fn iron_golem_parts() -> [Part; 8] {
+    [
+        vbox([0.0, -7.0, -2.0], [-4.0, -12.0, -5.5], [8.0, 10.0, 8.0], [0.0, 0.0], 0.0), // head
+        vbox([0.0, -7.0, -2.0], [-1.0, -5.0, -7.5], [2.0, 4.0, 2.0], [24.0, 0.0], 0.0), // nose
+        vbox([0.0, -7.0, 0.0], [-9.0, -2.0, -6.0], [18.0, 12.0, 11.0], [0.0, 40.0], 0.0), // body
+        vbox([0.0, -7.0, 0.0], [-4.5, 10.0, -3.0], [9.0, 5.0, 6.0], [0.0, 70.0], 0.5), // waist
+        vbox([0.0, -7.0, 0.0], [-13.0, -2.5, -3.0], [4.0, 30.0, 6.0], [60.0, 21.0], 0.0), // right arm
+        vbox([0.0, -7.0, 0.0], [9.0, -2.5, -3.0], [4.0, 30.0, 6.0], [60.0, 58.0], 0.0), // left arm
+        vbox([5.0, 11.0, 0.0], [-3.5, -3.0, -3.0], [6.0, 16.0, 5.0], [60.0, 0.0], 0.0), // right leg
+        vbox([-4.0, 11.0, 0.0], [-3.5, -3.0, -3.0], [6.0, 16.0, 5.0], [37.0, 0.0], 0.0), // left leg
+    ]
+}
+
+fn iron_golem_poses(anim: &EntityAnim) -> [PartPose; 8] {
+    let (s, a) = (anim.limb_swing, anim.limb_swing_amount);
+    let head = head_pose(anim, vpivot([0.0, -7.0, -2.0]));
+    // Legs swing opposite each other; arms sway slightly out of phase.
+    let right_leg = leg_pose(vpivot([5.0, 11.0, 0.0]), swing(s, a, 0.0, 1.5));
+    let left_leg = leg_pose(vpivot([-4.0, 11.0, 0.0]), swing(s, a, std::f32::consts::PI, 1.5));
+    let arm = |sign: f32| leg_pose(vpivot([0.0, -7.0, 0.0]), swing(s, a, 0.0, 1.5) * sign - 0.2 * a);
+    [
+        head,
+        head, // nose tracks the head
+        PartPose::still(),
+        PartPose::still(),
+        arm(1.0),
+        arm(-1.0),
+        right_leg,
+        left_leg,
+    ]
+}
+
+/// Horse (`ModelHorse`, horse/horse_brown.png 128x128): a reasonable subset of
+/// the vanilla model — body, a 30°-tilted neck/head group (with the two head
+/// detail boxes, ears and mane) plus a three-segment hanging tail and four
+/// three-box legs. Saddle/tack is omitted. Order: body, [neck, head, head-top,
+/// mouth, right ear, left ear, mane], [tail base, mid, tip], then the 12 leg
+/// boxes (back-left, back-right, front-left, front-right; each leg/shin/hoof).
+fn horse_parts() -> [Part; 23] {
+    [
+        vbox([0.0, 11.0, 9.0], [-5.0, -8.0, -19.0], [10.0, 10.0, 24.0], [0.0, 34.0], 0.0), // body
+        // Neck/head group (rp 0,4,-10), tilted 30° in horse_poses.
+        vbox([0.0, 4.0, -10.0], [-2.05, -9.8, -2.0], [4.0, 14.0, 8.0], [0.0, 12.0], 0.0), // neck
+        vbox([0.0, 4.0, -10.0], [-2.5, -10.0, -1.5], [5.0, 5.0, 7.0], [0.0, 0.0], 0.0), // head
+        vbox([0.0, 3.95, -10.0], [-2.0, -10.0, -7.0], [4.0, 3.0, 6.0], [24.0, 18.0], 0.0), // upper snout
+        vbox([0.0, 4.0, -10.0], [-2.0, -7.0, -6.5], [4.0, 2.0, 5.0], [24.0, 27.0], 0.0), // mouth
+        vbox([0.0, 4.0, -10.0], [-2.45, -12.0, 4.0], [2.0, 3.0, 1.0], [0.0, 0.0], 0.0), // right ear
+        vbox([0.0, 4.0, -10.0], [0.45, -12.0, 4.0], [2.0, 3.0, 1.0], [0.0, 0.0], 0.0), // left ear
+        vbox([0.0, 4.0, -10.0], [-1.0, -11.5, 5.0], [2.0, 16.0, 4.0], [58.0, 0.0], 0.0), // mane
+        // Tail (rp 0,3,14), hanging back in horse_poses.
+        vbox([0.0, 3.0, 14.0], [-1.0, -1.0, 0.0], [2.0, 2.0, 3.0], [44.0, 0.0], 0.0), // tail base
+        vbox([0.0, 3.0, 14.0], [-1.5, -2.0, 3.0], [3.0, 4.0, 7.0], [38.0, 7.0], 0.0), // tail mid
+        vbox([0.0, 3.0, 14.0], [-1.5, -4.5, 9.0], [3.0, 4.0, 7.0], [24.0, 3.0], 0.0), // tail tip
+        // Legs (static): each leg + shin + hoof.
+        vbox([4.0, 9.0, 11.0], [-2.5, -2.0, -2.5], [4.0, 9.0, 5.0], [78.0, 29.0], 0.0), // BL leg
+        vbox([4.0, 16.0, 11.0], [-2.0, 0.0, -1.5], [3.0, 5.0, 3.0], [78.0, 43.0], 0.0), // BL shin
+        vbox([4.0, 16.0, 11.0], [-2.5, 5.1, -2.0], [4.0, 3.0, 4.0], [78.0, 51.0], 0.0), // BL hoof
+        vbox([-4.0, 9.0, 11.0], [-1.5, -2.0, -2.5], [4.0, 9.0, 5.0], [96.0, 29.0], 0.0), // BR leg
+        vbox([-4.0, 16.0, 11.0], [-1.0, 0.0, -1.5], [3.0, 5.0, 3.0], [96.0, 43.0], 0.0), // BR shin
+        vbox([-4.0, 16.0, 11.0], [-1.5, 5.1, -2.0], [4.0, 3.0, 4.0], [96.0, 51.0], 0.0), // BR hoof
+        vbox([4.0, 9.0, -8.0], [-1.9, -1.0, -2.1], [3.0, 8.0, 4.0], [44.0, 29.0], 0.0), // FL leg
+        vbox([4.0, 16.0, -8.0], [-1.9, 0.0, -1.6], [3.0, 5.0, 3.0], [44.0, 41.0], 0.0), // FL shin
+        vbox([4.0, 16.0, -8.0], [-2.4, 5.1, -2.1], [4.0, 3.0, 4.0], [44.0, 51.0], 0.0), // FL hoof
+        vbox([-4.0, 9.0, -8.0], [-1.1, -1.0, -2.1], [3.0, 8.0, 4.0], [60.0, 29.0], 0.0), // FR leg
+        vbox([-4.0, 16.0, -8.0], [-1.1, 0.0, -1.6], [3.0, 5.0, 3.0], [60.0, 41.0], 0.0), // FR shin
+        vbox([-4.0, 16.0, -8.0], [-1.6, 5.1, -2.1], [4.0, 3.0, 4.0], [60.0, 51.0], 0.0), // FR hoof
+    ]
+}
+
+fn horse_poses(anim: &EntityAnim) -> [PartPose; 23] {
+    use std::f32::consts::{FRAC_PI_6, PI};
+    let (s, a) = (anim.limb_swing, anim.limb_swing_amount);
+    // The neck/head group sits at a fixed 30° tilt (vanilla setBoxRotation),
+    // overlaid with head yaw/pitch.
+    let neck = PartPose {
+        pivot: vpivot([0.0, 4.0, -10.0]),
+        angles: Vec3::new(FRAC_PI_6 + anim.head_pitch.to_radians(), anim.net_head_yaw.to_radians(), 0.0),
+        group_pivot: Vec3::ZERO,
+        group_angle_x: 0.0,
+    };
+    let tail = |angle: f32| PartPose {
+        pivot: vpivot([0.0, 3.0, 14.0]),
+        angles: Vec3::new(angle, 0.0, 0.0),
+        group_pivot: Vec3::ZERO,
+        group_angle_x: 0.0,
+    };
+    let leg = |x: f32, z: f32, phase: f32| leg_pose(vpivot([x, 9.0, z]), swing(s, a, phase, 0.8));
+    [
+        PartPose::still(), // body
+        neck, neck, neck, neck, neck, neck, neck, // neck/head group + mane
+        tail(-1.134464), tail(-1.134464), tail(-1.40215), // tail segments
+        leg(4.0, 11.0, 0.0), leg(4.0, 11.0, 0.0), leg(4.0, 11.0, 0.0),      // back-left
+        leg(-4.0, 11.0, PI), leg(-4.0, 11.0, PI), leg(-4.0, 11.0, PI),      // back-right
+        leg(4.0, -8.0, PI), leg(4.0, -8.0, PI), leg(4.0, -8.0, PI),         // front-left
+        leg(-4.0, -8.0, 0.0), leg(-4.0, -8.0, 0.0), leg(-4.0, -8.0, 0.0),   // front-right
+    ]
+}
+
+/// Witch (`ModelWitch` extends `ModelVillager`, witch.png 64x128): the villager
+/// body plus a pointed hat (brim + two cone tiers) on the head and a wart on
+/// the nose. The villager parts come first (see [`villager_parts`]); then the
+/// hat brim, two cone tiers and the nose wart.
+fn witch_parts() -> [Part; 13] {
+    let v = villager_parts();
+    [
+        v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8],
+        // Hat brim: child of head (rp 0,0,0) at (-5,-10.03,-5), 10x2x10 @ (0,64).
+        vbox([-5.0, -10.03125, -5.0], [0.0, 0.0, 0.0], [10.0, 2.0, 10.0], [0.0, 64.0], 0.0),
+        // Cone tier 1 (7x4x7 @ (0,76)), centred over the brim.
+        vbox([-3.25, -14.03125, -3.0], [0.0, 0.0, 0.0], [7.0, 4.0, 7.0], [0.0, 76.0], 0.0),
+        // Cone tier 2 (4x4x4 @ (0,87)).
+        vbox([-1.5, -18.03125, -1.0], [0.0, 0.0, 0.0], [4.0, 4.0, 4.0], [0.0, 87.0], 0.0),
+        // Nose wart: child of the nose (cumulative rp 0,-4,0) @ (0,3,-6.75).
+        vbox([0.0, -4.0, 0.0], [0.0, 3.0, -6.75], [1.0, 1.0, 1.0], [0.0, 0.0], -0.25),
+    ]
+}
+
+fn witch_poses(anim: &EntityAnim) -> [PartPose; 13] {
+    let v = villager_poses(anim);
+    let head = head_pose(anim, vpivot([0.0, 0.0, 0.0]));
+    [
+        v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8],
+        head, head, head, // hat tiers track the head
+        head,             // wart tracks the head
+    ]
+}
+
+/// Guardian (`ModelGuardian`, guardian.png 64x64): a boxy body with side
+/// plates, top/bottom rims, a front eye and a three-segment tail. The spines
+/// are omitted (animated, radially placed). Order: core, left plate, right
+/// plate, top rim, bottom rim, eye, tail base, tail mid, tail tip.
+fn guardian_parts() -> [Part; 9] {
+    [
+        vbox([0.0, 0.0, 0.0], [-6.0, 10.0, -8.0], [12.0, 12.0, 16.0], [0.0, 0.0], 0.0), // core
+        vbox([0.0, 0.0, 0.0], [-8.0, 10.0, -6.0], [2.0, 12.0, 12.0], [0.0, 28.0], 0.0), // left plate
+        vbox([0.0, 0.0, 0.0], [6.0, 10.0, -6.0], [2.0, 12.0, 12.0], [0.0, 28.0], 0.0), // right plate
+        vbox([0.0, 0.0, 0.0], [-6.0, 8.0, -6.0], [12.0, 2.0, 12.0], [16.0, 40.0], 0.0), // top rim
+        vbox([0.0, 0.0, 0.0], [-6.0, 22.0, -6.0], [12.0, 2.0, 12.0], [16.0, 40.0], 0.0), // bottom rim
+        vbox([0.0, 0.0, -8.25], [-1.0, 15.0, 0.0], [2.0, 2.0, 1.0], [8.0, 0.0], 0.0), // eye
+        vbox([0.0, 0.0, 0.0], [-2.0, 14.0, 7.0], [4.0, 4.0, 8.0], [40.0, 0.0], 0.0), // tail base
+        vbox([0.0, 0.0, 0.0], [0.0, 14.0, 15.0], [3.0, 3.0, 7.0], [0.0, 54.0], 0.0), // tail mid
+        vbox([0.0, 0.0, 0.0], [0.0, 14.0, 22.0], [2.0, 2.0, 6.0], [41.0, 32.0], 0.0), // tail tip
+    ]
+}
+
+fn guardian_poses(anim: &EntityAnim) -> [PartPose; 9] {
+    let _ = anim;
+    [PartPose::still(); 9]
+}
+
+/// Wither (`ModelWither`, wither/wither.png 64x64): three heads on a ribbed
+/// spine with a hanging tail. Order: centre head, left head, right head, ribs
+/// (top bar), spine, tail.
+fn wither_parts() -> [Part; 6] {
+    [
+        vbox([0.0, 0.0, 0.0], [-4.0, -4.0, -4.0], [8.0, 8.0, 8.0], [0.0, 0.0], 0.0), // centre head
+        vbox([-8.0, 4.0, 0.0], [-4.0, -4.0, -4.0], [6.0, 6.0, 6.0], [32.0, 0.0], 0.0), // left head
+        vbox([10.0, 4.0, 0.0], [-4.0, -4.0, -4.0], [6.0, 6.0, 6.0], [32.0, 0.0], 0.0), // right head
+        vbox([0.0, 0.0, 0.0], [-10.0, 3.9, -0.5], [20.0, 3.0, 3.0], [0.0, 16.0], 0.0), // shoulder bar
+        vbox([-2.0, 6.9, -0.5], [0.0, 0.0, 0.0], [3.0, 10.0, 3.0], [0.0, 22.0], 0.0), // spine
+        vbox([-2.0, 16.9, -0.5], [0.0, 0.0, 0.0], [3.0, 6.0, 3.0], [12.0, 22.0], 0.0), // tail
+    ]
+}
+
+fn wither_poses(anim: &EntityAnim) -> [PartPose; 6] {
+    let head = head_pose(anim, vpivot([0.0, 0.0, 0.0]));
+    [
+        head,
+        PartPose::still(),
+        PartPose::still(),
+        PartPose::still(),
+        PartPose::still(),
+        PartPose::still(),
+    ]
+}
+
+/// Rabbit (`ModelRabbit`, rabbit/brown.png 64x32): body, head with nose and two
+/// ears, four limbs (two arms, two thighs, two feet) and a tail. Order: body,
+/// head, nose, right ear, left ear, right arm, left arm, right thigh, left
+/// thigh, right foot, left foot, tail.
+fn rabbit_parts() -> [Part; 12] {
+    [
+        vbox([0.0, 19.0, 8.0], [-3.0, -2.0, -10.0], [6.0, 5.0, 10.0], [0.0, 0.0], 0.0), // body
+        vbox([0.0, 16.0, -1.0], [-2.5, -4.0, -5.0], [5.0, 4.0, 5.0], [32.0, 0.0], 0.0), // head
+        vbox([0.0, 16.0, -1.0], [-0.5, -2.5, -5.5], [1.0, 1.0, 1.0], [32.0, 9.0], 0.0), // nose
+        vbox([0.0, 16.0, -1.0], [-2.5, -9.0, -1.0], [2.0, 5.0, 1.0], [52.0, 0.0], 0.0), // right ear
+        vbox([0.0, 16.0, -1.0], [0.5, -9.0, -1.0], [2.0, 5.0, 1.0], [58.0, 0.0], 0.0), // left ear
+        vbox([-3.0, 17.0, -1.0], [-1.0, 0.0, -1.0], [2.0, 7.0, 2.0], [0.0, 15.0], 0.0), // right arm
+        vbox([3.0, 17.0, -1.0], [-1.0, 0.0, -1.0], [2.0, 7.0, 2.0], [8.0, 15.0], 0.0), // left arm
+        vbox([-3.0, 17.5, 3.7], [-1.0, 0.0, 0.0], [2.0, 4.0, 5.0], [16.0, 15.0], 0.0), // right thigh
+        vbox([3.0, 17.5, 3.7], [-1.0, 0.0, 0.0], [2.0, 4.0, 5.0], [30.0, 15.0], 0.0), // left thigh
+        vbox([-3.0, 17.5, 3.7], [-1.0, 5.5, -3.7], [2.0, 1.0, 7.0], [8.0, 24.0], 0.0), // right foot
+        vbox([3.0, 17.5, 3.7], [-1.0, 5.5, -3.7], [2.0, 1.0, 7.0], [26.0, 24.0], 0.0), // left foot
+        vbox([0.0, 20.0, 7.0], [-1.5, -1.5, 0.0], [3.0, 3.0, 2.0], [52.0, 6.0], 0.0), // tail
+    ]
+}
+
+fn rabbit_poses(anim: &EntityAnim) -> [PartPose; 12] {
+    // Rest pose carries fixed tilts from the vanilla constructor: ears/head
+    // upright, arms/thighs tucked. Head and ears track look direction.
+    let head = head_pose(anim, vpivot([0.0, 16.0, -1.0]));
+    let arm = leg_pose(vpivot([0.0, 17.0, -1.0]), -0.19198622); // -11° tuck
+    let thigh = leg_pose(vpivot([0.0, 17.5, 3.7]), -0.34906584); // -20° tuck
+    [
+        PartPose::still(), // body
+        head,
+        head, // nose
+        head, // right ear
+        head, // left ear
+        arm,
+        arm,
+        thigh,
+        thigh,
+        PartPose::still(), // right foot
+        PartPose::still(), // left foot
+        leg_pose(vpivot([0.0, 20.0, 7.0]), -0.3490659), // tail
+    ]
+}
+
+/// Ghast (`ModelGhast`, ghast.png 64x32): a 16³ cube body with nine 2-wide
+/// tentacles hanging beneath it (lengths from the vanilla seeded RNG). Static.
+/// The vanilla body sits at engine y ≈ 8..24 with tentacles below. Order: body
+/// then nine tentacles.
+fn ghast_parts() -> [Part; 10] {
+    // Tentacle lengths from `new Random(1660L)` (random.nextInt(7)+8, in order).
+    let lengths = [13.0f32, 10.0, 9.0, 11.0, 8.0, 11.0, 12.0, 13.0, 12.0];
+    // Body: addBox(-8,-8,-8, 16) at rotationPointY = 24-16 = 8 (vanilla i=-16).
+    let mut parts = vec![vbox([0.0, 8.0, 0.0], [-8.0, -8.0, -8.0], [16.0, 16.0, 16.0], [0.0, 0.0], 0.0)];
+    for (j, len) in lengths.iter().enumerate() {
+        let fx = (((j % 3) as f32 - (j / 3 % 2) as f32 * 0.5 + 0.25) / 2.0 * 2.0 - 1.0) * 5.0;
+        let fz = ((j / 3) as f32 / 2.0 * 2.0 - 1.0) * 5.0;
+        // Tentacle: addBox(-1,0,-1, 2,len,2) hanging down from rotationPointY=15.
+        parts.push(vbox([fx, 15.0, fz], [-1.0, 0.0, -1.0], [2.0, *len, 2.0], [0.0, 0.0], 0.0));
+    }
+    parts.try_into().unwrap()
+}
+
+/// Blaze (`ModelBlaze`, blaze.png 64x32): a head and twelve rotating rods in
+/// three rings. The rods are placed at their rest-frame ring positions (vanilla
+/// spins them via ageInTicks). Order: head then twelve rods.
+fn blaze_parts() -> [Part; 13] {
+    let mut parts = vec![
+        // Head: addBox(-4,-4,-4, 8) centred at engine y ~ 16 (sits above the rods).
+        vbox([0.0, 8.0, 0.0], [-4.0, -4.0, -4.0], [8.0, 8.0, 8.0], [0.0, 0.0], 0.0),
+    ];
+    // Three rings of four rods (vanilla loops: radius 9/7/5, vanilla y -2/2/11,
+    // where smaller y is higher). Rest frame: the animated angle starts near 0,
+    // so the rods spread evenly around each ring.
+    let rings = [(9.0f32, -2.0f32), (7.0, 2.0), (5.0, 11.0)];
+    for (ring, &(radius, base_y)) in rings.iter().enumerate() {
+        for k in 0..4 {
+            let angle = std::f32::consts::TAU * ((ring * 4 + k) as f32) / 12.0;
+            let (fx, fz) = (angle.cos() * radius, angle.sin() * radius);
+            // Rod: addBox(0,0,0, 2,8,2) from rotationPointY (engine y ≈ 12-base_y).
+            parts.push(vbox([fx, 12.0 - base_y, fz], [0.0, 0.0, 0.0], [2.0, 8.0, 2.0], [0.0, 16.0], 0.0));
+        }
+    }
+    parts.try_into().unwrap()
+}
+
+fn blaze_poses(anim: &EntityAnim) -> [PartPose; 13] {
+    let head = head_pose(anim, vpivot([0.0, 8.0, 0.0]));
+    let mut poses = [PartPose::still(); 13];
+    poses[0] = head;
+    poses
+}
+
 /// Rotate a local offset about the vertical (Y) axis.
 fn rotate_y(local: Vec3, sin: f32, cos: f32) -> Vec3 {
     Vec3::new(
@@ -1311,7 +1633,7 @@ mod tests {
     }
 
     #[test]
-    fn player_humanoid_emits_six_boxes_with_in_range_uvs() {
+    fn player_humanoid_emits_seven_boxes_with_in_range_uvs() {
         let mut mesh = ModelMesh::new();
         mesh.push_entity(
             EntityKind::RemotePlayer,
@@ -1320,12 +1642,28 @@ mod tests {
             &EntityAnim::default(),
             None,
         );
-        // 6 parts × 6 faces × 4 verts; 6 parts × 6 faces × 6 indices.
-        assert_eq!(mesh.vertices.len(), 144);
-        assert_eq!(mesh.indices.len(), 216);
+        // 7 parts (6 base + hat overlay) × 6 faces × 4 verts; ×6 indices.
+        assert_eq!(mesh.vertices.len(), 168);
+        assert_eq!(mesh.indices.len(), 252);
         assert_well_formed(&mesh);
         let (v0, v1) = slot_v_range(EntitySlot::Player);
         assert!(mesh.vertices.iter().all(|v| (v0..=v1).contains(&v.uv[1])));
+    }
+
+    /// The player now layers a hat overlay (vanilla bipedHeadwear) over the
+    /// base head: the seventh box sampling the (32,0) head-overlay region.
+    #[test]
+    fn player_emits_a_hat_overlay_box() {
+        let mut mesh = ModelMesh::new();
+        mesh.push_entity(EntityKind::RemotePlayer, Vec3::ZERO, 0.0, &EntityAnim::default(), None);
+        // Base head is box 5 (verts 120..144); the hat is the seventh box.
+        assert_eq!(mesh.vertices.len(), 168, "player must emit a 7th hat box");
+        // The hat samples a different U band than the base head (head front is
+        // at U 8..16 px; the hat front is at U 40..48 px), so the two boxes'
+        // U sets differ.
+        let head_us: Vec<f32> = mesh.vertices[120..144].iter().map(|v| v.uv[0]).collect();
+        let hat_us: Vec<f32> = mesh.vertices[144..168].iter().map(|v| v.uv[0]).collect();
+        assert_ne!(head_us, hat_us, "hat overlay must sample its own UV region");
     }
 
     #[test]
@@ -1499,10 +1837,16 @@ mod tests {
         let v_default: Vec<f32> = default.vertices.iter().map(|v| v.uv[1]).collect();
         let v_skinned: Vec<f32> = skinned.vertices.iter().map(|v| v.uv[1]).collect();
         assert_ne!(v_default, v_skinned);
-        let region_start =
-            (PLAYER_SKIN_BASE_ROW * ENTITY_SLOT_PX) as f32 / ENTITY_ATLAS_HEIGHT as f32;
+        // The skinned player must sample the first per-player skin slot's row in
+        // the grid (its V band), not the shared Player slot.
+        let (_, sy) = crate::texture::slot_grid_origin(PLAYER_SKIN_BASE_ROW);
+        let region_start = sy as f32 / ENTITY_ATLAS_HEIGHT as f32;
+        let region_end = (sy + ENTITY_SLOT_PX) as f32 / ENTITY_ATLAS_HEIGHT as f32;
         assert!(
-            skinned.vertices.iter().all(|v| v.uv[1] >= region_start - 1e-6),
+            skinned
+                .vertices
+                .iter()
+                .all(|v| (region_start - 1e-6..=region_end + 1e-6).contains(&v.uv[1])),
             "skinned player must sample the per-player region"
         );
     }
@@ -1530,7 +1874,7 @@ mod tests {
     fn modeled_mobs_are_well_formed_and_textured() {
         for id in [
             50, 51, 53, 54, 57, 120, 58, 52, 59, 90, 91, 92, 96, 93, 94, 95, 97, 98, 55, 62, 65,
-            60, 67,
+            60, 67, 99, 100, 66, 56, 61, 68, 64, 101,
         ] {
             let mesh = build_mob(id);
             assert_well_formed(&mesh);
@@ -1564,13 +1908,30 @@ mod tests {
             (97, Snowman),
             (65, Bat),
             (60, Silverfish),
+            (99, IronGolem),
+            (100, Horse),
+            (66, Witch),
+            (56, Ghast),
+            (61, Blaze),
+            (68, Guardian),
+            (64, Wither),
+            (101, Rabbit),
         ] {
             let mesh = build_mob(id);
             let (v0, v1) = slot_v_range(slot);
+            // Both axes must stay inside the slot's grid cell (the atlas is a
+            // multi-column grid, so the U band identifies the column too).
+            let (ox, oy) = entity_slot_origin(slot);
+            let (u0, u1) = (
+                ox as f32 / ENTITY_ATLAS_WIDTH as f32,
+                (ox + ENTITY_SLOT_PX) as f32 / ENTITY_ATLAS_WIDTH as f32,
+            );
+            let _ = oy;
             assert!(
-                mesh.vertices
-                    .iter()
-                    .all(|v| (v0 - 1e-6..=v1 + 1e-6).contains(&v.uv[1])),
+                mesh.vertices.iter().all(|v| {
+                    (v0 - 1e-6..=v1 + 1e-6).contains(&v.uv[1])
+                        && (u0 - 1e-6..=u1 + 1e-6).contains(&v.uv[0])
+                }),
                 "mob {id} sampled outside its slot"
             );
         }
