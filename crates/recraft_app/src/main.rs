@@ -1557,6 +1557,7 @@ fn render_frame(
             &hud,
             chat_input,
             debug.as_ref(),
+            settings.show_fps,
             screen_open,
         );
     }

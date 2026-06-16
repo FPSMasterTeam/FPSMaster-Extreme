@@ -90,6 +90,9 @@ impl GuiIngame {
         hud: &HudState,
         chat_input: Option<&mut TextInput>,
         debug: Option<&DebugInfo>,
+        // Whether the "Show FPS" option is enabled. When set (and F3 is off) a
+        // small plain FPS readout is drawn top-left; otherwise nothing is.
+        show_fps: bool,
         // Whether a screen (inventory / pause / chat) is open. The HUD still draws
         // (over the screen's scrim) so the hotbar/status bars stay visible, but the
         // crosshair is hidden so it doesn't sit in the middle of the menu.
@@ -99,10 +102,12 @@ impl GuiIngame {
 
         draw_screen_overlay(ui, width, height, hud.screen_overlay, hud.overlay_textures);
 
-        // F3 replaces the small FPS readout with the full debug overlay.
+        // F3 shows the full debug overlay; otherwise the optional "Show FPS"
+        // readout is a small plain text line (no debug HUD by default).
         match debug {
             Some(info) => draw_debug_overlay(ui, width, scale, fps, chunk_count, info),
-            None => draw_fps_panel(ui, scale, fps, chunk_count),
+            None if show_fps => draw_fps_text(ui, scale, fps),
+            None => {}
         }
 
         // Crosshair: 10 GUI px arms, 2 GUI px thick. Hidden while a screen is open.
@@ -136,13 +141,10 @@ fn gui_scale(width: i32, height: i32) -> i32 {
     super::gui_scale(width, height)
 }
 
-fn draw_fps_panel(ui: &mut UiFrame, scale: i32, fps: f32, chunk_count: usize) {
-    let fps_text = format!("FPS {:>3.0}", fps);
-    let chunks_text = format!("Chunks {chunk_count}");
-    let width = text_width(&fps_text, scale).max(text_width(&chunks_text, scale)) + 8 * scale;
-    ui.rect(UiRect::new(4 * scale, 4 * scale, width, 26 * scale), BLACK_170);
-    ui.text_shadowed(8 * scale, 8 * scale, scale, faded_white(1.0), fps_text);
-    ui.text_shadowed(8 * scale, 19 * scale, scale, MUTED, chunks_text);
+/// The optional "Show FPS" readout: a single small shadowed line in the
+/// top-left, no background plate (the full debug HUD is F3-only).
+fn draw_fps_text(ui: &mut UiFrame, scale: i32, fps: f32) {
+    ui.text_shadowed(4 * scale, 4 * scale, scale, faded_white(1.0), format!("FPS {:>3.0}", fps));
 }
 
 /// Per-line background behind the F3 text (vanilla draws a translucent plate).
