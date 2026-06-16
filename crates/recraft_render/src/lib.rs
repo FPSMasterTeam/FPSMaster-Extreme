@@ -18,7 +18,7 @@ pub use chunk_mesh::{
 };
 pub use font::char_width;
 pub use item_names::{build_tooltip, item_display_name};
-pub use model::{held_item_frame, EntityAnim, HeldItemFrame, ModelMesh, ModelVertex};
+pub use model::{held_item_frame, ChestKind, EntityAnim, HeldItemFrame, ModelMesh, ModelVertex};
 pub use particle::{build_particle_mesh, ParticleBillboard};
 pub use renderer::{RenderStats, Renderer, RendererError};
 pub use texture::{AtlasUv, OverlayTextures, PackMeta, PbrAtlases, TextureAtlasImage, discover_resource_packs};

@@ -1431,7 +1431,7 @@ pub const ENTITY_SLOT_PX: u32 = 128;
 
 /// Number of fixed slots stacked at the top of the entity atlas (one per
 /// [`EntitySlot`], including the trailing guaranteed-white slot).
-pub const ENTITY_SLOT_COUNT: u32 = 42;
+pub const ENTITY_SLOT_COUNT: u32 = 45;
 
 /// Extra 64x64 rows reserved below the fixed slots for per-player downloaded
 /// skins, allocated at runtime by the skin loader.
@@ -1539,8 +1539,12 @@ pub enum EntitySlot {
     Wither = 39,
     /// Rabbit (rabbit/brown.png, 64x32).
     Rabbit = 40,
+    /// Chest block-entity textures (entity/chest/{normal,trapped,ender}.png).
+    ChestNormal = 41,
+    ChestTrapped = 42,
+    ChestEnder = 43,
     /// Guaranteed opaque-white slot sampled by solid-color geometry.
-    White = 41,
+    White = 44,
 }
 
 /// Pixel origin (top-left corner) of an entity atlas slot.
@@ -1563,8 +1567,11 @@ pub const ENTITY_WHITE_UV: [f32; 2] = {
 /// The 1.8 entity textures loaded into each mob slot, plus the procedural
 /// fallback tint used when the asset is missing. The player slot is handled
 /// separately (normalize_skin / procedural_skin).
-const MOB_SLOT_ASSETS: [(EntitySlot, &str, [u8; 3]); 30] = [
+const MOB_SLOT_ASSETS: [(EntitySlot, &str, [u8; 3]); 33] = [
     (EntitySlot::ArmorStand, "armorstand/wood", [150, 120, 75]),
+    (EntitySlot::ChestNormal, "chest/normal", [162, 114, 51]),
+    (EntitySlot::ChestTrapped, "chest/trapped", [162, 80, 51]),
+    (EntitySlot::ChestEnder, "chest/ender", [40, 80, 76]),
     (EntitySlot::Zombie, "zombie/zombie", [88, 124, 80]),
     (EntitySlot::Skeleton, "skeleton/skeleton", [192, 192, 192]),
     (EntitySlot::Creeper, "creeper/creeper", [86, 170, 70]),
@@ -2153,6 +2160,9 @@ mod tests {
             EntitySlot::Guardian,
             EntitySlot::Wither,
             EntitySlot::Rabbit,
+            EntitySlot::ChestNormal,
+            EntitySlot::ChestTrapped,
+            EntitySlot::ChestEnder,
             EntitySlot::White,
         ];
         let mut seen = std::collections::HashSet::new();

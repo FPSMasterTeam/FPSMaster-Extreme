@@ -84,6 +84,12 @@ impl BlockState {
         if self.id == 51 {
             return RenderShape::Fire;
         }
+        // Chests (normal 54, ender 130, trapped 146) are block-entities: the
+        // chunk mesher skips them and the renderer draws the dedicated chest
+        // model with its own entity texture instead of a terrain box.
+        if matches!(self.id, 54 | 130 | 146) {
+            return RenderShape::None;
+        }
         match self.shape() {
             Shape::Cross => RenderShape::Cross,
             Shape::Rail => RenderShape::Rail,

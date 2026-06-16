@@ -29,7 +29,7 @@ use recraft_protocol::v1_8_9::{
         TitleAction, UseEntityKind,
     },
 };
-use recraft_render::{held_item_frame, Camera, EntityAnim, ModelMesh};
+use recraft_render::{held_item_frame, Camera, ChestKind, EntityAnim, ModelMesh};
 use winit::{
     event::{ElementState, KeyEvent},
     keyboard::{KeyCode, PhysicalKey},
@@ -464,6 +464,11 @@ pub struct GameState {
     /// Block changes received for chunks that weren't loaded yet, replayed once
     /// the chunk arrives (otherwise spawn-platform blocks can be lost).
     pending_block_changes: std::collections::HashMap<ChunkPos, Vec<(i32, i32, i32, BlockState)>>,
+    /// Per-chest lid-open amount (0 = closed .. 1 = fully open), keyed by world
+    /// block position, eased toward its target each tick. Entries that reach 0
+    /// (fully closed) are pruned. The open target is driven by S24 BlockAction
+    /// (viewer count); see [`GameState::tick_chest_lids`].
+    chest_lid_angles: std::collections::HashMap<[i32; 3], f32>,
     // Smoothed 0..1 view-state amounts, advanced once per physics tick so the
     // sneak camera dip and sprint FOV widen ease in/out instead of snapping.
     sneak_amount: f32,
@@ -706,6 +711,7 @@ impl GameState {
             dirty_chunks: HashSet::new(),
             urgent_remesh: HashSet::new(),
             pending_block_changes: std::collections::HashMap::new(),
+            chest_lid_angles: std::collections::HashMap::new(),
             sneak_amount: 0.0,
             previous_sneak_amount: 0.0,
             sprint_amount: 0.0,
@@ -1442,6 +1448,7 @@ impl GameState {
         let sprint_target = f32::from(self.sprinting);
         self.sneak_amount += (sneak_target - self.sneak_amount) * APPROACH;
         self.sprint_amount += (sprint_target - self.sprint_amount) * APPROACH;
+        self.tick_chest_lids();
     }
 
     pub fn update_camera(&mut self, tick_alpha: f32) {
@@ -1620,6 +1627,104 @@ impl GameState {
                 }
             }
         }
+    }
+
+    /// Append the chest block-entities near the camera to the entity model.
+    /// Chests no longer mesh as terrain (their `render_shape` is `None`), so the
+    /// dedicated [`recraft_render::ModelMesh::push_chest`] model is drawn here in
+    /// the same model pass as mobs, sampling the chest entity textures. Loaded
+    /// chunks within `max_dist_sq` of the camera are scanned for chest ids
+    /// (54 normal, 130 ender, 146 trapped); each chest's lid uses its eased
+    /// open amount (see [`Self::tick_chest_lids`]) and is lit by the world
+    /// lightmap like the surrounding terrain.
+    pub fn build_chest_models(
+        &self,
+        mesh: &mut ModelMesh,
+        brightness: f32,
+        tick_alpha: f32,
+        max_dist_sq: f64,
+    ) {
+        let sun_b = recraft_render::sky::sun_brightness(self.world_time(tick_alpha));
+        let frustum = self.camera.frustum();
+        let cam = self.camera.position;
+        let max_chunk_dist = (max_dist_sq.sqrt() / 16.0).ceil() as i32 + 1;
+        let cam_cx = (cam.x.floor() as i32).div_euclid(16);
+        let cam_cz = (cam.z.floor() as i32).div_euclid(16);
+
+        for chunk in self.world.chunks() {
+            let cpos = chunk.position;
+            if (cpos.x - cam_cx).abs() > max_chunk_dist || (cpos.z - cam_cz).abs() > max_chunk_dist {
+                continue;
+            }
+            for section in chunk.sections() {
+                let base_y = section.y() * 16;
+                for ly in 0..16u8 {
+                    for lz in 0..16u8 {
+                        for lx in 0..16u8 {
+                            let block = section.get(lx, ly, lz);
+                            let kind = match block.id {
+                                54 => ChestKind::Normal,
+                                130 => ChestKind::Ender,
+                                146 => ChestKind::Trapped,
+                                _ => continue,
+                            };
+                            let wx = cpos.x * 16 + lx as i32;
+                            let wy = base_y + ly as i32;
+                            let wz = cpos.z * 16 + lz as i32;
+                            // Cull by distance (cell centre) then frustum.
+                            let cx = wx as f64 + 0.5;
+                            let cy = wy as f64 + 0.5;
+                            let cz = wz as f64 + 0.5;
+                            let d = (cx - cam.x as f64).powi(2)
+                                + (cy - cam.y as f64).powi(2)
+                                + (cz - cam.z as f64).powi(2);
+                            if d > max_dist_sq {
+                                continue;
+                            }
+                            let min = Vec3::new(wx as f32, wy as f32, wz as f32);
+                            let max = min + Vec3::ONE;
+                            if !frustum.intersects_aabb(min, max) {
+                                continue;
+                            }
+                            let lid = self
+                                .chest_lid_angles
+                                .get(&[wx, wy, wz])
+                                .copied()
+                                .unwrap_or(0.0);
+                            let start = mesh.vertices.len();
+                            mesh.push_chest([wx, wy, wz], block.meta, lid, kind);
+                            // Light the chest by the lightmap at its centre, like mobs.
+                            let factor = entity_light(
+                                &self.world,
+                                Vec3::new(cx as f32, cy as f32, cz as f32),
+                                sun_b,
+                                brightness,
+                            );
+                            for v in &mut mesh.vertices[start..] {
+                                v.color[0] *= factor;
+                                v.color[1] *= factor;
+                                v.color[2] *= factor;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Ease each tracked chest lid toward its target (1 = open while viewers > 0,
+    /// 0 = closed) at vanilla's 0.1/tick, pruning fully-closed entries. The open
+    /// target comes from the S24 BlockAction viewer count; until that packet is
+    /// decoded no chest opens, so this currently only animates entries a future
+    /// BlockAction handler inserts. Run once per simulation tick from
+    /// [`Self::advance_view_state`].
+    fn tick_chest_lids(&mut self) {
+        self.chest_lid_angles.retain(|_, angle| {
+            // Targets aren't tracked yet (no BlockAction), so ease toward closed;
+            // a BlockAction handler would set the entry to its open target first.
+            *angle += (0.0 - *angle) * 0.1;
+            *angle > 0.001
+        });
     }
 
     /// World-light factor (0..1) for a model drawn at `pos`, matching the chunk
@@ -1933,6 +2038,18 @@ impl GameState {
                 mix(v.0 as u32 as u64);
             }
         }
+        // Animating chest lids (order-independent so the HashMap iteration order
+        // doesn't churn the key): each open chest folds its position + quantized
+        // lid angle. Closed chests aren't tracked, so this stays empty in idle
+        // scenes and only forces rebuilds while a lid is actually moving.
+        let mut chest_acc: u64 = 0;
+        for (&[x, y, z], &angle) in &self.chest_lid_angles {
+            chest_acc ^= (x as u32 as u64)
+                ^ ((z as u32 as u64) << 21)
+                ^ ((y as u64) << 42)
+                ^ ((angle * 64.0) as u64).wrapping_mul(0x9e37_79b9);
+        }
+        mix(chest_acc);
         h
     }
 
