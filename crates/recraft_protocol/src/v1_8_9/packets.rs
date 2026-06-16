@@ -660,6 +660,28 @@ pub enum ClientboundPlayPacket {
         header: String,
         footer: String,
     },
+    /// S29 SoundEffect — a named sound event at a world position. Coordinates
+    /// arrive as ÷8 fixed-point and are converted to blocks here. `pitch` is
+    /// the raw wire byte (vanilla stores `playback_rate * 63`).
+    SoundEffect {
+        name: String,
+        x: f64,
+        y: f64,
+        z: f64,
+        volume: f32,
+        pitch: u8,
+    },
+    /// S28 Effect — a hardcoded effect played by integer id (1000 click,
+    /// 1003 door toggle, 2001 block break with blockstate `data`, …). When
+    /// `disable_relative_volume` is set the sound plays at full volume.
+    Effect {
+        effect_id: i32,
+        x: i32,
+        y: i32,
+        z: i32,
+        data: i32,
+        disable_relative_volume: bool,
+    },
     Unknown {
         id: i32,
         body: Vec<u8>,
@@ -1451,6 +1473,28 @@ impl ClientboundPlayPacket {
                 header: body.read_string(32767)?,
                 footer: body.read_string(32767)?,
             }),
+            0x29 => Ok(Self::SoundEffect {
+                name: body.read_string(256)?,
+                x: body.read_i32()? as f64 / 8.0,
+                y: body.read_i32()? as f64 / 8.0,
+                z: body.read_i32()? as f64 / 8.0,
+                volume: body.read_f32()?,
+                pitch: body.read_u8()?,
+            }),
+            0x28 => {
+                let effect_id = body.read_i32()?;
+                let (x, y, z) = read_block_pos(&mut body)?;
+                let data = body.read_i32()?;
+                let disable_relative_volume = body.read_bool()?;
+                Ok(Self::Effect {
+                    effect_id,
+                    x,
+                    y,
+                    z,
+                    data,
+                    disable_relative_volume,
+                })
+            }
             id => Ok(Self::Unknown {
                 id,
                 body: frame.body,

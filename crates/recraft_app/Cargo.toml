@@ -11,6 +11,7 @@ arboard.workspace = true
 env_logger.workspace = true
 glam.workspace = true
 hickory-resolver.workspace = true
+kira.workspace = true
 log.workspace = true
 pollster.workspace = true
 recraft_core = { path = "../recraft_core" }

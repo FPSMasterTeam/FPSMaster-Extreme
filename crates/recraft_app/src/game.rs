@@ -41,6 +41,7 @@ use crate::item_renderer::{DroppedItem, PlayerHeldItem};
 use crate::particle::ParticleSystem;
 use crate::player_list::PlayerList;
 use crate::scoreboard::Scoreboard;
+use crate::sound::QueuedSound;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScreenOverlay {
@@ -533,6 +534,10 @@ pub struct GameState {
     /// Client-side particle effects (S2A SpawnParticle + local block breaks),
     /// simulated here and drawn as billboards by the renderer.
     particles: ParticleSystem,
+    /// Sounds queued this frame by packets / local prediction, drained by the
+    /// host (`main.rs`) into the audio backend so the game layer stays
+    /// audio-free. World coordinates map 1:1 to render coordinates here.
+    sound_queue: Vec<QueuedSound>,
 }
 
 /// In-progress survival block break: the target cell, the face the dig started
@@ -723,6 +728,7 @@ impl GameState {
             player_list: PlayerList::default(),
             title: TitleState::default(),
             particles: ParticleSystem::new(),
+            sound_queue: Vec::new(),
         }
     }
 
@@ -959,6 +965,22 @@ impl GameState {
 
     pub fn take_window_close(&mut self) -> bool {
         std::mem::take(&mut self.window_close_pending)
+    }
+
+    /// Drain the sounds queued this frame (by packets and local prediction) so
+    /// the host can play them through the audio backend.
+    pub fn take_sounds(&mut self) -> Vec<QueuedSound> {
+        std::mem::take(&mut self.sound_queue)
+    }
+
+    /// Queue a positional sound event at a world position.
+    fn queue_sound(&mut self, event: impl Into<String>, pos: Vec3, volume: f32, pitch: f32) {
+        self.sound_queue.push(QueuedSound {
+            event: event.into(),
+            position: Some(pos),
+            volume,
+            pitch,
+        });
     }
 
     // ─── Window interaction (vanilla Container.slotClick via container.rs) ─────
@@ -2236,10 +2258,12 @@ impl GameState {
         {
             self.mark_block_dirty_urgent(x, y, z);
             self.relight_after_edit(x, y, z, old);
-            // Block-break debris puff (vanilla addBlockDestroyEffects), unless
-            // the broken block was already air.
+            // On a real break (not air): a debris puff (vanilla
+            // addBlockDestroyEffects) and the block's dig sound (vol 1, pitch 0.8).
             if !old.is_air() {
                 self.particles.spawn_block_break(x, y, z);
+                let pos = Vec3::new(x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5);
+                self.queue_sound(dig_sound_for_block(old.id), pos, 1.0, 0.8);
             }
         }
     }
@@ -2334,6 +2358,10 @@ impl GameState {
         if self.world.set_block_if_chunk_loaded(px, py, pz, state) {
             self.mark_block_dirty_urgent(px, py, pz);
             self.relight_after_edit(px, py, pz, old);
+            // Vanilla plays the block's step sound on placement (the
+            // `getPlaceSound` family; we reuse the dig event at pitch 0.8).
+            let pos = Vec3::new(px as f32 + 0.5, py as f32 + 0.5, pz as f32 + 0.5);
+            self.queue_sound(dig_sound_for_block(state.id), pos, 1.0, 0.8);
             true
         } else {
             false
@@ -3105,6 +3133,33 @@ impl GameState {
                 false
             }
             ClientboundPlayPacket::CollectItem { .. } => false,
+            ClientboundPlayPacket::SoundEffect {
+                name,
+                x,
+                y,
+                z,
+                volume,
+                pitch,
+            } => {
+                let pos = Vec3::new(x as f32, y as f32, z as f32);
+                let rate = pitch as f32 / 63.5;
+                self.queue_sound(name, pos, volume, rate);
+                false
+            }
+            ClientboundPlayPacket::Effect {
+                effect_id,
+                x,
+                y,
+                z,
+                data,
+                ..
+            } => {
+                if let Some(event) = effect_event(effect_id, data) {
+                    let pos = Vec3::new(x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5);
+                    self.queue_sound(event, pos, 1.0, 1.0);
+                }
+                false
+            }
             // ConfirmTransaction is ponged on the network thread (vanilla replies
             // immediately), so the game loop never needs to act on it.
             ClientboundPlayPacket::KeepAlive { .. }
@@ -3420,6 +3475,49 @@ impl GameState {
 
 fn to_render_vec3(position: DVec3) -> Vec3 {
     Vec3::new(position.x as f32, position.y as f32, position.z as f32)
+}
+
+/// Map a hardcoded S28 Effect id (and its blockstate `data` for 2001) to a
+/// `sounds.json` event, for the handful of common effects worth playing. `None`
+/// for the many particle-only / unsupported effects.
+fn effect_event(effect_id: i32, data: i32) -> Option<String> {
+    Some(
+        match effect_id {
+            1000 => "random.click",
+            1001 => "random.click",
+            1002 => "random.bow",
+            1003 => "random.door_open",
+            1006 => "random.door_open", // wooden door toggle
+            1004 => "random.fizz",
+            1009 => "random.fizz", // fire extinguish
+            // 2001: block break — the low byte of `data` is the broken block id.
+            2001 => return Some(dig_sound_for_block((data & 0xff) as u16)),
+            _ => return None,
+        }
+        .to_string(),
+    )
+}
+
+/// Vanilla `Block.stepSound` → the `dig.<material>` event for a block id. Only
+/// the common materials are mapped; anything else falls back to `dig.stone`.
+fn dig_sound_for_block(id: u16) -> String {
+    let material = match id {
+        // wood: planks, logs, fences, doors, stairs, chests, crafting table…
+        5 | 17 | 47 | 53 | 54 | 58 | 63 | 64 | 65 | 85 | 96 | 107 | 134 | 135 | 136 | 146 | 162
+        | 163 | 164 | 183..=187 => "wood",
+        // gravel
+        13 => "gravel",
+        // sand
+        12 | 24 => "sand",
+        // grass / dirt / farmland / leaves / mycelium
+        2 | 3 | 18 | 31 | 60 | 110 | 161 => "grass",
+        // glass / glowstone / ice
+        20 | 79 | 89 | 95 | 102 => "glass",
+        // wool / carpet
+        35 | 171 => "cloth",
+        _ => "stone",
+    };
+    format!("dig.{material}")
 }
 
 /// Flat world-light factor (0..1) at a world position: vanilla lightmap combine
