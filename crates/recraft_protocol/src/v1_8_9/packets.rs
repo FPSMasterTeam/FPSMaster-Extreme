@@ -178,6 +178,13 @@ pub enum ServerboundPacket {
         fly_speed: f32,
         walk_speed: f32,
     },
+    /// C14 TabComplete — ask the server to complete the chat-box text. The
+    /// chat box never carries a looked-at block, so `has_position` is always
+    /// false here and no block position is written.
+    TabComplete {
+        text: String,
+        has_position: bool,
+    },
 }
 
 /// Minimal Slot data for a held item in a block-placement packet.
@@ -645,6 +652,10 @@ pub enum ClientboundPlayPacket {
         header: String,
         footer: String,
     },
+    /// S3A TabComplete — the completion candidates for the last C14 request.
+    TabComplete {
+        matches: Vec<String>,
+    },
     Unknown {
         id: i32,
         body: Vec<u8>,
@@ -888,6 +899,12 @@ impl ServerboundPacket {
                 body.write_f32(fly_speed);
                 body.write_f32(walk_speed);
                 PacketFrame::new(0x13, body.into_inner())
+            }
+            Self::TabComplete { text, has_position } => {
+                let mut body = PacketWriter::new();
+                body.write_string(&text);
+                body.write_bool(has_position);
+                PacketFrame::new(0x14, body.into_inner())
             }
         }
     }
@@ -1401,6 +1418,17 @@ impl ClientboundPlayPacket {
                 header: body.read_string(32767)?,
                 footer: body.read_string(32767)?,
             }),
+            0x3a => {
+                let count = body.read_var_i32()?;
+                if count < 0 {
+                    return Err(ProtocolError::InvalidData("negative tab-complete count"));
+                }
+                let mut matches = Vec::with_capacity(count.min(1024) as usize);
+                for _ in 0..count {
+                    matches.push(body.read_string(32767)?);
+                }
+                Ok(Self::TabComplete { matches })
+            }
             id => Ok(Self::Unknown {
                 id,
                 body: frame.body,
@@ -1883,6 +1911,36 @@ mod tests {
         let mut reader = PacketReader::new(&frame.body);
         assert_eq!(reader.read_string(100).unwrap(), "hello");
         assert!(reader.is_empty());
+    }
+
+    #[test]
+    fn serverbound_tab_complete_writes_text_and_flag() {
+        let frame = ServerboundPacket::TabComplete {
+            text: "/te".to_owned(),
+            has_position: false,
+        }
+        .into_frame();
+        assert_eq!(frame.id, 0x14);
+        let mut reader = PacketReader::new(&frame.body);
+        assert_eq!(reader.read_string(100).unwrap(), "/te");
+        assert!(!reader.read_bool().unwrap());
+        assert!(reader.is_empty());
+    }
+
+    #[test]
+    fn clientbound_tab_complete_decodes_match_list() {
+        let mut body = PacketWriter::new();
+        body.write_var_i32(2);
+        body.write_string("/tell");
+        body.write_string("/time");
+        let packet =
+            ClientboundPlayPacket::from_frame(PacketFrame::new(0x3a, body.into_inner())).unwrap();
+        assert_eq!(
+            packet,
+            ClientboundPlayPacket::TabComplete {
+                matches: vec!["/tell".to_owned(), "/time".to_owned()],
+            }
+        );
     }
 
     #[test]

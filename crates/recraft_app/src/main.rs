@@ -1061,6 +1061,7 @@ fn handle_actions(
                     network.send_packet(packet);
                 }
             }
+            GuiAction::OpenUrl(url) => open_url(&url),
             GuiAction::ReloadResourcePack(path) => {
                 log::info!("resource pack reload requested: {:?}", path);
                 *atlas_uv = renderer.reload_atlas(path);
@@ -1928,6 +1929,31 @@ fn chat_open_key(event: &winit::event::KeyEvent) -> Option<String> {
         PhysicalKey::Code(KeyCode::KeyT) => Some(String::new()),
         PhysicalKey::Code(KeyCode::Slash) => Some("/".to_owned()),
         _ => None,
+    }
+}
+
+/// Open a URL from a chat `open_url` clickEvent using the OS opener. Only
+/// http(s) links are opened (vanilla refuses other schemes); failures are
+/// logged rather than surfaced.
+fn open_url(url: &str) {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        log::warn!("ignoring non-http chat url: {url}");
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    let opener = ("open", &[] as &[&str]);
+    #[cfg(target_os = "windows")]
+    let opener = ("cmd", &["/C", "start", ""] as &[&str]);
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let opener = ("xdg-open", &[] as &[&str]);
+
+    let (program, args) = opener;
+    let result = std::process::Command::new(program)
+        .args(args)
+        .arg(url)
+        .spawn();
+    if let Err(err) = result {
+        log::warn!("failed to open url {url}: {err}");
     }
 }
 

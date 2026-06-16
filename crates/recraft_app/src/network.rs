@@ -525,6 +525,7 @@ fn packet_debug_name(packet: &ServerboundPacket) -> &'static str {
         ServerboundPacket::SwingArm => "C0A Animation",
         ServerboundPacket::ClientStatus { .. } => "C16 ClientStatus",
         ServerboundPacket::ChatMessage { .. } => "C01 ChatMessage",
+        ServerboundPacket::TabComplete { .. } => "C14 TabComplete",
         ServerboundPacket::PlayerAbilities { .. } => "C13 PlayerAbilities",
         ServerboundPacket::ConfirmTransaction { .. } => "C0F ConfirmTransaction",
         ServerboundPacket::ClientSettings { .. } => "C15 ClientSettings",
