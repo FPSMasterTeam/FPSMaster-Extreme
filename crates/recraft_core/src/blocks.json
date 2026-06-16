@@ -170,6 +170,32 @@
     {"id": 194, "shape": "door", "opaque": false, "layer": "cutout", "tex": {"top": "door_birch_upper", "bottom": "door_birch_lower"}},
     {"id": 195, "shape": "door", "opaque": false, "layer": "cutout", "tex": {"top": "door_jungle_upper", "bottom": "door_jungle_lower"}},
     {"id": 196, "shape": "door", "opaque": false, "layer": "cutout", "tex": {"top": "door_acacia_upper", "bottom": "door_acacia_lower"}},
-    {"id": 197, "shape": "door", "opaque": false, "layer": "cutout", "tex": {"top": "door_dark_oak_upper", "bottom": "door_dark_oak_lower"}}
+    {"id": 197, "shape": "door", "opaque": false, "layer": "cutout", "tex": {"top": "door_dark_oak_upper", "bottom": "door_dark_oak_lower"}},
+
+    {"id": 26, "shape": "cube", "collision": "auto", "opaque": false, "tex": {"top": "bed_feet_top", "bottom": "planks_oak", "side": "bed_feet_end"}},
+    {"id": 55, "shape": "lily", "collision": "none", "opaque": false, "layer": "cutout", "tex": "redstone_dust_cross"},
+    {"id": 69, "shape": "cross", "collision": "none", "opaque": false, "layer": "cutout", "tex": "lever"},
+    {"id": 75, "shape": "cross", "collision": "none", "opaque": false, "layer": "cutout", "tex": "redstone_torch_off"},
+    {"id": 76, "shape": "cross", "collision": "none", "opaque": false, "layer": "cutout", "tex": "redstone_torch_on"},
+    {"id": 93, "shape": "lily", "collision": "none", "opaque": false, "layer": "cutout", "tex": "repeater_off"},
+    {"id": 94, "shape": "lily", "collision": "none", "opaque": false, "layer": "cutout", "tex": "repeater_on"},
+    {"id": 97, "shape": "cube", "tex": "stone"},
+    {"id": 104, "shape": "cross", "collision": "none", "opaque": false, "layer": "cutout", "tex": "pumpkin_stem_disconnected"},
+    {"id": 105, "shape": "cross", "collision": "none", "opaque": false, "layer": "cutout", "tex": "melon_stem_disconnected"},
+    {"id": 115, "shape": "cross", "collision": "none", "opaque": false, "layer": "cutout", "tex": "nether_wart_stage_2"},
+    {"id": 116, "shape": "cube", "collision": "auto", "opaque": false, "tex": {"top": "enchanting_table_top", "bottom": "enchanting_table_bottom", "side": "enchanting_table_side"}},
+    {"id": 117, "shape": "cross", "collision": "none", "opaque": false, "layer": "cutout", "tex": "brewing_stand"},
+    {"id": 119, "shape": "none", "collision": "none", "opaque": false},
+    {"id": 122, "shape": "cube", "collision": "auto", "opaque": false, "tex": "dragon_egg"},
+    {"id": 127, "shape": "cross", "collision": "none", "opaque": false, "layer": "cutout", "tex": "cocoa_stage_2"},
+    {"id": 137, "shape": "cube", "tex": "command_block"},
+    {"id": 141, "shape": "cross", "collision": "none", "opaque": false, "layer": "cutout", "tex": "carrots_stage_3"},
+    {"id": 142, "shape": "cross", "collision": "none", "opaque": false, "layer": "cutout", "tex": "potatoes_stage_3"},
+    {"id": 149, "shape": "lily", "collision": "none", "opaque": false, "layer": "cutout", "tex": "comparator_off"},
+    {"id": 150, "shape": "lily", "collision": "none", "opaque": false, "layer": "cutout", "tex": "comparator_on"},
+    {"id": 151, "shape": "cube", "collision": "auto", "opaque": false, "tex": {"top": "daylight_detector_top", "side": "daylight_detector_side"}},
+    {"id": 153, "shape": "cube", "tex": "quartz_ore"},
+    {"id": 158, "shape": "cube", "tex": {"top": "furnace_top", "bottom": "furnace_top", "side": "furnace_side"}},
+    {"id": 178, "shape": "cube", "collision": "auto", "opaque": false, "tex": {"top": "daylight_detector_inverted_top", "side": "daylight_detector_side"}}
   ]
 }

@@ -437,6 +437,39 @@ mod tests {
     }
 
     #[test]
+    fn every_1_8_block_id_has_a_render_def_no_magenta_fallback() {
+        use crate::block::{BlockState, RenderShape};
+        let registry = registry();
+        // 36 = moving-piston technical block (a transient TileEntity, never a
+        // persistent world block); 166 = barrier (intentionally invisible,
+        // special-cased in BlockState::render_shape). Everything else in the
+        // 1.8.9 id range must map a texture so no block renders the magenta
+        // missing tile.
+        let intentional_no_texture = [36u16, 166];
+        for id in 1u16..=BlockState::MAX_BLOCK_ID {
+            if intentional_no_texture.contains(&id) {
+                continue;
+            }
+            assert!(
+                registry.def(id).is_some(),
+                "block id {id} has no registry def — it renders the magenta missing tile"
+            );
+            let block = BlockState::new(id, 0);
+            // Entity-rendered blocks (signs/banners/skulls, shape None) carry no
+            // terrain texture by design; every other block must map one.
+            if block.render_shape() != RenderShape::None {
+                let textured = [BlockFace::Top, BlockFace::Bottom, BlockFace::Side]
+                    .into_iter()
+                    .any(|face| block.texture_name(face).is_some());
+                assert!(
+                    textured,
+                    "renderable block id {id} maps no texture — magenta fallback"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn atlas_names_are_unique_and_sorted() {
         let registry = parse(EMBEDDED_BLOCKS).unwrap();
         let names = registry.all_texture_names();
