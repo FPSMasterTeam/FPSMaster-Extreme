@@ -11,6 +11,7 @@ mod singleplayer;
 mod skin;
 mod servers;
 mod settings;
+mod sound;
 mod text_input;
 
 use std::{
@@ -110,6 +111,9 @@ struct App {
     /// + hand + nametags. When the next frame's fingerprint matches, the rebuild
     /// and GPU upload are skipped (the renderer keeps the previous mesh).
     last_entity_key: Option<u64>,
+    /// Audio backend: resolves `sounds.json` events and plays positioned/UI
+    /// sounds queued by the game. Silent if no output device is available.
+    sound: sound::SoundManager,
     quit: bool,
 }
 
@@ -363,6 +367,7 @@ impl ApplicationHandler for WinitApp {
             panorama_timer: 0.0,
             entity_model: recraft_render::ModelMesh::new(),
             last_entity_key: None,
+            sound: sound::SoundManager::new(),
             quit: false,
         };
         renderer.upload_world(&app.game.world);
@@ -1397,6 +1402,15 @@ fn render_frame(
     let tick_alpha = (tick_accumulator / 0.05).clamp(0.0, 1.0);
     if app.in_world {
         app.game.update_camera(tick_alpha);
+        // Anchor the audio listener to the camera and play this frame's queued
+        // sounds (from packets and local block prediction).
+        app.sound.set_listener(sound::Listener {
+            position: app.game.camera.position,
+            yaw: app.game.camera.yaw,
+        });
+        for queued in app.game.take_sounds() {
+            app.sound.play(&queued);
+        }
         // Start skin downloads for newly-seen textured players, then upload any
         // that finished, so the entity model can sample their atlas rows.
         let new_skins: Vec<([u8; 16], String)> = app
