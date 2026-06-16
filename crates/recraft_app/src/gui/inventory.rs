@@ -98,6 +98,13 @@ impl GuiScreen for GuiContainer {
         draw_background(ui, container, px, py, scale);
         draw_progress(ui, container, px, py, scale);
         draw_titles(ui, container, px, py, scale);
+        if container.kind == WindowKind::Enchant {
+            let hovered = super::enchant::option_at(container, ctx.mouse, px, py, scale);
+            super::enchant::draw_options(ui, container, px, py, scale, hovered);
+        }
+        if container.kind == WindowKind::Anvil {
+            draw_anvil_field(ui, container, hud.inventory, px, py, scale);
+        }
 
         let icon = 16 * scale;
         let hovered = self.slot_at(ctx.mouse, container);
@@ -144,6 +151,18 @@ impl GuiScreen for GuiContainer {
         // (vanilla locks the drag to its owning button).
         if ctx.game.container_drag_active() {
             return Vec::new();
+        }
+        // Enchanting table: a left click on an enabled enchant option would send
+        // a `C11 EnchantItem` packet in vanilla. That serverbound packet isn't
+        // modelled in `recraft_protocol`, so the click is a visual no-op here.
+        // TODO: send the enchant action once `EnchantItem` exists in the protocol.
+        if let Some(container) = ctx.game.open_container() {
+            if container.kind == WindowKind::Enchant
+                && super::enchant::option_at(container, (x, y), self.px, self.py, self.scale)
+                    .is_some()
+            {
+                return Vec::new();
+            }
         }
         let slot = slot_under(self, ctx, (x, y));
         if ctx.modifiers.shift_key() {
@@ -310,6 +329,9 @@ fn draw_background(ui: &mut UiFrame, container: &Container, px: i32, py: i32, sc
         WindowKind::Crafting => GuiTexture::CraftingTable,
         WindowKind::Brewing => GuiTexture::BrewingStand,
         WindowKind::Enchant => GuiTexture::EnchantingTable,
+        WindowKind::Anvil => GuiTexture::Anvil,
+        WindowKind::Beacon => GuiTexture::Beacon,
+        WindowKind::Villager => GuiTexture::Villager,
         WindowKind::Chest(_) => unreachable!(),
     };
     ui.image(
@@ -340,6 +362,28 @@ fn draw_titles(ui: &mut UiFrame, container: &Container, px: i32, py: i32, scale:
         TITLE_COLOR,
         "Inventory",
     );
+}
+
+/// The anvil's rename field (vanilla `GuiRepair`): a recessed box at the top of
+/// the window showing the left-input item's display name. Display-only — there
+/// is no rename plumbing (no editable text input, no `C17 PluginMessage MC|ItemName`
+/// send), so it just echoes the current name. TODO: make it an editable field.
+fn draw_anvil_field(
+    ui: &mut UiFrame,
+    container: &Container,
+    player: &[Option<recraft_protocol::v1_8_9::packets::SlotItem>],
+    px: i32,
+    py: i32,
+    scale: i32,
+) {
+    // Vanilla field: 110 px wide, 16 px tall, top-left at (26, 24).
+    let field = UiRect::new(px + 26 * scale, py + 24 * scale, 110 * scale, 16 * scale);
+    ui.rect(field, UiColor::rgba(0, 0, 0, 128));
+    // The left input item (window slot 0) supplies the displayed name.
+    if let Some(item) = container.slot_item(0, player) {
+        let name = recraft_render::item_display_name(item.id, item.damage);
+        ui.text(field.x + 7 * scale, field.y + 4 * scale, scale, UiColor::rgba(224, 224, 224, 255), name);
+    }
 }
 
 /// Progress sprites driven by WindowProperty: the furnace flame + smelt arrow.

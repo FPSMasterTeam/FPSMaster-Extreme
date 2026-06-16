@@ -31,6 +31,12 @@ pub enum GuiTexture {
     BrewingStand,
     /// gui/container/enchanting_table.png — the enchantment window.
     EnchantingTable,
+    /// gui/container/anvil.png — the anvil repair/rename window.
+    Anvil,
+    /// gui/container/beacon.png — the beacon window (larger than 176×166).
+    Beacon,
+    /// gui/container/villager.png — the villager trading window.
+    Villager,
 }
 
 /// Loaded vanilla GUI textures (hotbar widget, status icons, inventory window)
@@ -50,6 +56,9 @@ pub struct GuiAtlas {
     pub crafting_table: Option<RgbaImage>,
     pub brewing_stand: Option<RgbaImage>,
     pub enchanting_table: Option<RgbaImage>,
+    pub anvil: Option<RgbaImage>,
+    pub beacon: Option<RgbaImage>,
+    pub villager: Option<RgbaImage>,
     /// The 16×16-tile block atlas, used as item-icon source for block items.
     blocks: Option<RgbaImage>,
     block_uv: AtlasUv,
@@ -77,6 +86,9 @@ impl GuiAtlas {
             crafting_table: crate::texture::load_gui_image("container/crafting_table"),
             brewing_stand: crate::texture::load_gui_image("container/brewing_stand"),
             enchanting_table: crate::texture::load_gui_image("container/enchanting_table"),
+            anvil: crate::texture::load_gui_image("container/anvil"),
+            beacon: crate::texture::load_gui_image("container/beacon"),
+            villager: crate::texture::load_gui_image("container/villager"),
             blocks,
             block_uv,
             items: ItemAtlasImage::load_default(),
@@ -97,6 +109,9 @@ impl GuiAtlas {
             GuiTexture::CraftingTable => self.crafting_table.as_ref(),
             GuiTexture::BrewingStand => self.brewing_stand.as_ref(),
             GuiTexture::EnchantingTable => self.enchanting_table.as_ref(),
+            GuiTexture::Anvil => self.anvil.as_ref(),
+            GuiTexture::Beacon => self.beacon.as_ref(),
+            GuiTexture::Villager => self.villager.as_ref(),
         }
     }
 
