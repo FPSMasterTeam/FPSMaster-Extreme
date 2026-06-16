@@ -12,6 +12,9 @@ pub enum EntityKind {
     RemotePlayer,
     Mob(u8),
     Object(u8),
+    /// A floating experience orb (S11 SpawnExperienceOrb), rendered as a
+    /// colour-cycling billboard rather than an articulated model.
+    ExperienceOrb,
 }
 
 #[derive(Debug, Clone)]
@@ -91,6 +94,10 @@ pub struct EntityState {
     /// mobs.
     pub custom_name: Option<String>,
     pub custom_name_visible: bool,
+    /// Living-entity health (metadata index 6, a float in 1.8). Drives the
+    /// client-derived boss bar for withers / ender dragons. `None` until a
+    /// health metadata update arrives.
+    pub health: Option<f32>,
 }
 
 /// Vanilla `getArmSwingAnimationEnd` with no haste: a swing runs 6 ticks.
@@ -161,6 +168,7 @@ impl EntityState {
             invisible: false,
             custom_name: None,
             custom_name_visible: false,
+            health: None,
         }
     }
 
@@ -370,6 +378,7 @@ fn entity_size(kind: EntityKind) -> (f64, f64) {
         EntityKind::LocalPlayer | EntityKind::RemotePlayer => (0.3, 1.8),
         EntityKind::Mob(id) => mob_size(id),
         EntityKind::Object(id) => object_size(id),
+        EntityKind::ExperienceOrb => (0.25, 0.25),
     }
 }
 

@@ -39,6 +39,10 @@ pub struct HudState<'a> {
     pub title: Option<TitleOverlay<'a>>,
     pub screen_overlay: ScreenOverlay,
     pub overlay_textures: &'a OverlayTextures,
+    /// Client-derived boss bar (vanilla `BossStatus`): the nearest wither /
+    /// ender dragon's display name and 0..1 health fraction, or `None` when no
+    /// boss is in range.
+    pub boss: Option<(String, f32)>,
 }
 
 /// Data for the F3 debug overlay: the player feet position (world coords),
@@ -130,6 +134,7 @@ impl GuiIngame {
         draw_chat(ui, width, height, hud, chat_input);
         draw_status_bars(ui, width, height, hud);
         draw_hotbar(ui, width, height, hud);
+        draw_boss_bar(ui, width, height, hud);
         draw_title(ui, width, height, hud);
         draw_action_bar(ui, width, height, hud);
         draw_sidebar(ui, width, height, hud);
@@ -477,6 +482,39 @@ fn draw_chat(ui: &mut UiFrame, width: i32, height: i32, hud: &HudState, input: O
         ui.text_shadowed(rect.x + pad, rect.y + scale, scale, faded_white(alpha), row);
         bottom = rect.y;
     }
+}
+
+/// Client-derived boss bar (vanilla `BossStatus`): a purple/pink bar centred at
+/// the top of the screen, its filled width scaled by the boss health fraction,
+/// with the boss name centred above it. 1.8 has no bossbar packet, so the data
+/// is reconstructed from the tracked entity health (see `GameState::boss_bar`).
+fn draw_boss_bar(ui: &mut UiFrame, width: i32, height: i32, hud: &HudState) {
+    let Some((name, fraction)) = &hud.boss else {
+        return;
+    };
+    let scale = gui_scale(width, height);
+    // Vanilla layout: a 182×5 bar at (width/2 - 91, 12) in GUI pixels.
+    const BAR_W: i32 = 182;
+    const BAR_H: i32 = 5;
+    let bar_w = BAR_W * scale;
+    let bar_h = BAR_H * scale;
+    let x = width / 2 - bar_w / 2;
+    let y = 12 * scale;
+    // Empty track then the pink/purple filled portion.
+    ui.rect(UiRect::new(x, y, bar_w, bar_h), UiColor::rgba(60, 20, 60, 200));
+    let fill_w = (bar_w as f32 * fraction.clamp(0.0, 1.0)).round() as i32;
+    if fill_w > 0 {
+        ui.rect(UiRect::new(x, y, fill_w, bar_h), UiColor::rgba(190, 70, 200, 230));
+    }
+    // Boss name centred just above the bar.
+    let name_w = text_width(name, scale);
+    ui.text_shadowed(
+        width / 2 - name_w / 2,
+        y - text_height(scale) - scale,
+        scale,
+        faded_white(1.0),
+        name.clone(),
+    );
 }
 
 /// Center-screen title + subtitle with vanilla fade timing.

@@ -37,7 +37,7 @@ use winit::{
 
 use crate::chat::{self, ChatState};
 use crate::container::{max_stack, stackable, Container};
-use crate::item_renderer::{DroppedItem, PlayerHeldItem};
+use crate::item_renderer::{DroppedItem, FallingBlock, PlayerHeldItem};
 use crate::particle::ParticleSystem;
 use crate::player_list::PlayerList;
 use crate::scoreboard::Scoreboard;
@@ -434,6 +434,13 @@ pub struct GameState {
     /// The item stack carried by each dropped-item entity (from EntityMetadata
     /// index 10), used to render the floating item.
     entity_items: std::collections::HashMap<EntityId, SlotItem>,
+    /// Experience value carried by each XP-orb entity (S11 SpawnExperienceOrb),
+    /// used to pick the orb's sprite cell.
+    entity_xp: std::collections::HashMap<EntityId, i16>,
+    /// Blockstate carried by each falling-block entity (SpawnObject kind 70,
+    /// packed in its data int), used to render the falling cube with terrain
+    /// textures.
+    falling_blocks: std::collections::HashMap<EntityId, BlockState>,
     /// Equipment worn/held by other entities (S04 EntityEquipment). Indexed
     /// 0 = held, 1 = boots, 2 = leggings, 3 = chestplate, 4 = helmet.
     entity_equipment: std::collections::HashMap<EntityId, [Option<SlotItem>; 5]>,
@@ -683,6 +690,8 @@ impl GameState {
             creative: false,
             entity_uuids: std::collections::HashMap::new(),
             entity_items: std::collections::HashMap::new(),
+            entity_xp: std::collections::HashMap::new(),
+            falling_blocks: std::collections::HashMap::new(),
             entity_equipment: std::collections::HashMap::new(),
             vehicles: std::collections::HashMap::new(),
             dirty_chunks: HashSet::new(),
@@ -1497,8 +1506,9 @@ impl GameState {
                 continue;
             }
             // Item entities (object type 2) are drawn as item geometry in the
-            // separate world-item pass, not as a placeholder box.
-            if entity.kind == EntityKind::Object(2) {
+            // separate world-item pass, not as a placeholder box. Experience
+            // orbs render as billboards in their own per-frame pass.
+            if entity.kind == EntityKind::Object(2) || entity.kind == EntityKind::ExperienceOrb {
                 continue;
             }
             // Distance cull: distant mobs aren't worth the per-frame articulated
@@ -1646,6 +1656,127 @@ impl GameState {
         self.particles.billboards(tick_alpha)
     }
 
+    /// This frame's experience-orb billboards (vanilla `RenderXPOrb`): a
+    /// camera-facing quad sampling `experience_orb.png`, the sprite cell chosen
+    /// by the orb's xp value, colour-cycling through the green/red rainbow over
+    /// its age, drawn at half alpha and full brightness.
+    pub fn xp_orbs(&self, tick_alpha: f32) -> Vec<recraft_render::ParticleBillboard> {
+        let mut orbs = Vec::new();
+        for entity in self.world.entities() {
+            if entity.kind != EntityKind::ExperienceOrb {
+                continue;
+            }
+            let xp = self.entity_xp.get(&entity.id).copied().unwrap_or(0);
+            let cell = xp_orb_texture_cell(xp);
+            let pos = to_render_vec3(entity.render_position(tick_alpha as f64));
+            // Vanilla RenderXPOrb colour cycle: f = (age + partial) / 2,
+            // r = (sin(f)+1)*0.5, g = 1.0, b = (sin(f+4.1887903)+1)*0.1, α 0.5.
+            let f = (entity.age as f32 + tick_alpha) / 2.0;
+            let color = [
+                (f.sin() + 1.0) * 0.5,
+                1.0,
+                ((f + 4.188_790_3).sin() + 1.0) * 0.1,
+                0.5,
+            ];
+            orbs.push(recraft_render::ParticleBillboard {
+                world_pos: (pos + Vec3::new(0.0, 0.25, 0.0)).into(),
+                size: 0.25, // ~0.5 wide quad
+                uv: xp_orb_cell_uv(cell),
+                color,
+            });
+        }
+        orbs
+    }
+
+    /// This frame's falling-block cubes (SpawnObject kind 70): each carries its
+    /// blockstate, interpolated world position and lightmap sample; the renderer
+    /// builds a full terrain-textured cube at that position.
+    pub fn falling_block_cubes(&self, tick_alpha: f32) -> Vec<FallingBlock> {
+        let mut cubes = Vec::new();
+        for entity in self.world.entities() {
+            let Some(block) = self.falling_blocks.get(&entity.id) else {
+                continue;
+            };
+            let pos = to_render_vec3(entity.render_position(tick_alpha as f64));
+            let (block_l, sky_l) =
+                self.world
+                    .light_at(pos.x.floor() as i32, pos.y.floor() as i32, pos.z.floor() as i32);
+            cubes.push(FallingBlock {
+                block: *block,
+                pos,
+                light: [sky_l as f32 / 15.0, block_l as f32 / 15.0],
+            });
+        }
+        cubes
+    }
+
+    /// This frame's projectile sprites: SpawnObject kinds mapped to an item id
+    /// and rendered as 2D item-sprite billboards through the dropped-item path.
+    /// Arrows are emitted as a thin elongated billboard (a full 3D model is
+    /// deferred). Kinds already handled elsewhere (item=2, falling block=70,
+    /// armor stand=78) are skipped.
+    pub fn projectiles(&self, tick_alpha: f32) -> Vec<DroppedItem> {
+        let mut sprites = Vec::new();
+        for entity in self.world.entities() {
+            let EntityKind::Object(kind) = entity.kind else {
+                continue;
+            };
+            let Some(item_id) = projectile_item_id(kind) else {
+                continue;
+            };
+            let pos = to_render_vec3(entity.render_position(tick_alpha as f64));
+            let (block_l, sky_l) =
+                self.world
+                    .light_at(pos.x.floor() as i32, pos.y.floor() as i32, pos.z.floor() as i32);
+            sprites.push(DroppedItem {
+                item: SlotItem::new(item_id, 1, 0),
+                pos,
+                // No bob/spin for projectiles: a fixed phase keeps the sprite
+                // steady (build_world_items lifts it 0.25 + a small bob).
+                phase: 0.0,
+                light: [sky_l as f32 / 15.0, block_l as f32 / 15.0],
+            });
+        }
+        sprites
+    }
+
+    /// Client-derived boss bar (vanilla `BossStatus`): the nearest living wither
+    /// (SpawnMob type 64) or ender dragon (type 63) within range, returning its
+    /// display name and 0..1 health fraction. 1.8 has no bossbar packet, so this
+    /// is reconstructed from the entity's tracked health metadata.
+    pub fn boss_bar(&self) -> Option<(String, f32)> {
+        let eye = DVec3::new(
+            self.camera.position.x as f64,
+            self.camera.position.y as f64,
+            self.camera.position.z as f64,
+        );
+        let mut best: Option<(f64, &EntityState, f32, &str)> = None;
+        for entity in self.world.entities() {
+            let (max_health, default_name) = match entity.kind {
+                EntityKind::Mob(64) => (300.0, "Wither"),
+                EntityKind::Mob(63) => (200.0, "Ender Dragon"),
+                _ => continue,
+            };
+            let Some(health) = entity.health.filter(|h| *h > 0.0) else {
+                continue;
+            };
+            // Vanilla tracks the boss within ~80 blocks of the view.
+            let dist = entity.position.distance(eye);
+            if dist > 80.0 {
+                continue;
+            }
+            if best.as_ref().is_none_or(|(d, ..)| dist < *d) {
+                best = Some((dist, entity, health / max_health, default_name));
+            }
+        }
+        let (_, entity, fraction, default_name) = best?;
+        let name = entity
+            .custom_name
+            .clone()
+            .unwrap_or_else(|| default_name.to_string());
+        Some((name, fraction.clamp(0.0, 1.0)))
+    }
+
     /// Held items of remote players, each with the arm's world-space reference
     /// frame so the item renderer can orient the model correctly in the hand.
     pub fn player_held_items(&self, tick_alpha: f32) -> Vec<PlayerHeldItem> {
@@ -1743,7 +1874,10 @@ impl GameState {
         // Every renderable entity's interpolated state (matches build_entity_model's
         // skip rules so the fingerprint changes exactly when its output would).
         for e in self.world.entities() {
-            if e.id == self.player.id || e.kind == EntityKind::Object(2) {
+            if e.id == self.player.id
+                || e.kind == EntityKind::Object(2)
+                || e.kind == EntityKind::ExperienceOrb
+            {
                 continue;
             }
             // Same distance cull as build_entity_model: distant mobs are neither
@@ -2789,6 +2923,7 @@ impl GameState {
                 z,
                 yaw,
                 pitch,
+                data,
                 ..
             } => {
                 self.spawn_remote_entity(
@@ -2800,6 +2935,33 @@ impl GameState {
                     yaw,
                     pitch,
                 );
+                // Falling block (kind 70): the blockstate is packed into the
+                // data int (low 12 bits id, next 4 bits meta).
+                if kind == 70 {
+                    let id = (data & 0xfff) as u16;
+                    let meta = ((data >> 12) & 0xf) as u8;
+                    self.falling_blocks
+                        .insert(EntityId(entity_id), BlockState::new(id, meta));
+                }
+                false
+            }
+            ClientboundPlayPacket::SpawnExperienceOrb {
+                entity_id,
+                x,
+                y,
+                z,
+                count,
+            } => {
+                self.spawn_remote_entity(
+                    entity_id,
+                    EntityKind::ExperienceOrb,
+                    x,
+                    y,
+                    z,
+                    0.0,
+                    0.0,
+                );
+                self.entity_xp.insert(EntityId(entity_id), count);
                 false
             }
             ClientboundPlayPacket::EntityRelativeMove {
@@ -2949,6 +3111,8 @@ impl GameState {
                     self.world.remove_entity(id);
                     self.entity_uuids.remove(&id);
                     self.entity_items.remove(&id);
+                    self.entity_xp.remove(&id);
+                    self.falling_blocks.remove(&id);
                     self.entity_equipment.remove(&id);
                     // Drop both directions of any mount relationship.
                     self.vehicles.remove(&id);
@@ -3160,6 +3324,34 @@ impl GameState {
                 }
                 false
             }
+            ClientboundPlayPacket::BlockAction {
+                x,
+                y,
+                z,
+                action_id,
+                action_param,
+                block_type,
+            } => {
+                // Note block (block id 25): play the pitched note and puff a
+                // coloured NOTE particle. Chest/piston actions (other block
+                // types) carry no client-side sound/particle here and are
+                // ignored (T17 will extend this).
+                if block_type == 25 {
+                    let note = action_param.min(24);
+                    let pitch = 2.0_f32.powf((note as f32 - 12.0) / 12.0);
+                    let instrument = NOTE_INSTRUMENTS
+                        .get(action_id as usize)
+                        .copied()
+                        .unwrap_or("harp");
+                    let center = Vec3::new(x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5);
+                    self.queue_sound(format!("note.{instrument}"), center, 3.0, pitch);
+                    // The NOTE branch reads the rainbow colour from offset.x.
+                    let above = Vec3::new(x as f32 + 0.5, y as f32 + 1.2, z as f32 + 0.5);
+                    self.particles
+                        .spawn(23, above, Vec3::new(note as f32 / 24.0, 0.0, 0.0), 0.0, 1, &[]);
+                }
+                false
+            }
             // ConfirmTransaction is ponged on the network thread (vanilla replies
             // immediately), so the game loop never needs to act on it.
             ClientboundPlayPacket::KeepAlive { .. }
@@ -3232,6 +3424,12 @@ impl GameState {
                 (3, MetadataValue::Byte(visible)) => {
                     if let Some(entity) = self.remote_entity_mut(entity_id) {
                         entity.custom_name_visible = *visible != 0;
+                    }
+                }
+                (6, MetadataValue::Float(health)) => {
+                    // Living-entity health (drives the client-derived boss bar).
+                    if let Some(entity) = self.remote_entity_mut(entity_id) {
+                        entity.health = Some(*health);
                     }
                 }
                 (10, MetadataValue::Slot(Some(item))) => {
@@ -3480,6 +3678,61 @@ fn to_render_vec3(position: DVec3) -> Vec3 {
 /// Map a hardcoded S28 Effect id (and its blockstate `data` for 2001) to a
 /// `sounds.json` event, for the handful of common effects worth playing. `None`
 /// for the many particle-only / unsupported effects.
+/// Note-block instrument sound suffixes by S24 BlockAction `action_id`
+/// (vanilla `BlockNote` order). The block under the note block selects this:
+/// 0 harp, 1 bass drum, 2 snare, 3 click/hat, 4 bass attack.
+const NOTE_INSTRUMENTS: [&str; 5] = ["harp", "bd", "snare", "hat", "bassattack"];
+
+/// The `experience_orb.png` sprite cell for an orb worth `xp` experience
+/// (vanilla `RenderXPOrb.getTextureByXP`): higher-value orbs use larger,
+/// brighter cells. The sheet is 16px cells, 4 per row.
+fn xp_orb_texture_cell(xp: i16) -> u32 {
+    match xp {
+        x if x >= 2477 => 10,
+        x if x >= 1237 => 9,
+        x if x >= 617 => 8,
+        x if x >= 307 => 7,
+        x if x >= 149 => 6,
+        x if x >= 73 => 5,
+        x if x >= 37 => 4,
+        x if x >= 17 => 3,
+        x if x >= 7 => 2,
+        x if x >= 3 => 1,
+        _ => 0,
+    }
+}
+
+/// Corner UVs into the 64×64 `experience_orb.png` for sprite `cell` (16px cells,
+/// 4 per row), in the `ParticleBillboard` corner order: bottom-right, top-right,
+/// top-left, bottom-left.
+fn xp_orb_cell_uv(cell: u32) -> [[f32; 2]; 4] {
+    let col = (cell % 4) as f32;
+    let row = (cell / 4) as f32;
+    let u0 = col * 16.0 / 64.0;
+    let u1 = u0 + 16.0 / 64.0;
+    let v0 = row * 16.0 / 64.0;
+    let v1 = v0 + 16.0 / 64.0;
+    [[u1, v1], [u1, v0], [u0, v0], [u0, v1]]
+}
+
+/// The item id whose sprite stands in for a SpawnObject projectile `kind`
+/// (vanilla projectile render textures), or `None` for kinds rendered
+/// elsewhere or not handled. Arrow (60) maps to the arrow item (262).
+fn projectile_item_id(kind: u8) -> Option<i16> {
+    Some(match kind {
+        60 => 262, // arrow (rendered as a thin sprite; 3D model deferred)
+        61 => 332, // snowball
+        62 => 344, // egg
+        64 => 385, // small fireball / fire charge
+        65 => 368, // ender pearl
+        72 => 381, // eye of ender
+        73 => 373, // splash potion
+        75 => 384, // bottle o' enchanting
+        76 => 401, // firework rocket
+        _ => return None,
+    })
+}
+
 fn effect_event(effect_id: i32, data: i32) -> Option<String> {
     Some(
         match effect_id {
@@ -5294,5 +5547,180 @@ mod interaction_tests {
             gs.pick_target(),
             Some(InteractionTarget::Entity { id: 7, .. })
         ));
+    }
+
+    #[test]
+    fn xp_orb_texture_cell_matches_vanilla_thresholds() {
+        assert_eq!(xp_orb_texture_cell(0), 0);
+        assert_eq!(xp_orb_texture_cell(2), 0);
+        assert_eq!(xp_orb_texture_cell(3), 1);
+        assert_eq!(xp_orb_texture_cell(6), 1);
+        assert_eq!(xp_orb_texture_cell(7), 2);
+        assert_eq!(xp_orb_texture_cell(16), 2);
+        assert_eq!(xp_orb_texture_cell(17), 3);
+        assert_eq!(xp_orb_texture_cell(37), 4);
+        assert_eq!(xp_orb_texture_cell(73), 5);
+        assert_eq!(xp_orb_texture_cell(149), 6);
+        assert_eq!(xp_orb_texture_cell(307), 7);
+        assert_eq!(xp_orb_texture_cell(617), 8);
+        assert_eq!(xp_orb_texture_cell(1237), 9);
+        assert_eq!(xp_orb_texture_cell(2477), 10);
+        assert_eq!(xp_orb_texture_cell(i16::MAX), 10);
+    }
+
+    #[test]
+    fn spawn_experience_orb_tracks_entity_and_xp() {
+        let mut g = GameState::empty_for_server(1.0);
+        g.apply_play_packet(ClientboundPlayPacket::SpawnExperienceOrb {
+            entity_id: 7,
+            x: 3.0,
+            y: 64.0,
+            z: -2.0,
+            count: 150,
+        });
+        let orb = g.world.entity(EntityId(7)).expect("orb spawned");
+        assert_eq!(orb.kind, EntityKind::ExperienceOrb);
+        assert_eq!(g.entity_xp.get(&EntityId(7)).copied(), Some(150));
+        // The renderer-facing list reports one billboard with cell-6 UVs.
+        let orbs = g.xp_orbs(1.0);
+        assert_eq!(orbs.len(), 1);
+        // count 150 → cell 6; despawn drops the tracking.
+        g.apply_play_packet(ClientboundPlayPacket::DestroyEntities { entity_ids: vec![7] });
+        assert!(g.entity_xp.get(&EntityId(7)).is_none());
+        assert!(g.xp_orbs(1.0).is_empty());
+    }
+
+    #[test]
+    fn falling_block_decodes_id_and_meta_from_data() {
+        let mut g = GameState::empty_for_server(1.0);
+        // data = id | meta << 12: stone-bricks (98) meta 3.
+        let data = 98 | (3 << 12);
+        g.apply_play_packet(ClientboundPlayPacket::SpawnObject {
+            entity_id: 7,
+            kind: 70,
+            x: 3.0,
+            y: 80.0,
+            z: 0.5,
+            yaw: 0.0,
+            pitch: 0.0,
+            data,
+            velocity: None,
+        });
+        let block = g.falling_blocks.get(&EntityId(7)).copied().expect("tracked");
+        assert_eq!(block, BlockState::new(98, 3));
+        let cubes = g.falling_block_cubes(1.0);
+        assert_eq!(cubes.len(), 1);
+        assert_eq!(cubes[0].block, BlockState::new(98, 3));
+    }
+
+    #[test]
+    fn projectile_kinds_map_to_item_sprites() {
+        assert_eq!(projectile_item_id(60), Some(262)); // arrow
+        assert_eq!(projectile_item_id(61), Some(332)); // snowball
+        assert_eq!(projectile_item_id(65), Some(368)); // ender pearl
+        // Falling block, item and armor stand are rendered elsewhere, not here.
+        assert_eq!(projectile_item_id(70), None);
+        assert_eq!(projectile_item_id(2), None);
+        assert_eq!(projectile_item_id(78), None);
+
+        // A spawned snowball surfaces in the projectile sprite list.
+        let mut g = GameState::empty_for_server(1.0);
+        g.apply_play_packet(ClientboundPlayPacket::SpawnObject {
+            entity_id: 7,
+            kind: 61,
+            x: 3.0,
+            y: 64.0,
+            z: 0.5,
+            yaw: 0.0,
+            pitch: 0.0,
+            data: 0,
+            velocity: None,
+        });
+        let sprites = g.projectiles(1.0);
+        assert_eq!(sprites.len(), 1);
+        assert_eq!(sprites[0].item.id, 332);
+    }
+
+    #[test]
+    fn note_block_action_plays_pitched_note_and_spawns_particle() {
+        let mut g = GameState::empty_for_server(1.0);
+        // instrument 2 (snare), note 12 → pitch 2^((12-12)/12) = 1.0.
+        g.apply_play_packet(ClientboundPlayPacket::BlockAction {
+            x: 1,
+            y: 65,
+            z: -2,
+            action_id: 2,
+            action_param: 12,
+            block_type: 25,
+        });
+        let sounds = g.take_sounds();
+        assert_eq!(sounds.len(), 1);
+        assert_eq!(sounds[0].event, "note.snare");
+        assert!((sounds[0].pitch - 1.0).abs() < 1e-6);
+        assert!((sounds[0].volume - 3.0).abs() < 1e-6);
+        // note 24 → pitch 2^(12/12) = 2.0; note 0 → 2^(-1) = 0.5.
+        for (note, expected) in [(24u8, 2.0_f32), (0, 0.5)] {
+            let mut g = GameState::empty_for_server(1.0);
+            g.apply_play_packet(ClientboundPlayPacket::BlockAction {
+                x: 0,
+                y: 0,
+                z: 0,
+                action_id: 0,
+                action_param: note,
+                block_type: 25,
+            });
+            let s = g.take_sounds();
+            assert!((s[0].pitch - expected).abs() < 1e-6, "note {note}");
+        }
+    }
+
+    #[test]
+    fn block_action_for_non_note_block_is_ignored() {
+        let mut g = GameState::empty_for_server(1.0);
+        // A chest open (block type 54) carries no client sound here.
+        g.apply_play_packet(ClientboundPlayPacket::BlockAction {
+            x: 0,
+            y: 0,
+            z: 0,
+            action_id: 1,
+            action_param: 1,
+            block_type: 54,
+        });
+        assert!(g.take_sounds().is_empty());
+    }
+
+    #[test]
+    fn boss_bar_reports_nearest_wither_health_fraction() {
+        use recraft_protocol::v1_8_9::packets::MetadataEntry;
+        let mut g = GameState::empty_for_server(1.0);
+        g.camera.position = Vec3::new(0.0, 70.0, 0.0);
+        // No boss in range yet.
+        assert!(g.boss_bar().is_none());
+        // A wither (mob type 64) close by, at half its 300 max health.
+        g.apply_play_packet(ClientboundPlayPacket::SpawnMob {
+            entity_id: 7,
+            kind: 64,
+            x: 5.0,
+            y: 70.0,
+            z: 0.0,
+            yaw: 0.0,
+            pitch: 0.0,
+            head_pitch: 0.0,
+            metadata: vec![],
+        });
+        // Health metadata (index 6, float) = 150 → fraction 0.5.
+        g.apply_play_packet(ClientboundPlayPacket::EntityMetadata {
+            entity_id: 7,
+            metadata: vec![MetadataEntry { index: 6, value: MetadataValue::Float(150.0) }],
+        });
+        let (name, fraction) = g.boss_bar().expect("wither in range");
+        assert_eq!(name, "Wither");
+        assert!((fraction - 0.5).abs() < 1e-6);
+        // A dead wither (0 health) drops off the bar.
+        g.apply_play_packet(ClientboundPlayPacket::EntityMetadata {
+            entity_id: 7,
+            metadata: vec![MetadataEntry { index: 6, value: MetadataValue::Float(0.0) }],
+        });
+        assert!(g.boss_bar().is_none());
     }
 }

@@ -33,6 +33,16 @@ pub struct DroppedItem {
     pub light: [f32; 2],
 }
 
+/// A falling-block entity (SpawnObject kind 70) to render as a full terrain-
+/// textured cube at its interpolated world position.
+pub struct FallingBlock {
+    pub block: BlockState,
+    /// Entity feet position in world coordinates.
+    pub pos: Vec3,
+    /// `[sky_light, block_light]` in 0..1, sampled at the entity position.
+    pub light: [f32; 2],
+}
+
 /// A held item on another player, with the arm's world-space reference frame
 /// so the item model can be oriented correctly.
 pub struct PlayerHeldItem {
@@ -212,6 +222,29 @@ impl ItemRenderer {
                     d.light,
                 );
             }
+        }
+        (vertices, indices)
+    }
+
+    /// Build full terrain-textured cubes for the falling-block entities this
+    /// frame, into the same vertex buffer the dropped items use (it binds the
+    /// block atlas). Each cube spans one block, centred horizontally on the
+    /// entity and sitting on its feet (vanilla `RenderFallingBlock`).
+    pub fn build_falling_blocks(
+        items: &[FallingBlock],
+        atlas: &AtlasUv,
+    ) -> (Vec<Vertex>, Vec<u32>) {
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+        for f in items {
+            if f.block.is_air() || f.block.render_shape() == RenderShape::None {
+                continue;
+            }
+            // Unit-cube model space (0..1) → world: centred horizontally on the
+            // entity, base at its feet.
+            let base = f.pos - Vec3::new(0.5, 0.0, 0.5);
+            let to_world = |c: Vec3| base + c;
+            push_block_cube(&mut vertices, &mut indices, &to_world, f.block, atlas, f.light);
         }
         (vertices, indices)
     }

@@ -510,6 +510,15 @@ pub enum ClientboundPlayPacket {
         /// Trailing data-watcher metadata (sneak/name/age flags etc.).
         metadata: Vec<MetadataEntry>,
     },
+    /// S11 SpawnExperienceOrb — a floating XP orb. `count` is the experience
+    /// value the orb carries (drives the sprite size in the renderer).
+    SpawnExperienceOrb {
+        entity_id: i32,
+        x: f64,
+        y: f64,
+        z: f64,
+        count: i16,
+    },
     SpawnObject {
         entity_id: i32,
         kind: i8,
@@ -670,6 +679,18 @@ pub enum ClientboundPlayPacket {
         z: f64,
         volume: f32,
         pitch: u8,
+    },
+    /// S24 BlockAction — a transient block animation/sound (note-block pluck,
+    /// piston extend/retract, chest lid). `action_id` and `action_param` are
+    /// block-type-specific (for a note block: instrument and note); `block_type`
+    /// is the block id the action applies to.
+    BlockAction {
+        x: i32,
+        y: i32,
+        z: i32,
+        action_id: u8,
+        action_param: u8,
+        block_type: i32,
     },
     /// S28 Effect — a hardcoded effect played by integer id (1000 click,
     /// 1003 door toggle, 2001 block break with blockstate `data`, …). When
@@ -1188,6 +1209,13 @@ impl ClientboundPlayPacket {
                     metadata,
                 })
             }
+            0x11 => Ok(Self::SpawnExperienceOrb {
+                entity_id: body.read_var_i32()?,
+                x: fixed_point(body.read_i32()?),
+                y: fixed_point(body.read_i32()?),
+                z: fixed_point(body.read_i32()?),
+                count: body.read_i16()?,
+            }),
             0x15 => Ok(Self::EntityRelativeMove {
                 entity_id: body.read_var_i32()?,
                 dx: fixed_point_delta(body.read_i8()?),
@@ -1481,6 +1509,20 @@ impl ClientboundPlayPacket {
                 volume: body.read_f32()?,
                 pitch: body.read_u8()?,
             }),
+            0x24 => {
+                let (x, y, z) = read_block_pos(&mut body)?;
+                let action_id = body.read_u8()?;
+                let action_param = body.read_u8()?;
+                let block_type = body.read_var_i32()?;
+                Ok(Self::BlockAction {
+                    x,
+                    y,
+                    z,
+                    action_id,
+                    action_param,
+                    block_type,
+                })
+            }
             0x28 => {
                 let effect_id = body.read_i32()?;
                 let (x, y, z) = read_block_pos(&mut body)?;
@@ -1752,6 +1794,56 @@ mod tests {
             }
             other => panic!("expected SpawnMob, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn spawn_experience_orb_decodes_fixed_point_and_count() {
+        let mut body = PacketWriter::new();
+        body.write_var_i32(7);
+        body.write_i32(32 * 10); // x = 10.0
+        body.write_i32(32 * 64); // y = 64.0
+        body.write_i32(32 * -3); // z = -3.0
+        body.write_i16(150); // xp value
+        let packet =
+            ClientboundPlayPacket::from_frame(PacketFrame::new(0x11, body.into_inner())).unwrap();
+        match packet {
+            ClientboundPlayPacket::SpawnExperienceOrb {
+                entity_id,
+                x,
+                y,
+                z,
+                count,
+            } => {
+                assert_eq!(entity_id, 7);
+                assert!((x - 10.0).abs() < 1e-9);
+                assert!((y - 64.0).abs() < 1e-9);
+                assert!((z + 3.0).abs() < 1e-9);
+                assert_eq!(count, 150);
+            }
+            other => panic!("expected SpawnExperienceOrb, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn block_action_decodes_position_and_note() {
+        let mut body = PacketWriter::new();
+        body.write_bytes(&encoded_block_pos(1, 65, -2));
+        body.write_u8(2); // instrument (snare)
+        body.write_u8(12); // note
+        body.write_var_i32(25); // note block
+        let packet =
+            ClientboundPlayPacket::from_frame(PacketFrame::new(0x24, body.into_inner())).unwrap();
+        assert_eq!(
+            packet,
+            ClientboundPlayPacket::BlockAction {
+                x: 1,
+                y: 65,
+                z: -2,
+                action_id: 2,
+                action_param: 12,
+                block_type: 25,
+            }
+        );
     }
 
     #[test]

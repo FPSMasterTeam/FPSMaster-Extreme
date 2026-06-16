@@ -1354,6 +1354,19 @@ impl PassBench {
     }
 }
 
+/// Append a (vertices, indices) mesh onto an accumulator buffer, rebasing the
+/// indices onto the existing vertex count. Used to merge the dropped-item,
+/// projectile, falling-block and player-held geometry into the world-item pass.
+fn append_mesh(
+    vertices: &mut Vec<recraft_render::Vertex>,
+    indices: &mut Vec<u32>,
+    mesh: (Vec<recraft_render::Vertex>, Vec<u32>),
+) {
+    let base = vertices.len() as u32;
+    vertices.extend(mesh.0);
+    indices.extend(mesh.1.iter().map(|i| i + base));
+}
+
 /// Render one frame: world, entities + first-person hand, HUD and the open
 /// screen. Driven from `AboutToWait` so the frame rate is paced by our own
 /// vsync/FPS-cap logic instead of macOS Core Animation throttling.
@@ -1483,14 +1496,25 @@ fn render_frame(
             }
             renderer.upload_model(&app.entity_model);
         }
-        let dropped = app.game.dropped_items(tick_alpha);
+        // Dropped items, projectile sprites and falling-block cubes all share
+        // the world-item pass (it binds the block/item atlas). Projectiles reuse
+        // the dropped-item sprite path mapped to an item id.
+        let mut dropped = app.game.dropped_items(tick_alpha);
+        dropped.extend(app.game.projectiles(tick_alpha));
         let (mut item_vertices, mut item_indices) =
             ItemRenderer::build_world_items(&app.game.camera, &dropped, atlas_uv);
+        let falling = app.game.falling_block_cubes(tick_alpha);
+        append_mesh(
+            &mut item_vertices,
+            &mut item_indices,
+            ItemRenderer::build_falling_blocks(&falling, atlas_uv),
+        );
         let held = app.game.player_held_items(tick_alpha);
-        let (held_v, held_i) = ItemRenderer::build_player_held_items(&held, atlas_uv);
-        let base = item_vertices.len() as u32;
-        item_vertices.extend(held_v);
-        item_indices.extend(held_i.iter().map(|i| i + base));
+        append_mesh(
+            &mut item_vertices,
+            &mut item_indices,
+            ItemRenderer::build_player_held_items(&held, atlas_uv),
+        );
         renderer.set_world_items(&item_vertices, &item_indices);
         // Particle billboards (rebuilt every frame; not cached by entity_key
         // since particles move/age continuously).
@@ -1498,12 +1522,18 @@ fn render_frame(
         let (particle_v, particle_i) =
             recraft_render::build_particle_mesh(&app.game.camera, &particles);
         renderer.set_particles(&particle_v, &particle_i);
+        // Experience-orb billboards (colour-cycle continuously, so also rebuilt
+        // each frame against their own texture).
+        let orbs = app.game.xp_orbs(tick_alpha);
+        let (orb_v, orb_i) = recraft_render::build_particle_mesh(&app.game.camera, &orbs);
+        renderer.set_xp_orbs(&orb_v, &orb_i);
     } else {
         app.last_entity_key = None;
         renderer.upload_model(&recraft_render::ModelMesh::new());
         renderer.set_first_person_item(&[], &[]);
         renderer.set_world_items(&[], &[]);
         renderer.set_particles(&[], &[]);
+        renderer.set_xp_orbs(&[], &[]);
         renderer.set_nametags(&app.game.camera, &[]);
     }
     // Mining crack overlay (vanilla destroy_stage_N textures over the dig target).
@@ -1543,6 +1573,7 @@ fn render_frame(
         title: game.title_overlay(tick_accumulator / 0.05),
         screen_overlay: game.screen_overlay(),
         overlay_textures: &overlay_textures,
+        boss: game.boss_bar(),
     };
     let wants_panorama = screen
         .as_ref()

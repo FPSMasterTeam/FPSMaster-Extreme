@@ -238,6 +238,9 @@ impl ModelMesh {
                 );
             }
             EntityKind::Object(_) => {}
+            // Experience orbs are drawn as colour-cycling billboards in their
+            // own pass, never as an articulated model.
+            EntityKind::ExperienceOrb => {}
         }
     }
 
