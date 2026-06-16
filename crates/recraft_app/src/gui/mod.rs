@@ -178,6 +178,8 @@ pub enum GuiAction {
     SaveSettings,
     /// Send a serverbound packet (inventory clicks, window close, …).
     SendPacket(ServerboundPacket),
+    /// Open a URL from a chat component's `open_url` clickEvent in the OS browser.
+    OpenUrl(String),
 }
 
 /// Immutable per-frame data screens draw from.

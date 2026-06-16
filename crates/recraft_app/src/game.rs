@@ -3356,13 +3356,18 @@ impl GameState {
                 false
             }
             ClientboundPlayPacket::ChatMessage { json, position } => {
-                let text = chat::flatten_chat_json(&json);
                 if position == 2 {
-                    self.chat.set_action_bar(text);
+                    self.chat.set_action_bar(chat::flatten_chat_json(&json));
                 } else {
+                    let segments = chat::parse_chat_components(&json);
+                    let text: String = segments.iter().map(|s| s.text.as_str()).collect();
                     log::info!("[chat] {}", chat::strip_legacy_codes(&text));
-                    self.chat.push_message(text);
+                    self.chat.push_components(segments);
                 }
+                false
+            }
+            ClientboundPlayPacket::TabComplete { matches } => {
+                self.chat.set_completions(matches);
                 false
             }
             ClientboundPlayPacket::ScoreboardObjective {

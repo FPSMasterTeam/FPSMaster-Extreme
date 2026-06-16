@@ -693,6 +693,49 @@ fn draw_boss_bar(ui: &mut UiFrame, width: i32, height: i32, hud: &HudState) {
     );
 }
 
+/// Replay the open-chat row layout from [`draw_chat`] and return each clickable
+/// chat segment's on-screen rect plus its click event, so the open chat screen
+/// can hit-test a mouse click. Mirrors the geometry used when `input` is `Some`
+/// (the chat box is open).
+pub(crate) fn chat_click_regions(
+    width: i32,
+    height: i32,
+    chat: &ChatState,
+) -> Vec<(UiRect, chat::ClickEvent)> {
+    let scale = gui_scale(width, height);
+    let line_height = 10 * scale;
+    let pad = 2 * scale;
+    let chat_width = (CHAT_WIDTH_GUI * scale).min(width - 8 * scale);
+    let wrap_width = chat_width - 2 * pad;
+    let x = 2 * scale;
+
+    // The input bar occupies the bottom; backlog rows stack above it.
+    let mut bottom = height - 2 * scale - (line_height + 2 * pad) - 2 * scale;
+
+    let mut regions = Vec::new();
+    let mut emitted = 0;
+    for line in chat.lines().iter().rev() {
+        // Per-message wrapped rows: the first wrapped row is drawn topmost, so
+        // the last row (visually lowest) is laid out first going upward.
+        let spans = chat::clickable_spans(&line.segments, wrap_width, scale);
+        for row in spans.into_iter().rev() {
+            if emitted >= 20 {
+                return regions;
+            }
+            let row_y = bottom - line_height;
+            for span in row {
+                regions.push((
+                    UiRect::new(x + pad + span.x_start, row_y, span.x_end - span.x_start, line_height),
+                    span.event,
+                ));
+            }
+            bottom = row_y;
+            emitted += 1;
+        }
+    }
+    regions
+}
+
 /// Center-screen title + subtitle with vanilla fade timing.
 fn draw_title(ui: &mut UiFrame, width: i32, height: i32, hud: &HudState) {
     let Some(title) = hud.title else {
