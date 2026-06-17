@@ -128,7 +128,14 @@ impl GuiIngame {
     ) {
         let scale = gui_scale(width, height);
 
-        draw_screen_overlay(ui, width, height, hud.screen_overlay, hud.overlay_textures);
+        draw_screen_overlay(
+            ui,
+            width,
+            height,
+            hud.screen_overlay,
+            hud.overlay_textures,
+            hud.vitals.update_counter,
+        );
 
         // F3 shows the full debug overlay; otherwise the optional "Show FPS"
         // readout is a small plain text line (no debug HUD by default).
@@ -997,6 +1004,9 @@ fn draw_screen_overlay(
     height: i32,
     overlay: ScreenOverlay,
     textures: &OverlayTextures,
+    // Free-running client-tick counter (vanilla `updateCounter`), used to cycle
+    // the animated fire overlay frames.
+    anim_tick: i32,
 ) {
     let full = UiRect::new(0, 0, width, height);
     match overlay {
@@ -1014,7 +1024,10 @@ fn draw_screen_overlay(
             }
         }
         ScreenOverlay::Fire => {
-            if let Some(tex) = &textures.fire {
+            if !textures.fire.is_empty() {
+                // Vanilla cycles fire_layer_1 frames roughly every other tick.
+                let frame = (anim_tick.rem_euclid(textures.fire.len() as i32 * 2) / 2) as usize;
+                let tex = &textures.fire[frame];
                 // Two overlapping quads covering the lower ~60% of the screen,
                 // offset horizontally like vanilla's first-person fire.
                 let fire_h = height * 6 / 10;

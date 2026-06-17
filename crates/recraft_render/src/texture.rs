@@ -2028,7 +2028,10 @@ fn read_pack_meta(path: &Path) -> Option<PackMeta> {
 #[derive(Debug)]
 pub struct OverlayTextures {
     pub lava: Option<Arc<RgbaImage>>,
-    pub fire: Option<Arc<RgbaImage>>,
+    /// All 16×16 frames of `fire_layer_1.png` (an N·16-tall vertical strip), in
+    /// order. The HUD cycles them to animate the on-fire overlay like vanilla.
+    /// Empty when the asset is missing.
+    pub fire: Vec<Arc<RgbaImage>>,
 }
 
 impl OverlayTextures {
@@ -2046,16 +2049,24 @@ impl OverlayTextures {
 
         let fire = load_asset_image("assets/minecraft/textures/blocks/fire_layer_1.png")
             .or_else(|| load_asset_image("assets/minecraft/textures/block/fire_1.png"))
-            .map(|img| {
-                if img.height() > TILE_SIZE {
-                    Arc::new(image::imageops::crop_imm(&img, 0, 0, TILE_SIZE, TILE_SIZE).to_image())
-                } else {
-                    Arc::new(img)
-                }
-            });
+            .map(|img| split_animation_frames(&img))
+            .unwrap_or_default();
 
         Self { lava, fire }
     }
+}
+
+/// Split a square-tiled vertical animation strip into its `height / width`
+/// frames (each `width`×`width`). A single-frame or non-strip image yields one
+/// frame.
+fn split_animation_frames(img: &RgbaImage) -> Vec<Arc<RgbaImage>> {
+    let (w, h) = (img.width(), img.height());
+    if w == 0 || h < w || h % w != 0 {
+        return vec![Arc::new(img.clone())];
+    }
+    (0..h / w)
+        .map(|i| Arc::new(image::imageops::crop_imm(img, 0, i * w, w, w).to_image()))
+        .collect()
 }
 
 #[cfg(test)]
@@ -2114,6 +2125,20 @@ mod tests {
                 "expected a common item to resolve when item assets exist"
             );
         }
+    }
+
+    #[test]
+    fn animation_strip_splits_into_square_frames() {
+        // A 5-frame vertical strip (16×80) splits into 5 distinct 16×16 frames.
+        let strip = RgbaImage::new(TILE_SIZE, TILE_SIZE * 5);
+        let frames = split_animation_frames(&strip);
+        assert_eq!(frames.len(), 5);
+        for f in &frames {
+            assert_eq!((f.width(), f.height()), (TILE_SIZE, TILE_SIZE));
+        }
+        // A single square (or non-strip) image yields exactly one frame.
+        let single = RgbaImage::new(TILE_SIZE, TILE_SIZE);
+        assert_eq!(split_animation_frames(&single).len(), 1);
     }
 
     #[test]
