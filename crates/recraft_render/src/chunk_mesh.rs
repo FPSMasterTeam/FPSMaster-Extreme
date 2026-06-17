@@ -595,12 +595,15 @@ fn append_fire<S: BlockSource>(
     let texture = block.texture_name(BlockFace::Side);
     warn_if_missing(ctx.atlas, block, "its fire texture", texture);
     let rect = ctx.atlas.tile_rect(texture);
-    let uv = [
-        [rect[0], rect[1]],
-        [rect[0] + rect[2], rect[1]],
-        [rect[0] + rect[2], rect[1] + rect[3]],
-        [rect[0], rect[1] + rect[3]],
-    ];
+    let uv = inset_tile_uvs(
+        [
+            [rect[0], rect[1]],
+            [rect[0] + rect[2], rect[1]],
+            [rect[0] + rect[2], rect[1] + rect[3]],
+            [rect[0], rect[1] + rect[3]],
+        ],
+        ctx.atlas,
+    );
     // Fire emits light; render near full-bright using its own cell light.
     let light = face_light(ctx, x, y, z);
     let color = [1.0, 1.0, 1.0, 1.0];
@@ -955,7 +958,7 @@ fn emit_face<S: BlockSource>(
         corners[i] = [x as f32 + px, y as f32 + py, z as f32 + pz];
         let (u, v) = face_uv(face.normal, px, py, pz);
         local[i] = [u, v];
-        uvs[i] = [rect[0] + u * rect[2], rect[1] + v * rect[3]];
+        uvs[i] = rect_uv(rect, u, v);
         // In flat mode the per-vertex smooth light below is unused (we shade flat).
         if ctx.flat {
             continue;
@@ -1065,7 +1068,7 @@ fn append_cross<S: BlockSource>(
     let color = [tint[0], tint[1], tint[2], block.render_alpha()];
     let texture = block.texture_name(BlockFace::Side);
     warn_if_missing(ctx.atlas, block, "its cross texture", texture);
-    let uvs = ctx.atlas.uv(texture);
+    let uvs = inset_tile_uvs(ctx.atlas.uv(texture), ctx.atlas);
     let (ox, oy, oz) = cross_plant_offset(block.id, x, z);
     let (fx, fy, fz) = (x as f32 + ox, y as f32 + oy, z as f32 + oz);
     // Vanilla cross model: the diagonals are inset 0.8/16 from the corners
@@ -1092,7 +1095,6 @@ fn append_cross<S: BlockSource>(
         push_greedy_quad_double_sided(buffer, q0, ruv, origin, color, light);
         push_greedy_quad_double_sided(buffer, q1, ruv, origin, color, light);
     } else {
-        let uvs = inset_tile_uvs(uvs, ctx.atlas);
         buffer.push_quad_double_sided(q0, uvs, color, light);
         buffer.push_quad_double_sided(q1, uvs, color, light);
     }
@@ -1100,10 +1102,11 @@ fn append_cross<S: BlockSource>(
 
 /// Pull a full-tile UV quad in by half a texel on every side. With nearest
 /// filtering the raw tile bounds land exactly on the texel grid, so a fragment
-/// right at the quad edge floors into the neighbouring atlas tile. Cross plants
-/// carry a green vertex tint, so any opaque neighbour texel that bleeds in shows
-/// up as a shimmering bright-green speck tracing the crossed planes' edges.
-/// Sampling texel centres keeps every fetch inside the sprite.
+/// right at the quad edge floors into the neighbouring atlas tile — and since the
+/// quad carries a vertex tint (grass/foliage green, etc.), any opaque neighbour
+/// texel that bleeds in shows up as a shimmering bright speck along the edges.
+/// Sampling texel centres instead keeps every fetch inside the sprite. Used by
+/// the full-tile shapes (cross plants, ladders).
 fn inset_tile_uvs(uvs: [[f32; 2]; 4], atlas: &AtlasUv) -> [[f32; 2]; 4] {
     let [du, dv] = atlas.tile_size();
     let (hu, hv) = (du / 32.0, dv / 32.0); // half a texel (a tile is 16 texels)
@@ -1116,6 +1119,20 @@ fn inset_tile_uvs(uvs: [[f32; 2]; 4], atlas: &AtlasUv) -> [[f32; 2]; 4] {
         ]
     };
     [pull(uvs[0]), pull(uvs[1]), pull(uvs[2]), pull(uvs[3])]
+}
+
+/// Map an in-tile `(u, v)` fraction (0..1 over the box face) to an atlas UV,
+/// clamped half a texel inside the tile rect. Same fix as [`inset_tile_uvs`] but
+/// for the box/cube path, where faces spanning the full extent land on the tile
+/// edge and would otherwise floor into a neighbour (visible on cutout/translucent
+/// blocks: glass, stained glass, panes, iron bars, leaves). Interior crops
+/// (slabs, stairs) are untouched — only the 0/1 extremes get pulled in.
+fn rect_uv(rect: [f32; 4], u: f32, v: f32) -> [f32; 2] {
+    let (hu, hv) = (rect[2] / 32.0, rect[3] / 32.0); // half a texel
+    [
+        (rect[0] + u * rect[2]).clamp(rect[0] + hu, rect[0] + rect[2] - hu),
+        (rect[1] + v * rect[3]).clamp(rect[1] + hv, rect[1] + rect[3] - hv),
+    ]
 }
 
 /// Rail: a flat (or sloped) quad 1/16 above the floor. The texture's V axis
@@ -1184,12 +1201,15 @@ fn append_rail<S: BlockSource>(
     let texture = block.texture_name(BlockFace::Top);
     warn_if_missing(ctx.atlas, block, "its rail texture", texture);
     let rect = ctx.atlas.tile_rect(texture);
-    let mut uvs = [
-        [rect[0], rect[1]],
-        [rect[0] + rect[2], rect[1]],
-        [rect[0] + rect[2], rect[1] + rect[3]],
-        [rect[0], rect[1] + rect[3]],
-    ];
+    let mut uvs = inset_tile_uvs(
+        [
+            [rect[0], rect[1]],
+            [rect[0] + rect[2], rect[1]],
+            [rect[0] + rect[2], rect[1] + rect[3]],
+            [rect[0], rect[1] + rect[3]],
+        ],
+        ctx.atlas,
+    );
     uvs.rotate_right(turns);
     // Double-sided so the track is visible from above and (through a glass
     // floor) below, under back-face culling.
@@ -1214,8 +1234,11 @@ fn append_torch<S: BlockSource>(
     warn_if_missing(ctx.atlas, block, "its torch texture", texture);
     let rect = ctx.atlas.tile_rect(texture);
     // Sub-tile UV by pixel (16px tile): u for the centre column 7..9, v top→down.
-    let u = |px: f32| rect[0] + (px / 16.0) * rect[2];
-    let v = |px: f32| rect[1] + (px / 16.0) * rect[3];
+    // Clamp half a texel inside the tile so the full-height v 0/16 edges don't
+    // floor into the neighbouring atlas tile under nearest sampling (see rect_uv).
+    let (hu, hv) = (rect[2] / 32.0, rect[3] / 32.0);
+    let u = |px: f32| (rect[0] + (px / 16.0) * rect[2]).clamp(rect[0] + hu, rect[0] + rect[2] - hu);
+    let v = |px: f32| (rect[1] + (px / 16.0) * rect[3]).clamp(rect[1] + hv, rect[1] + rect[3] - hv);
 
     // Torches are self-lit; render near full-bright (block-light 14 ≈ sky-less).
     let light = face_light(ctx, x, y + 1, z);
@@ -1275,7 +1298,7 @@ fn append_ladder<S: BlockSource>(
     let color = [tint[0], tint[1], tint[2], block.render_alpha()];
     let texture = block.texture_name(BlockFace::Side);
     warn_if_missing(ctx.atlas, block, "its ladder texture", texture);
-    let uvs = ctx.atlas.uv(texture);
+    let uvs = inset_tile_uvs(ctx.atlas.uv(texture), ctx.atlas);
     // Double-sided so the rungs show under back-face culling regardless of which
     // way the single quad happens to wind.
     emit_double_sided(mesh, ctx, block, corners, uvs, color, light);
@@ -2276,6 +2299,32 @@ mod tests {
         let (half_u, half_v) = (rect[2] / 32.0, rect[3] / 32.0);
         assert!(!mesh.cutout.vertices.is_empty());
         for v in &mesh.cutout.vertices {
+            let u = v.uv[0] as f32 / 65535.0;
+            let w = v.uv[1] as f32 / 65535.0;
+            assert!(
+                u >= rect[0] + half_u - 1e-4 && u <= rect[0] + rect[2] - half_u + 1e-4,
+                "u {u} not inside tile {rect:?}"
+            );
+            assert!(
+                w >= rect[1] + half_v - 1e-4 && w <= rect[1] + rect[3] - half_v + 1e-4,
+                "v {w} not inside tile {rect:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cube_face_uvs_stay_half_a_texel_inside_the_tile() {
+        // emit_face maps full faces onto the tile edges; nearest sampling would
+        // floor into the neighbour tile, bleeding along edges of glass/leaves/
+        // panes/etc. Every face UV must stay ≥ half a texel inside its tile.
+        let uv = atlas();
+        let mut world = World::new();
+        world.set_block(0, 0, 0, BlockState::new(1, 0)); // stone: all six faces exposed
+        let mesh = build_world_mesh(&world, &uv, BiomeColors::default(), false, false);
+        let rect = uv.tile_rect(BlockState::new(1, 0).texture_name(BlockFace::Side));
+        let (half_u, half_v) = (rect[2] / 32.0, rect[3] / 32.0);
+        assert!(!mesh.solid.vertices.is_empty());
+        for v in &mesh.solid.vertices {
             let u = v.uv[0] as f32 / 65535.0;
             let w = v.uv[1] as f32 / 65535.0;
             assert!(

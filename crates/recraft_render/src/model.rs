@@ -185,16 +185,27 @@ impl ModelMesh {
     /// local→world transform — the first-person `renderPlayerArm` matrix chain
     /// is computed by the caller and folded into `transform`. Samples the
     /// player skin's right-arm region.
+    ///
+    /// The box is built in the engine's own model convention (feet-up +y, front
+    /// +z) — the same flip [`vbox`] bakes for every third-person limb — so
+    /// [`plane_frac`]/[`box_region`] map the skin exactly as the third-person
+    /// right arm does. The caller's `transform` is a verbatim vanilla
+    /// `renderPlayerArm` GL chain that operates in vanilla model coords (front
+    /// −z, y-down), so each engine-local vertex is converted back to vanilla
+    /// coords (`y → 1.5 − y`, `z → −z`, with 1.5 = 24·1/16) before the chain.
+    /// This leaves the arm geometry/pose pixel-identical while correcting the
+    /// previously mirrored texture mapping.
     pub fn push_arm_box(&mut self, transform: &dyn Fn(Vec3) -> Vec3, alpha: f32) {
         let region = box_region(40.0, 16.0, 4.0, 12.0, 4.0); // player right arm
         let (ox, oy) = entity_slot_origin(EntitySlot::Player);
+        let to_vanilla = |e: Vec3| transform(Vec3::new(e.x, 1.5 - e.y, -e.z));
         self.push_textured_box(
-            Vec3::new(-3.0, -2.0, -2.0) * 0.0625,
-            Vec3::new(1.0, 10.0, 2.0) * 0.0625,
+            Vec3::new(-3.0, 14.0, -2.0) * 0.0625,
+            Vec3::new(1.0, 26.0, 2.0) * 0.0625,
             &region,
             [ox as f32, oy as f32],
             alpha,
-            transform,
+            &to_vanilla,
         );
     }
 
@@ -2222,6 +2233,45 @@ mod tests {
             sum / mesh.vertices.len() as f32
         };
         assert!((centroid(&moved) - centroid(&rest)).distance(Vec3::new(1.0, 2.0, 3.0)) < 1.0e-4);
+    }
+
+    #[test]
+    fn first_person_arm_samples_the_same_front_rect_as_the_third_person_arm() {
+        // The empty-hand first-person arm must read its skin exactly like the
+        // third-person right arm — earlier it was built in raw vanilla coords
+        // (y-down, front −z) while plane_frac/box_region assume engine coords
+        // (y-up, front +z), which sampled the BACK sub-rect upside-down on the
+        // physical front face (a mirrored arm). Both boxes use push_textured_box
+        // with FACES order, so the front face (+z, FACES index 3) is verts
+        // 12..16 of each box. The first-person arm's front-face UV set must equal
+        // the third-person right arm's, in atlas pixels: U∈[44,48], V∈[20,32].
+        let (ox, oy) = entity_slot_origin(EntitySlot::Player);
+        let to_px = |v: &ModelVertex| {
+            (
+                (v.uv[0] * ENTITY_ATLAS_WIDTH as f32 - ox as f32).round() as i32,
+                (v.uv[1] * ENTITY_ATLAS_HEIGHT as f32 - oy as f32).round() as i32,
+            )
+        };
+
+        // First-person arm (any transform: UVs are transform-independent).
+        let mut fp = ModelMesh::new();
+        fp.push_arm_box(&|local| local, 1.0);
+        let mut fp_front: Vec<(i32, i32)> = fp.vertices[12..16].iter().map(to_px).collect();
+
+        // Third-person right arm is humanoid part index 3 → verts 72..96; its
+        // front face is verts 84..88.
+        let mut tp = ModelMesh::new();
+        tp.push_entity(EntityKind::RemotePlayer, Vec3::ZERO, 0.0, &EntityAnim::default(), None);
+        let mut tp_front: Vec<(i32, i32)> = tp.vertices[84..88].iter().map(to_px).collect();
+
+        fp_front.sort();
+        tp_front.sort();
+        assert_eq!(
+            fp_front, tp_front,
+            "first-person arm front face must sample the same texels as the third-person arm"
+        );
+        // And it is the front sub-rect (U 44..48, V 20..32), not the back (U 52..56).
+        assert!(fp_front.iter().all(|&(u, v)| (44..=48).contains(&u) && (20..=32).contains(&v)));
     }
 
     #[test]
