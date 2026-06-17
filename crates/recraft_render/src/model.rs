@@ -445,10 +445,15 @@ fn mob_model(id: u8) -> Option<MobModel> {
     use EntitySlot::*;
     Some(match id {
         50 => MobModel::Creeper,
+        // 1.8 mob bipeds MIRROR the right arm/leg (ModelBiped, like the player's
+        // legacy 64x32 layout): their 64x64 textures leave the separate-left-limb
+        // regions (32,48)/(16,48) empty/transparent. So zombie/giant/pigman use
+        // separate=false (mirror) like the skeleton — separate=true would sample
+        // those transparent regions and drop the left arm + left leg.
         51 => MobModel::Humanoid { slot: Skeleton, separate: false },
         // Giant is a scaled-up zombie; render it as a zombie biped.
-        53 | 54 => MobModel::Humanoid { slot: Zombie, separate: true },
-        57 => MobModel::Humanoid { slot: ZombiePigman, separate: true },
+        53 | 54 => MobModel::Humanoid { slot: Zombie, separate: false },
+        57 => MobModel::Humanoid { slot: ZombiePigman, separate: false },
         120 => MobModel::Villager,
         58 => MobModel::Enderman,
         52 | 59 => MobModel::Spider { slot: Spider }, // spider, cave spider
@@ -2156,6 +2161,28 @@ mod tests {
             oy as f32 / ENTITY_ATLAS_HEIGHT as f32,
             (oy + ENTITY_SLOT_PX) as f32 / ENTITY_ATLAS_HEIGHT as f32,
         )
+    }
+
+    /// Regression for the reported "zombie missing a left arm and left leg": 1.8
+    /// mob bipeds mirror the right limbs and leave the 64x64 separate-left-limb
+    /// regions (texture rows 48..64) empty/transparent. So no biped-mob vertex
+    /// may sample below row 48 of its slot — otherwise the left arm/leg vanish.
+    #[test]
+    fn biped_mobs_do_not_sample_the_empty_left_limb_region() {
+        for (id, slot) in [(54u8, EntitySlot::Zombie), (57, EntitySlot::ZombiePigman), (51, EntitySlot::Skeleton)] {
+            let (_, oy) = entity_slot_origin(slot);
+            // The empty left-limb block starts at row 48 within the slot.
+            let limit = (oy as f32 + 48.0) / ENTITY_ATLAS_HEIGHT as f32;
+            let mesh = build_mob(id);
+            for v in &mesh.vertices {
+                assert!(
+                    v.uv[1] <= limit + 1e-4,
+                    "mob {id} samples the empty left-limb region (v={} > {limit}); \
+                     it must mirror the right limbs (separate=false)",
+                    v.uv[1]
+                );
+            }
+        }
     }
 
     #[test]

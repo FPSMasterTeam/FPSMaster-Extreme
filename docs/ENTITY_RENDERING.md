@@ -26,7 +26,7 @@
 |----|------|------|-------------|------|
 | 50 | Creeper 苦力怕 | ✅ 完整 | Creeper / creeper.png | |
 | 51 | Skeleton 骷髅 | ✅ 完整 | 人形(镜像左肢) / skeleton.png | 64×32 贴图 |
-| 54 | Zombie 僵尸 | ✅ 完整 | 人形(独立左肢) / zombie.png | 改用 64×64 独立左肢 |
+| 54 | Zombie 僵尸 | ✅ 完整 | 人形(镜像左肢) / zombie.png | 1.8 mob biped 镜像右肢；其 64×64 贴图的独立左肢区为空，故 separate=false |
 | 53 | Giant 巨人 | ⚠️ 近似 | 僵尸人形 / zombie.png | 未放大 |
 | 57 | Zombie Pigman 僵尸猪人 | ✅ 修复 | 人形 / zombie_pigman.png | 原来错误复用僵尸纹理 |
 | 120 | Villager 村民 | ✅ 新增 | 专属模型(大鼻子/长袍/抱臂) / villager.png | 原来强套 biped 致贴图错乱 |

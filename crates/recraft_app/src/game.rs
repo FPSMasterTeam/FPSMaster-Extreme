@@ -2903,10 +2903,13 @@ impl GameState {
         if self.world.set_block_if_chunk_loaded(px, py, pz, state) {
             self.mark_block_dirty_urgent(px, py, pz);
             self.relight_after_edit(px, py, pz, old);
-            // Vanilla plays the block's step sound on placement (the
-            // `getPlaceSound` family; we reuse the dig event at pitch 0.8).
-            let pos = Vec3::new(px as f32 + 0.5, py as f32 + 0.5, pz as f32 + 0.5);
-            self.queue_sound(dig_sound_for_block(state.id), pos, 1.0, 0.8);
+            // No client-side place sound: vanilla's `ItemBlock.onItemUse` plays it
+            // via `World.playSoundEffect`, but on the client that hits the empty
+            // `RenderGlobal.playSound` (a no-op). The audible place sound comes
+            // from the server's S29 SoundEffect (`WorldManager.playSound` →
+            // `sendToAllNear`, which includes the placer). Playing it here too
+            // would double it. (Block *breaking* differs: the server excludes the
+            // breaker via `sendToAllNearExcept`, so that one is predicted locally.)
             true
         } else {
             false
