@@ -496,6 +496,23 @@ struct DebugSkip {
     flat: bool,
 }
 
+/// Inputs for the inventory player-preview (vanilla `GuiInventory.drawEntityOnScreen`).
+/// The biped is built at feet origin with its body yaw and head pose already
+/// baked in; the renderer projects it into the panel box and scissors to it.
+/// All pixel measurements are physical (framebuffer) pixels.
+pub struct InventoryPreview<'a> {
+    /// The posed local-player biped (feet at y=0, +y up, +z front toward viewer).
+    pub mesh: &'a ModelMesh,
+    /// Feet anchor in physical px (panel-center x, near the panel bottom).
+    pub anchor: [f32; 2],
+    /// Physical px per model block (vanilla `scale` × the GUI pixel scale).
+    pub pixels_per_block: f32,
+    /// Whole-model tilt about X through the feet, in radians (cursor lean).
+    pub tilt_rad: f32,
+    /// Scissor rect clipping the draw to the panel: [x, y, w, h] in physical px.
+    pub scissor: [u32; 4],
+}
+
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -528,6 +545,14 @@ pub struct Renderer {
     overlay_pipeline: wgpu::RenderPipeline,
     model_pipeline: wgpu::RenderPipeline,
     model_mesh: Option<DynamicMesh>,
+    /// Inventory player-preview (vanilla `GuiInventory.drawEntityOnScreen`): the
+    /// local-player biped baked into clip space and drawn in the UI pass,
+    /// scissored to the panel's model box. Same shader as `model_pipeline` but a
+    /// `surface_format` target (the UI pass writes the swapchain, not HDR).
+    inventory_preview_pipeline: wgpu::RenderPipeline,
+    inventory_preview_mesh: Option<DynamicMesh>,
+    /// Scissor rect (physical px: x, y, w, h) clipping the preview to its panel.
+    inventory_preview_scissor: Option<[u32; 4]>,
     /// First-person held-item geometry (block-atlas textured), per frame.
     first_person_item: Option<DynamicMesh>,
     /// Dropped-item entities in the world (block-atlas textured), per frame.
@@ -1891,6 +1916,50 @@ impl Renderer {
         cache: None,
         multiview_mask: None,
         });
+        // Inventory player preview: same model shader/layout, but its colour
+        // target is the swapchain (`surface_format`) since it draws in the UI
+        // pass. Depth-tested+written against the UI pass's window depth so the
+        // biped self-occludes; no cull (faces wind both ways through the pose).
+        let inventory_preview_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("inventory-preview-pipeline"),
+                layout: Some(&model_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &model_shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[ModelVertex::layout()],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &model_shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: surface_format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::Less),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                cache: None,
+                multiview_mask: None,
+            });
 
         let sky_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("sky-pipeline-layout"),
@@ -2694,6 +2763,9 @@ impl Renderer {
             overlay_pipeline,
             model_pipeline,
             model_mesh: None,
+            inventory_preview_pipeline,
+            inventory_preview_mesh: None,
+            inventory_preview_scissor: None,
             first_person_item: None,
             world_items: None,
             glint_pipeline,
@@ -3487,6 +3559,67 @@ impl Renderer {
             mesh.indices.len() as u32,
             "model",
         );
+    }
+
+    /// Set (or clear with `None`) the inventory player-preview drawn in the UI
+    /// pass (vanilla `GuiInventory.drawEntityOnScreen`). `mesh` is the local
+    /// player's biped built at feet origin (feet y=0, +y up, +z front) with the
+    /// body yaw and head pose already baked in; this projects it orthographically
+    /// into the panel's model box and scissors the draw to it. All measurements
+    /// are physical pixels.
+    pub fn set_inventory_preview(&mut self, preview: Option<&InventoryPreview>) {
+        let Some(p) = preview else {
+            self.inventory_preview_scissor = None;
+            if let Some(m) = self.inventory_preview_mesh.as_mut() {
+                m.index_count = 0;
+            }
+            return;
+        };
+        // Vanilla flips the GUI Y axis and draws an orthographic model: +y up in
+        // the model maps to a smaller screen y, the model's front (+z after the
+        // yaw bake faces the viewer) maps to nearer depth. `pixels_per_block` is
+        // vanilla's `scale` times the GUI pixel scale; `anchor` is the feet point
+        // (panel-center x, near the panel bottom) in physical px. The whole model
+        // tilts about the feet by `tilt_rad` so it leans toward the cursor.
+        let (sw, sh) = (self.config.width as f32, self.config.height as f32);
+        let (sin_t, cos_t) = p.tilt_rad.sin_cos();
+        let to_clip = |pos: [f32; 3]| -> [f32; 3] {
+            // Tilt about X through the feet, then orthographic projection.
+            let (x, y, z) = (pos[0], pos[1], pos[2]);
+            let ty = y * cos_t - z * sin_t;
+            let tz = y * sin_t + z * cos_t;
+            let sx = p.anchor[0] + x * p.pixels_per_block;
+            let sy = p.anchor[1] - ty * p.pixels_per_block;
+            // Depth: the model's front (larger tz toward the viewer) → nearer. A
+            // fixed 0.1/block factor keeps the ~1-block-deep biped well inside the
+            // [0,1] depth box while still self-occluding (nearer parts win).
+            let depth = 0.5 - tz * 0.1;
+            [
+                sx / sw * 2.0 - 1.0,
+                1.0 - sy / sh * 2.0,
+                depth.clamp(0.0, 1.0),
+            ]
+        };
+        let vertices: Vec<ModelVertex> = p
+            .mesh
+            .vertices
+            .iter()
+            .map(|v| ModelVertex {
+                position: to_clip(v.position),
+                color: v.color,
+                uv: v.uv,
+            })
+            .collect();
+        fill_dynamic_mesh(
+            &self.device,
+            &self.queue,
+            &mut self.inventory_preview_mesh,
+            bytemuck::cast_slice(&vertices),
+            bytemuck::cast_slice(&p.mesh.indices),
+            p.mesh.indices.len() as u32,
+            "inventory-preview",
+        );
+        self.inventory_preview_scissor = Some(p.scissor);
     }
 
     /// The block/item atlas UV table, for building first-person item geometry.
@@ -5121,6 +5254,27 @@ impl Renderer {
                 up.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                 up.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 up.draw_indexed(0..mesh.index_count, 0, 0..1);
+                draw_calls += 1;
+            }
+            // Inventory player preview (vanilla `GuiInventory.drawEntityOnScreen`):
+            // the local-player biped baked into clip space, scissored to the
+            // panel's model box so it never overdraws the rest of the window. The
+            // pass's depth is shared with the block icons (cleared to far), so the
+            // biped self-occludes; drawn before the overlay so the carried stack /
+            // tooltips still render on top. The scissor is reset to the full frame
+            // afterwards so the overlay layer is not clipped.
+            if let (Some(mesh), Some([sx, sy, sw, sh])) = (
+                self.inventory_preview_mesh.as_ref().filter(|m| m.index_count > 0),
+                self.inventory_preview_scissor,
+            ) {
+                up.set_scissor_rect(sx, sy, sw, sh);
+                up.set_pipeline(&self.inventory_preview_pipeline);
+                up.set_bind_group(0, &self.gui_camera_bind_group, &[]);
+                up.set_bind_group(1, &self.entity_bind_group, &[]);
+                up.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                up.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                up.draw_indexed(0..mesh.index_count, 0, 0..1);
+                up.set_scissor_rect(0, 0, self.config.width, self.config.height);
                 draw_calls += 1;
             }
             // UI foreground layer (counts, hover, carried stack) over the cubes.

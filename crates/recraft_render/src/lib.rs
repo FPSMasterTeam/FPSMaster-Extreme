@@ -20,7 +20,7 @@ pub use font::char_width;
 pub use item_names::{build_tooltip, item_display_name};
 pub use model::{held_item_frame, ChestKind, EntityAnim, HeldItemFrame, ModelMesh, ModelVertex};
 pub use particle::{build_particle_mesh, ParticleBillboard};
-pub use renderer::{RenderStats, Renderer, RendererError};
+pub use renderer::{InventoryPreview, RenderStats, Renderer, RendererError};
 pub use texture::{AtlasUv, OverlayTextures, PackMeta, PbrAtlases, TextureAtlasImage, discover_resource_packs};
 pub use ui::{
     gui_pixel_scale, text_height, text_width, GuiAtlas, GuiTexture, UiColor, UiFrame, UiRect,

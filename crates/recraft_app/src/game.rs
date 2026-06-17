@@ -1006,6 +1006,18 @@ impl GameState {
         self.open_container.as_ref()
     }
 
+    /// The downloaded-skin atlas row for the local player, resolved by matching
+    /// `name` against the tab-list roster (the local player has no entry in the
+    /// entity-uuid map). `None` falls back to the default player skin.
+    pub fn local_skin_row(
+        &self,
+        name: &str,
+        skin_rows: &std::collections::HashMap<[u8; 16], u32>,
+    ) -> Option<u32> {
+        let (uuid, _) = self.player_list.iter().find(|(_, info)| info.name == name)?;
+        skin_rows.get(uuid).copied()
+    }
+
     /// Whether a paint-drag is in progress (the screen defers the commit to the
     /// mouse release, falling back to a normal click when only one slot painted).
     pub fn container_drag_active(&self) -> bool {

@@ -23,6 +23,70 @@ use super::{DrawCtx, GuiAction, GuiScreen, ScreenCtx};
 /// Vanilla container title color (`0x404040`, no shadow).
 const TITLE_COLOR: UiColor = UiColor::rgba(64, 64, 64, 255);
 
+/// The player-preview pose for the inventory window (vanilla
+/// `GuiInventory.drawEntityOnScreen`). All angles are degrees in the model's
+/// own convention: `body_yaw` is the body twist, `net_head_yaw` is the head
+/// turn relative to the body, `head_pitch` is the head tilt, and `tilt` is the
+/// whole-model X lean applied during projection.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PreviewPose {
+    pub body_yaw: f32,
+    pub net_head_yaw: f32,
+    pub head_pitch: f32,
+    pub tilt: f32,
+}
+
+/// Where the preview biped sits in the window (vanilla offsets, all in GUI px
+/// relative to the window origin `(guiLeft, guiTop)`): the model panel box and
+/// the feet anchor `drawEntityOnScreen` draws at (`guiLeft+51, guiTop+75`).
+const PREVIEW_PANEL: (i32, i32, i32, i32) = (26, 8, 75, 78); // x0, y0, x1, y1
+const PREVIEW_ANCHOR_X: i32 = 51;
+const PREVIEW_ANCHOR_Y: i32 = 75;
+/// Vanilla `drawEntityOnScreen` look reference: the mouse is taken relative to a
+/// point 50 GUI px above the feet (`guiTop + 75 - 50`).
+const PREVIEW_LOOK_Y: i32 = PREVIEW_ANCHOR_Y - 50;
+/// Vanilla `drawEntityOnScreen` scale.
+pub const PREVIEW_SCALE: f32 = 30.0;
+
+/// The look pose from the cursor, mirroring vanilla `drawEntityOnScreen`:
+/// `f = atan((anchorX - mouseX)/40)`, `f1 = atan((lookY - mouseY)/40)`, with
+/// body yaw `f*20`, head total yaw `f*40` (so net head yaw `f*20`), head pitch
+/// `-f1*20` and a whole-model lean of `-f1*20`. Mouse is in GUI px relative to
+/// the window origin.
+pub fn preview_pose(mouse_gui: (f32, f32), origin_gui: (f32, f32)) -> PreviewPose {
+    let dx = (origin_gui.0 + PREVIEW_ANCHOR_X as f32) - mouse_gui.0;
+    let dy = (origin_gui.1 + PREVIEW_LOOK_Y as f32) - mouse_gui.1;
+    let f = (dx / 40.0).atan();
+    let f1 = (dy / 40.0).atan();
+    PreviewPose {
+        body_yaw: f * 20.0,
+        net_head_yaw: f * 20.0,
+        head_pitch: -f1 * 20.0,
+        tilt: -f1 * 20.0,
+    }
+}
+
+/// The preview's scissor rect and feet anchor in physical px. `origin_px` is the
+/// window origin `(guiLeft, guiTop)` in physical px and `scale` the GUI pixel
+/// scale, so a GUI-px offset `o` maps to `origin_px + o*scale`. Returns
+/// `(scissor[x,y,w,h], anchor[x,y], pixels_per_block)`.
+pub fn preview_layout(origin_px: (i32, i32), scale: i32) -> ([u32; 4], [f32; 2], f32) {
+    let (x0, y0, x1, y1) = PREVIEW_PANEL;
+    let scissor = [
+        (origin_px.0 + x0 * scale).max(0) as u32,
+        (origin_px.1 + y0 * scale).max(0) as u32,
+        ((x1 - x0) * scale).max(0) as u32,
+        ((y1 - y0) * scale).max(0) as u32,
+    ];
+    let anchor = [
+        (origin_px.0 + PREVIEW_ANCHOR_X * scale) as f32,
+        (origin_px.1 + PREVIEW_ANCHOR_Y * scale) as f32,
+    ];
+    // Vanilla scales the entity (1 unit = 1 block) by `PREVIEW_SCALE`, so one
+    // model block spans `PREVIEW_SCALE` GUI px → `PREVIEW_SCALE * scale` physical.
+    (scissor, anchor, PREVIEW_SCALE * scale as f32)
+}
+
 #[derive(Default)]
 pub struct GuiContainer {
     /// Panel origin and GUI scale cached from the last `draw`, so input handlers
@@ -436,4 +500,64 @@ fn hotbar_digit(code: KeyCode) -> Option<i8> {
         KeyCode::Digit9 => 8,
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cursor_on_the_anchor_yields_a_neutral_facing() {
+        // The mouse sitting exactly on the model anchor (no offset) → zero yaw,
+        // and on the look reference (50 px up) → zero pitch/tilt.
+        let origin = (0.0, 0.0);
+        let pose = preview_pose(
+            (PREVIEW_ANCHOR_X as f32, PREVIEW_LOOK_Y as f32),
+            origin,
+        );
+        assert!(pose.body_yaw.abs() < 1e-4, "{pose:?}");
+        assert!(pose.net_head_yaw.abs() < 1e-4, "{pose:?}");
+        assert!(pose.head_pitch.abs() < 1e-4, "{pose:?}");
+        assert!(pose.tilt.abs() < 1e-4, "{pose:?}");
+    }
+
+    #[test]
+    fn moving_the_cursor_turns_and_tilts_like_vanilla() {
+        let origin = (10.0, 20.0);
+        let anchor_x = origin.0 + PREVIEW_ANCHOR_X as f32;
+        let look_y = origin.1 + PREVIEW_LOOK_Y as f32;
+        // Cursor 40 px right of the anchor and 40 px below the look point.
+        let mouse = (anchor_x + 40.0, look_y + 40.0);
+        let pose = preview_pose(mouse, origin);
+        // dx = -40, dy = -40 → f = atan(-1) = -π/4, so body_yaw = -π/4*20.
+        let expected = (-1.0_f32).atan() * 20.0;
+        assert!((pose.body_yaw - expected).abs() < 1e-4, "{pose:?}");
+        assert!((pose.head_pitch - (-expected)).abs() < 1e-4, "{pose:?}");
+        // Direct vanilla relations: head yaw equals body yaw, tilt equals pitch.
+        assert!((pose.net_head_yaw - pose.body_yaw).abs() < 1e-4, "{pose:?}");
+        assert!((pose.tilt - pose.head_pitch).abs() < 1e-4, "{pose:?}");
+        // Right-and-below cursor: body turns negative (mirrors vanilla
+        // `anchorX - mouseX`), head pitches/leans up (negative `-f1`, f1<0).
+        assert!(pose.body_yaw < 0.0, "{pose:?}");
+        assert!(pose.head_pitch > 0.0, "{pose:?}");
+    }
+
+    #[test]
+    fn yaw_and_pitch_are_clamped_by_the_atan_curve() {
+        // atan saturates near ±90°, so the *20 scaling caps the body yaw near
+        // ±π/2*20 ≈ ±31.4° regardless of how far the cursor is dragged. A cursor
+        // far to the right (`anchorX - mouseX` very negative) saturates negative.
+        let pose = preview_pose((10_000.0, 0.0), (0.0, 0.0));
+        assert!(pose.body_yaw <= -31.0 && pose.body_yaw >= -31.5, "{pose:?}");
+    }
+
+    #[test]
+    fn panel_layout_offsets_from_the_window_origin() {
+        let (scissor, anchor, ppb) = preview_layout((100, 50), 2);
+        // Panel box (26,8)->(75,78) GUI px, ×2 scale, offset by the origin.
+        assert_eq!(scissor, [100 + 26 * 2, 50 + 8 * 2, (75 - 26) * 2, (78 - 8) * 2]);
+        // Feet anchor at (51,75) GUI px ×2.
+        assert_eq!(anchor, [(100 + 51 * 2) as f32, (50 + 75 * 2) as f32]);
+        assert_eq!(ppb, PREVIEW_SCALE * 2.0);
+    }
 }

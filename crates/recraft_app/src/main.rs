@@ -1368,6 +1368,69 @@ fn append_mesh(
     indices.extend(mesh.1.iter().map(|i| i + base));
 }
 
+/// Build and hand the renderer the inventory player-preview, or clear it when
+/// the player-inventory window isn't open (vanilla `GuiInventory`). The biped is
+/// built at feet origin with the body yaw and head pose set from the cursor; the
+/// whole-model lean and projection into the panel are done by the renderer.
+fn build_inventory_preview(
+    renderer: &mut Renderer,
+    app: &App,
+    width: i32,
+    height: i32,
+    cursor_position: (f64, f64),
+) {
+    use crate::container::WindowKind;
+    use recraft_core::EntityKind;
+    use recraft_render::EntityAnim;
+
+    // Only the player inventory shows the preview — server containers do not.
+    let open = matches!(
+        app.game.open_container().map(|c| c.kind),
+        Some(WindowKind::Player)
+    );
+    if !app.in_world || app.screen.is_none() || !open {
+        renderer.set_inventory_preview(None);
+        return;
+    }
+    let container = app.game.open_container().expect("player container open");
+
+    let scale = gui::gui_scale(width, height);
+    // Window origin (vanilla `guiLeft`/`guiTop`): the panel is centred.
+    let origin_px = (
+        (width - container.x_size * scale) / 2,
+        (height - container.y_size * scale) / 2,
+    );
+    let origin_gui = (origin_px.0 as f32 / scale as f32, origin_px.1 as f32 / scale as f32);
+    let mouse_gui = (
+        cursor_position.0 as f32 / scale as f32,
+        cursor_position.1 as f32 / scale as f32,
+    );
+    let pose = gui::inventory::preview_pose(mouse_gui, origin_gui);
+    let (scissor, anchor, pixels_per_block) = gui::inventory::preview_layout(origin_px, scale);
+
+    // Build the biped at feet origin, facing +z (toward the viewer); the body
+    // yaw turns it, the head tracks the cursor relative to the body. Crouch is
+    // never applied here (vanilla resets the pose for the preview).
+    let anim = EntityAnim {
+        net_head_yaw: pose.net_head_yaw,
+        head_pitch: pose.head_pitch,
+        ..Default::default()
+    };
+    let skin_row = app
+        .game
+        .local_skin_row(app.session_username().unwrap_or(&app.username), app.skin_manager.rows());
+    let mut mesh = recraft_render::ModelMesh::new();
+    mesh.push_entity(EntityKind::LocalPlayer, glam::Vec3::ZERO, pose.body_yaw, &anim, skin_row);
+
+    renderer.set_inventory_preview(Some(&recraft_render::InventoryPreview {
+        mesh: &mesh,
+        anchor,
+        pixels_per_block,
+        tilt_rad: pose.tilt.to_radians(),
+        scissor,
+    }));
+}
+
 /// Render one frame: world, entities + first-person hand, HUD and the open
 /// screen. Driven from `AboutToWait` so the frame rate is paced by our own
 /// vsync/FPS-cap logic instead of macOS Core Animation throttling.
@@ -1556,6 +1619,12 @@ fn render_frame(
     let (width, height) = (size.width as i32, size.height as i32);
     let account_entries = app.account_entries();
     let mut ui = recraft_render::UiFrame::new();
+
+    // Inventory player preview (vanilla `GuiInventory.drawEntityOnScreen`): when
+    // the player-inventory window is open, render the local biped looking toward
+    // the cursor in the top-left panel. Built into its own short-lived mesh, then
+    // projected + scissored to the panel by the renderer.
+    build_inventory_preview(renderer, app, width, height, cursor_position);
 
     let App {
         screen,
