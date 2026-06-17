@@ -1766,111 +1766,81 @@ impl GameState {
         let sun_b = recraft_render::sky::sun_brightness(self.world_time(tick_alpha));
         let frustum = self.camera.frustum();
         let cam = self.camera.position;
-        let max_chunk_dist = (max_dist_sq.sqrt() / 16.0).ceil() as i32 + 1;
-        let cam_cx = (cam.x.floor() as i32).div_euclid(16);
-        let cam_cz = (cam.z.floor() as i32).div_euclid(16);
 
-        for chunk in self.world.chunks() {
-            let cpos = chunk.position;
-            if (cpos.x - cam_cx).abs() > max_chunk_dist || (cpos.z - cam_cz).abs() > max_chunk_dist {
+        for (&[wx, wy, wz], block) in self.world.block_entities() {
+            let kind = match block.id {
+                54 => ChestKind::Normal,
+                130 => ChestKind::Ender,
+                146 => ChestKind::Trapped,
+                _ => continue,
+            };
+            // Cull by distance (cell centre) then frustum.
+            let cx = wx as f64 + 0.5;
+            let cy = wy as f64 + 0.5;
+            let cz = wz as f64 + 0.5;
+            let d = (cx - cam.x as f64).powi(2)
+                + (cy - cam.y as f64).powi(2)
+                + (cz - cam.z as f64).powi(2);
+            if d > max_dist_sq {
                 continue;
             }
-            for section in chunk.sections() {
-                let base_y = section.y() * 16;
-                for ly in 0..16u8 {
-                    for lz in 0..16u8 {
-                        for lx in 0..16u8 {
-                            let block = section.get(lx, ly, lz);
-                            let kind = match block.id {
-                                54 => ChestKind::Normal,
-                                130 => ChestKind::Ender,
-                                146 => ChestKind::Trapped,
-                                _ => continue,
-                            };
-                            let wx = cpos.x * 16 + lx as i32;
-                            let wy = base_y + ly as i32;
-                            let wz = cpos.z * 16 + lz as i32;
-                            // Cull by distance (cell centre) then frustum.
-                            let cx = wx as f64 + 0.5;
-                            let cy = wy as f64 + 0.5;
-                            let cz = wz as f64 + 0.5;
-                            let d = (cx - cam.x as f64).powi(2)
-                                + (cy - cam.y as f64).powi(2)
-                                + (cz - cam.z as f64).powi(2);
-                            if d > max_dist_sq {
-                                continue;
-                            }
-                            let min = Vec3::new(wx as f32, wy as f32, wz as f32);
-                            let max = min + Vec3::ONE;
-                            if !frustum.intersects_aabb(min, max) {
-                                continue;
-                            }
-                            let lid = self
-                                .chest_lid_angles
-                                .get(&[wx, wy, wz])
-                                .copied()
-                                .unwrap_or(0.0);
-                            // Pairing: a chest pairs with a same-id chest on the
-                            // axis perpendicular to its facing (meta 2/3 face
-                            // N/S → pair on X; 4/5 face E/W → pair on Z). Ender
-                            // chests (130) are never double. The canonical half
-                            // (smaller X/Z, vanilla's adjacentChestXNeg/ZNeg ==
-                            // null) renders the large model; the other half is
-                            // skipped. Single chests keep push_chest.
-                            let axis = match (kind, block.meta) {
-                                (ChestKind::Ender, _) => None,
-                                (_, 2 | 3) => Some([1i32, 0, 0]),
-                                (_, 4 | 5) => Some([0i32, 0, 1]),
-                                _ => None,
-                            };
-                            let partner = axis.and_then(|d| {
-                                let pos = self.world.block_at(wx + d[0], wy + d[1], wz + d[2]);
-                                let neg = self.world.block_at(wx - d[0], wy - d[1], wz - d[2]);
-                                if neg.id == block.id {
-                                    // Neighbour on −axis renders the pair; skip.
-                                    Some(None)
-                                } else if pos.id == block.id {
-                                    // This is the canonical half; partner at +axis.
-                                    Some(Some([wx + d[0], wy + d[1], wz + d[2]]))
-                                } else {
-                                    None
-                                }
-                            });
-                            let start = mesh.vertices.len();
-                            match partner {
-                                // Other half of a pair — the canonical half draws it.
-                                Some(None) => continue,
-                                // Canonical half: one large model, lid shared (max).
-                                Some(Some(p)) => {
-                                    let partner_lid = self
-                                        .chest_lid_angles
-                                        .get(&p)
-                                        .copied()
-                                        .unwrap_or(0.0);
-                                    mesh.push_large_chest(
-                                        [wx, wy, wz],
-                                        block.meta,
-                                        lid.max(partner_lid),
-                                        kind,
-                                    );
-                                }
-                                None => mesh.push_chest([wx, wy, wz], block.meta, lid, kind),
-                            }
-                            // Light the chest by the lightmap at its centre, like mobs.
-                            let factor = entity_light(
-                                &self.world,
-                                Vec3::new(cx as f32, cy as f32, cz as f32),
-                                sun_b,
-                                brightness,
-                            );
-                            for v in &mut mesh.vertices[start..] {
-                                v.color[0] *= factor;
-                                v.color[1] *= factor;
-                                v.color[2] *= factor;
-                            }
-                        }
-                    }
+            let min = Vec3::new(wx as f32, wy as f32, wz as f32);
+            let max = min + Vec3::ONE;
+            if !frustum.intersects_aabb(min, max) {
+                continue;
+            }
+            let lid = self
+                .chest_lid_angles
+                .get(&[wx, wy, wz])
+                .copied()
+                .unwrap_or(0.0);
+            // Pairing: a chest pairs with a same-id chest on the axis
+            // perpendicular to its facing (meta 2/3 face N/S → pair on X; 4/5
+            // face E/W → pair on Z). Ender chests (130) are never double. The
+            // canonical half (smaller X/Z, vanilla's adjacentChestXNeg/ZNeg ==
+            // null) renders the large model; the other half is skipped. Single
+            // chests keep push_chest.
+            let axis = match (kind, block.meta) {
+                (ChestKind::Ender, _) => None,
+                (_, 2 | 3) => Some([1i32, 0, 0]),
+                (_, 4 | 5) => Some([0i32, 0, 1]),
+                _ => None,
+            };
+            let partner = axis.and_then(|d| {
+                let pos = self.world.block_at(wx + d[0], wy + d[1], wz + d[2]);
+                let neg = self.world.block_at(wx - d[0], wy - d[1], wz - d[2]);
+                if neg.id == block.id {
+                    // Neighbour on −axis renders the pair; skip.
+                    Some(None)
+                } else if pos.id == block.id {
+                    // This is the canonical half; partner at +axis.
+                    Some(Some([wx + d[0], wy + d[1], wz + d[2]]))
+                } else {
+                    None
                 }
+            });
+            let start = mesh.vertices.len();
+            match partner {
+                // Other half of a pair — the canonical half draws it.
+                Some(None) => continue,
+                // Canonical half: one large model, lid shared (max).
+                Some(Some(p)) => {
+                    let partner_lid = self.chest_lid_angles.get(&p).copied().unwrap_or(0.0);
+                    mesh.push_large_chest([wx, wy, wz], block.meta, lid.max(partner_lid), kind);
+                }
+                None => mesh.push_chest([wx, wy, wz], block.meta, lid, kind),
+            }
+            // Light the chest by the lightmap at its centre, like mobs.
+            let factor = entity_light(
+                &self.world,
+                Vec3::new(cx as f32, cy as f32, cz as f32),
+                sun_b,
+                brightness,
+            );
+            for v in &mut mesh.vertices[start..] {
+                v.color[0] *= factor;
+                v.color[1] *= factor;
+                v.color[2] *= factor;
             }
         }
     }
@@ -1878,8 +1848,8 @@ impl GameState {
     /// Append the sign, enchanting-table-book and end-portal block-entities near
     /// the camera to the entity model, and return the sign-text draws for the
     /// renderer's world-space text pass. Mirrors [`Self::build_chest_models`]:
-    /// loaded chunks within `max_dist_sq` are scanned, each block-entity is
-    /// distance + frustum culled and lit by the world lightmap. The book hover
+    /// the world's block-entity index is walked (not a per-frame voxel scan),
+    /// each entry distance + frustum culled and lit by the world lightmap. The book hover
     /// is driven by the world time (the same source folded into the entity
     /// fingerprint, so the book's phase matches the rebuild cadence).
     pub fn build_block_entity_models(
@@ -1893,83 +1863,63 @@ impl GameState {
         let sun_b = recraft_render::sky::sun_brightness(self.world_time(tick_alpha));
         let frustum = self.camera.frustum();
         let cam = self.camera.position;
-        let max_chunk_dist = (max_dist_sq.sqrt() / 16.0).ceil() as i32 + 1;
-        let cam_cx = (cam.x.floor() as i32).div_euclid(16);
-        let cam_cz = (cam.z.floor() as i32).div_euclid(16);
         let mut sign_texts = Vec::new();
 
-        for chunk in self.world.chunks() {
-            let cpos = chunk.position;
-            if (cpos.x - cam_cx).abs() > max_chunk_dist || (cpos.z - cam_cz).abs() > max_chunk_dist {
+        for (&[wx, wy, wz], block) in self.world.block_entities() {
+            // Signs (63 standing, 68 wall), enchanting table (116) and end
+            // portal (119); chests share the index but render in build_chest_models.
+            if !matches!(block.id, 63 | 68 | 116 | 119) {
                 continue;
             }
-            for section in chunk.sections() {
-                let base_y = section.y() * 16;
-                for ly in 0..16u8 {
-                    for lz in 0..16u8 {
-                        for lx in 0..16u8 {
-                            let block = section.get(lx, ly, lz);
-                            // Signs (63 standing, 68 wall), enchanting table (116)
-                            // and end portal (119) are the only block-entities here.
-                            if !matches!(block.id, 63 | 68 | 116 | 119) {
-                                continue;
-                            }
-                            let wx = cpos.x * 16 + lx as i32;
-                            let wy = base_y + ly as i32;
-                            let wz = cpos.z * 16 + lz as i32;
-                            let cx = wx as f64 + 0.5;
-                            let cy = wy as f64 + 0.5;
-                            let cz = wz as f64 + 0.5;
-                            let d = (cx - cam.x as f64).powi(2)
-                                + (cy - cam.y as f64).powi(2)
-                                + (cz - cam.z as f64).powi(2);
-                            if d > max_dist_sq {
-                                continue;
-                            }
-                            let min = Vec3::new(wx as f32, wy as f32, wz as f32);
-                            let max = min + Vec3::ONE;
-                            if !frustum.intersects_aabb(min, max) {
-                                continue;
-                            }
-                            let center = Vec3::new(cx as f32, cy as f32, cz as f32);
-                            let factor = entity_light(&self.world, center, sun_b, brightness);
-                            let start = mesh.vertices.len();
-                            let cell = [wx, wy, wz];
-                            match block.id {
-                                63 | 68 => {
-                                    let kind = if block.id == 63 {
-                                        SignKind::Standing
-                                    } else {
-                                        SignKind::Wall
-                                    };
-                                    mesh.push_sign(cell, block.meta, kind);
-                                    if let Some(lines) = self.signs.get(&cell) {
-                                        if lines.iter().any(|l| !l.is_empty()) {
-                                            let (c, right, up, hw, hh) =
-                                                ModelMesh::sign_text_basis(cell, block.meta, kind);
-                                            sign_texts.push(SignTextDraw {
-                                                lines: lines.clone(),
-                                                center: c,
-                                                right,
-                                                up,
-                                                half_width: hw,
-                                                half_height: hh,
-                                            });
-                                        }
-                                    }
-                                }
-                                116 => mesh.push_book(cell, time),
-                                119 => mesh.push_end_portal(cell),
-                                _ => unreachable!(),
-                            }
-                            for v in &mut mesh.vertices[start..] {
-                                v.color[0] *= factor;
-                                v.color[1] *= factor;
-                                v.color[2] *= factor;
-                            }
+            let cx = wx as f64 + 0.5;
+            let cy = wy as f64 + 0.5;
+            let cz = wz as f64 + 0.5;
+            let d = (cx - cam.x as f64).powi(2)
+                + (cy - cam.y as f64).powi(2)
+                + (cz - cam.z as f64).powi(2);
+            if d > max_dist_sq {
+                continue;
+            }
+            let min = Vec3::new(wx as f32, wy as f32, wz as f32);
+            let max = min + Vec3::ONE;
+            if !frustum.intersects_aabb(min, max) {
+                continue;
+            }
+            let center = Vec3::new(cx as f32, cy as f32, cz as f32);
+            let factor = entity_light(&self.world, center, sun_b, brightness);
+            let start = mesh.vertices.len();
+            let cell = [wx, wy, wz];
+            match block.id {
+                63 | 68 => {
+                    let kind = if block.id == 63 {
+                        SignKind::Standing
+                    } else {
+                        SignKind::Wall
+                    };
+                    mesh.push_sign(cell, block.meta, kind);
+                    if let Some(lines) = self.signs.get(&cell) {
+                        if lines.iter().any(|l| !l.is_empty()) {
+                            let (c, right, up, hw, hh) =
+                                ModelMesh::sign_text_basis(cell, block.meta, kind);
+                            sign_texts.push(SignTextDraw {
+                                lines: lines.clone(),
+                                center: c,
+                                right,
+                                up,
+                                half_width: hw,
+                                half_height: hh,
+                            });
                         }
                     }
                 }
+                116 => mesh.push_book(cell, time),
+                119 => mesh.push_end_portal(cell),
+                _ => unreachable!(),
+            }
+            for v in &mut mesh.vertices[start..] {
+                v.color[0] *= factor;
+                v.color[1] *= factor;
+                v.color[2] *= factor;
             }
         }
         sign_texts
@@ -4382,28 +4332,48 @@ fn block_needs_tool(id: u16) -> bool {
     )
 }
 
-/// Block hardness in vanilla units; negative means unbreakable.
+/// Block hardness in vanilla 1.8.9 units; negative means unbreakable. The full
+/// table, copied from `references/minecraft-data` (pc/1.8 blocks.json) so mining
+/// time matches vanilla for every block id. Not-diggable blocks (bedrock, the
+/// portals, barrier, the moving-piston block, command block, fluids) map to
+/// -1.0 (unbreakable); 0.0 is an instant break.
 fn block_hardness(id: u16) -> f32 {
     match id {
-        7 | 119 | 120 => -1.0,      // bedrock, end portal frame
-        49 => 50.0,                 // obsidian
-        42 | 57 | 133 | 152 => 5.0, // iron / diamond / emerald / redstone block
-        61 | 62 => 3.5,             // furnace
-        // Ores and gold/lapis blocks (need a pickaxe).
-        14 | 15 | 16 | 21 | 22 | 41 | 56 | 73 | 74 | 129 => 3.0,
-        58 => 2.5, // crafting table
-        // Cobblestone, planks, logs, brick, slabs, mossy cobble, nether brick.
-        4 | 5 | 17 | 43 | 44 | 45 | 48 | 53 | 85 | 112 | 162 => 2.0,
-        // Stone, stone bricks, bookshelf.
-        1 | 47 | 98 => 1.5,
-        24 | 35 => 0.8,                // sandstone, wool
-        2 | 13 | 60 | 82 | 110 => 0.6, // grass, gravel, farmland, clay, mycelium
-        3 | 12 | 79 => 0.5,            // dirt, sand, ice
-        87 => 0.4,                     // netherrack
-        18 | 161 => 0.2,               // leaves
-        20 | 89 | 95 | 102 => 0.3,     // glass, glowstone, stained glass, glass pane
-        // Instant-break: saplings, plants, snow layer, flowers.
-        6 | 31 | 32 | 37 | 38 | 78 => 0.0,
+        49 => 50.0,  // obsidian
+        130 => 22.5, // ender chest
+        // mob spawner, iron/diamond/emerald/redstone blocks, anvil, beacon,
+        // brewing stand, enchanting table, dropper.
+        42 | 52 | 57 | 71 | 101 | 116 | 133 | 145 | 152 | 167 | 173 => 5.0,
+        30 => 4.0,                 // cobweb
+        23 | 61 | 62 | 158 => 3.5, // dispenser, furnaces, dropper
+        // ores, gold/lapis blocks, skull bases, mossy/cracked brick, jukebox,
+        // redstone lamp, hopper, sea lantern, wooden doors.
+        14 | 15 | 16 | 21 | 22 | 41 | 56 | 64 | 73 | 74 | 96 | 121 | 122 | 129
+        | 138 | 153 | 154 | 193 | 194 | 195 | 196 | 197 => 3.0,
+        54 | 58 | 146 => 2.5, // chest, crafting table, trapped chest
+        // cobblestone, planks, logs, brick, slabs, stairs, fences, walls, pistons…
+        4 | 5 | 17 | 43 | 44 | 45 | 48 | 53 | 67 | 84 | 85 | 107 | 108 | 112 | 113
+        | 114 | 118 | 125 | 126 | 134 | 135 | 136 | 139 | 162 | 163 | 164 | 181
+        | 182 | 183 | 184 | 185 | 186 | 187 | 188 | 189 | 190 | 191 | 192 => 2.0,
+        1 | 47 | 98 | 109 | 168 => 1.5, // stone, bookshelf, stone bricks, prismarine
+        159 | 172 => 1.25,              // stained / plain hardened clay
+        63 | 68 | 86 | 91 | 103 | 144 | 176 | 177 => 1.0, // signs, pumpkins, melon, skull, banners
+        24 | 25 | 35 | 128 | 155 | 156 | 179 | 180 => 0.8, // sandstone, note block, wool, quartz, red sandstone
+        97 => 0.75,                // monster egg
+        27 | 28 | 66 | 157 => 0.7, // rails
+        2 | 13 | 19 | 60 | 82 | 110 | 111 => 0.6, // grass, gravel, sponge, farmland, clay, mycelium, lily
+        3 | 12 | 29 | 33 | 34 | 69 | 70 | 72 | 77 | 79 | 88 | 92 | 117 | 143 | 147
+        | 148 | 170 | 174 => 0.5, // dirt, sand, pistons, lever, plates, ice, soul sand, cake, hay…
+        65 | 81 | 87 => 0.4,       // ladder, cactus, netherrack
+        20 | 89 | 95 | 102 | 123 | 124 | 160 | 169 => 0.3, // glass, glowstone, stained glass/pane, redstone lamp
+        18 | 26 | 78 | 80 | 106 | 127 | 151 | 161 | 178 => 0.2, // leaves, bed, snow, vine, cocoa, daylight sensor
+        171 => 0.1, // carpet
+        // Instant-break: plants, crops, torches, redstone, flowers, tnt, fire…
+        6 | 31 | 32 | 37 | 38 | 39 | 40 | 46 | 50 | 51 | 55 | 59 | 75 | 76 | 83
+        | 93 | 94 | 99 | 100 | 104 | 105 | 115 | 131 | 132 | 140 | 141 | 142 | 149
+        | 150 | 165 | 175 => 0.0,
+        // Unbreakable / not diggable.
+        7 | 8 | 9 | 10 | 11 | 36 | 90 | 119 | 120 | 137 | 166 => -1.0,
         _ => 1.0,
     }
 }
@@ -5038,6 +5008,51 @@ fn armor_points(id: i16) -> i32 {
 mod interaction_tests {
     use super::*;
     use recraft_core::{BlockState, EntityId, EntityKind};
+
+    #[test]
+    fn block_hardness_matches_vanilla_across_the_tiers() {
+        // Spot-check the full 1.8.9 hardness table (copied from minecraft-data)
+        // against known vanilla values, one per tier, to guard the big match.
+        for (id, expected) in [
+            (49u16, 50.0f32), // obsidian
+            (130, 22.5),      // ender chest
+            (52, 5.0),        // mob spawner
+            (30, 4.0),        // cobweb
+            (61, 3.5),        // furnace
+            (14, 3.0),        // coal ore
+            (54, 2.5),        // chest
+            (4, 2.0),         // cobblestone
+            (1, 1.5),         // stone
+            (159, 1.25),      // stained hardened clay
+            (63, 1.0),        // standing sign
+            (35, 0.8),        // wool
+            (97, 0.75),       // monster egg
+            (27, 0.7),        // golden rail
+            (2, 0.6),         // grass
+            (3, 0.5),         // dirt
+            (87, 0.4),        // netherrack
+            (20, 0.3),        // glass
+            (18, 0.2),        // leaves
+            (171, 0.1),       // carpet
+            (31, 0.0),        // tall grass (instant)
+            (46, 0.0),        // tnt (instant)
+        ] {
+            assert!(
+                (block_hardness(id) - expected).abs() < 1e-4,
+                "block {id} hardness {} != vanilla {expected}",
+                block_hardness(id)
+            );
+        }
+        // Unbreakable tier is negative (bedrock, fluids, portals, command block).
+        for id in [7u16, 8, 9, 10, 11, 90, 119, 120, 137, 166] {
+            assert!(block_hardness(id) < 0.0, "block {id} should be unbreakable");
+        }
+        // Every in-range id resolves; none accidentally hits a wrong sign.
+        for id in 1..=197u16 {
+            let h = block_hardness(id);
+            assert!(h.is_finite() && h >= -1.0, "block {id} hardness out of range: {h}");
+        }
+    }
 
     fn looking_along_x() -> GameState {
         // Empty world, camera at a block center looking toward +x (yaw -90).

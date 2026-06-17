@@ -6,6 +6,18 @@ use crate::{BlockState, Chunk, ChunkPos, EntityId, EntityState, SectionPos};
 pub struct World {
     chunks: HashMap<ChunkPos, Chunk>,
     entities: HashMap<EntityId, EntityState>,
+    /// Index of block-entity positions (signs, chests, enchanting tables, end
+    /// portals) → their current state, kept in sync on every block mutation.
+    /// Lets the renderer enumerate the handful of block-entities directly each
+    /// frame instead of brute-force scanning every loaded section's full 16³.
+    block_entities: HashMap<[i32; 3], BlockState>,
+}
+
+/// Block ids that carry a client-rendered block-entity (vanilla TileEntity):
+/// chest/trapped/ender (54/146/130), standing/wall sign (63/68), enchanting
+/// table (116) and end portal (119).
+pub const fn is_block_entity(id: u16) -> bool {
+    matches!(id, 54 | 63 | 68 | 116 | 119 | 130 | 146)
 }
 
 impl World {
@@ -35,6 +47,54 @@ impl World {
 
     pub fn remove_chunk(&mut self, pos: ChunkPos) {
         self.chunks.remove(&pos);
+        let (x0, z0) = (pos.x * 16, pos.z * 16);
+        self.block_entities
+            .retain(|&[x, _, z], _| !(x >= x0 && x < x0 + 16 && z >= z0 && z < z0 + 16));
+    }
+
+    /// Block-entity positions and states currently loaded, for the renderer's
+    /// per-frame block-entity pass. See [`is_block_entity`].
+    pub fn block_entities(&self) -> impl Iterator<Item = (&[i32; 3], &BlockState)> {
+        self.block_entities.iter()
+    }
+
+    /// Keep the block-entity index in step with a single-cell change.
+    fn index_block(&mut self, x: i32, y: i32, z: i32, block: BlockState) {
+        if is_block_entity(block.id) {
+            self.block_entities.insert([x, y, z], block);
+        } else {
+            self.block_entities.remove(&[x, y, z]);
+        }
+    }
+
+    /// Rebuild the block-entity index for one freshly loaded section (a bulk
+    /// load replaces all 4096 cells, so drop the section's old entries first).
+    fn reindex_section(&mut self, chunk_x: i32, chunk_z: i32, section_y: i32) {
+        let (x0, z0, y0) = (chunk_x * 16, chunk_z * 16, section_y * 16);
+        self.block_entities.retain(|&[x, y, z], _| {
+            !(x >= x0 && x < x0 + 16 && z >= z0 && z < z0 + 16 && y >= y0 && y < y0 + 16)
+        });
+        let Some(section) = self
+            .chunks
+            .get(&ChunkPos::new(chunk_x, chunk_z))
+            .and_then(|c| c.sections().find(|s| s.y() == section_y))
+        else {
+            return;
+        };
+        let mut found = Vec::new();
+        for ly in 0..16u8 {
+            for lz in 0..16u8 {
+                for lx in 0..16u8 {
+                    let b = section.get(lx, ly, lz);
+                    if is_block_entity(b.id) {
+                        found.push(([x0 + lx as i32, y0 + ly as i32, z0 + lz as i32], b));
+                    }
+                }
+            }
+        }
+        for (p, b) in found {
+            self.block_entities.insert(p, b);
+        }
     }
 
     pub fn chunk_mut_or_insert(&mut self, pos: ChunkPos) -> &mut Chunk {
@@ -58,6 +118,7 @@ impl World {
         let section = chunk.section_mut_or_insert(section_y);
         section.fill_blocks_raw(blocks);
         section.fill_light_nibbles(block_light, sky_light);
+        self.reindex_section(chunk_x, chunk_z, section_y);
     }
 
     pub fn set_block(&mut self, x: i32, y: i32, z: i32, block: BlockState) {
@@ -66,6 +127,7 @@ impl World {
         let local_z = mod_floor(z, 16) as u8;
         self.chunk_mut_or_insert(pos)
             .set_block(local_x, y, local_z, block);
+        self.index_block(x, y, z, block);
     }
 
     pub fn set_block_if_chunk_loaded(&mut self, x: i32, y: i32, z: i32, block: BlockState) -> bool {
@@ -76,6 +138,7 @@ impl World {
         let local_x = mod_floor(x, 16) as u8;
         let local_z = mod_floor(z, 16) as u8;
         chunk.set_block(local_x, y, local_z, block);
+        self.index_block(x, y, z, block);
         true
     }
 
@@ -619,6 +682,40 @@ mod tests {
         // Also exercise a non-negative chunk.
         world.load_section(2, 3, 0, &blocks, &block_light, &sky_light);
         assert_eq!(world.block_at(2 * 16 + 5, 6, 3 * 16 + 7), BlockState::STONE);
+    }
+
+    #[test]
+    fn block_entity_index_tracks_mutations_loads_and_unloads() {
+        let mut world = World::new();
+        let collect = |w: &World| {
+            let mut v: Vec<[i32; 3]> = w.block_entities().map(|(p, _)| *p).collect();
+            v.sort();
+            v
+        };
+
+        // set_block on a block-entity id indexes it; a non-entity id does not.
+        world.set_block(3, 64, 5, BlockState::new(63, 4)); // standing sign
+        world.set_block(3, 65, 5, BlockState::STONE);
+        assert_eq!(collect(&world), vec![[3, 64, 5]]);
+        assert_eq!(
+            world.block_entities().next().map(|(_, b)| *b),
+            Some(BlockState::new(63, 4))
+        );
+
+        // Overwriting the sign with a non-entity block drops it from the index.
+        world.set_block(3, 64, 5, BlockState::AIR);
+        assert!(world.block_entities().next().is_none());
+
+        // A bulk section load scans for block-entities (chest at local 5,6,7).
+        let mut blocks = vec![0u16; 4096];
+        blocks[6 * 256 + 7 * 16 + 5] = (54u16 << 4) | 2; // chest, meta 2
+        world.load_section(2, 3, 0, &blocks, &[], &[]);
+        let chest = [2 * 16 + 5, 6, 3 * 16 + 7];
+        assert_eq!(collect(&world), vec![chest]);
+
+        // Unloading the chunk clears its block-entities.
+        world.remove_chunk(ChunkPos::new(2, 3));
+        assert!(world.block_entities().next().is_none());
     }
 
     #[test]
