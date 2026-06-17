@@ -56,6 +56,11 @@ pub enum Shape {
     Piston,
     /// Extended piston head/arm (block 34): facing + sticky from meta.
     PistonHead,
+    /// Torch / redstone torch: a thin post, standing on the floor or leaning
+    /// against a wall depending on meta (`BlockTorch` FACING).
+    Torch,
+    /// Bed (id 26): a 9/16-tall directional block with head and foot halves.
+    Bed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -385,6 +390,8 @@ fn parse_shape(value: &str) -> Shape {
         "door" => Shape::Door,
         "piston" => Shape::Piston,
         "piston_head" => Shape::PistonHead,
+        "torch" => Shape::Torch,
+        "bed" => Shape::Bed,
         _ => Shape::Cube,
     }
 }
@@ -434,6 +441,40 @@ mod tests {
         let water = registry.def(8).unwrap();
         assert_eq!(water.collision, CollisionKind::None);
         assert_eq!(water.layer, RenderLayer::Translucent);
+    }
+
+    #[test]
+    fn every_1_8_block_id_has_a_render_def_no_magenta_fallback() {
+        use crate::block::{BlockState, RenderShape};
+        let registry = registry();
+        // 36 = moving-piston technical block (a transient TileEntity, never a
+        // persistent world block); 166 = barrier (intentionally invisible,
+        // special-cased in BlockState::render_shape). Everything else in the
+        // 1.8.9 id range must map a texture so no block renders the magenta
+        // missing tile.
+        let intentional_no_texture = [36u16, 166];
+        for id in 1u16..=BlockState::MAX_BLOCK_ID {
+            if intentional_no_texture.contains(&id) {
+                continue;
+            }
+            assert!(
+                registry.def(id).is_some(),
+                "block id {id} has no registry def — it renders the magenta missing tile"
+            );
+            let block = BlockState::new(id, 0);
+            // Entity-rendered blocks (signs/banners/skulls, shape None) carry no
+            // terrain texture by design; Bed uses hardcoded texture names in the
+            // mesher instead of the block-def lookup; every other block must map one.
+            if !matches!(block.render_shape(), RenderShape::None | RenderShape::Bed) {
+                let textured = [BlockFace::Top, BlockFace::Bottom, BlockFace::Side]
+                    .into_iter()
+                    .any(|face| block.texture_name(face).is_some());
+                assert!(
+                    textured,
+                    "renderable block id {id} maps no texture — magenta fallback"
+                );
+            }
+        }
     }
 
     #[test]

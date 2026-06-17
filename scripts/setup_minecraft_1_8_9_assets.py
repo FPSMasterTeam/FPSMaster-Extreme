@@ -47,6 +47,42 @@ def extract_assets(jar_path: pathlib.Path, dest: pathlib.Path) -> int:
     return count
 
 
+# Mojang's public asset object store (no login). Objects are content-addressed:
+# <RESOURCES>/<hash[:2]>/<hash>. The asset index maps logical paths
+# (e.g. "minecraft/sounds/random/pop.ogg") to those hashes.
+RESOURCES = "https://resources.download.minecraft.net"
+
+
+def download_sounds(version_meta: dict, dest: pathlib.Path) -> int:
+    """Download the 1.8.9 sound objects (ogg + sounds.json) into the extracted
+    asset tree. The client jar ships textures but not sounds, so these come from
+    the public asset object store referenced by the version's asset index."""
+    index_info = version_meta["assetIndex"]
+    index = request_json(index_info["url"])
+    objects = index["objects"]
+    wanted = {
+        path: meta["hash"]
+        for path, meta in objects.items()
+        if path == "minecraft/sounds.json" or path.startswith("minecraft/sounds/")
+    }
+    count = 0
+    for i, (path, h) in enumerate(sorted(wanted.items())):
+        target = dest / "assets" / path
+        if target.exists():
+            count += 1
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        url = f"{RESOURCES}/{h[:2]}/{h}"
+        try:
+            download(url, target)
+            count += 1
+        except Exception as err:  # noqa: BLE001 - best effort per file
+            print(f"  WARN failed {path}: {err}")
+        if (i + 1) % 100 == 0:
+            print(f"  ...{i + 1}/{len(wanted)} sound objects")
+    return count
+
+
 def main() -> None:
     ASSET_DIR.mkdir(parents=True, exist_ok=True)
     manifest = request_json(MANIFEST_URL)
@@ -61,6 +97,9 @@ def main() -> None:
     print(f"Asset jar ready: {DEST}")
     count = extract_assets(DEST, EXTRACTED)
     print(f"Extracted {count} asset files to: {EXTRACTED}")
+    print("Downloading 1.8.9 sound objects (ogg + sounds.json)...")
+    sounds = download_sounds(version_meta, EXTRACTED)
+    print(f"Sound objects ready: {sounds}")
     print("Run with: cargo run -p recraft_app")
 
 

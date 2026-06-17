@@ -124,6 +124,24 @@ struct CelestialUniform {
     view_proj: [[f32; 4]; 4],
 }
 
+/// Uniform for the enchantment-glint pass: the scroll offset (in glint-texture
+/// space) advanced each frame so the purple sheen travels across the item.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct GlintUniform {
+    scroll: f32,
+    _pad: [f32; 3],
+}
+
+/// The glint scroll offset in glint-texture space for a given wall-clock time
+/// (seconds). Vanilla advances the glint texture matrix by `(time%3000)/3000`
+/// scaled by 8 per second of texture travel; folding that to a continuous ramp
+/// gives `time/4 * 8 = time*2` texels/s, which the fragment shader adds to the
+/// scaled UV. Continuous (not wrapped) is fine since the texture is REPEAT.
+pub fn glint_scroll(time_secs: f32) -> f32 {
+    time_secs * 2.0
+}
+
 /// A vertex+index buffer pair that persists across frames and is refilled in
 /// place with `queue.write_buffer`, only reallocating when the geometry outgrows
 /// the current capacity. Used for the per-frame entity/hand geometry so a moving
@@ -478,6 +496,39 @@ struct DebugSkip {
     flat: bool,
 }
 
+/// Inputs for the inventory player-preview (vanilla `GuiInventory.drawEntityOnScreen`).
+/// The biped is built at feet origin with its body yaw and head pose already
+/// baked in; the renderer projects it into the panel box and scissors to it.
+/// All pixel measurements are physical (framebuffer) pixels.
+/// One sign block-entity's text to draw flat on its board (vanilla
+/// `TileEntitySignRenderer`'s per-line `drawString`). The four lines are already
+/// flattened (§-coded) text; the placement basis comes from
+/// [`crate::ModelMesh::sign_text_basis`].
+pub struct SignTextDraw {
+    pub lines: [String; 4],
+    /// Board front-face centre in world space.
+    pub center: Vec3,
+    /// Unit vectors spanning the board face (left→right, bottom→top).
+    pub right: Vec3,
+    pub up: Vec3,
+    /// Board half-extents in blocks (matching `right`/`up`).
+    pub half_width: f32,
+    pub half_height: f32,
+}
+
+pub struct InventoryPreview<'a> {
+    /// The posed local-player biped (feet at y=0, +y up, +z front toward viewer).
+    pub mesh: &'a ModelMesh,
+    /// Feet anchor in physical px (panel-center x, near the panel bottom).
+    pub anchor: [f32; 2],
+    /// Physical px per model block (vanilla `scale` × the GUI pixel scale).
+    pub pixels_per_block: f32,
+    /// Whole-model tilt about X through the feet, in radians (cursor lean).
+    pub tilt_rad: f32,
+    /// Scissor rect clipping the draw to the panel: [x, y, w, h] in physical px.
+    pub scissor: [u32; 4],
+}
+
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -503,6 +554,8 @@ pub struct Renderer {
     cutout_pipeline: wgpu::RenderPipeline,
     /// No-cull cutout variant for the isometric GUI block-icon cubes.
     gui_cube_pipeline: wgpu::RenderPipeline,
+    /// Item glint targeting the swapchain (the UI pass), over enchanted icons.
+    gui_glint_pipeline: wgpu::RenderPipeline,
     item_pipeline: wgpu::RenderPipeline,
     /// First-person held item: drawn on top (depth test always passes).
     first_person_item_pipeline: wgpu::RenderPipeline,
@@ -510,13 +563,50 @@ pub struct Renderer {
     overlay_pipeline: wgpu::RenderPipeline,
     model_pipeline: wgpu::RenderPipeline,
     model_mesh: Option<DynamicMesh>,
+    /// Inventory player-preview (vanilla `GuiInventory.drawEntityOnScreen`): the
+    /// local-player biped baked into clip space and drawn in the UI pass,
+    /// scissored to the panel's model box. Same shader as `model_pipeline` but a
+    /// `surface_format` target (the UI pass writes the swapchain, not HDR).
+    inventory_preview_pipeline: wgpu::RenderPipeline,
+    inventory_preview_mesh: Option<DynamicMesh>,
+    /// Scissor rect (physical px: x, y, w, h) clipping the preview to its panel.
+    inventory_preview_scissor: Option<[u32; 4]>,
     /// First-person held-item geometry (block-atlas textured), per frame.
     first_person_item: Option<DynamicMesh>,
     /// Dropped-item entities in the world (block-atlas textured), per frame.
     world_items: Option<DynamicMesh>,
+    /// Enchantment glint: re-draws the enchanted held / world item geometry
+    /// additively with the scrolling glint texture (vanilla `renderEffect`).
+    glint_pipeline: wgpu::RenderPipeline,
+    /// `enchanted_item_glint.png` texture+sampler, sampled (REPEAT) at group 3.
+    glint_bind_group: wgpu::BindGroup,
+    /// Per-frame scroll offset uniform driving the glint sheen (group 2).
+    glint_uniform_buffer: wgpu::Buffer,
+    glint_uniform_bind_group: wgpu::BindGroup,
+    /// Glint geometry (a subset of the held / world items that are enchanted).
+    first_person_item_glint: Option<DynamicMesh>,
+    world_items_glint: Option<DynamicMesh>,
+    /// Entity-armor glint: the enchanted worn-armor boxes, in model-pass vertex
+    /// format, drawn additively after the entity model pass.
+    entity_glint_pipeline: wgpu::RenderPipeline,
+    entity_glint: Option<DynamicMesh>,
     /// Crack overlay over the block being mined (vanilla destroy_stage_N).
     break_overlay: Option<DynamicMesh>,
-    last_break_overlay: Option<(i32, i32, i32, u8)>,
+    last_break_overlay: Option<(i32, i32, i32, u8, recraft_core::BlockState)>,
+    /// Camera-facing particle billboards (vanilla EntityFX), rebuilt each frame.
+    particles: Option<DynamicMesh>,
+    /// Camera-facing block-break debris (vanilla EntityDiggingFX) sampling the
+    /// block atlas, rebuilt each frame. Drawn with the overlay pipeline + block
+    /// atlas, like the dropped items.
+    block_particles: Option<DynamicMesh>,
+    /// Camera-facing experience-orb billboards (vanilla RenderXPOrb), per frame.
+    xp_orbs: Option<DynamicMesh>,
+    /// `particles.png` texture+sampler, bound at group 1 (same layout as the
+    /// block atlas) so the overlay pipeline samples it for the particle draw.
+    particle_bind_group: wgpu::BindGroup,
+    /// `experience_orb.png` texture+sampler, bound at group 1 for the XP-orb
+    /// billboard draw (same layout as the particle bind group).
+    xp_orb_bind_group: wgpu::BindGroup,
     entity_bind_group: wgpu::BindGroup,
     /// The entity atlas texture, retained so downloaded player skins can be
     /// written into their rows at runtime (the bind group references it by view).
@@ -542,17 +632,25 @@ pub struct Renderer {
     /// server sends a time update.
     world_time: f64,
     ui_pipeline: wgpu::RenderPipeline,
+    /// Same shader/layout as `ui_pipeline` but with the vanilla crosshair
+    /// inversion blend (`ONE_MINUS_DST_COLOR`/`ONE_MINUS_SRC_COLOR`).
+    crosshair_pipeline: wgpu::RenderPipeline,
     ui_bind_group_layout: wgpu::BindGroupLayout,
     ui_sampler: wgpu::Sampler,
     ui_cache: Option<UiCache>,
     /// Foreground UI layer (counts, hover, carried stack) drawn over the 3D
     /// block-icon cube pass.
     ui_overlay_cache: Option<UiCache>,
+    /// Crosshair layer, drawn with `crosshair_pipeline` over the 3D scene.
+    crosshair_cache: Option<UiCache>,
     /// Identity view-projection so the GUI cube pass can take pre-baked clip
     /// coordinates straight through the shared shader.
     gui_camera_bind_group: wgpu::BindGroup,
     /// 3D block-icon geometry for this frame (block atlas textured, clip-space).
     gui_item_mesh: Option<DynamicMesh>,
+    /// Clip-space glint geometry for enchanted GUI item icons, drawn additively
+    /// with the scrolling glint texture over the icons in the UI pass.
+    gui_glint_mesh: Option<DynamicMesh>,
     /// World-space billboarded player nametags (vanilla `drawNameplate`): the
     /// rasterized-name texture, its bind group/sampler, the quad mesh and the
     /// caches that avoid re-rasterizing a static name set.
@@ -562,6 +660,15 @@ pub struct Renderer {
     nametag_sampler: wgpu::Sampler,
     nametag_tex_size: (u32, u32),
     nametag_last_names: Vec<String>,
+    /// World-fixed sign block-entity text (vanilla `TileEntitySignRenderer`'s
+    /// per-line `drawString`): rasterized lines on their own texture, drawn as
+    /// quads laid flat on each sign's board face. Shares the nametag sampler and
+    /// the model pass's texture layout.
+    sign_text_mesh: Option<DynamicMesh>,
+    sign_text_texture: wgpu::Texture,
+    sign_text_bind_group: wgpu::BindGroup,
+    sign_text_tex_size: (u32, u32),
+    sign_text_last: Vec<[String; 4]>,
     /// The model pass's group-1 layout (texture+sampler), retained so the
     /// nametag bind group can be rebuilt when its texture grows.
     model_texture_layout: wgpu::BindGroupLayout,
@@ -577,6 +684,13 @@ pub struct Renderer {
     texture_bind_groups: Vec<wgpu::BindGroup>,
     /// Retained group(1) layout for rebuilding texture_bind_groups on atlas reload.
     texture_layout: wgpu::BindGroupLayout,
+    /// The block-atlas GPU texture itself, retained so animated tiles can be
+    /// re-uploaded into their atlas cells (mip 0) each frame.
+    block_atlas_texture: wgpu::Texture,
+    /// Animated tiles (water/lava/fire/…) and the last displayed frame index per
+    /// tile, so a cell is only re-uploaded when its frame actually advances.
+    animated_tiles: Vec<crate::texture::AnimatedTile>,
+    animated_last_frame: Vec<usize>,
     /// Retained group(2) layout for rebuilding lighting_bind_group on atlas reload.
     lighting_layout: wgpu::BindGroupLayout,
     /// PBR normal/specular atlas views + sampler, for rebuilding lighting bind group.
@@ -854,8 +968,17 @@ impl Renderer {
                 resource: gui_camera_buffer.as_entire_binding(),
             }],
         });
-        let (texture_layout, texture_bind_groups, biome_colors, atlas_uv, block_image) =
-            create_texture_bind_group(&device, &queue);
+        let (
+            texture_layout,
+            texture_bind_groups,
+            biome_colors,
+            atlas_uv,
+            block_image,
+            block_atlas_texture,
+            animated_tiles,
+        ) = create_texture_bind_group(&device, &queue);
+        // Force the first per-frame upload of every animated tile (sentinel index).
+        let animated_last_frame = vec![usize::MAX; animated_tiles.len()];
         let (entity_texture_layout, entity_bind_group, entity_texture) =
             create_entity_texture_bind_group(&device, &queue);
         // The UI reuses the block atlas (and its name→tile map) for item icons.
@@ -878,6 +1001,14 @@ impl Renderer {
         let sky_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("sky-shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader/sky.wgsl").into()),
+        });
+        let model_glint_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("model-glint-shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shader/model_glint.wgsl").into()),
+        });
+        let glint_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("glint-shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shader/glint.wgsl").into()),
         });
         let celestial_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("celestial-shader"),
@@ -1007,6 +1138,38 @@ impl Renderer {
             }],
         });
         let sky_atlas_bind_group = create_sky_atlas_bind_group(&device, &queue, &texture_layout);
+
+        // Enchantment glint: a scroll-offset uniform at group 2 and the
+        // (REPEAT-wrapped) glint texture at group 3. Groups 0/1 are the shared
+        // camera + block-atlas, so the same enchanted item geometry re-draws
+        // through this pipeline.
+        let glint_uniform_layout =
+            create_uniform_layout(&device, "glint-uniform-layout", wgpu::ShaderStages::FRAGMENT);
+        let glint_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("glint-uniform"),
+            size: std::mem::size_of::<GlintUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let glint_uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("glint-uniform-bind-group"),
+            layout: &glint_uniform_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: glint_uniform_buffer.as_entire_binding(),
+            }],
+        });
+        let glint_bind_group = create_glint_bind_group(&device, &queue, &texture_layout);
+
+        let particle_bind_group =
+            create_particle_bind_group(&device, &queue, &texture_layout);
+        let xp_orb_bind_group = create_asset_texture_bind_group(
+            &device,
+            &queue,
+            &texture_layout,
+            "assets/minecraft/textures/entity/experience_orb.png",
+            "xp-orb",
+        );
         let star_quads = sky_geometry::generate_stars();
 
         let ui_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -1525,9 +1688,15 @@ impl Renderer {
                 unclipped_depth: false,
                 conservative: false,
             },
+            // `Always` draws the hand over the whole world, and we WRITE its (near)
+            // depth so anything drawn in a later pass respects it — specifically the
+            // SSR water pass (shaders + Fancy), which runs after this in a separate
+            // pass and would otherwise depth-test against the world behind the hand
+            // and paint water over the held item. The enchant glint that follows
+            // uses `LessEqual`, so it still draws at the hand's own depth.
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: DEPTH_FORMAT,
-                depth_write_enabled: Some(false),
+                depth_write_enabled: Some(true),
                 depth_compare: Some(wgpu::CompareFunction::Always),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
@@ -1816,6 +1985,50 @@ impl Renderer {
         cache: None,
         multiview_mask: None,
         });
+        // Inventory player preview: same model shader/layout, but its colour
+        // target is the swapchain (`surface_format`) since it draws in the UI
+        // pass. Depth-tested+written against the UI pass's window depth so the
+        // biped self-occludes; no cull (faces wind both ways through the pose).
+        let inventory_preview_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("inventory-preview-pipeline"),
+                layout: Some(&model_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &model_shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[ModelVertex::layout()],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &model_shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: surface_format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::Less),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                cache: None,
+                multiview_mask: None,
+            });
 
         let sky_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("sky-pipeline-layout"),
@@ -1935,6 +2148,195 @@ impl Renderer {
         multiview_mask: None,
         });
 
+        // Enchantment glint: re-draws the enchanted item geometry additively.
+        // Group 0 camera, group 1 block atlas (for the silhouette cutout), group
+        // 2 the scroll uniform, group 3 the glint texture. Additive blend like
+        // the celestial pass, depth-tested but no depth write so it lays over the
+        // already-drawn item without fighting it. Drawn with no culling so block
+        // cubes and both sprite faces receive the sheen.
+        let glint_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("glint-pipeline-layout"),
+                bind_group_layouts: &[
+                    Some(&camera_layout),
+                    Some(&texture_layout),
+                    Some(&glint_uniform_layout),
+                    Some(&texture_layout),
+                ],
+                immediate_size: 0,
+            });
+        let glint_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("glint-pipeline"),
+            layout: Some(&glint_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &glint_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[Vertex::layout()],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &glint_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::SrcAlpha,
+                            dst_factor: wgpu::BlendFactor::One,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                        alpha: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::One,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                    }),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            cache: None,
+            multiview_mask: None,
+        });
+
+        // GUI item-icon glint: the same `Vertex` glint shader, but its colour
+        // target is the swapchain (`surface_format`) since it draws in the UI
+        // pass over the item icons. Same layout/blend as the world item glint.
+        let gui_glint_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("gui-glint-pipeline"),
+            layout: Some(&glint_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &glint_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[Vertex::layout()],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &glint_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_format,
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::SrcAlpha,
+                            dst_factor: wgpu::BlendFactor::One,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                        alpha: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::One,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                    }),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            cache: None,
+            multiview_mask: None,
+        });
+
+        // Entity-armor glint: the same additive scrolling sheen, but consuming
+        // the model-pass vertex layout and masking against the entity atlas
+        // (group 1). Group 0 camera, group 2 the scroll uniform, group 3 the
+        // glint texture — drawn right after the entity model pass.
+        let entity_glint_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("entity-glint-pipeline-layout"),
+                bind_group_layouts: &[
+                    Some(&camera_layout),
+                    Some(&entity_texture_layout),
+                    Some(&glint_uniform_layout),
+                    Some(&texture_layout),
+                ],
+                immediate_size: 0,
+            });
+        let entity_glint_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("entity-glint-pipeline"),
+                layout: Some(&entity_glint_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &model_glint_shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[ModelVertex::layout()],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &model_glint_shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: Some(wgpu::BlendState {
+                            color: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::SrcAlpha,
+                                dst_factor: wgpu::BlendFactor::One,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                            alpha: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::One,
+                                dst_factor: wgpu::BlendFactor::One,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                        }),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: Some(false),
+                    depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                cache: None,
+                multiview_mask: None,
+            });
+
         let ui_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("ui-pipeline-layout"),
             bind_group_layouts: &[Some(&ui_bind_group_layout)],
@@ -1981,6 +2383,63 @@ impl Renderer {
         multiview_mask: None,
         });
 
+        // Crosshair pipeline: identical to the UI pipeline except for the blend,
+        // which is vanilla `tryBlendFuncSeparate(GL_ONE_MINUS_DST_COLOR,
+        // GL_ONE_MINUS_SRC_COLOR, GL_ONE, GL_ZERO)` — the crosshair shows as the
+        // inverse of whatever's already in the swapchain (the 3D scene), so it
+        // stays visible on any background. Transparent sprite pixels (rgb 0)
+        // leave the scene unchanged; the white cross (rgb 1) inverts it.
+        let crosshair_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("crosshair-pipeline"),
+            layout: Some(&ui_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &ui_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &ui_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_format,
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::OneMinusDst,
+                            dst_factor: wgpu::BlendFactor::OneMinusSrc,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                        alpha: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::Zero,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                    }),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Always),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+        cache: None,
+        multiview_mask: None,
+        });
+
         // Nametag text atlas: a small RGBA texture, rebuilt when names change.
         // It shares the model pass's texture+sampler layout so nametag billboards
         // draw through the model pipeline.
@@ -1995,6 +2454,10 @@ impl Renderer {
             ..Default::default()
         });
         let (nametag_texture, nametag_bind_group) =
+            create_nametag_resources(&device, &entity_texture_layout, &nametag_sampler, 1, 1);
+        // Sign text reuses the same text-atlas mechanism (its own texture, the
+        // shared nametag sampler and the model texture layout).
+        let (sign_text_texture, sign_text_bind_group) =
             create_nametag_resources(&device, &entity_texture_layout, &nametag_sampler, 1, 1);
 
         let gpu_timer = timestamps_enabled.then(|| {
@@ -2545,16 +3008,33 @@ impl Renderer {
             flat_pipeline,
             cutout_pipeline,
             gui_cube_pipeline,
+            gui_glint_pipeline,
             item_pipeline,
             first_person_item_pipeline,
             transparent_pipeline,
             overlay_pipeline,
             model_pipeline,
             model_mesh: None,
+            inventory_preview_pipeline,
+            inventory_preview_mesh: None,
+            inventory_preview_scissor: None,
             first_person_item: None,
             world_items: None,
+            glint_pipeline,
+            glint_bind_group,
+            glint_uniform_buffer,
+            glint_uniform_bind_group,
+            first_person_item_glint: None,
+            world_items_glint: None,
+            entity_glint_pipeline,
+            entity_glint: None,
             break_overlay: None,
             last_break_overlay: None,
+            particles: None,
+            block_particles: None,
+            xp_orbs: None,
+            particle_bind_group,
+            xp_orb_bind_group,
             entity_bind_group,
             entity_texture,
             sky_pipeline,
@@ -2571,18 +3051,26 @@ impl Renderer {
             star_quads,
             world_time: 6000.0,
             ui_pipeline,
+            crosshair_pipeline,
             ui_bind_group_layout,
             ui_sampler,
             ui_cache: None,
             ui_overlay_cache: None,
+            crosshair_cache: None,
             gui_camera_bind_group,
             gui_item_mesh: None,
+            gui_glint_mesh: None,
             nametag_mesh: None,
             nametag_texture,
             nametag_bind_group,
             nametag_sampler,
             nametag_tex_size: (1, 1),
             nametag_last_names: Vec::new(),
+            sign_text_mesh: None,
+            sign_text_texture,
+            sign_text_bind_group,
+            sign_text_tex_size: (1, 1),
+            sign_text_last: Vec::new(),
             model_texture_layout: entity_texture_layout,
             gui_atlas,
             depth_tex,
@@ -2590,6 +3078,9 @@ impl Renderer {
             window_depth_view,
             texture_bind_groups,
             texture_layout,
+            block_atlas_texture,
+            animated_tiles,
+            animated_last_frame,
             lighting_layout,
             pbr_normal_view,
             pbr_specular_view,
@@ -3319,6 +3810,19 @@ impl Renderer {
         self.chunk_sections.remove(&pos);
     }
 
+    /// Free the GPU meshes of the given sections without touching their block
+    /// data. Drives the client-side render-distance safety net
+    /// ([`GameState::enforce_render_distance`]): sections beyond the view are
+    /// dropped here and re-meshed through the normal queue if the player returns.
+    pub fn drop_chunk_sections(&mut self, sections: &[SectionPos]) {
+        for &pos in sections {
+            // Drop the generation so any in-flight mesh job for this section is
+            // discarded on arrival (its generation no longer matches).
+            self.chunk_mesh_generations.remove(&pos);
+            self.remove_section(pos);
+        }
+    }
+
     /// Replace the per-frame entity/hand geometry drawn in the model pass. The
     /// underlying GPU buffers persist across frames and are refilled in place,
     /// only reallocating when the mesh outgrows the current capacity — so the
@@ -3336,6 +3840,83 @@ impl Renderer {
         );
     }
 
+    /// Replace this frame's entity-armor glint geometry: the enchanted worn
+    /// armor in model-pass vertex format, drawn additively with the scrolling
+    /// glint texture right after the entity model pass. Pass an empty mesh when
+    /// no visible armor is enchanted.
+    pub fn set_entity_glint(&mut self, mesh: &ModelMesh) {
+        fill_dynamic_mesh(
+            &self.device,
+            &self.queue,
+            &mut self.entity_glint,
+            bytemuck::cast_slice(&mesh.vertices),
+            bytemuck::cast_slice(&mesh.indices),
+            mesh.indices.len() as u32,
+            "entity-glint",
+        );
+    }
+
+    /// Set (or clear with `None`) the inventory player-preview drawn in the UI
+    /// pass (vanilla `GuiInventory.drawEntityOnScreen`). `mesh` is the local
+    /// player's biped built at feet origin (feet y=0, +y up, +z front) with the
+    /// body yaw and head pose already baked in; this projects it orthographically
+    /// into the panel's model box and scissors the draw to it. All measurements
+    /// are physical pixels.
+    pub fn set_inventory_preview(&mut self, preview: Option<&InventoryPreview>) {
+        let Some(p) = preview else {
+            self.inventory_preview_scissor = None;
+            if let Some(m) = self.inventory_preview_mesh.as_mut() {
+                m.index_count = 0;
+            }
+            return;
+        };
+        // Vanilla flips the GUI Y axis and draws an orthographic model: +y up in
+        // the model maps to a smaller screen y, the model's front (+z after the
+        // yaw bake faces the viewer) maps to nearer depth. `pixels_per_block` is
+        // vanilla's `scale` times the GUI pixel scale; `anchor` is the feet point
+        // (panel-center x, near the panel bottom) in physical px. The whole model
+        // tilts about the feet by `tilt_rad` so it leans toward the cursor.
+        let (sw, sh) = (self.config.width as f32, self.config.height as f32);
+        let (sin_t, cos_t) = p.tilt_rad.sin_cos();
+        let to_clip = |pos: [f32; 3]| -> [f32; 3] {
+            // Tilt about X through the feet, then orthographic projection.
+            let (x, y, z) = (pos[0], pos[1], pos[2]);
+            let ty = y * cos_t - z * sin_t;
+            let tz = y * sin_t + z * cos_t;
+            let sx = p.anchor[0] + x * p.pixels_per_block;
+            let sy = p.anchor[1] - ty * p.pixels_per_block;
+            // Depth: the model's front (larger tz toward the viewer) → nearer. A
+            // fixed 0.1/block factor keeps the ~1-block-deep biped well inside the
+            // [0,1] depth box while still self-occluding (nearer parts win).
+            let depth = 0.5 - tz * 0.1;
+            [
+                sx / sw * 2.0 - 1.0,
+                1.0 - sy / sh * 2.0,
+                depth.clamp(0.0, 1.0),
+            ]
+        };
+        let vertices: Vec<ModelVertex> = p
+            .mesh
+            .vertices
+            .iter()
+            .map(|v| ModelVertex {
+                position: to_clip(v.position),
+                color: v.color,
+                uv: v.uv,
+            })
+            .collect();
+        fill_dynamic_mesh(
+            &self.device,
+            &self.queue,
+            &mut self.inventory_preview_mesh,
+            bytemuck::cast_slice(&vertices),
+            bytemuck::cast_slice(&p.mesh.indices),
+            p.mesh.indices.len() as u32,
+            "inventory-preview",
+        );
+        self.inventory_preview_scissor = Some(p.scissor);
+    }
+
     /// The block/item atlas UV table, for building first-person item geometry.
     pub fn atlas_uv(&self) -> &AtlasUv {
         &self.atlas_uv
@@ -3345,7 +3926,8 @@ impl Renderer {
     /// uploading new GPU textures and recreating the mesh worker pool.
     /// Returns the new `AtlasUv` so the caller can update its own copy.
     pub fn reload_atlas(&mut self, pack_path: Option<std::path::PathBuf>) -> AtlasUv {
-        let atlas = TextureAtlasImage::load_with_pack(pack_path);
+        let mut atlas = TextureAtlasImage::load_with_pack(pack_path);
+        let animated = std::mem::take(&mut atlas.animated);
         let biome_colors = BiomeColors {
             grass: atlas.grass_color,
             foliage: atlas.foliage_color,
@@ -3422,6 +4004,11 @@ impl Renderer {
             .collect();
 
         self.texture_bind_groups = bind_groups;
+        // Retain the new atlas texture + animated tiles; force a re-upload of
+        // every animated cell on the next frame (sentinel last-frame index).
+        self.block_atlas_texture = texture;
+        self.animated_last_frame = vec![usize::MAX; animated.len()];
+        self.animated_tiles = animated;
 
         // Upload PBR atlases if the pack provides them
         let has_pbr = atlas.pbr.normal.is_some() || atlas.pbr.specular.is_some();
@@ -3539,6 +4126,82 @@ impl Renderer {
         );
     }
 
+    /// Replace this frame's first-person held-item glint geometry — the subset
+    /// of the held item that is enchanted, re-drawn additively with the glint
+    /// texture right after the item. Pass empty slices when the held item isn't
+    /// enchanted.
+    pub fn set_first_person_item_glint(&mut self, vertices: &[Vertex], indices: &[u32]) {
+        fill_dynamic_mesh(
+            &self.device,
+            &self.queue,
+            &mut self.first_person_item_glint,
+            bytemuck::cast_slice(vertices),
+            bytemuck::cast_slice(indices),
+            indices.len() as u32,
+            "first-person-item-glint",
+        );
+    }
+
+    /// Replace this frame's world-item glint geometry (the enchanted dropped /
+    /// third-person held items), drawn additively after the world items. Pass
+    /// empty slices to clear.
+    pub fn set_world_items_glint(&mut self, vertices: &[Vertex], indices: &[u32]) {
+        fill_dynamic_mesh(
+            &self.device,
+            &self.queue,
+            &mut self.world_items_glint,
+            bytemuck::cast_slice(vertices),
+            bytemuck::cast_slice(indices),
+            indices.len() as u32,
+            "world-items-glint",
+        );
+    }
+
+    /// Replace this frame's particle billboards (textured from `particles.png`).
+    /// Drawn alpha-blended in the world right after the dropped items. Pass empty
+    /// slices to clear.
+    pub fn set_particles(&mut self, vertices: &[Vertex], indices: &[u32]) {
+        fill_dynamic_mesh(
+            &self.device,
+            &self.queue,
+            &mut self.particles,
+            bytemuck::cast_slice(vertices),
+            bytemuck::cast_slice(indices),
+            indices.len() as u32,
+            "particles",
+        );
+    }
+
+    /// Replace this frame's block-break debris billboards (vanilla
+    /// EntityDiggingFX), textured from the block atlas. Drawn alpha-blended in
+    /// the world right after the particle billboards. Pass empty slices to clear.
+    pub fn set_block_particles(&mut self, vertices: &[Vertex], indices: &[u32]) {
+        fill_dynamic_mesh(
+            &self.device,
+            &self.queue,
+            &mut self.block_particles,
+            bytemuck::cast_slice(vertices),
+            bytemuck::cast_slice(indices),
+            indices.len() as u32,
+            "block-particles",
+        );
+    }
+
+    /// Replace this frame's experience-orb billboards (textured from
+    /// `experience_orb.png`). Drawn alpha-blended in the world like particles.
+    /// Pass empty slices to clear.
+    pub fn set_xp_orbs(&mut self, vertices: &[Vertex], indices: &[u32]) {
+        fill_dynamic_mesh(
+            &self.device,
+            &self.queue,
+            &mut self.xp_orbs,
+            bytemuck::cast_slice(vertices),
+            bytemuck::cast_slice(indices),
+            indices.len() as u32,
+            "xp-orbs",
+        );
+    }
+
     /// Set the world time in ticks (vanilla 0..24000 per day), which drives the
     /// day/night sky and the world lightmap. Called each frame with partial-tick
     /// interpolation; until the server sends a time update it stays at noon.
@@ -3644,7 +4307,7 @@ impl Renderer {
     /// Set (or clear) the mining crack overlay: the block cell being mined and
     /// its 0..9 destroy stage. Rebuilds the small overlay mesh only when the
     /// target or stage actually changes.
-    pub fn set_break_overlay(&mut self, overlay: Option<(i32, i32, i32, u8)>) {
+    pub fn set_break_overlay(&mut self, overlay: Option<(i32, i32, i32, u8, recraft_core::BlockState)>) {
         if overlay == self.last_break_overlay {
             return;
         }
@@ -3655,8 +4318,8 @@ impl Renderer {
                     mesh.index_count = 0;
                 }
             }
-            Some((x, y, z, stage)) => {
-                let (vertices, indices) = break_overlay_geometry(x, y, z, stage, &self.atlas_uv);
+            Some((x, y, z, stage, block)) => {
+                let (vertices, indices) = break_overlay_geometry(x, y, z, stage, block, &self.atlas_uv);
                 fill_dynamic_mesh(
                     &self.device,
                     &self.queue,
@@ -3798,6 +4461,130 @@ impl Renderer {
     }
 
 
+    /// Build and upload this frame's sign block-entity text (vanilla
+    /// `TileEntitySignRenderer`): the four §-coded lines of each visible sign,
+    /// rasterized onto a shared texture and drawn as quads laid flat on the
+    /// board face (depth-tested against the world, so terrain occludes them).
+    /// Pass an empty slice to hide them.
+    pub fn set_sign_text(&mut self, signs: &[SignTextDraw]) {
+        if signs.is_empty() {
+            if let Some(mesh) = &mut self.sign_text_mesh {
+                mesh.index_count = 0;
+            }
+            return;
+        }
+        // SCALE 2 rasterizes the text at twice the resolution. This is required
+        // for CJK/unicode: those glyphs live in 16px pages, and at SCALE 1 the
+        // font downsamples them 16→8 (nearest), dropping ~half the thin strokes
+        // so Chinese reads as blank fragments. At SCALE 2 unicode is 16→16 (1:1,
+        // full detail) and ASCII upscales cleanly. Layout below derives from
+        // line_h, so the on-board text size is unchanged — only the texture is
+        // sharper.
+        const SCALE: i32 = 2;
+        let line_h = (8 * SCALE) as u32;
+        let font = crate::font::font();
+        // Each sign gets one texture row block of 4 lines; the texture is as wide
+        // as the widest line across all signs.
+        let mut max_w = 1u32;
+        for s in signs {
+            for line in &s.lines {
+                max_w = max_w.max(font.text_width(line, SCALE).max(1) as u32);
+            }
+        }
+        let tex_w = max_w;
+        let tex_h = line_h * 4 * signs.len() as u32;
+
+        let lines_now: Vec<[String; 4]> = signs.iter().map(|s| s.lines.clone()).collect();
+        if lines_now != self.sign_text_last || self.sign_text_tex_size != (tex_w, tex_h) {
+            let mut pixels = vec![0u8; (tex_w * tex_h * 4) as usize];
+            for (i, s) in signs.iter().enumerate() {
+                for (j, line) in s.lines.iter().enumerate() {
+                    let y = (line_h * (4 * i as u32 + j as u32)) as i32;
+                    font.draw(
+                        &mut pixels, tex_w, tex_h, 0, y, SCALE, [0, 0, 0, 255], false, line,
+                    );
+                }
+            }
+            if self.sign_text_tex_size != (tex_w, tex_h) {
+                let (texture, bind_group) = create_nametag_resources(
+                    &self.device,
+                    &self.model_texture_layout,
+                    &self.nametag_sampler,
+                    tex_w,
+                    tex_h,
+                );
+                self.sign_text_texture = texture;
+                self.sign_text_bind_group = bind_group;
+                self.sign_text_tex_size = (tex_w, tex_h);
+            }
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.sign_text_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &pixels,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4 * tex_w),
+                    rows_per_image: Some(tex_h),
+                },
+                wgpu::Extent3d {
+                    width: tex_w,
+                    height: tex_h,
+                    depth_or_array_layers: 1,
+                },
+            );
+            self.sign_text_last = lines_now;
+        }
+
+        // Vanilla packs four 10px-tall lines into the board face; the board is
+        // ~16px tall in model px. Map line height to ~0.18 of the board height so
+        // four lines fill the readable area, and lay them out top-to-bottom.
+        let mut vertices: Vec<ModelVertex> = Vec::new();
+        let mut indices: Vec<u32> = Vec::new();
+        for (i, s) in signs.iter().enumerate() {
+            // World units per text px so four lines span ~0.72 of the board.
+            let world_per_px = (s.half_height * 2.0 * 0.18) / line_h as f32;
+            for (j, line) in s.lines.iter().enumerate() {
+                let w = font.text_width(line, SCALE).max(0) as f32;
+                if w <= 0.0 {
+                    continue;
+                }
+                let half_w = w * world_per_px * 0.5;
+                let half_h = line_h as f32 * world_per_px * 0.5;
+                // Centre each line; stack the four down from near the top.
+                let row = j as f32 - 1.5; // -1.5,-0.5,0.5,1.5 about the board centre
+                let line_gap = line_h as f32 * world_per_px * 1.25;
+                let center = s.center + s.up * (-row * line_gap);
+                let v0 = (line_h * (4 * i as u32 + j as u32)) as f32 / tex_h as f32;
+                let v1 = (line_h * (4 * i as u32 + j as u32 + 1)) as f32 / tex_h as f32;
+                let u1 = w / tex_w as f32;
+                push_billboard(
+                    &mut vertices,
+                    &mut indices,
+                    center,
+                    s.right,
+                    s.up,
+                    half_w,
+                    half_h,
+                    [[0.0, v0], [u1, v0], [u1, v1], [0.0, v1]],
+                    [1.0, 1.0, 1.0, 1.0],
+                );
+            }
+        }
+        fill_dynamic_mesh(
+            &self.device,
+            &self.queue,
+            &mut self.sign_text_mesh,
+            bytemuck::cast_slice(&vertices),
+            bytemuck::cast_slice(&indices),
+            indices.len() as u32,
+            "sign-text",
+        );
+    }
+
     pub fn render(&mut self, camera: &Camera) -> Result<(), RendererError> {
         self.render_inner(camera, None, None)
     }
@@ -3854,6 +4641,46 @@ impl Renderer {
         });
     }
 
+    /// Cycle animated terrain tiles by writing the current frame into each
+    /// tile's 16×16 atlas cell (mip 0) when its frame index advances. Vanilla
+    /// runs the atlas animation at 20 ticks/sec, so a frame is held `frametime`
+    /// ticks; `frame = order[(tick / frametime) % order.len()]`. Only mip 0 is
+    /// updated — the lower mips keep frame 0, a minor staleness that is only
+    /// visible at distance where the chunk LOD already blurs the surface.
+    fn update_animated_tiles(&mut self, time: f32) {
+        if self.animated_tiles.is_empty() {
+            return;
+        }
+        let tick = (time * 20.0) as u64;
+        for (i, tile) in self.animated_tiles.iter().enumerate() {
+            let slot = (tick / tile.frametime as u64) as usize % tile.order.len();
+            let frame = tile.order[slot];
+            if self.animated_last_frame[i] == frame {
+                continue;
+            }
+            self.animated_last_frame[i] = frame;
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.block_atlas_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x: tile.atlas_x, y: tile.atlas_y, z: 0 },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &tile.frames[frame],
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4 * crate::texture::TILE_SIZE),
+                    rows_per_image: Some(crate::texture::TILE_SIZE),
+                },
+                wgpu::Extent3d {
+                    width: crate::texture::TILE_SIZE,
+                    height: crate::texture::TILE_SIZE,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+    }
+
     fn render_inner(
         &mut self,
         camera: &Camera,
@@ -3866,6 +4693,9 @@ impl Renderer {
         let sky = crate::sky::sky_colors(self.world_time);
         let view_proj = camera.view_projection();
         let time = self.start_time.elapsed().as_secs_f32();
+        // Advance animated terrain tiles (water/lava/fire/…) by re-uploading the
+        // current 16×16 frame into each tile's atlas cell when it changes.
+        self.update_animated_tiles(time);
         self.queue.write_buffer(
             &self.camera_buffer,
             0,
@@ -3875,6 +4705,15 @@ impl Renderer {
                 time,
                 self.atlas_uv.tile_size(),
             )),
+        );
+        // Enchantment glint scroll for this frame (drives the travelling sheen).
+        self.queue.write_buffer(
+            &self.glint_uniform_buffer,
+            0,
+            bytemuck::bytes_of(&GlintUniform {
+                scroll: glint_scroll(time),
+                _pad: [0.0; 3],
+            }),
         );
         // Post-pass camera (depth-aware DoF / motion blur): unproject depth and
         // reproject into last frame. Updated before prev is overwritten.
@@ -4484,11 +5323,38 @@ impl Renderer {
                 draw_calls += 1;
             }
 
+            // Enchantment glint over enchanted worn armor, re-drawn additively
+            // with the scrolling glint texture (masked to the armor silhouette
+            // by the entity atlas). Drawn right after the entity model so the
+            // sheen lays over it without writing depth.
+            if let Some(glint) = self.entity_glint.as_ref().filter(|m| m.index_count > 0) {
+                pass.set_pipeline(&self.entity_glint_pipeline);
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                pass.set_bind_group(1, &self.entity_bind_group, &[]);
+                pass.set_bind_group(2, &self.glint_uniform_bind_group, &[]);
+                pass.set_bind_group(3, &self.glint_bind_group, &[]);
+                pass.set_vertex_buffer(0, glint.vertex_buffer.slice(..));
+                pass.set_index_buffer(glint.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..glint.index_count, 0, 0..1);
+                draw_calls += 1;
+            }
+
             // Billboarded player nametags (depth-tested against the world).
             if let Some(mesh) = self.nametag_mesh.as_ref().filter(|m| m.index_count > 0) {
                 pass.set_pipeline(&self.model_pipeline);
                 pass.set_bind_group(0, &self.camera_bind_group, &[]);
                 pass.set_bind_group(1, &self.nametag_bind_group, &[]);
+                pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+                draw_calls += 1;
+            }
+
+            // World-fixed sign block-entity text on the board faces.
+            if let Some(mesh) = self.sign_text_mesh.as_ref().filter(|m| m.index_count > 0) {
+                pass.set_pipeline(&self.model_pipeline);
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                pass.set_bind_group(1, &self.sign_text_bind_group, &[]);
                 pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                 pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..mesh.index_count, 0, 0..1);
@@ -4507,6 +5373,69 @@ impl Renderer {
                 pass.set_vertex_buffer(0, items.vertex_buffer.slice(..));
                 pass.set_index_buffer(items.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..items.index_count, 0, 0..1);
+                draw_calls += 1;
+            }
+
+            // Enchantment glint over the enchanted world items, re-drawn with
+            // the scrolling glint texture additively (vanilla `renderEffect`).
+            if let Some(glint) = self.world_items_glint.as_ref().filter(|m| m.index_count > 0) {
+                pass.set_pipeline(&self.glint_pipeline);
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                pass.set_bind_group(
+                    1,
+                    &self.texture_bind_groups[self.mipmap_levels as usize],
+                    &[],
+                );
+                pass.set_bind_group(2, &self.glint_uniform_bind_group, &[]);
+                pass.set_bind_group(3, &self.glint_bind_group, &[]);
+                pass.set_vertex_buffer(0, glint.vertex_buffer.slice(..));
+                pass.set_index_buffer(glint.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..glint.index_count, 0, 0..1);
+                draw_calls += 1;
+            }
+
+            // Particle billboards, sampled from particles.png. The item pipeline
+            // is cutout-only (REPLACE blend), so particles use the overlay
+            // pipeline (alpha-blended, depth-tested, no depth write) like the
+            // mining crack — semi-transparent smoke/flame then blends correctly.
+            if let Some(particles) = self.particles.as_ref().filter(|m| m.index_count > 0) {
+                pass.set_pipeline(&self.overlay_pipeline);
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                pass.set_bind_group(1, &self.particle_bind_group, &[]);
+                pass.set_vertex_buffer(0, particles.vertex_buffer.slice(..));
+                pass.set_index_buffer(particles.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..particles.index_count, 0, 0..1);
+                draw_calls += 1;
+            }
+
+            // Block-break debris billboards, sampled from the BLOCK atlas (the
+            // broken block's terrain tile) — vanilla EntityDiggingFX. Drawn with
+            // the overlay pipeline (alpha-blended, depth-tested, no depth write)
+            // but bound to the block atlas instead of particles.png, like the
+            // dropped items.
+            if let Some(debris) = self.block_particles.as_ref().filter(|m| m.index_count > 0) {
+                pass.set_pipeline(&self.overlay_pipeline);
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                pass.set_bind_group(
+                    1,
+                    &self.texture_bind_groups[self.mipmap_levels as usize],
+                    &[],
+                );
+                pass.set_vertex_buffer(0, debris.vertex_buffer.slice(..));
+                pass.set_index_buffer(debris.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..debris.index_count, 0, 0..1);
+                draw_calls += 1;
+            }
+
+            // Experience-orb billboards, sampled from experience_orb.png, drawn
+            // alpha-blended like particles (overlay pipeline).
+            if let Some(orbs) = self.xp_orbs.as_ref().filter(|m| m.index_count > 0) {
+                pass.set_pipeline(&self.overlay_pipeline);
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                pass.set_bind_group(1, &self.xp_orb_bind_group, &[]);
+                pass.set_vertex_buffer(0, orbs.vertex_buffer.slice(..));
+                pass.set_index_buffer(orbs.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..orbs.index_count, 0, 0..1);
                 draw_calls += 1;
             }
 
@@ -4557,6 +5486,28 @@ impl Renderer {
                 pass.set_index_buffer(item.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..item.index_count, 0, 0..1);
                 draw_calls += 1;
+
+                // Glint over the held item if it is enchanted (same geometry,
+                // additive glint pipeline). Drawn right after so the sheen lays
+                // over the hand item; the hand sits near the camera, so the
+                // glint's depth test passes over the world like the item itself.
+                if let Some(glint) =
+                    self.first_person_item_glint.as_ref().filter(|m| m.index_count > 0)
+                {
+                    pass.set_pipeline(&self.glint_pipeline);
+                    pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                    pass.set_bind_group(
+                        1,
+                        &self.texture_bind_groups[self.mipmap_levels as usize],
+                        &[],
+                    );
+                    pass.set_bind_group(2, &self.glint_uniform_bind_group, &[]);
+                    pass.set_bind_group(3, &self.glint_bind_group, &[]);
+                    pass.set_vertex_buffer(0, glint.vertex_buffer.slice(..));
+                    pass.set_index_buffer(glint.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(0..glint.index_count, 0, 0..1);
+                    draw_calls += 1;
+                }
             }
             } // else (non-panorama sky + world content)
         }
@@ -4822,6 +5773,16 @@ impl Renderer {
                 up.draw(0..3, 0..1);
                 draw_calls += 1;
             }
+            // Crosshair: drawn over the scene (and the vignette/HUD background)
+            // with the inversion blend, like vanilla `GuiIngame`. The layer is a
+            // no-op where transparent, so an empty crosshair (screen open) costs
+            // nothing visible.
+            if let Some(cache) = &self.crosshair_cache {
+                up.set_pipeline(&self.crosshair_pipeline);
+                up.set_bind_group(0, &cache.bind_group, &[]);
+                up.draw(0..3, 0..1);
+                draw_calls += 1;
+            }
             // 3D block icons: convex cubes (cull-free) baked into clip space via
             // the identity camera. The pass cleared depth to the far plane, so
             // they depth-test correctly among themselves.
@@ -4832,6 +5793,41 @@ impl Renderer {
                 up.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                 up.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 up.draw_indexed(0..mesh.index_count, 0, 0..1);
+                draw_calls += 1;
+            }
+            // Inventory player preview (vanilla `GuiInventory.drawEntityOnScreen`):
+            // the local-player biped baked into clip space, scissored to the
+            // panel's model box so it never overdraws the rest of the window. The
+            // pass's depth is shared with the block icons (cleared to far), so the
+            // biped self-occludes; drawn before the overlay so the carried stack /
+            // tooltips still render on top. The scissor is reset to the full frame
+            // afterwards so the overlay layer is not clipped.
+            if let (Some(mesh), Some([sx, sy, sw, sh])) = (
+                self.inventory_preview_mesh.as_ref().filter(|m| m.index_count > 0),
+                self.inventory_preview_scissor,
+            ) {
+                up.set_scissor_rect(sx, sy, sw, sh);
+                up.set_pipeline(&self.inventory_preview_pipeline);
+                up.set_bind_group(0, &self.gui_camera_bind_group, &[]);
+                up.set_bind_group(1, &self.entity_bind_group, &[]);
+                up.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                up.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                up.draw_indexed(0..mesh.index_count, 0, 0..1);
+                up.set_scissor_rect(0, 0, self.config.width, self.config.height);
+                draw_calls += 1;
+            }
+            // Enchantment glint over enchanted item icons (block cubes and flat
+            // sprites), additive with the scrolling glint texture — drawn under
+            // the overlay layer so stack counts / tooltips stay on top.
+            if let Some(glint) = self.gui_glint_mesh.as_ref().filter(|m| m.index_count > 0) {
+                up.set_pipeline(&self.gui_glint_pipeline);
+                up.set_bind_group(0, &self.gui_camera_bind_group, &[]);
+                up.set_bind_group(1, &self.texture_bind_groups[self.mipmap_levels as usize], &[]);
+                up.set_bind_group(2, &self.glint_uniform_bind_group, &[]);
+                up.set_bind_group(3, &self.glint_bind_group, &[]);
+                up.set_vertex_buffer(0, glint.vertex_buffer.slice(..));
+                up.set_index_buffer(glint.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                up.draw_indexed(0..glint.index_count, 0, 0..1);
                 draw_calls += 1;
             }
             // UI foreground layer (counts, hover, carried stack) over the cubes.
@@ -4921,6 +5917,19 @@ impl Renderer {
             divisor,
             "ui-front",
         );
+        prepare_ui_layer(
+            &self.device,
+            &self.queue,
+            &mut self.crosshair_cache,
+            &self.ui_bind_group_layout,
+            &self.ui_sampler,
+            &self.gui_atlas,
+            ui.crosshair_commands(),
+            width,
+            height,
+            divisor,
+            "ui-crosshair",
+        );
 
         // 3D block icons, baked into clip space for the GPU cube pass.
         let surface = (self.config.width as f32, self.config.height as f32);
@@ -4945,6 +5954,42 @@ impl Renderer {
             bytemuck::cast_slice(&indices),
             indices.len() as u32,
             "gui-block-items",
+        );
+
+        // Enchanted item icons: a clip-space glint overlay per slot — the cube
+        // faces for block icons, a flat sprite quad otherwise — drawn additively
+        // with the scrolling glint texture over the icons (vanilla `renderEffect`).
+        let mut glint_v: Vec<Vertex> = Vec::new();
+        let mut glint_i: Vec<u32> = Vec::new();
+        for item in ui.glint_items() {
+            match item.block {
+                Some((block_id, meta)) => crate::gui_item::append_block_icon(
+                    &mut glint_v,
+                    &mut glint_i,
+                    recraft_core::BlockState::new(block_id, meta),
+                    item.dst,
+                    surface,
+                    &self.atlas_uv,
+                    &self.biome_colors,
+                ),
+                None => crate::gui_item::append_flat_item_glint(
+                    &mut glint_v,
+                    &mut glint_i,
+                    item.item_id,
+                    item.dst,
+                    surface,
+                    &self.atlas_uv,
+                ),
+            }
+        }
+        fill_dynamic_mesh(
+            &self.device,
+            &self.queue,
+            &mut self.gui_glint_mesh,
+            bytemuck::cast_slice(&glint_v),
+            bytemuck::cast_slice(&glint_i),
+            glint_i.len() as u32,
+            "gui-item-glint",
         );
     }
 }
@@ -5098,88 +6143,78 @@ fn fill_dynamic_mesh(
     mesh.index_count = index_count;
 }
 
-/// Geometry for the mining crack overlay: a cube slightly inflated around the
-/// mined block cell, every face textured with the `destroy_stage_<stage>`
-/// atlas tile at full brightness. Drawn with the translucent pipeline, so the
-/// crack texels alpha-blend over the block beneath (vanilla look).
+/// Geometry for the mining crack overlay: the `destroy_stage_<stage>` atlas tile
+/// applied to every face of the mined block's render boxes, each slightly
+/// inflated so the overlay never z-fights the block. A partial block cracks only
+/// over its shape (a slab over its half, stairs over their steps) — the texture
+/// crops to each box exactly like the world mesher, so the crack lines up with
+/// the visible faces instead of floating on a full cube. Drawn with the
+/// translucent pipeline, so the crack texels alpha-blend over the block beneath
+/// (vanilla look). Blocks with no render boxes (cross/torch/…) fall back to a
+/// full cube so the crack stays visible.
 fn break_overlay_geometry(
     x: i32,
     y: i32,
     z: i32,
     stage: u8,
+    block: recraft_core::BlockState,
     atlas: &AtlasUv,
 ) -> (Vec<Vertex>, Vec<u32>) {
-    let uv = atlas.uv(Some(&format!("destroy_stage_{}", stage.min(9))));
+    let rect = atlas.tile_rect(Some(&format!("destroy_stage_{}", stage.min(9))));
+    let computed = block.render_boxes();
+    let fallback = [recraft_core::BlockBox { min: [0.0; 3], max: [1.0; 3] }];
+    let boxes: &[recraft_core::BlockBox] = if computed.as_slice().is_empty() {
+        &fallback
+    } else {
+        computed.as_slice()
+    };
+
     // Inflate past the block faces so the overlay never z-fights them.
     const PAD: f32 = 0.004;
-    let lo = [x as f32 - PAD, y as f32 - PAD, z as f32 - PAD];
-    let hi = [
-        x as f32 + 1.0 + PAD,
-        y as f32 + 1.0 + PAD,
-        z as f32 + 1.0 + PAD,
+
+    // Each face: outward normal (for the UV convention) plus four corners, where
+    // a corner component selects the box min (0) or max (1) along that axis. The
+    // translucent pipeline doesn't cull, so the winding only needs to be
+    // consistent.
+    const FACES: [([i32; 3], [[u8; 3]; 4]); 6] = [
+        ([1, 0, 0], [[1, 0, 0], [1, 1, 0], [1, 1, 1], [1, 0, 1]]),
+        ([-1, 0, 0], [[0, 0, 1], [0, 1, 1], [0, 1, 0], [0, 0, 0]]),
+        ([0, 1, 0], [[0, 1, 1], [1, 1, 1], [1, 1, 0], [0, 1, 0]]),
+        ([0, -1, 0], [[0, 0, 0], [1, 0, 0], [1, 0, 1], [0, 0, 1]]),
+        ([0, 0, 1], [[1, 0, 1], [1, 1, 1], [0, 1, 1], [0, 0, 1]]),
+        ([0, 0, -1], [[0, 0, 0], [0, 1, 0], [1, 1, 0], [1, 0, 0]]),
     ];
 
-    // Corner order per face matches the atlas UV order (bottom-left, top-left,
-    // top-right, bottom-right); the translucent pipeline doesn't cull, so the
-    // winding only needs to be consistent.
-    let faces: [[[f32; 3]; 4]; 6] = [
-        // -X
-        [
-            [lo[0], lo[1], hi[2]],
-            [lo[0], hi[1], hi[2]],
-            [lo[0], hi[1], lo[2]],
-            [lo[0], lo[1], lo[2]],
-        ],
-        // +X
-        [
-            [hi[0], lo[1], lo[2]],
-            [hi[0], hi[1], lo[2]],
-            [hi[0], hi[1], hi[2]],
-            [hi[0], lo[1], hi[2]],
-        ],
-        // -Y
-        [
-            [lo[0], lo[1], lo[2]],
-            [lo[0], lo[1], hi[2]],
-            [hi[0], lo[1], hi[2]],
-            [hi[0], lo[1], lo[2]],
-        ],
-        // +Y
-        [
-            [lo[0], hi[1], hi[2]],
-            [lo[0], hi[1], lo[2]],
-            [hi[0], hi[1], lo[2]],
-            [hi[0], hi[1], hi[2]],
-        ],
-        // -Z
-        [
-            [lo[0], lo[1], lo[2]],
-            [lo[0], hi[1], lo[2]],
-            [hi[0], hi[1], lo[2]],
-            [hi[0], lo[1], lo[2]],
-        ],
-        // +Z
-        [
-            [hi[0], lo[1], hi[2]],
-            [hi[0], hi[1], hi[2]],
-            [lo[0], hi[1], hi[2]],
-            [lo[0], lo[1], hi[2]],
-        ],
-    ];
-
-    let mut vertices = Vec::with_capacity(24);
-    let mut indices = Vec::with_capacity(36);
-    for corners in faces {
-        let base = vertices.len() as u32;
-        for (corner, corner_uv) in corners.iter().zip(uv.iter()) {
-            vertices.push(Vertex {
-                position: *corner,
-                color: [1.0, 1.0, 1.0, 1.0],
-                uv: *corner_uv,
-                light: crate::FULLBRIGHT,
-            });
+    let mut vertices = Vec::with_capacity(24 * boxes.len());
+    let mut indices = Vec::with_capacity(36 * boxes.len());
+    for b in boxes {
+        let bmin = [b.min[0] as f32, b.min[1] as f32, b.min[2] as f32];
+        let bmax = [b.max[0] as f32, b.max[1] as f32, b.max[2] as f32];
+        for (normal, corners) in FACES {
+            let base = vertices.len() as u32;
+            for c in corners {
+                // Box-local coord (0..1 within the cell) drives the UV so the
+                // crack crops to the box; PAD inflates only the world position.
+                let lc = [
+                    if c[0] == 0 { bmin[0] } else { bmax[0] },
+                    if c[1] == 0 { bmin[1] } else { bmax[1] },
+                    if c[2] == 0 { bmin[2] } else { bmax[2] },
+                ];
+                let pos = [
+                    x as f32 + lc[0] + if c[0] == 0 { -PAD } else { PAD },
+                    y as f32 + lc[1] + if c[1] == 0 { -PAD } else { PAD },
+                    z as f32 + lc[2] + if c[2] == 0 { -PAD } else { PAD },
+                ];
+                let (fu, fv) = crate::gui_item::face_uv(normal, lc[0], lc[1], lc[2]);
+                vertices.push(Vertex {
+                    position: pos,
+                    color: [1.0, 1.0, 1.0, 1.0],
+                    uv: [rect[0] + fu * rect[2], rect[1] + fv * rect[3]],
+                    light: crate::FULLBRIGHT,
+                });
+            }
+            indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
         }
-        indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     }
     (vertices, indices)
 }
@@ -5310,6 +6345,186 @@ fn create_sky_atlas_bind_group(
     });
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("sky-atlas-bind-group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(&sampler),
+            },
+        ],
+    })
+}
+
+/// Upload `particles.png` (the 16×16 particle sprite sheet) and build a
+/// texture+sampler bind group the particle draw samples at group 1. Reuses the
+/// block-atlas layout so the overlay pipeline accepts it. Falls back to a single
+/// transparent texel if the asset is missing, so particles simply don't show
+/// rather than crashing. Nearest filtering keeps the pixel sprites crisp.
+fn create_particle_bind_group(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    layout: &wgpu::BindGroupLayout,
+) -> wgpu::BindGroup {
+    create_asset_texture_bind_group(
+        device,
+        queue,
+        layout,
+        "assets/minecraft/textures/particle/particles.png",
+        "particle",
+    )
+}
+
+/// Upload a single asset PNG and build a nearest-filtered texture+sampler bind
+/// group on the block-atlas layout (so the overlay pipeline can sample it).
+/// Falls back to a transparent texel if the asset is missing, so the draw is
+/// simply invisible rather than crashing. Used for the particle sheet and the
+/// experience-orb sheet.
+fn create_asset_texture_bind_group(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    layout: &wgpu::BindGroupLayout,
+    asset: &str,
+    label: &str,
+) -> wgpu::BindGroup {
+    let image = crate::texture::load_asset_image(asset);
+    let (width, height, pixels) = match image {
+        Some(img) => (img.width(), img.height(), img.into_raw()),
+        None => {
+            log::warn!("{asset} not found; {label} will be invisible");
+            (1, 1, vec![0u8, 0, 0, 0])
+        }
+    };
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(&format!("{label}-texture")),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &pixels,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(4 * width),
+            rows_per_image: Some(height),
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some(&format!("{label}-sampler")),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Nearest,
+        min_filter: wgpu::FilterMode::Nearest,
+        mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+        ..Default::default()
+    });
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some(&format!("{label}-bind-group")),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(&sampler),
+            },
+        ],
+    })
+}
+
+/// Upload `enchanted_item_glint.png` and build a REPEAT-wrapped texture+sampler
+/// bind group on the block-atlas layout (so the glint pipeline can sample it at
+/// group 3). The glint UV is scaled past 1.0 and scrolled, so the texture must
+/// tile; linear filtering keeps the streaks smooth as they travel. Falls back to
+/// a single transparent texel if the asset is missing, so the glint is simply
+/// absent rather than crashing.
+fn create_glint_bind_group(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    layout: &wgpu::BindGroupLayout,
+) -> wgpu::BindGroup {
+    let image = crate::texture::load_asset_image(
+        "assets/minecraft/textures/misc/enchanted_item_glint.png",
+    );
+    let (width, height, pixels) = match image {
+        Some(img) => (img.width(), img.height(), img.into_raw()),
+        None => {
+            log::warn!("enchanted_item_glint.png not found; the glint will be absent");
+            (1, 1, vec![0u8, 0, 0, 0])
+        }
+    };
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("glint-texture"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &pixels,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(4 * width),
+            rows_per_image: Some(height),
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("glint-sampler"),
+        address_mode_u: wgpu::AddressMode::Repeat,
+        address_mode_v: wgpu::AddressMode::Repeat,
+        address_mode_w: wgpu::AddressMode::Repeat,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+        ..Default::default()
+    });
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("glint-bind-group"),
         layout,
         entries: &[
             wgpu::BindGroupEntry {
@@ -5679,8 +6894,11 @@ fn create_texture_bind_group(
     BiomeColors,
     AtlasUv,
     Option<image::RgbaImage>,
+    wgpu::Texture,
+    Vec<crate::texture::AnimatedTile>,
 ) {
-    let atlas = TextureAtlasImage::load_default();
+    let mut atlas = TextureAtlasImage::load_default();
+    let animated = std::mem::take(&mut atlas.animated);
     let biome_colors = BiomeColors {
         grass: atlas.grass_color,
         foliage: atlas.foliage_color,
@@ -5810,7 +7028,7 @@ fn create_texture_bind_group(
     // Hand the CPU atlas image to the UI for block item thumbnails (reuses this
     // build instead of loading the atlas a second time).
     let block_image = image::RgbaImage::from_raw(atlas.width, atlas.height, atlas.pixels);
-    (layout, bind_groups, biome_colors, atlas_uv, block_image)
+    (layout, bind_groups, biome_colors, atlas_uv, block_image, texture, animated)
 }
 
 fn create_default_pbr_textures(
@@ -6066,4 +7284,21 @@ fn create_panorama_resources(
         bind_group,
         uniform_buffer,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::glint_scroll;
+
+    #[test]
+    fn glint_scroll_advances_over_time() {
+        // The sheen must move: a later time gives a different (larger) offset, so
+        // the scrolling-UV sample changes frame to frame.
+        let t0 = glint_scroll(0.0);
+        let t1 = glint_scroll(0.5);
+        let t2 = glint_scroll(2.0);
+        assert_eq!(t0, 0.0);
+        assert!(t1 > t0);
+        assert!(t2 > t1);
+    }
 }

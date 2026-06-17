@@ -71,6 +71,9 @@ pub enum WindowKind {
     Crafting,
     Brewing,
     Enchant,
+    Anvil,
+    Beacon,
+    Villager,
 }
 
 /// An open window: its slots, own inventory, drag state and transaction counter.
@@ -178,6 +181,26 @@ impl Container {
                 for i in 0..container_size.max(1) {
                     slots.push(Slot { back: SlotBack::Container(i), x: 25 + i as i32 * 18, y: 47, kind: SlotKind::Limit1 });
                 }
+                (84, 142, 176, 166)
+            }
+            WindowKind::Anvil => {
+                // Vanilla `ContainerRepair`: two inputs (left/middle), one output.
+                slots.push(Slot { back: SlotBack::Container(0), x: 27, y: 47, kind: SlotKind::Normal });
+                slots.push(Slot { back: SlotBack::Container(1), x: 76, y: 47, kind: SlotKind::Normal });
+                slots.push(Slot { back: SlotBack::Container(2), x: 134, y: 47, kind: SlotKind::Output });
+                (84, 142, 176, 166)
+            }
+            WindowKind::Beacon => {
+                // Vanilla `ContainerBeacon`: a single payment slot; the window is
+                // larger than the standard 176×166.
+                slots.push(Slot { back: SlotBack::Container(0), x: 136, y: 110, kind: SlotKind::Limit1 });
+                (132, 190, 230, 219)
+            }
+            WindowKind::Villager => {
+                // Vanilla `ContainerMerchant`: two buy slots + one sell (output).
+                slots.push(Slot { back: SlotBack::Container(0), x: 36, y: 52, kind: SlotKind::Normal });
+                slots.push(Slot { back: SlotBack::Container(1), x: 62, y: 52, kind: SlotKind::Normal });
+                slots.push(Slot { back: SlotBack::Container(2), x: 120, y: 52, kind: SlotKind::Output });
                 (84, 142, 176, 166)
             }
             WindowKind::Player => (84, 142, 176, 166),
@@ -682,7 +705,10 @@ impl WindowKind {
             "crafting_table" | "workbench" => WindowKind::Crafting,
             "brewing_stand" => WindowKind::Brewing,
             "enchanting_table" => WindowKind::Enchant,
-            // Anvil, beacon, etc. fall back to a chest-shaped grid.
+            "anvil" => WindowKind::Anvil,
+            "beacon" => WindowKind::Beacon,
+            "villager" => WindowKind::Villager,
+            // Unknown types fall back to a chest-shaped grid.
             _ => WindowKind::Chest((slots.max(1) as u8).div_ceil(9)),
         }
     }
@@ -767,4 +793,63 @@ fn is_non_stackable(id: i16) -> bool {
             | 359
             | 373
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The OpenWindow `inventory_type` string maps to the right kind, and chest
+    /// rows derive from the container slot count.
+    #[test]
+    fn window_type_strings_map_to_kinds() {
+        let cases: &[(&str, usize, WindowKind)] = &[
+            ("minecraft:crafting_table", 10, WindowKind::Crafting),
+            ("minecraft:furnace", 3, WindowKind::Furnace),
+            ("minecraft:chest", 27, WindowKind::Chest(3)),
+            ("minecraft:chest", 54, WindowKind::Chest(6)),
+            ("minecraft:dispenser", 9, WindowKind::Dispenser),
+            ("minecraft:dropper", 9, WindowKind::Dispenser),
+            ("minecraft:hopper", 5, WindowKind::Hopper),
+            ("minecraft:brewing_stand", 4, WindowKind::Brewing),
+            ("minecraft:anvil", 3, WindowKind::Anvil),
+            ("minecraft:enchanting_table", 2, WindowKind::Enchant),
+            ("minecraft:beacon", 1, WindowKind::Beacon),
+            ("minecraft:villager", 3, WindowKind::Villager),
+            // Unknown types fall back to a chest grid sized from the slot count.
+            ("minecraft:unknown_thing", 9, WindowKind::Chest(1)),
+        ];
+        for &(ty, slots, expected) in cases {
+            assert_eq!(WindowKind::from_type(ty, slots), expected, "type {ty}");
+        }
+    }
+
+    /// Each window lays out its own container slots plus the shared 36
+    /// player-inventory slots, with the vanilla container slot count.
+    #[test]
+    fn window_layouts_have_container_plus_player_slots() {
+        // (type, container_size, expected container slot count, x_size, y_size).
+        let cases: &[(&str, usize, usize, i32, i32)] = &[
+            ("minecraft:crafting_table", 10, 10, 176, 166), // 3×3 grid + result
+            ("minecraft:furnace", 3, 3, 176, 166),          // input/fuel/result
+            ("minecraft:chest", 27, 27, 176, 168),          // 3 rows
+            ("minecraft:chest", 54, 54, 176, 222),          // 6 rows
+            ("minecraft:dispenser", 9, 9, 176, 166),        // 3×3
+            ("minecraft:hopper", 5, 5, 176, 133),           // 1×5
+            ("minecraft:brewing_stand", 4, 4, 176, 166),    // 3 bottles + ingredient
+            ("minecraft:anvil", 3, 3, 176, 166),            // 2 inputs + output
+            ("minecraft:enchanting_table", 2, 2, 176, 166), // item + lapis
+            ("minecraft:beacon", 1, 1, 230, 219),           // payment slot
+            ("minecraft:villager", 3, 3, 176, 166),         // buy/buy/sell
+        ];
+        for &(ty, size, want_container, want_x, want_y) in cases {
+            let c = Container::open(1, ty, String::new(), size);
+            let container_slots = c.slots().len() - 36; // 36 = main 27 + hotbar 9
+            assert_eq!(container_slots, want_container, "container slots for {ty}");
+            assert_eq!(c.x_size, want_x, "x_size for {ty}");
+            assert_eq!(c.y_size, want_y, "y_size for {ty}");
+            // The last 9 slots are the hotbar, the 27 before them the main inv.
+            assert_eq!(c.slots().len(), want_container + 36, "total slots for {ty}");
+        }
+    }
 }

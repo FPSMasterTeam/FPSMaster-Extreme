@@ -43,6 +43,69 @@ pub struct PbrAtlases {
     pub specular: Option<(Vec<u8>, u32, u32)>,
 }
 
+/// One animated atlas tile: a texture loaded from an N-frame vertical strip.
+/// The renderer cycles the 16×16 `frames` through the tile's atlas cell each
+/// frame so water/lava/fire animate without any mesh/UV/shader change.
+#[derive(Debug, Clone)]
+pub struct AnimatedTile {
+    /// Top-left pixel of the tile's cell in the block atlas (mip 0).
+    pub atlas_x: u32,
+    pub atlas_y: u32,
+    /// All animation frames as 16×16 RGBA images (downscaled from the strip's
+    /// native frame size, like the static `copy_tile` path).
+    pub frames: Vec<RgbaImage>,
+    /// Ticks each displayed frame stays on screen (`animation.frametime`, ≥1).
+    pub frametime: u32,
+    /// Display order as indices into `frames` (`animation.frames`, or 0..N).
+    pub order: Vec<usize>,
+}
+
+/// Parse an `<name>.png.mcmeta` animation block into `(frametime, order)`.
+/// `frametime` defaults to 1; `order` is `None` when no explicit `frames`
+/// array is present (caller then cycles 0..N in order). Invalid JSON yields the
+/// defaults so a malformed mcmeta never breaks atlas loading.
+fn parse_animation_meta(json: &str) -> (u32, Option<Vec<usize>>) {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
+        return (1, None);
+    };
+    let animation = value.get("animation");
+    let frametime = animation
+        .and_then(|a| a.get("frametime"))
+        .and_then(|f| f.as_u64())
+        .map(|f| f.max(1) as u32)
+        .unwrap_or(1);
+    let order = animation
+        .and_then(|a| a.get("frames"))
+        .and_then(|f| f.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_u64().map(|n| n as usize))
+                .collect::<Vec<_>>()
+        })
+        .filter(|order: &Vec<usize>| !order.is_empty());
+    (frametime, order)
+}
+
+/// Split a vertical animation strip into its frames, each downscaled to
+/// `TILE_SIZE`×`TILE_SIZE` (matching the static atlas tile size). Returns
+/// `None` when the image is not a strip (height ≤ width, or not a whole
+/// multiple of the frame width).
+fn split_animation_frames_16(image: &DynamicImage) -> Option<Vec<RgbaImage>> {
+    let (w, h) = (image.width(), image.height());
+    if w == 0 || h <= w || h % w != 0 {
+        return None;
+    }
+    let frames = (0..h / w)
+        .map(|i| {
+            image
+                .crop_imm(0, i * w, w, w)
+                .resize_exact(TILE_SIZE, TILE_SIZE, FilterType::Nearest)
+                .to_rgba8()
+        })
+        .collect();
+    Some(frames)
+}
+
 /// Map a 1.8.9 block texture name to its 1.13+ (flattened) equivalent.
 /// Returns `None` when the name is unchanged across versions.
 fn name_1_8_to_1_13(name: &str) -> Option<&'static str> {
@@ -275,6 +338,33 @@ fn read_block_texture(
     }
 }
 
+/// Read a block texture's `.png.mcmeta` sidecar, following the same 1.8 →
+/// 1.13+ path fallback as [`read_block_texture`] so the animation metadata is
+/// found next to whichever PNG actually loaded.
+fn read_block_texture_meta(
+    name: &str,
+    read: &mut dyn FnMut(&str) -> Option<Vec<u8>>,
+) -> Option<Vec<u8>> {
+    if name.contains('/') {
+        return read(&format!("assets/minecraft/textures/{name}.png.mcmeta"));
+    }
+    let candidates = [
+        format!("assets/minecraft/textures/blocks/{name}.png.mcmeta"),
+        format!("assets/minecraft/textures/block/{name}.png.mcmeta"),
+    ];
+    for asset in &candidates {
+        if let Some(bytes) = read(asset) {
+            return Some(bytes);
+        }
+    }
+    if let Some(mapped) = name_1_8_to_1_13(name) {
+        return read(&format!(
+            "assets/minecraft/textures/block/{mapped}.png.mcmeta"
+        ));
+    }
+    None
+}
+
 /// Maps texture base-names to atlas tile indices and yields UVs. Index 0 is the
 /// magenta "missing" tile, so unknown/missing textures are visually obvious.
 #[derive(Debug, Clone, Default)]
@@ -388,6 +478,8 @@ pub struct TextureAtlasImage {
     missing_indices: Vec<u32>,
     /// PBR normal + specular atlases (only present when a resource pack provides them).
     pub pbr: PbrAtlases,
+    /// Tiles loaded from multi-frame strips, for per-frame CPU atlas animation.
+    pub animated: Vec<AnimatedTile>,
 }
 
 #[derive(Debug, Clone)]
@@ -434,6 +526,13 @@ impl TextureAtlasImage {
         // The recessed front face of an extended piston body (the mesher draws it
         // directly; it is not a per-face entry in any block def).
         names.push("piston_inner".to_owned());
+        // Bed textures: the mesher selects head/feet×top/end/side directly by
+        // name (the block def has no per-face tex entries), so register them here.
+        for part in ["feet", "head"] {
+            for face in ["top", "end", "side"] {
+                names.push(format!("bed_{part}_{face}"));
+            }
+        }
         // Item sprites (under textures/items/) join the atlas so the
         // first-person item renderer can draw real held items; their atlas
         // names keep the "items/" prefix.
@@ -469,7 +568,8 @@ impl TextureAtlasImage {
 
     fn from_asset_directory(path: PathBuf, names: &[String]) -> Result<Self, String> {
         let mut read = |asset: &str| read_directory_image(&path, asset);
-        let (built, loaded) = build_atlas(names, &mut read);
+        let mut read_meta = |asset: &str| read_directory_bytes(&path, asset);
+        let (built, loaded) = build_atlas(names, &mut read, &mut read_meta);
         if loaded == 0 && !names.is_empty() {
             return Err("directory has no block textures".to_owned());
         }
@@ -478,9 +578,16 @@ impl TextureAtlasImage {
 
     fn from_asset_zip(path: PathBuf, names: &[String]) -> Result<Self, String> {
         let file = File::open(&path).map_err(|err| err.to_string())?;
-        let mut zip = ZipArchive::new(file).map_err(|err| err.to_string())?;
-        let mut read = |asset: &str| read_zip_image(&mut zip, asset);
-        let (built, loaded) = build_atlas(names, &mut read);
+        let zip = Arc::new(Mutex::new(
+            ZipArchive::new(file).map_err(|err| err.to_string())?,
+        ));
+        let mut read = |asset: &str| {
+            zip.lock().ok().and_then(|mut z| read_zip_image(&mut z, asset))
+        };
+        let mut read_meta = |asset: &str| {
+            zip.lock().ok().and_then(|mut z| read_zip_bytes(&mut z, asset))
+        };
+        let (built, loaded) = build_atlas(names, &mut read, &mut read_meta);
         if loaded == 0 && !names.is_empty() {
             return Err("archive has no block textures".to_owned());
         }
@@ -489,7 +596,8 @@ impl TextureAtlasImage {
 
     fn fallback(names: &[String]) -> Self {
         let mut read = |_: &str| None;
-        let (built, _) = build_atlas(names, &mut read);
+        let mut read_meta = |_: &str| None;
+        let (built, _) = build_atlas(names, &mut read, &mut read_meta);
         Self::from_built(built, TextureAtlasSource::Fallback, PbrAtlases::default())
     }
 
@@ -559,7 +667,26 @@ impl TextureAtlasImage {
             }
             None
         };
-        let (built, loaded) = build_atlas(names, &mut read);
+        let mut read_meta = |asset: &str| {
+            if let Some(bytes) = read_directory_bytes(&pack_path, asset) {
+                return Some(bytes);
+            }
+            for base in &base_paths {
+                let bytes = if base.is_dir() {
+                    read_directory_bytes(base, asset)
+                } else {
+                    File::open(base)
+                        .ok()
+                        .and_then(|file| ZipArchive::new(file).ok())
+                        .and_then(|mut zip| read_zip_bytes(&mut zip, asset))
+                };
+                if let Some(bytes) = bytes {
+                    return Some(bytes);
+                }
+            }
+            None
+        };
+        let (built, loaded) = build_atlas(names, &mut read, &mut read_meta);
         if loaded == 0 && !names.is_empty() {
             return Err("resource pack has no block textures".to_owned());
         }
@@ -596,7 +723,30 @@ impl TextureAtlasImage {
             }
             None
         };
-        let (built, loaded) = build_atlas(names, &mut read);
+        let mut read_meta = |asset: &str| {
+            if let Some(bytes) = pack_zip
+                .lock()
+                .ok()
+                .and_then(|mut z| read_zip_bytes(&mut z, asset))
+            {
+                return Some(bytes);
+            }
+            for base in &base_paths {
+                let bytes = if base.is_dir() {
+                    read_directory_bytes(base, asset)
+                } else {
+                    File::open(base)
+                        .ok()
+                        .and_then(|file| ZipArchive::new(file).ok())
+                        .and_then(|mut zip| read_zip_bytes(&mut zip, asset))
+                };
+                if let Some(bytes) = bytes {
+                    return Some(bytes);
+                }
+            }
+            None
+        };
+        let (built, loaded) = build_atlas(names, &mut read, &mut read_meta);
         if loaded == 0 && !names.is_empty() {
             return Err("resource pack has no block textures".to_owned());
         }
@@ -616,6 +766,7 @@ impl TextureAtlasImage {
             rows: built.rows,
             missing_indices: built.missing_indices,
             pbr,
+            animated: built.animated,
         }
     }
 }
@@ -627,6 +778,7 @@ struct BuiltAtlas {
     grass_color: [f32; 3],
     foliage_color: [f32; 3],
     missing_indices: Vec<u32>,
+    animated: Vec<AnimatedTile>,
 }
 
 /// Place the missing-tile at index 0 then every named texture at index 1.., one
@@ -635,6 +787,7 @@ struct BuiltAtlas {
 fn build_atlas(
     names: &[String],
     read: &mut dyn FnMut(&str) -> Option<DynamicImage>,
+    read_meta: &mut dyn FnMut(&str) -> Option<Vec<u8>>,
 ) -> (BuiltAtlas, usize) {
     let tile_count = names.len() as u32 + 1; // +1 for the missing tile at 0
     let rows = tile_count.div_ceil(ATLAS_COLUMNS).max(1);
@@ -645,10 +798,35 @@ fn build_atlas(
     let mut loaded = 0;
     let mut missing = Vec::new();
     let mut missing_indices = Vec::new();
+    let mut animated = Vec::new();
     for (offset, name) in names.iter().enumerate() {
         let index = offset as u32 + 1;
         name_to_index.insert(name.clone(), index);
         if let Some(source) = read_block_texture(name, read) {
+            // Multi-frame strips animate: keep every 16×16 frame and the tile's
+            // atlas cell so the renderer can cycle them. copy_tile still seeds
+            // the cell with frame 0 (the static fallback when not animated).
+            if let Some(frames) = split_animation_frames_16(&source) {
+                let (frametime, explicit) = read_block_texture_meta(name, read_meta)
+                    .map(|bytes| {
+                        parse_animation_meta(&String::from_utf8_lossy(&bytes))
+                    })
+                    .unwrap_or((1, None));
+                // Drop any explicit frame index that is out of range; fall back
+                // to the natural 0..N order if nothing valid remains.
+                let order: Vec<usize> = explicit
+                    .map(|o| o.into_iter().filter(|&i| i < frames.len()).collect())
+                    .filter(|o: &Vec<usize>| !o.is_empty())
+                    .unwrap_or_else(|| (0..frames.len()).collect());
+                let (atlas_x, atlas_y) = tile_origin(index);
+                animated.push(AnimatedTile {
+                    atlas_x,
+                    atlas_y,
+                    frames,
+                    frametime,
+                    order,
+                });
+            }
             copy_tile(&mut image, index, source);
             loaded += 1;
         } else {
@@ -688,6 +866,7 @@ fn build_atlas(
             grass_color: u8_to_unit(grass),
             foliage_color: u8_to_unit(foliage),
             missing_indices,
+            animated,
         },
         loaded,
     )
@@ -1422,40 +1601,70 @@ pub(crate) fn load_asset_bytes(asset: &str) -> Option<Vec<u8>> {
     None
 }
 
-/// Side length in pixels of one slot in the entity texture atlas grid.
-pub const ENTITY_SLOT_PX: u32 = 64;
+/// Side length in pixels of one slot in the entity texture atlas grid. Each
+/// slot is `ENTITY_SLOT_PX` square; mob textures sit at their NATIVE resolution
+/// in the slot's top-left corner (so a 64px mob occupies the top-left quarter
+/// and a 128px mob fills the slot), which keeps the model UV math — rects in
+/// native px divided by the atlas dimensions — correct for both.
+pub const ENTITY_SLOT_PX: u32 = 128;
 
 /// Number of fixed slots stacked at the top of the entity atlas (one per
 /// [`EntitySlot`], including the trailing guaranteed-white slot).
-pub const ENTITY_SLOT_COUNT: u32 = 36;
+pub const ENTITY_SLOT_COUNT: u32 = 50;
 
 /// Extra 64x64 rows reserved below the fixed slots for per-player downloaded
 /// skins, allocated at runtime by the skin loader.
 pub const PLAYER_SKIN_SLOTS: u32 = 64;
 
-/// First atlas row of the per-player skin region.
+/// First flat slot index of the per-player skin region (skin rows follow the
+/// fixed [`EntitySlot`]s in the same grid).
 pub const PLAYER_SKIN_BASE_ROW: u32 = ENTITY_SLOT_COUNT;
 
-/// Dimensions of the entity texture atlas: a single column of fixed
-/// [`EntitySlot`] rows followed by [`PLAYER_SKIN_SLOTS`] per-player skin rows,
-/// each `ENTITY_SLOT_PX` square.
-pub const ENTITY_ATLAS_WIDTH: u32 = ENTITY_SLOT_PX;
-pub const ENTITY_ATLAS_HEIGHT: u32 = (ENTITY_SLOT_COUNT + PLAYER_SKIN_SLOTS) * ENTITY_SLOT_PX;
+/// Total slots packed into the entity atlas grid: the fixed [`EntitySlot`]s
+/// plus the per-player skin slots.
+const ENTITY_ATLAS_SLOTS: u32 = ENTITY_SLOT_COUNT + PLAYER_SKIN_SLOTS;
+
+/// Columns of the entity atlas grid. At 128px slots a single column would be
+/// 106·128 ≈ 13.5k px tall, past the 8192 `max_texture_dimension_2d` default;
+/// two columns keep both axes well under the limit (256 × 6784).
+pub const ENTITY_ATLAS_COLS: u32 = 2;
+
+/// Dimensions of the entity texture atlas: an `ENTITY_ATLAS_COLS`-wide grid of
+/// `ENTITY_SLOT_PX`-square slots, the fixed [`EntitySlot`]s first (row-major)
+/// then the [`PLAYER_SKIN_SLOTS`] per-player skin slots. Each slot's UV box is
+/// `1/ENTITY_ATLAS_COLS` wide and one row tall.
+pub const ENTITY_ATLAS_WIDTH: u32 = ENTITY_ATLAS_COLS * ENTITY_SLOT_PX;
+pub const ENTITY_ATLAS_HEIGHT: u32 =
+    ENTITY_ATLAS_SLOTS.div_ceil(ENTITY_ATLAS_COLS) * ENTITY_SLOT_PX;
+
+/// Pixel origin (top-left) of the flat slot `index` in the row-major grid.
+pub fn slot_grid_origin(index: u32) -> (u32, u32) {
+    let col = index % ENTITY_ATLAS_COLS;
+    let row = index / ENTITY_ATLAS_COLS;
+    (col * ENTITY_SLOT_PX, row * ENTITY_SLOT_PX)
+}
 
 /// Pixel origin (top-left) of per-player skin row `index` (0-based).
 pub fn player_skin_row_origin(index: u32) -> (u32, u32) {
-    (0, (PLAYER_SKIN_BASE_ROW + index) * ENTITY_SLOT_PX)
+    slot_grid_origin(PLAYER_SKIN_BASE_ROW + index)
 }
 
-/// Decode a downloaded skin PNG and normalize it to the modern 64x64 layout,
-/// returning tightly-packed RGBA (64×64×4 bytes) for upload into a skin row.
+/// Decode a downloaded skin PNG, normalize it to the modern 64x64 layout, and
+/// embed it in the top-left of an `ENTITY_SLOT_PX`-square slot (the rest left
+/// transparent), returning tightly-packed RGBA (`ENTITY_SLOT_PX²×4` bytes) for
+/// upload into a skin row. The humanoid model samples the 0..64px regions where
+/// the skin sits, so the larger slot leaves the UV layout unchanged.
 pub fn normalize_skin_png(bytes: &[u8]) -> Option<Vec<u8>> {
     let image = image::load_from_memory(bytes).ok()?.to_rgba8();
-    Some(normalize_skin(image).into_raw())
+    let mut slot = RgbaImage::new(ENTITY_SLOT_PX, ENTITY_SLOT_PX);
+    let _ = slot.copy_from(&normalize_skin(image), 0, 0);
+    Some(slot.into_raw())
 }
 
-/// One 64x64 slot of the entity texture atlas. The discriminant is the slot's
-/// row index from the top; `entity_slot_origin` yields its pixel origin.
+/// One `ENTITY_SLOT_PX`-square slot of the entity texture atlas. The
+/// discriminant is the slot's row index from the top; `entity_slot_origin`
+/// yields its pixel origin. Each mob texture sits at its native resolution in
+/// the slot's top-left corner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EntitySlot {
     /// Player skin (steve.png), normalized to the modern 64x64 layout.
@@ -1497,29 +1706,65 @@ pub enum EntitySlot {
     ArmorDiamond2 = 33,
     /// Armor stand wooden model (armorstand/wood.png).
     ArmorStand = 34,
+    /// Iron golem (iron_golem.png, 128x128).
+    IronGolem = 35,
+    /// Horse (horse/horse_brown.png, 128x128).
+    Horse = 36,
+    /// Witch (witch.png, 64x128) — villager-based with a hat.
+    Witch = 37,
+    /// Guardian (guardian.png, 64x64).
+    Guardian = 38,
+    /// Wither (wither/wither.png, 64x64).
+    Wither = 39,
+    /// Rabbit (rabbit/brown.png, 64x32).
+    Rabbit = 40,
+    /// Chest block-entity textures (entity/chest/{normal,trapped,ender}.png).
+    ChestNormal = 41,
+    ChestTrapped = 42,
+    ChestEnder = 43,
+    /// Double-chest textures (entity/chest/{normal,trapped}_double.png, 128x64):
+    /// fill the full 128px slot width, sampled by the large-chest model.
+    ChestNormalDouble = 44,
+    ChestTrappedDouble = 45,
+    /// Sign block-entity texture (entity/sign.png, 64x32).
+    Sign = 46,
+    /// Enchanting-table book block-entity (entity/enchanting_table_book.png, 64x32).
+    EnchantBook = 47,
+    /// Arrow projectile (entity/arrow.png, 32x32).
+    Arrow = 48,
     /// Guaranteed opaque-white slot sampled by solid-color geometry.
-    White = 35,
+    White = 49,
 }
 
 /// Pixel origin (top-left corner) of an entity atlas slot.
 pub fn entity_slot_origin(slot: EntitySlot) -> (u32, u32) {
-    (0, slot as u32 * ENTITY_SLOT_PX)
+    slot_grid_origin(slot as u32)
 }
 
 /// UV of a texel inside the guaranteed-opaque-white region of the entity
 /// atlas (the center of the `EntitySlot::White` slot); solid-color model
 /// geometry samples here so its vertex tint passes through unchanged.
-pub const ENTITY_WHITE_UV: [f32; 2] = [
-    0.5,
-    ((EntitySlot::White as u32 * ENTITY_SLOT_PX + ENTITY_SLOT_PX / 2) as f32)
-        / ENTITY_ATLAS_HEIGHT as f32,
-];
+pub const ENTITY_WHITE_UV: [f32; 2] = {
+    let col = EntitySlot::White as u32 % ENTITY_ATLAS_COLS;
+    let row = EntitySlot::White as u32 / ENTITY_ATLAS_COLS;
+    [
+        ((col * ENTITY_SLOT_PX + ENTITY_SLOT_PX / 2) as f32) / ENTITY_ATLAS_WIDTH as f32,
+        ((row * ENTITY_SLOT_PX + ENTITY_SLOT_PX / 2) as f32) / ENTITY_ATLAS_HEIGHT as f32,
+    ]
+};
 
 /// The 1.8 entity textures loaded into each mob slot, plus the procedural
 /// fallback tint used when the asset is missing. The player slot is handled
 /// separately (normalize_skin / procedural_skin).
-const MOB_SLOT_ASSETS: [(EntitySlot, &str, [u8; 3]); 24] = [
+const MOB_SLOT_ASSETS: [(EntitySlot, &str, [u8; 3]); 38] = [
     (EntitySlot::ArmorStand, "armorstand/wood", [150, 120, 75]),
+    (EntitySlot::ChestNormal, "chest/normal", [162, 114, 51]),
+    (EntitySlot::ChestTrapped, "chest/trapped", [162, 80, 51]),
+    (EntitySlot::ChestEnder, "chest/ender", [40, 80, 76]),
+    (EntitySlot::ChestNormalDouble, "chest/normal_double", [162, 114, 51]),
+    (EntitySlot::ChestTrappedDouble, "chest/trapped_double", [162, 80, 51]),
+    (EntitySlot::Sign, "sign", [156, 127, 78]),
+    (EntitySlot::EnchantBook, "enchanting_table_book", [120, 30, 30]),
     (EntitySlot::Zombie, "zombie/zombie", [88, 124, 80]),
     (EntitySlot::Skeleton, "skeleton/skeleton", [192, 192, 192]),
     (EntitySlot::Creeper, "creeper/creeper", [86, 170, 70]),
@@ -1543,6 +1788,13 @@ const MOB_SLOT_ASSETS: [(EntitySlot, &str, [u8; 3]); 24] = [
     (EntitySlot::Blaze, "blaze", [232, 170, 40]),
     (EntitySlot::Ghast, "ghast/ghast", [220, 220, 220]),
     (EntitySlot::Silverfish, "silverfish", [120, 120, 130]),
+    (EntitySlot::IronGolem, "iron_golem", [216, 206, 192]),
+    (EntitySlot::Horse, "horse/horse_brown", [120, 78, 44]),
+    (EntitySlot::Witch, "witch", [80, 72, 88]),
+    (EntitySlot::Guardian, "guardian", [156, 142, 124]),
+    (EntitySlot::Wither, "wither/wither", [60, 60, 60]),
+    (EntitySlot::Rabbit, "rabbit/brown", [150, 110, 78]),
+    (EntitySlot::Arrow, "arrow", [180, 180, 180]),
 ];
 
 /// RGBA pixels for the entity atlas sampled by the model pass: a vertical
@@ -1625,24 +1877,30 @@ impl EntityAtlasImage {
     }
 }
 
-/// Copy a (normalized, at most 64x64) image into its slot, anchored top-left.
+/// Copy a (normalized, at most `ENTITY_SLOT_PX` square) image into its slot,
+/// anchored top-left. The surrounding slot stays at the atlas' default opaque
+/// white, so any model UV outside the texture samples a safe texel.
 fn blit_slot(atlas: &mut RgbaImage, slot: EntitySlot, image: &RgbaImage) {
     let (x, y) = entity_slot_origin(slot);
     let _ = atlas.copy_from(image, x, y);
 }
 
-/// Fit a mob texture into a 64-wide slot keeping its aspect ratio: 64x64
-/// textures fill the slot, 64x32 textures (and other 2:1 sources) end up in
-/// the slot's top half, which matches their models' UV layout. Anything else
-/// is scaled to 64 wide with the height clamped to the slot.
+/// Place a mob texture at its NATIVE resolution in the top-left of its slot:
+/// model part rects are authored in native texture pixels, so a 64px mob fills
+/// the top-left quarter of a 128px slot and a 128px mob fills it, both sampling
+/// correctly via `(slot_origin + rect)/atlas_dims`. A source larger than the
+/// slot on either axis is downscaled to fit (preserving aspect ratio); smaller
+/// sources are never upscaled.
 fn normalize_entity_texture(image: RgbaImage) -> RgbaImage {
     let (w, h) = image.dimensions();
-    if w == ENTITY_SLOT_PX && h <= ENTITY_SLOT_PX {
+    if w <= ENTITY_SLOT_PX && h <= ENTITY_SLOT_PX {
         return image;
     }
-    let target_h = (h * ENTITY_SLOT_PX / w.max(1)).clamp(1, ENTITY_SLOT_PX);
+    let scale = (ENTITY_SLOT_PX as f32 / w as f32).min(ENTITY_SLOT_PX as f32 / h as f32);
+    let target_w = ((w as f32 * scale) as u32).clamp(1, ENTITY_SLOT_PX);
+    let target_h = ((h as f32 * scale) as u32).clamp(1, ENTITY_SLOT_PX);
     DynamicImage::ImageRgba8(image)
-        .resize_exact(ENTITY_SLOT_PX, target_h, FilterType::Nearest)
+        .resize_exact(target_w, target_h, FilterType::Nearest)
         .to_rgba8()
 }
 
@@ -1824,6 +2082,22 @@ fn read_zip_image<R: Read + std::io::Seek>(
     image::load_from_memory(&bytes).ok()
 }
 
+/// Read a raw asset file (e.g. a `.mcmeta` sidecar) from an asset directory.
+fn read_directory_bytes(root: &Path, asset_path: &str) -> Option<Vec<u8>> {
+    fs::read(directory_texture_path(root, asset_path)).ok()
+}
+
+/// Read a raw asset file (e.g. a `.mcmeta` sidecar) from a zip archive.
+fn read_zip_bytes<R: Read + std::io::Seek>(
+    zip: &mut ZipArchive<R>,
+    asset_path: &str,
+) -> Option<Vec<u8>> {
+    let mut file = zip.by_name(asset_path).ok()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    Some(bytes)
+}
+
 /// Build PBR normal and specular atlases with the same tile layout as the
 /// colour atlas.  For each texture name, looks for `_n.png` (normal) and
 /// `_s.png` (specular) in both 1.8 and 1.13+ paths.
@@ -1964,7 +2238,10 @@ fn read_pack_meta(path: &Path) -> Option<PackMeta> {
 #[derive(Debug)]
 pub struct OverlayTextures {
     pub lava: Option<Arc<RgbaImage>>,
-    pub fire: Option<Arc<RgbaImage>>,
+    /// All 16×16 frames of `fire_layer_1.png` (an N·16-tall vertical strip), in
+    /// order. The HUD cycles them to animate the on-fire overlay like vanilla.
+    /// Empty when the asset is missing.
+    pub fire: Vec<Arc<RgbaImage>>,
 }
 
 impl OverlayTextures {
@@ -1982,16 +2259,24 @@ impl OverlayTextures {
 
         let fire = load_asset_image("assets/minecraft/textures/blocks/fire_layer_1.png")
             .or_else(|| load_asset_image("assets/minecraft/textures/block/fire_1.png"))
-            .map(|img| {
-                if img.height() > TILE_SIZE {
-                    Arc::new(image::imageops::crop_imm(&img, 0, 0, TILE_SIZE, TILE_SIZE).to_image())
-                } else {
-                    Arc::new(img)
-                }
-            });
+            .map(|img| split_animation_frames(&img))
+            .unwrap_or_default();
 
         Self { lava, fire }
     }
+}
+
+/// Split a square-tiled vertical animation strip into its `height / width`
+/// frames (each `width`×`width`). A single-frame or non-strip image yields one
+/// frame.
+fn split_animation_frames(img: &RgbaImage) -> Vec<Arc<RgbaImage>> {
+    let (w, h) = (img.width(), img.height());
+    if w == 0 || h < w || h % w != 0 {
+        return vec![Arc::new(img.clone())];
+    }
+    (0..h / w)
+        .map(|i| Arc::new(image::imageops::crop_imm(img, 0, i * w, w, w).to_image()))
+        .collect()
 }
 
 #[cfg(test)]
@@ -2053,6 +2338,63 @@ mod tests {
     }
 
     #[test]
+    fn animation_strip_splits_into_square_frames() {
+        // A 5-frame vertical strip (16×80) splits into 5 distinct 16×16 frames.
+        let strip = RgbaImage::new(TILE_SIZE, TILE_SIZE * 5);
+        let frames = split_animation_frames(&strip);
+        assert_eq!(frames.len(), 5);
+        for f in &frames {
+            assert_eq!((f.width(), f.height()), (TILE_SIZE, TILE_SIZE));
+        }
+        // A single square (or non-strip) image yields exactly one frame.
+        let single = RgbaImage::new(TILE_SIZE, TILE_SIZE);
+        assert_eq!(split_animation_frames(&single).len(), 1);
+    }
+
+    #[test]
+    fn animated_atlas_frames_split_to_tile_size() {
+        // A tall strip (N>1) yields N frames, each downscaled to TILE_SIZE.
+        // water_still is 16×512 → 32 frames; lava_flow is 32×512 → 16 frames
+        // whose 32px source frames are resized to 16px.
+        let still = DynamicImage::ImageRgba8(RgbaImage::new(TILE_SIZE, TILE_SIZE * 8));
+        let frames = split_animation_frames_16(&still).expect("tall strip is animated");
+        assert_eq!(frames.len(), 8);
+        for f in &frames {
+            assert_eq!((f.width(), f.height()), (TILE_SIZE, TILE_SIZE));
+        }
+        // A 32px-wide flow strip downscales each frame to TILE_SIZE.
+        let flow = DynamicImage::ImageRgba8(RgbaImage::new(32, 32 * 4));
+        let flow_frames = split_animation_frames_16(&flow).expect("flow strip is animated");
+        assert_eq!(flow_frames.len(), 4);
+        assert_eq!((flow_frames[0].width(), flow_frames[0].height()), (TILE_SIZE, TILE_SIZE));
+
+        // A single 16×16 source is not a strip → no animation.
+        let single = DynamicImage::ImageRgba8(RgbaImage::new(TILE_SIZE, TILE_SIZE));
+        assert!(split_animation_frames_16(&single).is_none());
+    }
+
+    #[test]
+    fn animation_mcmeta_parses_frametime_and_order() {
+        // frametime present, no explicit frame order.
+        let (frametime, order) =
+            parse_animation_meta(r#"{"animation":{"frametime":2}}"#);
+        assert_eq!(frametime, 2);
+        assert_eq!(order, None);
+
+        // Explicit frame order is parsed; frametime defaults to 1.
+        let (frametime, order) =
+            parse_animation_meta(r#"{"animation":{"frames":[0,1,2,1]}}"#);
+        assert_eq!(frametime, 1);
+        assert_eq!(order, Some(vec![0, 1, 2, 1]));
+
+        // Empty / malformed metadata falls back to the safe defaults.
+        assert_eq!(parse_animation_meta("{}"), (1, None));
+        assert_eq!(parse_animation_meta("not json"), (1, None));
+        // frametime of 0 is clamped up to 1 (avoids a div-by-zero downstream).
+        assert_eq!(parse_animation_meta(r#"{"animation":{"frametime":0}}"#).0, 1);
+    }
+
+    #[test]
     fn slot_origins_are_distinct_and_inside_the_atlas() {
         let slots = [
             EntitySlot::Player,
@@ -2090,6 +2432,20 @@ mod tests {
             EntitySlot::ArmorDiamond1,
             EntitySlot::ArmorDiamond2,
             EntitySlot::ArmorStand,
+            EntitySlot::IronGolem,
+            EntitySlot::Horse,
+            EntitySlot::Witch,
+            EntitySlot::Guardian,
+            EntitySlot::Wither,
+            EntitySlot::Rabbit,
+            EntitySlot::ChestNormal,
+            EntitySlot::ChestTrapped,
+            EntitySlot::ChestEnder,
+            EntitySlot::ChestNormalDouble,
+            EntitySlot::ChestTrappedDouble,
+            EntitySlot::Sign,
+            EntitySlot::EnchantBook,
+            EntitySlot::Arrow,
             EntitySlot::White,
         ];
         let mut seen = std::collections::HashSet::new();
@@ -2141,11 +2497,32 @@ mod tests {
     }
 
     #[test]
-    fn normalize_entity_texture_keeps_two_to_one_sources_in_the_top_half() {
-        let legacy = RgbaImage::from_pixel(128, 64, Rgba([1, 2, 3, 255]));
-        let normalized = normalize_entity_texture(legacy);
-        assert_eq!(normalized.dimensions(), (64, 32));
-        let square = RgbaImage::from_pixel(128, 128, Rgba([1, 2, 3, 255]));
-        assert_eq!(normalize_entity_texture(square).dimensions(), (64, 64));
+    fn normalize_entity_texture_keeps_native_sized_sources_unscaled() {
+        // Sources that fit the slot are left at native resolution (placed
+        // top-left by blit_slot), so the model UV math stays correct.
+        for dims in [(64, 32), (64, 64), (64, 128), (128, 128)] {
+            let src = RgbaImage::from_pixel(dims.0, dims.1, Rgba([1, 2, 3, 255]));
+            assert_eq!(normalize_entity_texture(src).dimensions(), dims);
+        }
+        // An over-size source is downscaled to fit, preserving aspect ratio.
+        let huge = RgbaImage::from_pixel(256, 128, Rgba([1, 2, 3, 255]));
+        assert_eq!(normalize_entity_texture(huge).dimensions(), (128, 64));
+    }
+
+    #[test]
+    fn normalize_skin_png_fills_a_full_slot() {
+        // A 64x64 source skin must be embedded in a full ENTITY_SLOT_PX slot so
+        // the renderer's fixed-size skin upload accepts it.
+        let mut png = std::io::Cursor::new(Vec::new());
+        RgbaImage::from_pixel(64, 64, Rgba([10, 20, 30, 255]))
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let rgba = normalize_skin_png(png.get_ref()).unwrap();
+        assert_eq!(rgba.len(), (ENTITY_SLOT_PX * ENTITY_SLOT_PX * 4) as usize);
+        // Top-left texel carries the skin; a texel past the 64px skin is the
+        // transparent slot padding.
+        assert_eq!(&rgba[0..4], &[10, 20, 30, 255]);
+        let past = ((64 * ENTITY_SLOT_PX + 64) * 4) as usize;
+        assert_eq!(&rgba[past..past + 4], &[0, 0, 0, 0]);
     }
 }

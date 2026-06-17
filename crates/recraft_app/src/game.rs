@@ -29,7 +29,9 @@ use recraft_protocol::v1_8_9::{
         TitleAction, UseEntityKind,
     },
 };
-use recraft_render::{held_item_frame, Camera, EntityAnim, ModelMesh};
+use recraft_render::{
+    arm_attach, Camera, ChestKind, EntityAnim, ModelMesh, SignKind, SignTextDraw,
+};
 use winit::{
     event::{ElementState, KeyEvent},
     keyboard::{KeyCode, PhysicalKey},
@@ -37,9 +39,12 @@ use winit::{
 
 use crate::chat::{self, ChatState};
 use crate::container::{max_stack, stackable, Container};
-use crate::item_renderer::{DroppedItem, PlayerHeldItem};
+use crate::item_renderer::{is_enchanted, DroppedItem, FallingBlock, PlayerHeldItem};
+use crate::particle::ParticleSystem;
 use crate::player_list::PlayerList;
 use crate::scoreboard::Scoreboard;
+use crate::settings::{GameAction, Keybinds};
+use crate::sound::QueuedSound;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScreenOverlay {
@@ -75,6 +80,9 @@ pub struct TickActions {
     pub use_pressed: bool,
     pub left_held: bool,
     pub right_held: bool,
+    /// 1.7-style animations: lets a sword swing/attack fire while blocking
+    /// (right-click held). Off keeps the 1.8 lock (the block swallows attacks).
+    pub old_animations: bool,
 }
 
 #[derive(Default)]
@@ -93,22 +101,30 @@ pub struct InputState {
 }
 
 impl InputState {
-    pub fn handle_key(&mut self, event: KeyEvent) {
+    pub fn handle_key(&mut self, event: KeyEvent, keybinds: &Keybinds) {
         let pressed = event.state == ElementState::Pressed;
-        match event.physical_key {
-            PhysicalKey::Code(KeyCode::KeyW) => self.forward = pressed,
-            PhysicalKey::Code(KeyCode::KeyS) => self.backward = pressed,
-            PhysicalKey::Code(KeyCode::KeyA) => self.left = pressed,
-            PhysicalKey::Code(KeyCode::KeyD) => self.right = pressed,
-            PhysicalKey::Code(KeyCode::Space) => self.jump = pressed,
-            PhysicalKey::Code(KeyCode::ShiftLeft) => self.sneak = pressed,
+        let PhysicalKey::Code(code) = event.physical_key else {
+            return;
+        };
+        // Arrow-key view turning is a recraft extra (not a vanilla rebindable
+        // control), so it stays on the fixed arrow keys.
+        match code {
+            KeyCode::ArrowLeft => return self.turn_left = pressed,
+            KeyCode::ArrowRight => return self.turn_right = pressed,
+            KeyCode::ArrowUp => return self.look_up = pressed,
+            KeyCode::ArrowDown => return self.look_down = pressed,
+            _ => {}
+        }
+        match keybinds.action_for(code) {
+            Some(GameAction::Forward) => self.forward = pressed,
+            Some(GameAction::Back) => self.backward = pressed,
+            Some(GameAction::Left) => self.left = pressed,
+            Some(GameAction::Right) => self.right = pressed,
+            Some(GameAction::Jump) => self.jump = pressed,
+            Some(GameAction::Sneak) => self.sneak = pressed,
             // Sprint is a toggle (not hold): each press of the sprint key flips
             // the intent. It is cleared by the wall-cancel and by sneaking.
-            PhysicalKey::Code(KeyCode::ControlLeft) if pressed => self.sprint = !self.sprint,
-            PhysicalKey::Code(KeyCode::ArrowLeft) => self.turn_left = pressed,
-            PhysicalKey::Code(KeyCode::ArrowRight) => self.turn_right = pressed,
-            PhysicalKey::Code(KeyCode::ArrowUp) => self.look_up = pressed,
-            PhysicalKey::Code(KeyCode::ArrowDown) => self.look_down = pressed,
+            Some(GameAction::Sprint) if pressed => self.sprint = !self.sprint,
             _ => {}
         }
     }
@@ -190,6 +206,26 @@ fn effective_attribute_value(
     d1.max(0.0)
 }
 
+/// One active potion effect on the local player (S1D EntityEffect). Only the
+/// amplifier feeds the HUD (absorption hearts, the heart tint); duration is
+/// kept for completeness but not ticked down — the server resends.
+#[derive(Debug, Clone, Copy)]
+struct ActiveEffect {
+    amplifier: i8,
+    /// Remaining ticks as last reported by the server. Stored for the complete
+    /// effect model but not consumed yet (effects are not ticked down — the
+    /// server resends them); kept for a future client-side expiry.
+    #[allow(dead_code)]
+    duration: i32,
+}
+
+// Potion effect ids that drive the health HUD (vanilla `Potion`).
+const POTION_REGENERATION: u8 = 10;
+const POTION_HUNGER: u8 = 17;
+const POTION_POISON: u8 = 19;
+const POTION_WITHER: u8 = 20;
+const POTION_ABSORPTION: u8 = 22;
+
 /// Snapshot driving the first-person hand/item rendering for one frame
 /// (vanilla ItemRenderer inputs at a given partialTicks).
 #[derive(Debug, Clone)]
@@ -220,6 +256,11 @@ pub enum ItemUseAction {
 }
 
 /// Standing eye height above the feet, in blocks (vanilla 1.8).
+/// Extra chunk rings kept meshed beyond the render distance before the
+/// render-distance safety net drops a column's GPU mesh, so chunks at the very
+/// edge don't evict/re-mesh while the player jitters across a boundary.
+const RESIDENCY_MARGIN: i32 = 2;
+
 const STANDING_EYE_HEIGHT: f64 = 1.62;
 /// How far the camera drops below the standing eye height while sneaking.
 const SNEAK_EYE_DROP: f64 = 0.08;
@@ -396,8 +437,29 @@ pub struct GameState {
     needs_respawn: bool,
     /// Last server-reported health (20 == full). Drives the death screen.
     health: f32,
+    /// The local player's `generic.maxHealth` attribute (vanilla 20), from S20
+    /// EntityProperties; sets the heart-row count alongside absorption.
+    max_health: f32,
+    /// The local player's active potion effects, keyed by effect id (S1D
+    /// EntityEffect / S1E RemoveEntityEffect). The server resends them, so they
+    /// are kept until removed or until a respawn, without ticking down.
+    effects: std::collections::HashMap<u8, ActiveEffect>,
     /// Last server-reported food level.
     food: i32,
+    /// Last server-reported food saturation (drives the hunger-bar jiggle).
+    saturation: f32,
+    /// Set once UpdateHealth has been received, so the first server health value
+    /// (the spawn value) plays no hurt sound and seeds no heart highlight.
+    health_received: bool,
+    /// Vanilla `GuiIngame.updateCounter`: a free-running client-tick counter that
+    /// seeds the heart-shake RNG and the heart/hunger blink timing.
+    hud_update_counter: i32,
+    /// Vanilla `GuiIngame.healthUpdateCounter`: the tick (in `hud_update_counter`
+    /// units) until which the heart row draws its blinking highlight frame.
+    health_update_counter: i64,
+    /// Vanilla `GuiIngame.lastPlayerHealth` (`j`): the health snapshot drawn in the
+    /// highlight frame while the row blinks after a health change.
+    last_player_health: i32,
     /// Experience bar fill (0..1) and level, from SetExperience.
     xp_bar: f32,
     xp_level: i32,
@@ -432,6 +494,13 @@ pub struct GameState {
     /// The item stack carried by each dropped-item entity (from EntityMetadata
     /// index 10), used to render the floating item.
     entity_items: std::collections::HashMap<EntityId, SlotItem>,
+    /// Experience value carried by each XP-orb entity (S11 SpawnExperienceOrb),
+    /// used to pick the orb's sprite cell.
+    entity_xp: std::collections::HashMap<EntityId, i16>,
+    /// Blockstate carried by each falling-block entity (SpawnObject kind 70,
+    /// packed in its data int), used to render the falling cube with terrain
+    /// textures.
+    falling_blocks: std::collections::HashMap<EntityId, BlockState>,
     /// Equipment worn/held by other entities (S04 EntityEquipment). Indexed
     /// 0 = held, 1 = boots, 2 = leggings, 3 = chestplate, 4 = helmet.
     entity_equipment: std::collections::HashMap<EntityId, [Option<SlotItem>; 5]>,
@@ -443,9 +512,28 @@ pub struct GameState {
     /// the background mesher before ordinary dirty sections, but never rebuilt on
     /// the render thread.
     urgent_remesh: HashSet<SectionPos>,
+    /// Columns whose GPU meshes were dropped by the render-distance safety net
+    /// (their block data is kept in `world`). Re-meshed when the player walks
+    /// back into range; pruned when the server unloads them. Bounds GPU memory
+    /// on servers that never send ChunkUnload. See `enforce_render_distance`.
+    evicted_columns: HashSet<ChunkPos>,
+    /// Player chunk at the last `enforce_render_distance` pass, so the scan runs
+    /// only when crossing a chunk boundary.
+    last_residency_chunk: Option<ChunkPos>,
     /// Block changes received for chunks that weren't loaded yet, replayed once
     /// the chunk arrives (otherwise spawn-platform blocks can be lost).
     pending_block_changes: std::collections::HashMap<ChunkPos, Vec<(i32, i32, i32, BlockState)>>,
+    /// Per-chest lid-open amount (0 = closed .. 1 = fully open), keyed by world
+    /// block position, eased toward its target each tick. Entries that reach 0
+    /// (fully closed) are pruned. The open target is driven by S24 BlockAction
+    /// (viewer count); see [`GameState::tick_chest_lids`].
+    chest_lid_angles: std::collections::HashMap<[i32; 3], f32>,
+    /// Per-chest lid-open TARGET (1 while a viewer has it open, 0 otherwise),
+    /// set by the S24 BlockAction viewer count; `chest_lid_angles` eases toward it.
+    chest_open_targets: std::collections::HashMap<[i32; 3], f32>,
+    /// Sign block-entity text, keyed by world block position: the four lines
+    /// flattened from their chat-JSON (S33 UpdateSign).
+    signs: std::collections::HashMap<[i32; 3], [String; 4]>,
     // Smoothed 0..1 view-state amounts, advanced once per physics tick so the
     // sneak camera dip and sprint FOV widen ease in/out instead of snapping.
     sneak_amount: f32,
@@ -501,10 +589,6 @@ pub struct GameState {
     sprinting: bool,
     /// Vanilla `sprintToggleTimer`: the 7-tick double-tap-W window.
     sprint_toggle_timer: i32,
-    /// Set on the tick an attack cancels sprint (the "w-tap reset"); blocks
-    /// the sprint-key-held re-enable for THIS tick so the server sees the
-    /// StopSprinting before the next StartSprinting.
-    sprint_reset_by_attack: bool,
     /// `movementInput.sneak` / `moveForward` from the previous tick (vanilla's
     /// `flag1` / `flag2`, read before `updatePlayerMoveState`).
     prev_sneak: bool,
@@ -529,6 +613,13 @@ pub struct GameState {
     /// nametags and skin lookups.
     pub player_list: PlayerList,
     title: TitleState,
+    /// Client-side particle effects (S2A SpawnParticle + local block breaks),
+    /// simulated here and drawn as billboards by the renderer.
+    particles: ParticleSystem,
+    /// Sounds queued this frame by packets / local prediction, drained by the
+    /// host (`main.rs`) into the audio backend so the game layer stays
+    /// audio-free. World coordinates map 1:1 to render coordinates here.
+    sound_queue: Vec<QueuedSound>,
 }
 
 /// In-progress survival block break: the target cell, the face the dig started
@@ -568,6 +659,45 @@ fn item_use_action(id: i16, damage: i16) -> ItemUseAction {
             ItemUseAction::Eat
         }
         _ => ItemUseAction::None,
+    }
+}
+
+/// Vanilla `EntityRenderer.hurtCameraEffect` roll, in radians, for the given
+/// hurt timer and partial-tick alpha. `hurt_time` counts down from `MAX_HURT`
+/// (10) to 0; the tilt follows `sin((f)⁴·π)·14°` and eases back to nothing.
+/// `attackedAtYaw` is always 0 here (the local EntityStatus hurt carries no
+/// direction), so it reduces to a pure screen roll.
+fn hurt_camera_roll(hurt_time: u8, alpha: f32) -> f32 {
+    const MAX_HURT: f32 = 10.0;
+    let f = hurt_time as f32 - alpha;
+    if f <= 0.0 {
+        return 0.0;
+    }
+    let f = f / MAX_HURT;
+    let f = (f * f * f * f * std::f32::consts::PI).sin();
+    -(f * 14.0).to_radians()
+}
+
+/// Vanilla `RendererLivingEntity` death fall-over tilt, in radians, for a
+/// `death_time` (0 while alive, counting up to 20) and partial-tick alpha:
+/// `sqrt(min((death_time + alpha - 1)/20 · 1.6, 1)) · 90°`. 0 until the entity
+/// has been dead at least a tick.
+fn death_roll_radians(death_time: u8, alpha: f32) -> f32 {
+    if death_time == 0 {
+        return 0.0;
+    }
+    let f = ((death_time as f32 + alpha - 1.0) / 20.0 * 1.6).max(0.0).sqrt().min(1.0);
+    f * 90.0_f32.to_radians()
+}
+
+/// Vanilla `RenderPlayer.setModelVisibilities` arm state for a remote player:
+/// 0 = empty hand, 1 = holding an item, 3 = blocking (using a sword). Drives the
+/// third-person held-arm / blocking pose (`ModelBiped.heldItemRight`).
+fn held_item_right_state(item: Option<&SlotItem>, using_item: bool) -> u8 {
+    match item {
+        None => 0,
+        Some(it) if using_item && item_use_action(it.id, it.damage) == ItemUseAction::Block => 3,
+        Some(_) => 1,
     }
 }
 
@@ -659,7 +789,14 @@ impl GameState {
             freeze_movement_after_teleport: false,
             needs_respawn: false,
             health: 20.0,
+            max_health: 20.0,
+            effects: std::collections::HashMap::new(),
             food: 20,
+            saturation: 5.0,
+            health_received: false,
+            hud_update_counter: 0,
+            health_update_counter: 0,
+            last_player_health: 20,
             xp_bar: 0.0,
             xp_level: 0,
             is_dead: false,
@@ -674,11 +811,18 @@ impl GameState {
             creative: false,
             entity_uuids: std::collections::HashMap::new(),
             entity_items: std::collections::HashMap::new(),
+            entity_xp: std::collections::HashMap::new(),
+            falling_blocks: std::collections::HashMap::new(),
             entity_equipment: std::collections::HashMap::new(),
             vehicles: std::collections::HashMap::new(),
             dirty_chunks: HashSet::new(),
             urgent_remesh: HashSet::new(),
+            evicted_columns: HashSet::new(),
+            last_residency_chunk: None,
             pending_block_changes: std::collections::HashMap::new(),
+            chest_lid_angles: std::collections::HashMap::new(),
+            chest_open_targets: std::collections::HashMap::new(),
+            signs: std::collections::HashMap::new(),
             sneak_amount: 0.0,
             previous_sneak_amount: 0.0,
             sprint_amount: 0.0,
@@ -706,7 +850,6 @@ impl GameState {
             pending_actions: TickActions::default(),
             sprinting: false,
             sprint_toggle_timer: 0,
-            sprint_reset_by_attack: false,
             prev_sneak: false,
             prev_move_forward: 0.0,
             capabilities: PlayerCapabilities::default(),
@@ -718,6 +861,8 @@ impl GameState {
             scoreboard: Scoreboard::default(),
             player_list: PlayerList::default(),
             title: TitleState::default(),
+            particles: ParticleSystem::new(),
+            sound_queue: Vec::new(),
         }
     }
 
@@ -822,6 +967,30 @@ impl GameState {
 
     pub fn food(&self) -> i32 {
         self.food
+    }
+
+    /// Heart/hunger HUD animation state (vanilla `renderPlayerStats`): the live
+    /// food saturation plus the tick counters that drive the heart-shake RNG and
+    /// the heart-row blink/highlight.
+    pub fn hud_vitals(&self) -> crate::gui::ingame::HudVitals {
+        // Absorption hearts come from the Absorption effect (vanilla
+        // PotionAbsorption): 4 * (amplifier + 1) health points.
+        let absorption = self
+            .effects
+            .get(&POTION_ABSORPTION)
+            .map_or(0.0, |e| 4.0 * (e.amplifier as f32 + 1.0));
+        crate::gui::ingame::HudVitals {
+            saturation: self.saturation,
+            max_health: self.max_health,
+            absorption,
+            update_counter: self.hud_update_counter,
+            health_update_counter: self.health_update_counter,
+            last_player_health: self.last_player_health,
+            regen: self.effects.contains_key(&POTION_REGENERATION),
+            hunger_effect: self.effects.contains_key(&POTION_HUNGER),
+            poison: self.effects.contains_key(&POTION_POISON),
+            wither: self.effects.contains_key(&POTION_WITHER),
+        }
     }
 
     /// World time of day in ticks, interpolated by `tick_alpha` (0..1) for a
@@ -930,6 +1099,18 @@ impl GameState {
         self.open_container.as_ref()
     }
 
+    /// The downloaded-skin atlas row for the local player, resolved by matching
+    /// `name` against the tab-list roster (the local player has no entry in the
+    /// entity-uuid map). `None` falls back to the default player skin.
+    pub fn local_skin_row(
+        &self,
+        name: &str,
+        skin_rows: &std::collections::HashMap<[u8; 16], u32>,
+    ) -> Option<u32> {
+        let (uuid, _) = self.player_list.iter().find(|(_, info)| info.name == name)?;
+        skin_rows.get(uuid).copied()
+    }
+
     /// Whether a paint-drag is in progress (the screen defers the commit to the
     /// mouse release, falling back to a normal click when only one slot painted).
     pub fn container_drag_active(&self) -> bool {
@@ -954,6 +1135,33 @@ impl GameState {
 
     pub fn take_window_close(&mut self) -> bool {
         std::mem::take(&mut self.window_close_pending)
+    }
+
+    /// Drain the sounds queued this frame (by packets and local prediction) so
+    /// the host can play them through the audio backend.
+    pub fn take_sounds(&mut self) -> Vec<QueuedSound> {
+        std::mem::take(&mut self.sound_queue)
+    }
+
+    /// Queue a positional sound event at a world position.
+    fn queue_sound(&mut self, event: impl Into<String>, pos: Vec3, volume: f32, pitch: f32) {
+        self.sound_queue.push(QueuedSound {
+            event: event.into(),
+            position: Some(pos),
+            volume,
+            pitch,
+        });
+    }
+
+    /// Queue a non-positional UI sound (vanilla `PositionedSoundRecord.create`,
+    /// unattenuated, e.g. `gui.button.press`).
+    pub fn queue_ui_sound(&mut self, event: impl Into<String>) {
+        self.sound_queue.push(QueuedSound {
+            event: event.into(),
+            position: None,
+            volume: 1.0,
+            pitch: 1.0,
+        });
     }
 
     // ─── Window interaction (vanilla Container.slotClick via container.rs) ─────
@@ -1132,17 +1340,48 @@ impl GameState {
                 self.use_item_ticks = 0;
             } else {
                 self.use_item_ticks += 1;
+                // Vanilla EntityPlayer.updateItemUse: while eating/drinking, the
+                // chew/gulp sound fires every 4 ticks from tick 8 (itemInUseCount
+                // <= 25 && % 4 == 0, counting down from 32). The local player's
+                // playSound is client-only — the server never echoes it; only the
+                // finishing `random.burp` comes back over S29. Emit at the eye
+                // (listener) position; SoundManager picks the ogg variant.
+                if matches!(self.use_action, ItemUseAction::Eat | ItemUseAction::Drink)
+                    && self.use_item_ticks >= 8
+                    && self.use_item_ticks % 4 == 0
+                {
+                    let h = hash2d(self.hud_update_counter as i32, self.use_item_ticks, 0x9e37);
+                    let pos = self.camera.position;
+                    if self.use_action == ItemUseAction::Drink {
+                        let pitch = (h & 0xff) as f32 / 255.0 * 0.1 + 0.9;
+                        self.queue_sound("random.drink", pos, 0.5, pitch);
+                    } else {
+                        let vol = if h & 1 == 0 { 0.5 } else { 1.0 };
+                        let pitch = (((h >> 8) & 0xff) as f32 - ((h >> 16) & 0xff) as f32)
+                            / 255.0
+                            * 0.2
+                            + 1.0;
+                        self.queue_sound("random.eat", pos, vol, pitch);
+                    }
+                }
             }
         }
 
         // `if (isUsingItem()) { ... } else { ... }` — while an item is in use
-        // (sword block), attack/use presses are swallowed; otherwise they drive
-        // clickMouse / rightClickMouse.
+        // (sword block), vanilla 1.8 swallows ALL clicks: no attack/dig/use
+        // packet goes out (block-hitting was removed in 1.8), only the right-key
+        // release stops the block. old_animations restores the 1.7 *visual* and
+        // NOTHING else: a left-click starts the local arm swing (rendered layered
+        // onto the block pose for the "swing + block" look) but sends no packet,
+        // so the network stays vanilla-1.8 and Grim sees a plain block.
         if self.is_using_item() {
             if !a.right_held {
                 self.on_stopped_using_item(&mut out);
             }
-            // attack/use/pick presses are drained (ignored) this tick.
+            if a.old_animations && a.attack_pressed {
+                self.swing_arm();
+            }
+            // all click presses are drained (no packets) this tick.
         } else {
             if a.attack_pressed {
                 self.click_mouse(&mut out);
@@ -1169,12 +1408,21 @@ impl GameState {
     /// teleport ack (already sent via [`take_position_confirm`]) and resumes
     /// movement next tick. The caller must not send a movement packet on `None`.
     pub fn tick(&mut self, dt: f32) -> Option<(Vec<ServerboundPacket>, MovementSnapshot)> {
+        // Vanilla GuiIngame.updateTick: a free-running tick counter that drives the
+        // heart-shake RNG and the heart/hunger blink timing.
+        self.hud_update_counter = self.hud_update_counter.wrapping_add(1);
         self.title.tick();
         // Advance the day/night clock one tick (vanilla ticks world time forward
         // locally between server updates), unless daylight cycle is off.
         if self.daylight_cycle {
             self.world_time += self.time_rate;
         }
+        // Advance particle effects once per tick (before any early return), so
+        // smoke/flame age and move at the vanilla 20 Hz.
+        self.particles.tick();
+        // Count down the local player's hurt timer (vanilla EntityLivingBase
+        // .onUpdate), fading the hurt-camera tilt over 10 ticks.
+        self.player.hurt_time = self.player.hurt_time.saturating_sub(1);
         self.previous_player_position = self.player.position;
         let turn_speed = 110.0 * dt;
         if self.input.turn_left {
@@ -1196,11 +1444,55 @@ impl GameState {
         self.update_render_arm();
 
         // Advance remote-entity interpolation: one lerp step per tick toward
-        // the latest server target (vanilla newPosRotationIncrements).
+        // the latest server target (vanilla newPosRotationIncrements). Dropped
+        // items with no pending server correction run local EntityItem physics
+        // instead, so a freshly-dropped item arcs immediately rather than
+        // stalling in the air until the next position packet (T7).
+        // Entities with no pending server correction run local physics this tick
+        // (zero-latency motion): dropped items always, projectiles while they
+        // still carry motion. Everything else lerps toward the server target.
         let player_id = self.player.id;
+        let locally_simulated = |e: &EntityState| -> bool {
+            if e.id == player_id || e.position_increments != 0 {
+                return false;
+            }
+            match e.kind {
+                EntityKind::Object(2) => true, // dropped item
+                EntityKind::Object(kind) => {
+                    projectile_physics(kind).is_some() && e.velocity.length_squared() > 1.0e-6
+                }
+                _ => false,
+            }
+        };
         for entity in self.world.entities_mut() {
-            if entity.id != player_id {
+            if entity.id != player_id && !locally_simulated(entity) {
                 entity.tick_interpolation();
+            }
+        }
+        let simulating: Vec<EntityId> = self
+            .world
+            .entities()
+            .filter(|e| locally_simulated(e))
+            .map(|e| e.id)
+            .collect();
+        for id in simulating {
+            if let Some(mut e) = self.world.entity(id).cloned() {
+                match e.kind {
+                    EntityKind::Object(2) => recraft_core::physics::tick_item(&self.world, &mut e),
+                    EntityKind::Object(kind) => {
+                        if let Some((gravity, drag, collide)) = projectile_physics(kind) {
+                            recraft_core::physics::tick_projectile(
+                                &self.world,
+                                &mut e,
+                                gravity,
+                                drag,
+                                collide,
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+                self.world.upsert_entity(e);
             }
         }
 
@@ -1298,10 +1590,7 @@ impl GameState {
         }
         let flag3 = self.food > 6 || self.capabilities.allow_flying;
         // Double-tap-W start (on the ground, on a fresh forward press).
-        // Suppress on the tick an attack just cancelled sprint so the server
-        // sees StopSprinting before the re-enable (the "w-tap" gap).
-        if !self.sprint_reset_by_attack
-            && self.player.on_ground
+        if self.player.on_ground
             && !flag1
             && !flag2
             && move_forward >= 0.8
@@ -1316,8 +1605,11 @@ impl GameState {
             }
         }
         // Sprint-key-held start (no onGround requirement, exactly like vanilla).
-        if !self.sprint_reset_by_attack
-            && !self.sprinting
+        // Runs the same tick an attack cancelled sprint, so a sprint-attack while
+        // W + sprint are held re-enables sprint immediately — vanilla never sends
+        // a StopSprinting in that case (final isSprinting() stays true, so
+        // onUpdateWalkingPlayer emits no C0B); only the ×0.6 momentum hit lands.
+        if !self.sprinting
             && move_forward >= 0.8
             && flag3
             && !self.is_using_item()
@@ -1331,7 +1623,6 @@ impl GameState {
         {
             self.sprinting = false;
         }
-        self.sprint_reset_by_attack = false;
         self.prev_sneak = self.input.sneak;
         self.prev_move_forward = move_forward;
         if self.world.is_block_column_loaded(bx, bz) {
@@ -1373,6 +1664,7 @@ impl GameState {
         let sprint_target = f32::from(self.sprinting);
         self.sneak_amount += (sneak_target - self.sneak_amount) * APPROACH;
         self.sprint_amount += (sprint_target - self.sprint_amount) * APPROACH;
+        self.tick_chest_lids();
     }
 
     pub fn update_camera(&mut self, tick_alpha: f32) {
@@ -1389,6 +1681,7 @@ impl GameState {
         self.camera.fovy_degrees = (BASE_FOV + SPRINT_FOV_BOOST * sprint) * fly_factor;
         self.camera.yaw = self.player.yaw;
         self.camera.pitch = self.player.pitch;
+        self.camera.roll = hurt_camera_roll(self.player.hurt_time, alpha);
     }
 
     /// Start the hand-swing animation (vanilla `swingItem`): a new swing only
@@ -1427,15 +1720,19 @@ impl GameState {
     /// overlay is drawn by the renderer from `breaking_overlay()`.
     /// `tick_alpha` interpolates entity positions between simulation ticks
     /// (vanilla partialTicks) so movement stays smooth at any frame rate.
+    #[allow(clippy::too_many_arguments)]
     pub fn build_entity_model(
         &self,
         mesh: &mut ModelMesh,
+        glint: &mut ModelMesh,
         tick_alpha: f32,
         brightness: f32,
         skin_rows: &std::collections::HashMap<[u8; 16], u32>,
         max_dist_sq: f64,
+        old_animations: bool,
     ) {
         mesh.clear();
+        glint.clear();
         let sun_b = recraft_render::sky::sun_brightness(self.world_time(tick_alpha));
         // Cull entities outside the view frustum up front: most mobs in a loaded
         // world are off-screen at any moment, and building each one's articulated
@@ -1446,8 +1743,9 @@ impl GameState {
                 continue;
             }
             // Item entities (object type 2) are drawn as item geometry in the
-            // separate world-item pass, not as a placeholder box.
-            if entity.kind == EntityKind::Object(2) {
+            // separate world-item pass, not as a placeholder box. Experience
+            // orbs render as billboards in their own per-frame pass.
+            if entity.kind == EntityKind::Object(2) || entity.kind == EntityKind::ExperienceOrb {
                 continue;
             }
             // Distance cull: distant mobs aren't worth the per-frame articulated
@@ -1496,6 +1794,14 @@ impl GameState {
             // head past a natural turn (vanilla mobs clamp head rotation too).
             let net_head_yaw =
                 wrap_degrees(entity.render_head_yaw(tick_alpha) - body_yaw).clamp(-75.0, 75.0);
+            // Players lower the right arm to hold an item / raise it to block;
+            // mobs keep their archetype arm pose (held_item_right = 0).
+            let held_item_right = if matches!(entity.kind, EntityKind::RemotePlayer) {
+                let held = self.entity_equipment.get(&entity.id).and_then(|s| s[0].as_ref());
+                held_item_right_state(held, entity.using_item)
+            } else {
+                0
+            };
             let anim = EntityAnim {
                 limb_swing,
                 limb_swing_amount,
@@ -1503,6 +1809,9 @@ impl GameState {
                 head_pitch: entity.render_pitch(tick_alpha),
                 swing_progress: entity.render_swing(tick_alpha),
                 sneaking: entity.sneaking,
+                held_item_right,
+                old_animations,
+                death_roll: death_roll_radians(entity.death_time, tick_alpha),
             };
             let start = mesh.vertices.len();
             // Invisible entities (metadata flag 0x20) render no body model — but
@@ -1525,6 +1834,15 @@ impl GameState {
                     ];
                     if ids[1].is_some() || ids[2].is_some() || ids[3].is_some() || ids[4].is_some() {
                         mesh.push_armor(&ids, &anim, feet, body_yaw);
+                        // Enchanted armor pieces shimmer like enchanted items:
+                        // emit those boxes into the glint mesh for the additive
+                        // glint pass.
+                        let enchanted: [bool; 5] = std::array::from_fn(|i| {
+                            slots[i].as_ref().is_some_and(is_enchanted)
+                        });
+                        if enchanted[1] || enchanted[2] || enchanted[3] || enchanted[4] {
+                            glint.push_armor_glint(&ids, &enchanted, &anim, feet, body_yaw);
+                        }
                     }
                 }
             }
@@ -1534,24 +1852,219 @@ impl GameState {
             // already baked in the vertex colour.
             let center = Vec3::new(feet.x, feet.y + height as f32 * 0.5, feet.z);
             let factor = entity_light(&self.world, center, sun_b, brightness);
-            // Vanilla damage flash: when hurtTime > 0, the entity is tinted red.
-            // The intensity fades with the remaining hurt ticks (10 → 0).
-            let hurt_flash = if entity.hurt_time > 0 {
-                entity.hurt_time as f32 / 10.0
-            } else {
-                0.0
-            };
+            // Vanilla damage flash (RendererLivingEntity.setBrightness): while
+            // `hurtTime > 0 || deathTime > 0` the model colour is lerped toward
+            // pure red at a constant 0.3 strength (GL_INTERPOLATE with
+            // (1,0,0,0.3)) — held for the whole hurt animation AND the whole
+            // death animation, so the corpse stays red.
+            let hurt = entity.hurt_time > 0 || entity.death_time > 0;
             for v in &mut mesh.vertices[start..] {
                 v.color[0] *= factor;
                 v.color[1] *= factor;
                 v.color[2] *= factor;
-                if hurt_flash > 0.0 {
-                    v.color[0] = v.color[0] + (1.0 - v.color[0]) * hurt_flash * 0.5;
-                    v.color[1] *= 1.0 - hurt_flash * 0.4;
-                    v.color[2] *= 1.0 - hurt_flash * 0.4;
+                if hurt {
+                    v.color[0] = v.color[0] * 0.7 + 0.3;
+                    v.color[1] *= 0.7;
+                    v.color[2] *= 0.7;
                 }
             }
         }
+    }
+
+    /// Append the chest block-entities near the camera to the entity model.
+    /// Chests no longer mesh as terrain (their `render_shape` is `None`), so the
+    /// dedicated [`recraft_render::ModelMesh::push_chest`] model is drawn here in
+    /// the same model pass as mobs, sampling the chest entity textures. Loaded
+    /// chunks within `max_dist_sq` of the camera are scanned for chest ids
+    /// (54 normal, 130 ender, 146 trapped); each chest's lid uses its eased
+    /// open amount (see [`Self::tick_chest_lids`]) and is lit by the world
+    /// lightmap like the surrounding terrain.
+    pub fn build_chest_models(
+        &self,
+        mesh: &mut ModelMesh,
+        brightness: f32,
+        tick_alpha: f32,
+        max_dist_sq: f64,
+    ) {
+        let sun_b = recraft_render::sky::sun_brightness(self.world_time(tick_alpha));
+        let frustum = self.camera.frustum();
+        let cam = self.camera.position;
+
+        for (&[wx, wy, wz], block) in self.world.block_entities() {
+            let kind = match block.id {
+                54 => ChestKind::Normal,
+                130 => ChestKind::Ender,
+                146 => ChestKind::Trapped,
+                _ => continue,
+            };
+            // Cull by distance (cell centre) then frustum.
+            let cx = wx as f64 + 0.5;
+            let cy = wy as f64 + 0.5;
+            let cz = wz as f64 + 0.5;
+            let d = (cx - cam.x as f64).powi(2)
+                + (cy - cam.y as f64).powi(2)
+                + (cz - cam.z as f64).powi(2);
+            if d > max_dist_sq {
+                continue;
+            }
+            let min = Vec3::new(wx as f32, wy as f32, wz as f32);
+            let max = min + Vec3::ONE;
+            if !frustum.intersects_aabb(min, max) {
+                continue;
+            }
+            let lid = self
+                .chest_lid_angles
+                .get(&[wx, wy, wz])
+                .copied()
+                .unwrap_or(0.0);
+            // Pairing: a chest pairs with a same-id chest on the axis
+            // perpendicular to its facing (meta 2/3 face N/S → pair on X; 4/5
+            // face E/W → pair on Z). Ender chests (130) are never double. The
+            // canonical half (smaller X/Z, vanilla's adjacentChestXNeg/ZNeg ==
+            // null) renders the large model; the other half is skipped. Single
+            // chests keep push_chest.
+            let axis = match (kind, block.meta) {
+                (ChestKind::Ender, _) => None,
+                (_, 2 | 3) => Some([1i32, 0, 0]),
+                (_, 4 | 5) => Some([0i32, 0, 1]),
+                _ => None,
+            };
+            let partner = axis.and_then(|d| {
+                let pos = self.world.block_at(wx + d[0], wy + d[1], wz + d[2]);
+                let neg = self.world.block_at(wx - d[0], wy - d[1], wz - d[2]);
+                if neg.id == block.id {
+                    // Neighbour on −axis renders the pair; skip.
+                    Some(None)
+                } else if pos.id == block.id {
+                    // This is the canonical half; partner at +axis.
+                    Some(Some([wx + d[0], wy + d[1], wz + d[2]]))
+                } else {
+                    None
+                }
+            });
+            let start = mesh.vertices.len();
+            match partner {
+                // Other half of a pair — the canonical half draws it.
+                Some(None) => continue,
+                // Canonical half: one large model, lid shared (max).
+                Some(Some(p)) => {
+                    let partner_lid = self.chest_lid_angles.get(&p).copied().unwrap_or(0.0);
+                    mesh.push_large_chest([wx, wy, wz], block.meta, lid.max(partner_lid), kind);
+                }
+                None => mesh.push_chest([wx, wy, wz], block.meta, lid, kind),
+            }
+            // Light the chest by the lightmap at its centre, like mobs.
+            let factor = entity_light(
+                &self.world,
+                Vec3::new(cx as f32, cy as f32, cz as f32),
+                sun_b,
+                brightness,
+            );
+            for v in &mut mesh.vertices[start..] {
+                v.color[0] *= factor;
+                v.color[1] *= factor;
+                v.color[2] *= factor;
+            }
+        }
+    }
+
+    /// Append the sign, enchanting-table-book and end-portal block-entities near
+    /// the camera to the entity model, and return the sign-text draws for the
+    /// renderer's world-space text pass. Mirrors [`Self::build_chest_models`]:
+    /// the world's block-entity index is walked (not a per-frame voxel scan),
+    /// each entry distance + frustum culled and lit by the world lightmap. The book hover
+    /// is driven by the world time (the same source folded into the entity
+    /// fingerprint, so the book's phase matches the rebuild cadence).
+    pub fn build_block_entity_models(
+        &self,
+        mesh: &mut ModelMesh,
+        brightness: f32,
+        tick_alpha: f32,
+        max_dist_sq: f64,
+    ) -> Vec<SignTextDraw> {
+        let time = self.world_time(tick_alpha) as f32;
+        let sun_b = recraft_render::sky::sun_brightness(self.world_time(tick_alpha));
+        let frustum = self.camera.frustum();
+        let cam = self.camera.position;
+        let mut sign_texts = Vec::new();
+
+        for (&[wx, wy, wz], block) in self.world.block_entities() {
+            // Signs (63 standing, 68 wall), enchanting table (116) and end
+            // portal (119); chests share the index but render in build_chest_models.
+            if !matches!(block.id, 63 | 68 | 116 | 119) {
+                continue;
+            }
+            let cx = wx as f64 + 0.5;
+            let cy = wy as f64 + 0.5;
+            let cz = wz as f64 + 0.5;
+            let d = (cx - cam.x as f64).powi(2)
+                + (cy - cam.y as f64).powi(2)
+                + (cz - cam.z as f64).powi(2);
+            if d > max_dist_sq {
+                continue;
+            }
+            let min = Vec3::new(wx as f32, wy as f32, wz as f32);
+            let max = min + Vec3::ONE;
+            if !frustum.intersects_aabb(min, max) {
+                continue;
+            }
+            let center = Vec3::new(cx as f32, cy as f32, cz as f32);
+            let factor = entity_light(&self.world, center, sun_b, brightness);
+            let start = mesh.vertices.len();
+            let cell = [wx, wy, wz];
+            match block.id {
+                63 | 68 => {
+                    let kind = if block.id == 63 {
+                        SignKind::Standing
+                    } else {
+                        SignKind::Wall
+                    };
+                    mesh.push_sign(cell, block.meta, kind);
+                    if let Some(lines) = self.signs.get(&cell) {
+                        if lines.iter().any(|l| !l.is_empty()) {
+                            let (c, right, up, hw, hh) =
+                                ModelMesh::sign_text_basis(cell, block.meta, kind);
+                            sign_texts.push(SignTextDraw {
+                                lines: lines.clone(),
+                                center: c,
+                                right,
+                                up,
+                                half_width: hw,
+                                half_height: hh,
+                            });
+                        }
+                    }
+                }
+                116 => mesh.push_book(cell, time),
+                119 => mesh.push_end_portal(cell),
+                _ => unreachable!(),
+            }
+            for v in &mut mesh.vertices[start..] {
+                v.color[0] *= factor;
+                v.color[1] *= factor;
+                v.color[2] *= factor;
+            }
+        }
+        sign_texts
+    }
+
+    /// Ease each tracked chest lid toward its target (1 = open while viewers > 0,
+    /// 0 = closed) at vanilla's 0.1/tick, pruning fully-closed entries. The open
+    /// target comes from the S24 BlockAction viewer count; until that packet is
+    /// decoded no chest opens, so this currently only animates entries a future
+    /// BlockAction handler inserts. Run once per simulation tick from
+    /// [`Self::advance_view_state`].
+    fn tick_chest_lids(&mut self) {
+        let targets = &self.chest_open_targets;
+        self.chest_lid_angles.retain(|pos, angle| {
+            let target = targets.get(pos).copied().unwrap_or(0.0);
+            // Vanilla TileEntityChest eases the lid at 0.1/tick toward the target.
+            *angle += (target - *angle) * 0.1;
+            // Keep entries that are open, opening, or still closing.
+            *angle > 0.001 || target > 0.0
+        });
+        // Drop closed targets so the maps don't grow unbounded.
+        self.chest_open_targets.retain(|_, t| *t > 0.0);
     }
 
     /// World-light factor (0..1) for a model drawn at `pos`, matching the chunk
@@ -1591,9 +2104,187 @@ impl GameState {
         items
     }
 
+    /// This frame's particle billboards (interpolated by `tick_alpha`), for the
+    /// renderer to build into camera-facing quads.
+    pub fn particle_billboards(&self, tick_alpha: f32) -> Vec<recraft_render::ParticleBillboard> {
+        self.particles.billboards(tick_alpha)
+    }
+
+    /// This frame's block-break debris (vanilla `EntityDiggingFX`), for the item
+    /// renderer to billboard against the block atlas.
+    pub fn block_debris(&self, tick_alpha: f32) -> Vec<crate::particle::BlockDebris> {
+        self.particles.block_debris(tick_alpha)
+    }
+
+    /// This frame's experience-orb billboards (vanilla `RenderXPOrb`): a
+    /// camera-facing quad sampling `experience_orb.png`, the sprite cell chosen
+    /// by the orb's xp value, colour-cycling through the green/red rainbow over
+    /// its age, drawn at half alpha and full brightness.
+    pub fn xp_orbs(&self, tick_alpha: f32) -> Vec<recraft_render::ParticleBillboard> {
+        let mut orbs = Vec::new();
+        for entity in self.world.entities() {
+            if entity.kind != EntityKind::ExperienceOrb {
+                continue;
+            }
+            let xp = self.entity_xp.get(&entity.id).copied().unwrap_or(0);
+            let cell = xp_orb_texture_cell(xp);
+            let pos = to_render_vec3(entity.render_position(tick_alpha as f64));
+            // Vanilla RenderXPOrb colour cycle: f = (age + partial) / 2,
+            // r = (sin(f)+1)*0.5, g = 1.0, b = (sin(f+4.1887903)+1)*0.1, α 0.5.
+            let f = (entity.age as f32 + tick_alpha) / 2.0;
+            let color = [
+                (f.sin() + 1.0) * 0.5,
+                1.0,
+                ((f + 4.188_790_3).sin() + 1.0) * 0.1,
+                0.5,
+            ];
+            orbs.push(recraft_render::ParticleBillboard {
+                world_pos: (pos + Vec3::new(0.0, 0.25, 0.0)).into(),
+                size: 0.25, // ~0.5 wide quad
+                uv: xp_orb_cell_uv(cell),
+                color,
+            });
+        }
+        orbs
+    }
+
+    /// This frame's falling-block cubes (SpawnObject kind 70): each carries its
+    /// blockstate, interpolated world position and lightmap sample; the renderer
+    /// builds a full terrain-textured cube at that position.
+    pub fn falling_block_cubes(&self, tick_alpha: f32) -> Vec<FallingBlock> {
+        let mut cubes = Vec::new();
+        for entity in self.world.entities() {
+            let Some(block) = self.falling_blocks.get(&entity.id) else {
+                continue;
+            };
+            let pos = to_render_vec3(entity.render_position(tick_alpha as f64));
+            let (block_l, sky_l) =
+                self.world
+                    .light_at(pos.x.floor() as i32, pos.y.floor() as i32, pos.z.floor() as i32);
+            cubes.push(FallingBlock {
+                block: *block,
+                pos,
+                light: [sky_l as f32 / 15.0, block_l as f32 / 15.0],
+                scale: 1.0,
+                flash: 0.0,
+            });
+        }
+        cubes
+    }
+
+    /// This frame's primed-TNT cubes (SpawnObject kind 50): a TNT block that
+    /// swells and flashes white as its fuse counts down, a port of vanilla
+    /// `RenderTNTPrimed`. The fuse is client-local (1.8 never syncs it): it
+    /// starts at 80 and counts down with the entity's tracked age, so
+    /// `fuse = 80 - age`.
+    pub fn primed_tnt_cubes(&self, tick_alpha: f32) -> Vec<FallingBlock> {
+        let mut cubes = Vec::new();
+        for entity in self.world.entities() {
+            if entity.kind != EntityKind::Object(50) {
+                continue;
+            }
+            let fuse = (80i64 - entity.age as i64).max(0) as f32;
+            // Vanilla `f = fuse - partialTicks + 1`.
+            let f = fuse - tick_alpha + 1.0;
+            // Last 10 fuse ticks: swell to ×1.3 with a quartic ease-in.
+            let scale = if f < 10.0 {
+                let t = (1.0 - f / 10.0).clamp(0.0, 1.0);
+                1.0 + t * t * t * t * 0.3
+            } else {
+                1.0
+            };
+            // White flash on every other 5-tick fuse window; the overlay
+            // strength grows as the fuse shortens (vanilla `(1 - f/100) * 0.8`).
+            let flash = if (fuse as i64 / 5) % 2 == 0 {
+                (1.0 - f / 100.0) * 0.8
+            } else {
+                0.0
+            };
+            let pos = to_render_vec3(entity.render_position(tick_alpha as f64));
+            let (block_l, sky_l) =
+                self.world
+                    .light_at(pos.x.floor() as i32, pos.y.floor() as i32, pos.z.floor() as i32);
+            cubes.push(FallingBlock {
+                block: BlockState::new(46, 0),
+                pos,
+                light: [sky_l as f32 / 15.0, block_l as f32 / 15.0],
+                scale,
+                flash,
+            });
+        }
+        cubes
+    }
+
+    /// This frame's projectile sprites: SpawnObject kinds mapped to an item id
+    /// and rendered as 2D item-sprite billboards through the dropped-item path
+    /// (snowball, egg, ender pearl, …). Kinds rendered elsewhere — the arrow
+    /// (3D model in the entity pass), item=2, falling block=70, armor stand=78 —
+    /// are skipped.
+    pub fn projectiles(&self, tick_alpha: f32) -> Vec<DroppedItem> {
+        let mut sprites = Vec::new();
+        for entity in self.world.entities() {
+            let EntityKind::Object(kind) = entity.kind else {
+                continue;
+            };
+            let Some(item_id) = projectile_item_id(kind) else {
+                continue;
+            };
+            let pos = to_render_vec3(entity.render_position(tick_alpha as f64));
+            let (block_l, sky_l) =
+                self.world
+                    .light_at(pos.x.floor() as i32, pos.y.floor() as i32, pos.z.floor() as i32);
+            sprites.push(DroppedItem {
+                item: SlotItem::new(item_id, 1, 0),
+                pos,
+                // No bob/spin for projectiles: a fixed phase keeps the sprite
+                // steady (build_world_items lifts it 0.25 + a small bob).
+                phase: 0.0,
+                light: [sky_l as f32 / 15.0, block_l as f32 / 15.0],
+            });
+        }
+        sprites
+    }
+
+    /// Client-derived boss bar (vanilla `BossStatus`): the nearest living wither
+    /// (SpawnMob type 64) or ender dragon (type 63) within range, returning its
+    /// display name and 0..1 health fraction. 1.8 has no bossbar packet, so this
+    /// is reconstructed from the entity's tracked health metadata.
+    pub fn boss_bar(&self) -> Option<(String, f32)> {
+        let eye = DVec3::new(
+            self.camera.position.x as f64,
+            self.camera.position.y as f64,
+            self.camera.position.z as f64,
+        );
+        let mut best: Option<(f64, &EntityState, f32, &str)> = None;
+        for entity in self.world.entities() {
+            let (max_health, default_name) = match entity.kind {
+                EntityKind::Mob(64) => (300.0, "Wither"),
+                EntityKind::Mob(63) => (200.0, "Ender Dragon"),
+                _ => continue,
+            };
+            let Some(health) = entity.health.filter(|h| *h > 0.0) else {
+                continue;
+            };
+            // Vanilla tracks the boss within ~80 blocks of the view.
+            let dist = entity.position.distance(eye);
+            if dist > 80.0 {
+                continue;
+            }
+            if best.as_ref().is_none_or(|(d, ..)| dist < *d) {
+                best = Some((dist, entity, health / max_health, default_name));
+            }
+        }
+        let (_, entity, fraction, default_name) = best?;
+        let name = entity
+            .custom_name
+            .clone()
+            .unwrap_or_else(|| default_name.to_string());
+        Some((name, fraction.clamp(0.0, 1.0)))
+    }
+
     /// Held items of remote players, each with the arm's world-space reference
     /// frame so the item renderer can orient the model correctly in the hand.
-    pub fn player_held_items(&self, tick_alpha: f32) -> Vec<PlayerHeldItem> {
+    pub fn player_held_items(&self, tick_alpha: f32, old_animations: bool) -> Vec<PlayerHeldItem> {
         let mut items = Vec::new();
         for entity in self.world.entities() {
             if entity.kind != EntityKind::RemotePlayer || entity.id == self.player.id {
@@ -1617,15 +2308,25 @@ impl GameState {
                 head_pitch: entity.render_pitch(tick_alpha),
                 swing_progress: entity.render_swing(tick_alpha),
                 sneaking: entity.sneaking,
+                held_item_right: held_item_right_state(Some(item), entity.using_item),
+                old_animations,
+                death_roll: death_roll_radians(entity.death_time, tick_alpha),
             };
-            let frame = held_item_frame(feet, body_yaw, &anim);
+            let attach = arm_attach(feet, body_yaw, &anim);
+            // Sample the lightmap at the rendered hand (bottom-centre of the arm).
+            let hand = attach.to_world(recraft_render::ArmAttach::HAND_PX);
             let (block_l, sky_l) = self.world.light_at(
-                frame.hand.x.floor() as i32,
-                frame.hand.y.floor() as i32,
-                frame.hand.z.floor() as i32,
+                hand.x.floor() as i32,
+                hand.y.floor() as i32,
+                hand.z.floor() as i32,
             );
             let light = [sky_l as f32 / 15.0, block_l as f32 / 15.0];
-            items.push(PlayerHeldItem { item: item.clone(), frame, light });
+            items.push(PlayerHeldItem {
+                item: item.clone(),
+                attach,
+                sneaking: entity.sneaking,
+                light,
+            });
         }
         items
     }
@@ -1688,7 +2389,10 @@ impl GameState {
         // Every renderable entity's interpolated state (matches build_entity_model's
         // skip rules so the fingerprint changes exactly when its output would).
         for e in self.world.entities() {
-            if e.id == self.player.id || e.kind == EntityKind::Object(2) {
+            if e.id == self.player.id
+                || e.kind == EntityKind::Object(2)
+                || e.kind == EntityKind::ExperienceOrb
+            {
                 continue;
             }
             // Same distance cull as build_entity_model: distant mobs are neither
@@ -1709,7 +2413,10 @@ impl GameState {
             mix(qa(lsa));
             mix(qa(e.render_swing(tick_alpha)));
             mix(e.hurt_time as u64);
-            mix((e.sneaking as u64) << 2 | (e.invisible as u64) << 1 | e.custom_name_visible as u64);
+            // Death animation advances every tick (and the roll per frame), so
+            // fold it in or the cached model would freeze mid-fall.
+            mix(qa(death_roll_radians(e.death_time, tick_alpha)));
+            mix((e.using_item as u64) << 3 | (e.sneaking as u64) << 2 | (e.invisible as u64) << 1 | e.custom_name_visible as u64);
             if let Some(name) = &e.custom_name {
                 for b in name.as_bytes() {
                     mix(*b as u64);
@@ -1735,6 +2442,35 @@ impl GameState {
                 mix(v.0 as u32 as u64);
             }
         }
+        // Animating chest lids (order-independent so the HashMap iteration order
+        // doesn't churn the key): each open chest folds its position + quantized
+        // lid angle. Closed chests aren't tracked, so this stays empty in idle
+        // scenes and only forces rebuilds while a lid is actually moving.
+        let mut chest_acc: u64 = 0;
+        for (&[x, y, z], &angle) in &self.chest_lid_angles {
+            chest_acc ^= (x as u32 as u64)
+                ^ ((z as u32 as u64) << 21)
+                ^ ((y as u64) << 42)
+                ^ ((angle * 64.0) as u64).wrapping_mul(0x9e37_79b9);
+        }
+        mix(chest_acc);
+        // Sign text (order-independent): fold each sign's position and a hash of
+        // its lines so a new/edited sign re-triggers the block-entity rebuild.
+        let mut sign_acc: u64 = 0;
+        for (&[x, y, z], lines) in &self.signs {
+            let mut s = (x as u32 as u64) ^ ((z as u32 as u64) << 21) ^ ((y as u64) << 42);
+            for line in lines {
+                for b in line.as_bytes() {
+                    s = (s ^ *b as u64).wrapping_mul(0x0000_0100_0000_01b3);
+                }
+            }
+            sign_acc ^= s;
+        }
+        mix(sign_acc);
+        // Coarse book-hover timer (world time advances ~20/sec): quantized to a
+        // few steps per second so the floating book animates without forcing a
+        // per-frame rebuild. Idle scenes with a frozen sky still update slowly.
+        mix((self.world_time(tick_alpha) / 4.0) as u64);
         h
     }
 
@@ -1989,20 +2725,36 @@ impl GameState {
     }
 
     /// Vanilla `PlayerControllerMP.attackEntity` + `attackTargetEntityWithCurrentItem`:
-    /// sync held item, send C02 ATTACK, and apply the sprint hit (halve
-    /// horizontal motion + cancel sprint — the w-tap reset; no knockback enchant
-    /// here so it fires exactly when sprinting).
+    /// sync held item, send C02 ATTACK (always, regardless of target), and apply
+    /// the sprint hit (halve horizontal motion + cancel sprint; no knockback
+    /// enchant here so it fires exactly when sprinting). The cancel runs before
+    /// this tick's `onLivingUpdate` sprint recompute, which re-enables sprint the
+    /// same tick if W + sprint are still held (vanilla held-key behaviour) — so
+    /// the ×0.6 momentum is the only server-visible effect and no StopSprinting
+    /// packet is sent.
+    ///
+    /// The sprint hit only lands when the target's CLIENT-side `attackEntityFrom`
+    /// returns true. On a remote world a living mob (`EntityLivingBase`) short-
+    /// circuits to `false` via `worldObj.isRemote`, so hitting a normal mob does
+    /// NOT slow the attacker — only other players (`EntityOtherPlayerMP` → true)
+    /// and non-living objects (minecart/boat/…) do. Grim gates attack-slow the
+    /// same way (`PacketPlayerAttack`: `!isLivingEntity || PLAYER`), so slowing on
+    /// a mob hit desyncs its prediction → Simulation. XP orbs (and dropped items)
+    /// aren't attackable in vanilla (`canAttackWithItem` false), so never slow.
     fn attack_entity(&mut self, id: i32, out: &mut Vec<ServerboundPacket>) {
         self.sync_current_play_item(out);
         out.push(ServerboundPacket::UseEntity {
             target: id,
             kind: UseEntityKind::Attack,
         });
-        if self.sprinting {
+        let target_slows = matches!(
+            self.world.entity(EntityId(id)).map(|e| e.kind),
+            Some(EntityKind::RemotePlayer | EntityKind::Object(_))
+        );
+        if target_slows && self.sprinting {
             self.player.velocity.x *= 0.6;
             self.player.velocity.z *= 0.6;
             self.sprinting = false;
-            self.sprint_reset_by_attack = true;
         }
     }
 
@@ -2046,7 +2798,7 @@ impl GameState {
                 z,
                 face,
             });
-            let ticks = block_break_ticks(self.world.block_at(x, y, z));
+            let ticks = self.block_break_ticks(self.world.block_at(x, y, z));
             if ticks <= 1.0 {
                 // Instant break (hardness ~0): START alone destroys it.
                 self.breaking = None;
@@ -2070,6 +2822,75 @@ impl GameState {
         self.breaking
             .as_ref()
             .is_some_and(|b| b.x == x && b.y == y && b.z == z && b.item.as_ref() == self.held_item())
+    }
+
+    /// Vanilla `EntityPlayer.getBreakSpeed`: the held tool's dig speed against
+    /// `block` — its raw strength times the efficiency enchant, haste / mining
+    /// fatigue, and the in-air penalty. (Underwater Aqua-Affinity is not
+    /// modelled.)
+    fn break_speed(&self, block: BlockState) -> f32 {
+        let item = self.held_item();
+        let mut f = item.map_or(1.0, |it| tool_strength(it, block));
+        // Efficiency adds (level² + 1), but only to a tool already effective here.
+        if f > 1.0 {
+            if let Some(level) = item.map(efficiency_level).filter(|l| *l > 0) {
+                f += (level * level + 1) as f32;
+            }
+        }
+        // Haste (potion id 3) speeds up; mining fatigue (id 4) cripples.
+        if let Some(e) = self.effects.get(&3) {
+            f *= 1.0 + (e.amplifier as f32 + 1.0) * 0.2;
+        }
+        if let Some(e) = self.effects.get(&4) {
+            f *= match e.amplifier {
+                0 => 0.3,
+                1 => 0.09,
+                2 => 0.0027,
+                _ => 0.000_81,
+            };
+        }
+        if !self.player.on_ground {
+            f /= 5.0;
+        }
+        f.max(0.0)
+    }
+
+    /// Vanilla `EntityPlayer.canHarvestBlock`: true when the block needs no tool
+    /// (its material is hand-harvestable) or the held pickaxe is the right class
+    /// and tier. Drives the `/30` vs `/100` dig divisor (and, server-side, drops).
+    fn can_harvest_block(&self, block: BlockState) -> bool {
+        if !block_needs_tool(block.id) {
+            return true;
+        }
+        matches!(
+            self.held_item().map(|it| tool_props(it.id)),
+            Some(Some((ToolClass::Pickaxe, _, level))) if level >= block_harvest_level(block.id)
+        )
+    }
+
+    /// Number of 20 Hz ticks to break `block` in survival, matching vanilla's
+    /// `Block.getPlayerRelativeBlockHardness` (`break_speed / hardness / divisor`,
+    /// divisor 30 when harvestable else 100; the block breaks once the summed
+    /// per-tick progress reaches 1). `INFINITY` for unbreakable blocks; 1 for an
+    /// instant break. The server (Grim FastBreak) predicts this exactly, so it
+    /// must match to keep digging legal.
+    fn block_break_ticks(&self, block: BlockState) -> f32 {
+        let hardness = block_hardness(block.id);
+        if hardness < 0.0 {
+            return f32::INFINITY; // unbreakable (bedrock, etc.)
+        }
+        let speed = self.break_speed(block);
+        if speed <= 0.0 {
+            return f32::INFINITY;
+        }
+        let divisor = if self.can_harvest_block(block) { 30.0 } else { 100.0 };
+        // Per-tick progress; ≥1 means the click alone destroys it (hardness 0, or
+        // a very fast tool).
+        let per_tick = speed / hardness / divisor;
+        if per_tick >= 1.0 {
+            return 1.0;
+        }
+        (1.0 / per_tick).ceil().max(1.0)
     }
 
     /// Vanilla `PlayerControllerMP.onPlayerDamageBlock`: advance the held dig.
@@ -2203,6 +3024,13 @@ impl GameState {
         {
             self.mark_block_dirty_urgent(x, y, z);
             self.relight_after_edit(x, y, z, old);
+            // On a real break (not air): a debris puff (vanilla
+            // addBlockDestroyEffects) and the block's dig sound (vol 1, pitch 0.8).
+            if !old.is_air() {
+                self.particles.spawn_block_debris(x, y, z, old);
+                let pos = Vec3::new(x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5);
+                self.queue_sound(dig_sound_for_block(old.id), pos, 1.0, 0.8);
+            }
         }
     }
 
@@ -2296,6 +3124,13 @@ impl GameState {
         if self.world.set_block_if_chunk_loaded(px, py, pz, state) {
             self.mark_block_dirty_urgent(px, py, pz);
             self.relight_after_edit(px, py, pz, old);
+            // No client-side place sound: vanilla's `ItemBlock.onItemUse` plays it
+            // via `World.playSoundEffect`, but on the client that hits the empty
+            // `RenderGlobal.playSound` (a no-op). The audible place sound comes
+            // from the server's S29 SoundEffect (`WorldManager.playSound` →
+            // `sendToAllNear`, which includes the placer). Playing it here too
+            // would double it. (Block *breaking* differs: the server excludes the
+            // breaker via `sendToAllNearExcept`, so that one is predicted locally.)
             true
         } else {
             false
@@ -2304,10 +3139,10 @@ impl GameState {
 
     /// The block currently being mined and its 0..9 crack stage, for the HUD /
     /// breaking overlay.
-    pub fn breaking_overlay(&self) -> Option<(i32, i32, i32, u8)> {
+    pub fn breaking_overlay(&self) -> Option<(i32, i32, i32, u8, BlockState)> {
         self.breaking.as_ref().map(|b| {
             let stage = (b.progress.clamp(0.0, 0.999) * 10.0) as u8;
-            (b.x, b.y, b.z, stage)
+            (b.x, b.y, b.z, stage, self.world.block_at(b.x, b.y, b.z))
         })
     }
 
@@ -2533,9 +3368,33 @@ impl GameState {
                 self.world.upsert_entity(self.player.clone());
                 false
             }
-            ClientboundPlayPacket::UpdateHealth { health, food, .. } => {
+            ClientboundPlayPacket::UpdateHealth {
+                health,
+                food,
+                food_saturation,
+            } => {
+                // Vanilla seeds the heart-row highlight from the local player's
+                // hurtResistantTime, which the client does not simulate here. The
+                // server's UpdateHealth is the change signal instead: on a health
+                // change, blink the row (20 ticks on damage, 10 on heal) and record
+                // the pre-change health drawn in the highlight frame (vanilla `j`).
+                // The very first value is the spawn health, so it seeds no blink.
+                // The hurt *sound* is played from the EntityStatus(2) path (vanilla
+                // EntityPlayer.handleStatusUpdate), not from UpdateHealth.
+                if self.health_received {
+                    let old = self.health.ceil() as i32;
+                    let new = health.ceil() as i32;
+                    if let Some(window) = crate::gui::ingame::health_blink_window(old, new) {
+                        self.last_player_health = old;
+                        self.health_update_counter = (self.hud_update_counter + window) as i64;
+                    }
+                } else {
+                    self.last_player_health = health.ceil() as i32;
+                }
+                self.health_received = true;
                 self.health = health;
                 self.food = food;
+                self.saturation = food_saturation;
                 // A dead player is frozen by the server until it respawns. We no
                 // longer auto-respawn — the UI shows a death screen and the player
                 // clicks "respawn" (which sets needs_respawn via request_respawn).
@@ -2567,6 +3426,8 @@ impl GameState {
                 self.needs_respawn = false;
                 self.is_dead = false;
                 self.health = 20.0;
+                self.max_health = 20.0;
+                self.effects.clear();
                 self.position_synced = false;
                 self.pending_confirm = false;
                 self.player.velocity = DVec3::ZERO;
@@ -2650,6 +3511,28 @@ impl GameState {
             ClientboundPlayPacket::BlockChange { x, y, z, id, meta } => {
                 self.apply_block_change(x, y, z, id, meta)
             }
+            ClientboundPlayPacket::SpawnParticle {
+                particle_id,
+                x,
+                y,
+                z,
+                offset_x,
+                offset_y,
+                offset_z,
+                speed,
+                count,
+                args,
+            } => {
+                self.particles.spawn(
+                    particle_id,
+                    Vec3::new(x, y, z),
+                    Vec3::new(offset_x, offset_y, offset_z),
+                    speed,
+                    count,
+                    &args,
+                );
+                false
+            }
             ClientboundPlayPacket::ChunkBulk {
                 sky_light_sent,
                 chunks,
@@ -2701,7 +3584,8 @@ impl GameState {
                 z,
                 yaw,
                 pitch,
-                ..
+                data,
+                velocity,
             } => {
                 self.spawn_remote_entity(
                     entity_id,
@@ -2712,6 +3596,41 @@ impl GameState {
                     yaw,
                     pitch,
                 );
+                // Seed the spawn velocity (present when data != 0, e.g. a thrown
+                // projectile) so the client can simulate the flight locally
+                // instead of waiting on server position packets.
+                if let Some((vx, vy, vz)) = velocity {
+                    if let Some(entity) = self.remote_entity_mut(entity_id) {
+                        entity.velocity = DVec3::new(vx, vy, vz);
+                    }
+                }
+                // Falling block (kind 70): the blockstate is packed into the
+                // data int (low 12 bits id, next 4 bits meta).
+                if kind == 70 {
+                    let id = (data & 0xfff) as u16;
+                    let meta = ((data >> 12) & 0xf) as u8;
+                    self.falling_blocks
+                        .insert(EntityId(entity_id), BlockState::new(id, meta));
+                }
+                false
+            }
+            ClientboundPlayPacket::SpawnExperienceOrb {
+                entity_id,
+                x,
+                y,
+                z,
+                count,
+            } => {
+                self.spawn_remote_entity(
+                    entity_id,
+                    EntityKind::ExperienceOrb,
+                    x,
+                    y,
+                    z,
+                    0.0,
+                    0.0,
+                );
+                self.entity_xp.insert(EntityId(entity_id), count);
                 false
             }
             ClientboundPlayPacket::EntityRelativeMove {
@@ -2861,6 +3780,8 @@ impl GameState {
                     self.world.remove_entity(id);
                     self.entity_uuids.remove(&id);
                     self.entity_items.remove(&id);
+                    self.entity_xp.remove(&id);
+                    self.falling_blocks.remove(&id);
                     self.entity_equipment.remove(&id);
                     // Drop both directions of any mount relationship.
                     self.vehicles.remove(&id);
@@ -2892,27 +3813,75 @@ impl GameState {
                 entity_id,
                 properties,
             } => {
-                // Only the local player's movement speed feeds the prediction;
+                // Only the local player's attributes feed the HUD/prediction;
                 // other entities' attributes aren't modeled.
                 if entity_id == self.player.id.0 {
                     for property in &properties {
-                        if property.key == "generic.movementSpeed" {
-                            self.walk_speed_attribute =
-                                effective_attribute_value(property, &SPRINT_SPEED_BOOST_UUID)
-                                    as f32;
+                        match property.key.as_str() {
+                            "generic.movementSpeed" => {
+                                self.walk_speed_attribute =
+                                    effective_attribute_value(property, &SPRINT_SPEED_BOOST_UUID)
+                                        as f32;
+                            }
+                            "generic.maxHealth" => {
+                                self.max_health =
+                                    effective_attribute_value(property, &[0u8; 16]) as f32;
+                            }
+                            _ => {}
                         }
                     }
                 }
                 false
             }
-            ClientboundPlayPacket::ChatMessage { json, position } => {
-                let text = chat::flatten_chat_json(&json);
-                if position == 2 {
-                    self.chat.set_action_bar(text);
-                } else {
-                    log::info!("[chat] {}", chat::strip_legacy_codes(&text));
-                    self.chat.push_message(text);
+            ClientboundPlayPacket::EntityEffect {
+                entity_id,
+                effect_id,
+                amplifier,
+                duration,
+                ..
+            } => {
+                // Track only the local player's effects (the HUD reads them for
+                // absorption hearts, the regen heartbeat and the heart tint).
+                if entity_id == self.player.id.0 {
+                    self.effects.insert(
+                        effect_id as u8,
+                        ActiveEffect {
+                            amplifier,
+                            duration,
+                        },
+                    );
                 }
+                false
+            }
+            ClientboundPlayPacket::RemoveEntityEffect {
+                entity_id,
+                effect_id,
+            } => {
+                if entity_id == self.player.id.0 {
+                    self.effects.remove(&(effect_id as u8));
+                }
+                false
+            }
+            ClientboundPlayPacket::ChatMessage { json, position } => {
+                if position == 2 {
+                    self.chat.set_action_bar(chat::flatten_chat_json(&json));
+                } else {
+                    let segments = chat::parse_chat_components(&json);
+                    let text: String = segments.iter().map(|s| s.text.as_str()).collect();
+                    log::info!("[chat] {}", chat::strip_legacy_codes(&text));
+                    self.chat.push_components(segments);
+                }
+                false
+            }
+            ClientboundPlayPacket::TabComplete { matches } => {
+                self.chat.set_completions(matches);
+                false
+            }
+            ClientboundPlayPacket::UpdateSign { x, y, z, lines } => {
+                // Store the four lines flattened from chat-JSON, keyed by block
+                // position; the sign block-entity renderer draws them in world.
+                let text = lines.map(|line| chat::flatten_chat_json(&line));
+                self.signs.insert([x, y, z], text);
                 false
             }
             ClientboundPlayPacket::ScoreboardObjective {
@@ -3013,6 +3982,24 @@ impl GameState {
                     if let Some(entity) = self.world.entity_mut(EntityId(entity_id)) {
                         entity.start_hurt();
                     }
+                    // The local player's own hurt animation also plays the hurt
+                    // sound (vanilla EntityPlayer.handleStatusUpdate → playHurtSound).
+                    // UpdateHealth covers damage that changes health, but EntityStatus
+                    // fires on every hit (incl. absorbed/blocked), so play it here too.
+                    if EntityId(entity_id) == self.player.id {
+                        // Drive the hurt-camera tilt off the authoritative local
+                        // player (its world copy isn't tick-interpolated, so its
+                        // hurt timer would never decrement).
+                        self.player.start_hurt();
+                        let pos = self.camera.position;
+                        self.queue_sound("game.player.hurt", pos, 1.0, 1.0);
+                    }
+                }
+                // Status 3 (death): start the fall-over + red-corpse animation.
+                if status == 3 {
+                    if let Some(entity) = self.world.entity_mut(EntityId(entity_id)) {
+                        entity.start_death();
+                    }
                 }
                 false
             }
@@ -3045,6 +4032,79 @@ impl GameState {
                 false
             }
             ClientboundPlayPacket::CollectItem { .. } => false,
+            ClientboundPlayPacket::SoundEffect {
+                name,
+                x,
+                y,
+                z,
+                volume,
+                pitch,
+            } => {
+                let pos = Vec3::new(x as f32, y as f32, z as f32);
+                let rate = pitch as f32 / 63.5;
+                self.queue_sound(name, pos, volume, rate);
+                false
+            }
+            ClientboundPlayPacket::Effect {
+                effect_id,
+                x,
+                y,
+                z,
+                data,
+                ..
+            } => {
+                if let Some(event) = effect_event(effect_id, data) {
+                    let pos = Vec3::new(x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5);
+                    self.queue_sound(event, pos, 1.0, 1.0);
+                }
+                false
+            }
+            ClientboundPlayPacket::BlockAction {
+                x,
+                y,
+                z,
+                action_id,
+                action_param,
+                block_type,
+            } => {
+                // Note block (block id 25): play the pitched note and puff a
+                // coloured NOTE particle. Chest/piston actions (other block
+                // types) carry no client-side sound/particle here and are
+                // ignored (T17 will extend this).
+                if block_type == 25 {
+                    let note = action_param.min(24);
+                    let pitch = 2.0_f32.powf((note as f32 - 12.0) / 12.0);
+                    let instrument = NOTE_INSTRUMENTS
+                        .get(action_id as usize)
+                        .copied()
+                        .unwrap_or("harp");
+                    let center = Vec3::new(x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5);
+                    self.queue_sound(format!("note.{instrument}"), center, 3.0, pitch);
+                    // The NOTE branch reads the rainbow colour from offset.x.
+                    let above = Vec3::new(x as f32 + 0.5, y as f32 + 1.2, z as f32 + 0.5);
+                    self.particles
+                        .spawn(23, above, Vec3::new(note as f32 / 24.0, 0.0, 0.0), 0.0, 1, &[]);
+                } else if matches!(block_type, 54 | 130 | 146) && action_id == 1 {
+                    // Chest/ender/trapped lid: action_param is the viewer count.
+                    // Drive the lid-open target and play the open/close sound on
+                    // the 0↔viewers transition (vanilla random.chestopen/closed).
+                    let pos = [x, y, z];
+                    let was_open = self.chest_open_targets.get(&pos).copied().unwrap_or(0.0) > 0.0;
+                    let now_open = action_param > 0;
+                    if now_open {
+                        self.chest_open_targets.insert(pos, 1.0);
+                        self.chest_lid_angles.entry(pos).or_insert(0.0);
+                    } else {
+                        self.chest_open_targets.insert(pos, 0.0);
+                    }
+                    if now_open != was_open {
+                        let center = Vec3::new(x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5);
+                        let event = if now_open { "random.chestopen" } else { "random.chestclosed" };
+                        self.queue_sound(event.to_string(), center, 0.5, 1.0);
+                    }
+                }
+                false
+            }
             // ConfirmTransaction is ponged on the network thread (vanilla replies
             // immediately), so the game loop never needs to act on it.
             ClientboundPlayPacket::KeepAlive { .. }
@@ -3099,12 +4159,14 @@ impl GameState {
                 (0, MetadataValue::Byte(flags)) => {
                     let on_fire = flags & 0x01 != 0;
                     let sneaking = flags & 0x02 != 0;
+                    let using_item = flags & 0x10 != 0;
                     let invisible = flags & 0x20 != 0;
                     if entity_id == self.player.id.0 {
                         self.player.on_fire = on_fire;
                     }
                     if let Some(entity) = self.remote_entity_mut(entity_id) {
                         entity.sneaking = sneaking;
+                        entity.using_item = using_item;
                         entity.on_fire = on_fire;
                         entity.invisible = invisible;
                     }
@@ -3117,6 +4179,18 @@ impl GameState {
                 (3, MetadataValue::Byte(visible)) => {
                     if let Some(entity) = self.remote_entity_mut(entity_id) {
                         entity.custom_name_visible = *visible != 0;
+                    }
+                }
+                (6, MetadataValue::Float(health)) => {
+                    // Living-entity health (drives the client-derived boss bar).
+                    // Health reaching 0 is the other death signal besides
+                    // EntityStatus 3 (some servers only send one), so kick off the
+                    // death animation here too — `start_death` is idempotent.
+                    if let Some(entity) = self.remote_entity_mut(entity_id) {
+                        entity.health = Some(*health);
+                        if *health <= 0.0 {
+                            entity.start_death();
+                        }
                     }
                 }
                 (10, MetadataValue::Slot(Some(item))) => {
@@ -3145,15 +4219,39 @@ impl GameState {
         }
     }
 
-    /// Drain up to `max` dirty sections, nearest to the player first, leaving the
+    /// Drain this frame's dirty sections: every GPU-mesh removal (unloaded
+    /// column) plus up to `max` real (re)mesh sections nearest the player, the
     /// rest queued for following frames. Bounds the per-frame mesh-rebuild cost
-    /// so a join-time burst of chunks doesn't stall rendering.
+    /// so a join-time burst of chunks doesn't stall rendering, while never
+    /// deferring removals (which would leak their GPU mesh while exploring).
     pub fn take_dirty_chunks_budget(&mut self, max: usize) -> Vec<SectionPos> {
-        if max == 0 || self.dirty_chunks.is_empty() {
+        if self.dirty_chunks.is_empty() {
             return Vec::new();
         }
+        // Sections whose column is no longer loaded are GPU-mesh *removals*: the
+        // server unloaded the chunk and `world` already dropped it, so applying
+        // one only frees a buffer slot (no meshing). They sit at the far edge of
+        // view, so the nearest-first budget below would starve them during
+        // sustained exploration — the GPU mesh leaks until the player stops and
+        // the dirty set finally drains, which is the out-of-memory path. Drain
+        // every removal each frame; spend `max` only on real (re)mesh work.
+        let removals: Vec<SectionPos> = self
+            .dirty_chunks
+            .iter()
+            .copied()
+            .filter(|p| self.world.chunk(p.chunk()).is_none())
+            .collect();
+        for p in &removals {
+            self.dirty_chunks.remove(p);
+        }
+        let mut out = removals;
+
+        if max == 0 || self.dirty_chunks.is_empty() {
+            return out;
+        }
         if self.dirty_chunks.len() <= max {
-            return self.dirty_chunks.drain().collect();
+            out.extend(self.dirty_chunks.drain());
+            return out;
         }
         let pcx = (self.player.position.x.floor() as i32).div_euclid(16);
         let pcy = (self.player.position.y.floor() as i32).div_euclid(16);
@@ -3169,7 +4267,66 @@ impl GameState {
         for p in &all {
             self.dirty_chunks.remove(p);
         }
-        all
+        out.extend(all);
+        out
+    }
+
+    /// Render-distance safety net: bound resident GPU mesh memory to the client's
+    /// view, independent of whether the server ever unloads. Columns that drift
+    /// beyond `render_distance + RESIDENCY_MARGIN` (Chebyshev, chunks) have their
+    /// GPU meshes dropped — their block data stays in `world`, so re-entering the
+    /// area re-meshes without a server round-trip and never shows a hole. Columns
+    /// that come back into range are re-queued for meshing through the normal
+    /// dirty budget. Runs only when the player crosses a chunk boundary. Returns
+    /// the sections whose GPU mesh the caller should free.
+    pub fn enforce_render_distance(&mut self, render_distance: u32) -> Vec<SectionPos> {
+        let cx = (self.player.position.x.floor() as i32).div_euclid(16);
+        let cz = (self.player.position.z.floor() as i32).div_euclid(16);
+        let here = ChunkPos::new(cx, cz);
+        if self.last_residency_chunk == Some(here) {
+            return Vec::new();
+        }
+        self.last_residency_chunk = Some(here);
+        let keep = render_distance as i32 + RESIDENCY_MARGIN;
+        let chebyshev = |c: ChunkPos| (c.x - cx).abs().max((c.z - cz).abs());
+
+        // Previously-evicted columns that returned to range (re-mesh) or that the
+        // server has since unloaded (just forget them).
+        let returning: Vec<ChunkPos> = self
+            .evicted_columns
+            .iter()
+            .copied()
+            .filter(|&c| chebyshev(c) <= keep || self.world.chunk(c).is_none())
+            .collect();
+        for c in returning {
+            self.evicted_columns.remove(&c);
+            if let Some(chunk) = self.world.chunk(c) {
+                if chebyshev(c) <= keep {
+                    let ys: Vec<i32> = chunk.sections().map(|s| s.y()).collect();
+                    for y in ys {
+                        self.dirty_chunks.insert(SectionPos::new(c.x, y, c.z));
+                    }
+                }
+            }
+        }
+
+        // Drop the GPU meshes of in-world columns that drifted out of range.
+        let mut removals = Vec::new();
+        let to_evict: Vec<ChunkPos> = self
+            .world
+            .chunks()
+            .map(|chunk| chunk.position)
+            .filter(|&c| chebyshev(c) > keep && !self.evicted_columns.contains(&c))
+            .collect();
+        for c in to_evict {
+            self.evicted_columns.insert(c);
+            for y in 0..16 {
+                removals.push(SectionPos::new(c.x, y, c.z));
+            }
+            // Cancel any queued (re)mesh work for a column we're dropping.
+            self.dirty_chunks.retain(|s| s.x != c.x || s.z != c.z);
+        }
+        removals
     }
 
     /// Mark every loaded section dirty so the whole world re-meshes — used when a
@@ -3362,6 +4519,122 @@ fn to_render_vec3(position: DVec3) -> Vec3 {
     Vec3::new(position.x as f32, position.y as f32, position.z as f32)
 }
 
+/// Map a hardcoded S28 Effect id (and its blockstate `data` for 2001) to a
+/// `sounds.json` event, for the handful of common effects worth playing. `None`
+/// for the many particle-only / unsupported effects.
+/// Note-block instrument sound suffixes by S24 BlockAction `action_id`
+/// (vanilla `BlockNote` order). The block under the note block selects this:
+/// 0 harp, 1 bass drum, 2 snare, 3 click/hat, 4 bass attack.
+const NOTE_INSTRUMENTS: [&str; 5] = ["harp", "bd", "snare", "hat", "bassattack"];
+
+/// The `experience_orb.png` sprite cell for an orb worth `xp` experience
+/// (vanilla `RenderXPOrb.getTextureByXP`): higher-value orbs use larger,
+/// brighter cells. The sheet is 16px cells, 4 per row.
+fn xp_orb_texture_cell(xp: i16) -> u32 {
+    match xp {
+        x if x >= 2477 => 10,
+        x if x >= 1237 => 9,
+        x if x >= 617 => 8,
+        x if x >= 307 => 7,
+        x if x >= 149 => 6,
+        x if x >= 73 => 5,
+        x if x >= 37 => 4,
+        x if x >= 17 => 3,
+        x if x >= 7 => 2,
+        x if x >= 3 => 1,
+        _ => 0,
+    }
+}
+
+/// Corner UVs into the 64×64 `experience_orb.png` for sprite `cell` (16px cells,
+/// 4 per row), in the `ParticleBillboard` corner order: bottom-right, top-right,
+/// top-left, bottom-left.
+fn xp_orb_cell_uv(cell: u32) -> [[f32; 2]; 4] {
+    let col = (cell % 4) as f32;
+    let row = (cell / 4) as f32;
+    let u0 = col * 16.0 / 64.0;
+    let u1 = u0 + 16.0 / 64.0;
+    let v0 = row * 16.0 / 64.0;
+    let v1 = v0 + 16.0 / 64.0;
+    [[u1, v1], [u1, v0], [u0, v0], [u0, v1]]
+}
+
+/// Vanilla flight physics for a locally-simulated SpawnObject `kind`, as
+/// `(gravity, drag, collides)`: the per-tick downward pull, the air-resistance
+/// multiplier and whether a block hit sticks it. `None` for kinds that aren't
+/// simulated client-side (self-propelled fireballs/fireworks, the eye of ender,
+/// the fishing bobber — left on server interpolation).
+///
+/// Throwables share `EntityThrowable` (drag 0.99): snowball/egg/ender pearl/
+/// potion fall at 0.03, the thrown exp bottle at 0.07. Arrows fall at 0.05 and
+/// stick into blocks.
+fn projectile_physics(kind: u8) -> Option<(f64, f64, bool)> {
+    Some(match kind {
+        60 => (0.05, 0.99, true),           // arrow
+        61 | 62 | 65 | 73 => (0.03, 0.99, false), // snowball / egg / ender pearl / potion
+        75 => (0.07, 0.99, false),          // bottle o' enchanting
+        _ => return None,
+    })
+}
+
+/// The item id whose sprite stands in for a SpawnObject projectile `kind`
+/// (vanilla projectile render textures), or `None` for kinds rendered
+/// elsewhere or not handled. The arrow (60) is drawn as a 3D model, not a sprite.
+fn projectile_item_id(kind: u8) -> Option<i16> {
+    Some(match kind {
+        // Arrow (60) is drawn as a 3D model in the entity model pass, not a sprite.
+        61 => 332, // snowball
+        62 => 344, // egg
+        64 => 385, // small fireball / fire charge
+        65 => 368, // ender pearl
+        72 => 381, // eye of ender
+        73 => 373, // splash potion
+        75 => 384, // bottle o' enchanting
+        76 => 401, // firework rocket
+        _ => return None,
+    })
+}
+
+fn effect_event(effect_id: i32, data: i32) -> Option<String> {
+    Some(
+        match effect_id {
+            1000 => "random.click",
+            1001 => "random.click",
+            1002 => "random.bow",
+            1003 => "random.door_open",
+            1006 => "random.door_open", // wooden door toggle
+            1004 => "random.fizz",
+            1009 => "random.fizz", // fire extinguish
+            // 2001: block break — the low byte of `data` is the broken block id.
+            2001 => return Some(dig_sound_for_block((data & 0xff) as u16)),
+            _ => return None,
+        }
+        .to_string(),
+    )
+}
+
+/// Vanilla `Block.stepSound` → the `dig.<material>` event for a block id. Only
+/// the common materials are mapped; anything else falls back to `dig.stone`.
+fn dig_sound_for_block(id: u16) -> String {
+    let material = match id {
+        // wood: planks, logs, fences, doors, stairs, chests, crafting table…
+        5 | 17 | 47 | 53 | 54 | 58 | 63 | 64 | 65 | 85 | 96 | 107 | 134 | 135 | 136 | 146 | 162
+        | 163 | 164 | 183..=187 => "wood",
+        // gravel
+        13 => "gravel",
+        // sand
+        12 | 24 => "sand",
+        // grass / dirt / farmland / leaves / mycelium
+        2 | 3 | 18 | 31 | 60 | 110 | 161 => "grass",
+        // glass / glowstone / ice
+        20 | 79 | 89 | 95 | 102 => "glass",
+        // wool / carpet
+        35 | 171 => "cloth",
+        _ => "stone",
+    };
+    format!("dig.{material}")
+}
+
 /// Flat world-light factor (0..1) at a world position: vanilla lightmap combine
 /// (day/night-scaled skylight vs. block light) with a small floor, run through
 /// the same brightness-gamma the chunk shader uses. Keeps models in step with
@@ -3393,28 +4666,125 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
 }
 
-/// Number of 20 Hz ticks to break a block by hand in survival, matching vanilla's
-/// `Block.getPlayerRelativeBlockHardness`. Returns INFINITY for unbreakable blocks.
-///
-/// Per-tick damage = digSpeed / hardness / divisor, where digSpeed = 1 (bare hand,
-/// standing) and divisor = 30 if the block is hand-harvestable or 100 if it needs a
-/// tool (stone/ore/metal take 5x longer by hand). Ticks = ceil(1 / damage). The
-/// server (Grim FastBreak) predicts exactly this, so an under-estimate breaks "too
-/// fast" and flags; matching it keeps breaking legal.
-fn block_break_ticks(block: BlockState) -> f32 {
-    let hardness = block_hardness(block.id);
-    if hardness < 0.0 {
-        return f32::INFINITY; // unbreakable (bedrock, etc.)
+/// The five 1.8 tool item classes that affect mining.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolClass {
+    Pickaxe,
+    Axe,
+    Shovel,
+    Sword,
+    Shears,
+}
+
+/// Vanilla tool item id → (class, `efficiencyOnProperMaterial`, harvest level).
+/// Efficiency by tier: wood 2, stone 4, iron 6, diamond 8, gold 12; harvest level
+/// wood/gold 0, stone 1, iron 2, diamond 3. Swords/shears use a special speed
+/// curve (see [`tool_strength`]); the efficiency here is unused for them.
+fn tool_props(id: i16) -> Option<(ToolClass, f32, u8)> {
+    use ToolClass::*;
+    Some(match id {
+        269 => (Shovel, 2.0, 0),
+        270 => (Pickaxe, 2.0, 0),
+        271 => (Axe, 2.0, 0),
+        268 => (Sword, 2.0, 0),
+        273 => (Shovel, 4.0, 1),
+        274 => (Pickaxe, 4.0, 1),
+        275 => (Axe, 4.0, 1),
+        272 => (Sword, 4.0, 1),
+        256 => (Shovel, 6.0, 2),
+        257 => (Pickaxe, 6.0, 2),
+        258 => (Axe, 6.0, 2),
+        267 => (Sword, 6.0, 2),
+        277 => (Shovel, 8.0, 3),
+        278 => (Pickaxe, 8.0, 3),
+        279 => (Axe, 8.0, 3),
+        276 => (Sword, 8.0, 3),
+        284 => (Shovel, 12.0, 0),
+        285 => (Pickaxe, 12.0, 0),
+        286 => (Axe, 12.0, 0),
+        283 => (Sword, 12.0, 0),
+        359 => (Shears, 1.0, 0),
+        _ => return None,
+    })
+}
+
+/// The tool class that speeds up a block (vanilla `ItemTool.getStrVsBlock`'s
+/// material/effective-block check), or `None` if no held tool is effective.
+/// Grouped by the block's 1.8 material: pickaxe for rock/ore/metal, shovel for
+/// soft ground, axe for wood. Swords/shears/web are handled in [`tool_strength`].
+fn block_tool_class(id: u16) -> Option<ToolClass> {
+    use ToolClass::*;
+    // Only confident rock/wood/ground material matches are listed — over-claiming
+    // would make the client predict a faster break than the server (an anticheat
+    // flag), so unsure blocks fall through to None (bare-hand speed, which is safe).
+    match id {
+        // Rock / ore / metal — pickaxe.
+        1 | 4 | 14 | 15 | 16 | 21 | 22 | 23 | 24 | 41 | 42 | 43 | 44 | 45 | 48 | 49 | 52 | 56 | 57
+        | 61 | 62 | 67 | 70 | 73 | 74 | 77 | 79 | 87 | 98 | 101 | 108 | 109 | 112 | 113 | 114 | 116
+        | 118 | 121 | 129 | 130 | 133 | 139 | 145 | 152 | 153 | 155 | 156 | 158 | 159 | 168 | 172
+        | 173 | 174 | 179 | 180 | 181 | 182 => Some(Pickaxe),
+        27 | 28 | 66 | 157 => Some(Pickaxe), // rails
+        // Soft ground — shovel.
+        2 | 3 | 12 | 13 | 60 | 78 | 80 | 82 | 88 | 110 => Some(Shovel),
+        // Wood / plant / vine — axe (planks, logs, bookshelf, chest, crafting
+        // table, jukebox, note block, pumpkin, melon, ladder, signs, fences/
+        // gates, doors, trapdoor, daylight sensor, vines).
+        5 | 17 | 25 | 47 | 53 | 54 | 58 | 63 | 64 | 65 | 68 | 84 | 85 | 86 | 91 | 96 | 103 | 106
+        | 107 | 125 | 126 | 134 | 135 | 136 | 146 | 151 | 162 | 163 | 164 | 183..=197 => Some(Axe),
+        _ => None,
     }
-    if hardness == 0.0 {
-        return 1.0; // instant-break blocks (plants, snow layer) finish in one tick
+}
+
+/// Minimum harvest level a pickaxe must have to harvest a tool-required block
+/// (vanilla `setHarvestLevel`): 1 = stone, 2 = iron, 3 = diamond; default 0
+/// (wood/gold suffices). Only consulted for [`block_needs_tool`] blocks.
+fn block_harvest_level(id: u16) -> u8 {
+    match id {
+        49 => 3,                                         // obsidian → diamond
+        14 | 41 | 56 | 57 | 73 | 74 | 129 | 133 | 152 => 2, // gold/diamond/redstone/emerald ore + their blocks
+        15 | 21 | 22 | 42 => 1,                          // iron/lapis ore, lapis & iron blocks → stone
+        _ => 0,
     }
-    let divisor = if block_needs_tool(block.id) {
-        100.0
-    } else {
-        30.0
+}
+
+/// Efficiency-enchant level on a stack (enchant id 32 in the `ench` NBT list),
+/// or 0 when absent.
+fn efficiency_level(item: &SlotItem) -> i32 {
+    let Some(nbt) = item.nbt.as_ref() else {
+        return 0;
     };
-    (hardness * divisor).ceil().max(1.0)
+    let Some(ench) = nbt.get("ench").and_then(|t| t.as_list()) else {
+        return 0;
+    };
+    for entry in ench {
+        if let Some(c) = entry.as_compound() {
+            if c.get("id").and_then(|t| t.as_short()) == Some(32) {
+                return c.get("lvl").and_then(|t| t.as_short()).unwrap_or(0) as i32;
+            }
+        }
+    }
+    0
+}
+
+/// Vanilla `ItemStack.getStrVsBlock`: the held tool's raw speed multiplier
+/// against `block` before enchants/potions. Pickaxe/axe/shovel give their tier
+/// efficiency on an effective block (else 1); a sword is 15× on cobweb and 1.5×
+/// elsewhere; shears are 15× on cobweb/leaves, 5× on wool, 1× otherwise.
+fn tool_strength(item: &SlotItem, block: BlockState) -> f32 {
+    if is_sword(item.id) {
+        return if block.id == 30 { 15.0 } else { 1.5 };
+    }
+    if item.id == 359 {
+        return match block.id {
+            30 | 18 | 161 => 15.0, // cobweb, leaves, leaves2
+            35 => 5.0,             // wool
+            _ => 1.0,
+        };
+    }
+    match tool_props(item.id) {
+        Some((class, efficiency, _)) if block_tool_class(block.id) == Some(class) => efficiency,
+        _ => 1.0,
+    }
 }
 
 /// Whether the block requires a tool to harvest at full speed (vanilla material
@@ -3451,28 +4821,48 @@ fn block_needs_tool(id: u16) -> bool {
     )
 }
 
-/// Block hardness in vanilla units; negative means unbreakable.
+/// Block hardness in vanilla 1.8.9 units; negative means unbreakable. The full
+/// table, copied from `references/minecraft-data` (pc/1.8 blocks.json) so mining
+/// time matches vanilla for every block id. Not-diggable blocks (bedrock, the
+/// portals, barrier, the moving-piston block, command block, fluids) map to
+/// -1.0 (unbreakable); 0.0 is an instant break.
 fn block_hardness(id: u16) -> f32 {
     match id {
-        7 | 119 | 120 => -1.0,      // bedrock, end portal frame
-        49 => 50.0,                 // obsidian
-        42 | 57 | 133 | 152 => 5.0, // iron / diamond / emerald / redstone block
-        61 | 62 => 3.5,             // furnace
-        // Ores and gold/lapis blocks (need a pickaxe).
-        14 | 15 | 16 | 21 | 22 | 41 | 56 | 73 | 74 | 129 => 3.0,
-        58 => 2.5, // crafting table
-        // Cobblestone, planks, logs, brick, slabs, mossy cobble, nether brick.
-        4 | 5 | 17 | 43 | 44 | 45 | 48 | 53 | 85 | 112 | 162 => 2.0,
-        // Stone, stone bricks, bookshelf.
-        1 | 47 | 98 => 1.5,
-        24 | 35 => 0.8,                // sandstone, wool
-        2 | 13 | 60 | 82 | 110 => 0.6, // grass, gravel, farmland, clay, mycelium
-        3 | 12 | 79 => 0.5,            // dirt, sand, ice
-        87 => 0.4,                     // netherrack
-        18 | 161 => 0.2,               // leaves
-        20 | 89 | 95 | 102 => 0.3,     // glass, glowstone, stained glass, glass pane
-        // Instant-break: saplings, plants, snow layer, flowers.
-        6 | 31 | 32 | 37 | 38 | 78 => 0.0,
+        49 => 50.0,  // obsidian
+        130 => 22.5, // ender chest
+        // mob spawner, iron/diamond/emerald/redstone blocks, anvil, beacon,
+        // brewing stand, enchanting table, dropper.
+        42 | 52 | 57 | 71 | 101 | 116 | 133 | 145 | 152 | 167 | 173 => 5.0,
+        30 => 4.0,                 // cobweb
+        23 | 61 | 62 | 158 => 3.5, // dispenser, furnaces, dropper
+        // ores, gold/lapis blocks, skull bases, mossy/cracked brick, jukebox,
+        // redstone lamp, hopper, sea lantern, wooden doors.
+        14 | 15 | 16 | 21 | 22 | 41 | 56 | 64 | 73 | 74 | 96 | 121 | 122 | 129
+        | 138 | 153 | 154 | 193 | 194 | 195 | 196 | 197 => 3.0,
+        54 | 58 | 146 => 2.5, // chest, crafting table, trapped chest
+        // cobblestone, planks, logs, brick, slabs, stairs, fences, walls, pistons…
+        4 | 5 | 17 | 43 | 44 | 45 | 48 | 53 | 67 | 84 | 85 | 107 | 108 | 112 | 113
+        | 114 | 118 | 125 | 126 | 134 | 135 | 136 | 139 | 162 | 163 | 164 | 181
+        | 182 | 183 | 184 | 185 | 186 | 187 | 188 | 189 | 190 | 191 | 192 => 2.0,
+        1 | 47 | 98 | 109 | 168 => 1.5, // stone, bookshelf, stone bricks, prismarine
+        159 | 172 => 1.25,              // stained / plain hardened clay
+        63 | 68 | 86 | 91 | 103 | 144 | 176 | 177 => 1.0, // signs, pumpkins, melon, skull, banners
+        24 | 25 | 35 | 128 | 155 | 156 | 179 | 180 => 0.8, // sandstone, note block, wool, quartz, red sandstone
+        97 => 0.75,                // monster egg
+        27 | 28 | 66 | 157 => 0.7, // rails
+        2 | 13 | 19 | 60 | 82 | 110 | 111 => 0.6, // grass, gravel, sponge, farmland, clay, mycelium, lily
+        3 | 12 | 29 | 33 | 34 | 69 | 70 | 72 | 77 | 79 | 88 | 92 | 117 | 143 | 147
+        | 148 | 170 | 174 => 0.5, // dirt, sand, pistons, lever, plates, ice, soul sand, cake, hay…
+        65 | 81 | 87 => 0.4,       // ladder, cactus, netherrack
+        20 | 89 | 95 | 102 | 123 | 124 | 160 | 169 => 0.3, // glass, glowstone, stained glass/pane, redstone lamp
+        18 | 26 | 78 | 80 | 106 | 127 | 151 | 161 | 178 => 0.2, // leaves, bed, snow, vine, cocoa, daylight sensor
+        171 => 0.1, // carpet
+        // Instant-break: plants, crops, torches, redstone, flowers, tnt, fire…
+        6 | 31 | 32 | 37 | 38 | 39 | 40 | 46 | 50 | 51 | 55 | 59 | 75 | 76 | 83
+        | 93 | 94 | 99 | 100 | 104 | 105 | 115 | 131 | 132 | 140 | 141 | 142 | 149
+        | 150 | 165 | 175 => 0.0,
+        // Unbreakable / not diggable.
+        7 | 8 | 9 | 10 | 11 | 36 | 90 | 119 | 120 | 137 | 166 => -1.0,
         _ => 1.0,
     }
 }
@@ -3512,10 +4902,12 @@ struct EntityHit {
     origin: DVec3,
 }
 
-/// Targetable = a non-air block that has a selection/collision box (excludes
-/// air and fluids; includes leaves and glass).
+/// Targetable = any non-air, non-fluid block. Vanilla ray-picks every block with
+/// a selection box, which is all of them except air; torches, plants, rails and
+/// the other no-collision blocks have selection boxes too, so they break like the
+/// rest. Fluids stay non-pickable (a normal trace doesn't stop on liquid).
 fn is_pickable(block: BlockState) -> bool {
-    !block.is_air() && (block.is_solid_collision() || block.is_opaque_cube())
+    !block.is_air() && !block.is_liquid()
 }
 
 /// The neighbour cell a placement lands in, for a clicked face (vanilla
@@ -4108,6 +5500,201 @@ mod interaction_tests {
     use super::*;
     use recraft_core::{BlockState, EntityId, EntityKind};
 
+    #[test]
+    fn death_roll_follows_the_vanilla_fall_over_curve() {
+        let quarter = 90.0_f32.to_radians();
+        // Alive (deathTime 0) → upright, no matter the partial tick.
+        assert_eq!(death_roll_radians(0, 0.0), 0.0);
+        assert_eq!(death_roll_radians(0, 0.5), 0.0);
+        // First death tick starts at 0 and grows monotonically.
+        assert_eq!(death_roll_radians(1, 0.0), 0.0);
+        assert!(death_roll_radians(5, 0.0) > 0.0);
+        assert!(death_roll_radians(10, 0.0) > death_roll_radians(5, 0.0));
+        // sqrt arg hits 1 once (deathTime-1)/20*1.6 ≥ 1, i.e. deathTime ≥ 13.5,
+        // so by tick 14 the body is fully on its side (90°) and stays clamped.
+        assert!((death_roll_radians(14, 0.0) - quarter).abs() < 1e-6);
+        assert!((death_roll_radians(20, 0.0) - quarter).abs() < 1e-6);
+    }
+
+    #[test]
+    fn hurt_camera_roll_matches_the_vanilla_curve() {
+        // No hurt → no roll; an expired/zero timer → no roll.
+        assert_eq!(hurt_camera_roll(0, 0.0), 0.0);
+        assert_eq!(hurt_camera_roll(0, 0.5), 0.0);
+        // At the instant of the hit (timer just set to 10, no partial) f/maxHurt
+        // is 1.0 → sin(π) = 0, so the tilt starts at ~0 then grows.
+        assert!(hurt_camera_roll(10, 0.0).abs() < 1.0e-4);
+        // Mid-fade the view is tilted; the magnitude never exceeds 14°.
+        let mid = hurt_camera_roll(8, 0.0);
+        assert!(mid < 0.0, "tilt rolls one way (negative, like vanilla)");
+        for t in 0..=10u8 {
+            assert!(hurt_camera_roll(t, 0.0).abs() <= 14.0_f32.to_radians() + 1.0e-6);
+        }
+    }
+
+    #[test]
+    fn dirty_budget_never_starves_chunk_removals() {
+        let mut gs = GameState::empty_for_server(1.0);
+        gs.player.position = DVec3::new(0.0, 64.0, 0.0); // chunk (0,0)
+        gs.world.set_block(5, 64, 7, BlockState::STONE); // loads chunk (0,0)
+
+        // A near remesh (loaded column) and a far removal (the server unloaded
+        // chunk (50,50), so its column is gone). With max=1 the nearest-first
+        // budget would, before the fix, spend its one slot on the near remesh
+        // and leave the far removal queued — its GPU mesh would leak.
+        let near = SectionPos::new(0, 4, 0);
+        let far_removal = SectionPos::new(50, 4, 50);
+        gs.dirty_chunks.insert(near);
+        gs.dirty_chunks.insert(far_removal);
+
+        let taken = gs.take_dirty_chunks_budget(1);
+        assert!(
+            taken.contains(&far_removal),
+            "removal must be drained regardless of the nearest-first budget"
+        );
+        assert!(taken.contains(&near), "the budget should still take the near remesh");
+        assert!(gs.dirty_chunks.is_empty(), "nothing left queued");
+    }
+
+    #[test]
+    fn render_distance_evicts_far_chunks_keeps_data_and_remeshes_on_return() {
+        let mut gs = GameState::empty_for_server(1.0);
+        gs.world.set_block(5, 64, 5, BlockState::STONE); // chunk (0,0)
+        gs.world.set_block(20 * 16 + 5, 64, 5, BlockState::STONE); // chunk (20,0)
+
+        // Player in chunk (0,0), render distance 4 → keep radius 4 + 2 = 6.
+        gs.player.position = DVec3::new(0.5, 64.0, 0.5);
+        gs.dirty_chunks.clear();
+        let removals = gs.enforce_render_distance(4);
+
+        // The far column is dropped (all 16 sections), the near one kept.
+        let far = ChunkPos::new(20, 0);
+        assert_eq!(removals.iter().filter(|s| s.x == 20 && s.z == 0).count(), 16);
+        assert!(!removals.iter().any(|s| s.x == 0 && s.z == 0));
+        assert!(gs.evicted_columns.contains(&far));
+        // Block data stays in the world, so returning never shows a hole.
+        assert!(gs.world.chunk(far).is_some());
+
+        // Standing still (same chunk) is a no-op.
+        assert!(gs.enforce_render_distance(4).is_empty());
+
+        // Walk to the far column: it returns to range (re-queued for meshing),
+        // and the origin column is now the one evicted.
+        gs.player.position = DVec3::new(20.0 * 16.0 + 0.5, 64.0, 0.5);
+        gs.dirty_chunks.clear();
+        let removals = gs.enforce_render_distance(4);
+        assert!(!gs.evicted_columns.contains(&far));
+        assert!(gs.dirty_chunks.iter().any(|s| s.x == 20 && s.z == 0));
+        assert!(removals.iter().any(|s| s.x == 0 && s.z == 0));
+        assert!(gs.evicted_columns.contains(&ChunkPos::new(0, 0)));
+    }
+
+    #[test]
+    fn pickaxe_mines_stone_far_faster_than_bare_hand() {
+        let mut gs = GameState::empty_for_server(1.0);
+        gs.player.on_ground = true;
+        let stone = BlockState::new(1, 0);
+        // Bare hand on stone: needs a tool → divisor 100, speed 1 → 1.5·100 = 150.
+        assert_eq!(gs.block_break_ticks(stone), 150.0);
+        // Diamond pickaxe (eff 8), harvestable → divisor 30 → ceil(1.5·30/8) = 6.
+        gs.inventory[36] = Some(SlotItem::new(278, 1, 0));
+        assert_eq!(gs.block_break_ticks(stone), 6.0);
+        // Wooden pickaxe (eff 2) → ceil(1.5·30/2) = 23.
+        gs.inventory[36] = Some(SlotItem::new(270, 1, 0));
+        assert_eq!(gs.block_break_ticks(stone), 23.0);
+    }
+
+    #[test]
+    fn obsidian_needs_a_diamond_pickaxe_to_harvest() {
+        let mut gs = GameState::empty_for_server(1.0);
+        gs.player.on_ground = true;
+        let obsidian = BlockState::new(49, 0); // hardness 50, harvest level 3
+        // Stone pickaxe (tier 1 < 3): can't harvest → divisor 100, speed 4 → 1250.
+        gs.inventory[36] = Some(SlotItem::new(274, 1, 0));
+        assert_eq!(gs.block_break_ticks(obsidian), 1250.0);
+        // Diamond pickaxe (tier 3): harvestable → divisor 30, speed 8 → ceil(187.5)=188.
+        gs.inventory[36] = Some(SlotItem::new(278, 1, 0));
+        assert_eq!(gs.block_break_ticks(obsidian), 188.0);
+    }
+
+    #[test]
+    fn haste_and_air_penalty_scale_the_dig_speed() {
+        let mut gs = GameState::empty_for_server(1.0);
+        let stone = BlockState::new(1, 0);
+        gs.inventory[36] = Some(SlotItem::new(278, 1, 0)); // diamond pickaxe
+        gs.player.on_ground = true;
+        assert_eq!(gs.block_break_ticks(stone), 6.0);
+        // Haste I: speed ×1.2 → ceil(1.5·30/9.6) = 5.
+        gs.effects.insert(3, ActiveEffect { amplifier: 0, duration: 0 });
+        assert_eq!(gs.block_break_ticks(stone), 5.0);
+        // Mining in the air divides speed by 5 (vanilla !onGround): 8/5 = 1.6 → ceil(28.125)=29.
+        gs.effects.clear();
+        gs.player.on_ground = false;
+        assert_eq!(gs.block_break_ticks(stone), 29.0);
+    }
+
+    #[test]
+    fn shovel_and_sword_have_their_own_speed_curves() {
+        let mut gs = GameState::empty_for_server(1.0);
+        gs.player.on_ground = true;
+        // Diamond shovel on dirt (hand-harvestable, hardness 0.5): eff 8, /30 → ceil(1.875)=2.
+        let dirt = BlockState::new(3, 0);
+        gs.inventory[36] = Some(SlotItem::new(277, 1, 0));
+        assert_eq!(gs.block_break_ticks(dirt), 2.0);
+        // A pickaxe is NOT effective on dirt → speed 1 → ceil(0.5·30)=15.
+        gs.inventory[36] = Some(SlotItem::new(278, 1, 0));
+        assert_eq!(gs.block_break_ticks(dirt), 15.0);
+        // Sword shreds cobweb (15×); web hardness 4, hand-harvestable → ceil(4·30/15)=8.
+        let web = BlockState::new(30, 0);
+        gs.inventory[36] = Some(SlotItem::new(276, 1, 0));
+        assert_eq!(gs.block_break_ticks(web), 8.0);
+    }
+
+    #[test]
+    fn block_hardness_matches_vanilla_across_the_tiers() {
+        // Spot-check the full 1.8.9 hardness table (copied from minecraft-data)
+        // against known vanilla values, one per tier, to guard the big match.
+        for (id, expected) in [
+            (49u16, 50.0f32), // obsidian
+            (130, 22.5),      // ender chest
+            (52, 5.0),        // mob spawner
+            (30, 4.0),        // cobweb
+            (61, 3.5),        // furnace
+            (14, 3.0),        // coal ore
+            (54, 2.5),        // chest
+            (4, 2.0),         // cobblestone
+            (1, 1.5),         // stone
+            (159, 1.25),      // stained hardened clay
+            (63, 1.0),        // standing sign
+            (35, 0.8),        // wool
+            (97, 0.75),       // monster egg
+            (27, 0.7),        // golden rail
+            (2, 0.6),         // grass
+            (3, 0.5),         // dirt
+            (87, 0.4),        // netherrack
+            (20, 0.3),        // glass
+            (18, 0.2),        // leaves
+            (171, 0.1),       // carpet
+            (31, 0.0),        // tall grass (instant)
+            (46, 0.0),        // tnt (instant)
+        ] {
+            assert!(
+                (block_hardness(id) - expected).abs() < 1e-4,
+                "block {id} hardness {} != vanilla {expected}",
+                block_hardness(id)
+            );
+        }
+        // Unbreakable tier is negative (bedrock, fluids, portals, command block).
+        for id in [7u16, 8, 9, 10, 11, 90, 119, 120, 137, 166] {
+            assert!(block_hardness(id) < 0.0, "block {id} should be unbreakable");
+        }
+        // Every in-range id resolves; none accidentally hits a wrong sign.
+        for id in 1..=197u16 {
+            let h = block_hardness(id);
+            assert!(h.is_finite() && h >= -1.0, "block {id} hardness out of range: {h}");
+        }
+    }
+
     fn looking_along_x() -> GameState {
         // Empty world, camera at a block center looking toward +x (yaw -90).
         // Fractional coords mirror a real eye position (avoids the degenerate
@@ -4151,6 +5738,30 @@ mod interaction_tests {
                 ..Default::default()
             },
         )
+    }
+
+    #[test]
+    fn eating_plays_chew_sound_every_four_ticks_from_tick_eight() {
+        let mut g = GameState::empty_for_server(1.0);
+        g.inventory[36] = Some(item(297, 1)); // bread (EAT) in hotbar slot 0
+        // Right-click in air starts the use (sendUseItem sets use_action = Eat).
+        use_item(&mut g);
+        let _ = g.take_sounds(); // drop any press-tick sounds
+        let mut eat_ticks = Vec::new();
+        for _ in 0..30 {
+            act(
+                &mut g,
+                TickActions {
+                    right_held: true,
+                    ..Default::default()
+                },
+            );
+            if g.take_sounds().iter().any(|s| s.event == "random.eat") {
+                eat_ticks.push(g.use_item_ticks);
+            }
+        }
+        // Vanilla itemInUseCount <= 25 && % 4 == 0, counting down from 32.
+        assert_eq!(eat_ticks, vec![8, 12, 16, 20, 24, 28]);
     }
 
     #[test]
@@ -4267,10 +5878,10 @@ mod interaction_tests {
             leash: false,
         });
         g.tick(0.05);
-        // The rider snaps onto the vehicle (height 1.9 × 0.75 mount offset).
+        // The rider snaps onto the vehicle (pig height 0.9 × 0.75 mount offset).
         assert!((g.player.position.x - 10.0).abs() < 1.0e-6);
         assert!((g.player.position.z + 5.0).abs() < 1.0e-6);
-        assert!((g.player.position.y - (64.0 + 1.9 * 0.75)).abs() < 1.0e-6);
+        assert!((g.player.position.y - (64.0 + 0.9 * 0.75)).abs() < 1.0e-6);
 
         // Detaching (vehicle_id -1) clears the mount so physics resumes.
         g.apply_play_packet(ClientboundPlayPacket::AttachEntity {
@@ -4423,6 +6034,54 @@ mod interaction_tests {
     }
 
     #[test]
+    fn attack_while_blocking_swings_only_with_old_animations() {
+        // Enter the sword block, aiming at air.
+        let mut gs = looking_along_x();
+        gs.inventory[36] = Some(SlotItem::new(276, 1, 0));
+        use_item(&mut gs);
+        assert_eq!(gs.use_action, ItemUseAction::Block);
+
+        // 1.8 default: a left-click while blocking is swallowed — no swing.
+        let p = act(
+            &mut gs,
+            TickActions {
+                attack_pressed: true,
+                left_held: true,
+                right_held: true,
+                old_animations: false,
+                ..Default::default()
+            },
+        );
+        assert!(
+            !p.iter().any(|x| matches!(x, ServerboundPacket::SwingArm)),
+            "1.8 must not swing while blocking, got {p:?}"
+        );
+        assert!(!gs.is_swinging);
+        assert_eq!(gs.use_action, ItemUseAction::Block, "still blocking");
+
+        // 1.7 (old_animations) is ANIMATION-ONLY: the same left-click starts the
+        // local arm swing (for the "swing + block" visual) but sends NO packet —
+        // the network stays vanilla 1.8 (block-hitting removed), so Grim still
+        // sees a plain block. No SwingArm/UseEntity/PlayerDigging goes out.
+        let p = act(
+            &mut gs,
+            TickActions {
+                attack_pressed: true,
+                left_held: true,
+                right_held: true,
+                old_animations: true,
+                ..Default::default()
+            },
+        );
+        assert!(
+            p.is_empty(),
+            "old_animations must not send any packet while blocking, got {p:?}"
+        );
+        assert!(gs.is_swinging, "but the local swing animation starts");
+        assert_eq!(gs.use_action, ItemUseAction::Block, "block is not released");
+    }
+
+    #[test]
     fn non_sword_right_click_air_sends_use_but_does_not_block() {
         let mut gs = looking_along_x();
         gs.inventory[36] = Some(SlotItem::new(1, 1, 0));
@@ -4504,7 +6163,31 @@ mod interaction_tests {
     }
 
     #[test]
-    fn sprint_attack_resets_sprint_and_halves_horizontal_motion() {
+    fn sprint_attack_on_a_player_resets_sprint_and_halves_horizontal_motion() {
+        // Hitting another PLAYER slows: EntityOtherPlayerMP.attackEntityFrom
+        // returns true on the client, so the sprint hit lands.
+        let mut gs = looking_along_x();
+        gs.world.upsert_entity(EntityState::new_remote(
+            EntityId(1),
+            EntityKind::RemotePlayer,
+            DVec3::new(2.0, 0.0, 0.5),
+            0.0,
+            0.0,
+        ));
+        gs.sprinting = true;
+        gs.player.velocity = DVec3::new(1.0, 0.0, 2.0);
+        let _ = attack(&mut gs);
+        assert!(!gs.sprinting, "a sprint hit on a player cancels the sprint");
+        assert!((gs.player.velocity.x - 0.6).abs() < 1e-9);
+        assert!((gs.player.velocity.z - 1.2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn sprint_attack_on_a_mob_does_not_slow_or_cancel_sprint() {
+        // Hitting a living mob does NOT slow on the client: EntityLivingBase's
+        // attackEntityFrom short-circuits to false under `worldObj.isRemote`, so
+        // motion and the sprint flag are untouched (Grim expects no attack-slow
+        // here — applying one trips Simulation).
         let mut gs = looking_along_x();
         gs.world.upsert_entity(EntityState::new_remote(
             EntityId(1),
@@ -4516,9 +6199,58 @@ mod interaction_tests {
         gs.sprinting = true;
         gs.player.velocity = DVec3::new(1.0, 0.0, 2.0);
         let _ = attack(&mut gs);
-        assert!(!gs.sprinting, "a sprint hit cancels the sprint");
-        assert!((gs.player.velocity.x - 0.6).abs() < 1e-9);
-        assert!((gs.player.velocity.z - 1.2).abs() < 1e-9);
+        assert!(gs.sprinting, "a mob hit must NOT cancel the sprint");
+        assert_eq!(
+            gs.player.velocity,
+            DVec3::new(1.0, 0.0, 2.0),
+            "a mob hit must NOT halve horizontal motion"
+        );
+    }
+
+    #[test]
+    fn sprint_attack_reenables_sprint_same_tick_when_holding_forward() {
+        // Vanilla: a sprint-hit cancels sprint inside clickMouse, but the SAME
+        // tick's onLivingUpdate re-enables it while W + the sprint key are held,
+        // so isSprinting() is still true at onUpdateWalkingPlayer — no
+        // StopSprinting is sent (the ×0.6 momentum is the only server-visible
+        // effect). Suppressing the re-enable for a tick (the old
+        // `sprint_reset_by_attack` path) emitted a StopSprinting → StartSprinting
+        // pair vanilla never sends, which Grim flags as Simulation.
+        let mut gs = looking_along_x();
+        gs.player.yaw = -90.0; // the full tick recomputes the camera from this
+        gs.player.on_ground = true;
+        gs.sprinting = true;
+        gs.input.sprint = true; // toggle stands in for keyBindSprint.isKeyDown()
+        gs.input.forward = true;
+        // A PLAYER target at eye level (camera ends up at ~y=81.6 after update);
+        // attacking a player actually cancels sprint, so the re-enable is tested.
+        gs.world.upsert_entity(EntityState::new_remote(
+            EntityId(1),
+            EntityKind::RemotePlayer,
+            DVec3::new(2.0, 81.0, 0.5),
+            0.0,
+            0.0,
+        ));
+        gs.set_pending_actions(TickActions {
+            attack_pressed: true,
+            left_held: true,
+            ..Default::default()
+        });
+        let (packets, movement) = gs.tick(0.05).expect("not a freeze tick");
+        assert!(
+            packets.iter().any(|p| matches!(
+                p,
+                ServerboundPacket::UseEntity {
+                    target: 1,
+                    kind: UseEntityKind::Attack
+                }
+            )),
+            "the attack must land for this test to be meaningful: {packets:?}"
+        );
+        assert!(
+            movement.sprinting,
+            "sprint must re-enable the same tick so no StopSprinting is sent"
+        );
     }
 
     #[test]
@@ -4551,6 +6283,7 @@ mod interaction_tests {
     #[test]
     fn survival_dig_starts_on_press_and_finishes_after_holding() {
         let mut gs = looking_along_x();
+        gs.player.on_ground = true; // standing: no vanilla in-air dig penalty
         gs.world.set_block(3, 0, 0, BlockState::STONE);
         // Vanilla press tick: clickMouse swings + sends START, then
         // sendClickBlockToController advances the dig and swings again (two C0A).
@@ -4958,6 +6691,118 @@ mod interaction_tests {
     }
 
     #[test]
+    fn max_health_attribute_feeds_hud_vitals() {
+        use recraft_protocol::v1_8_9::packets::EntityProperty;
+        let mut gs = GameState::empty_for_server(1.0);
+        gs.player.id = EntityId(7);
+        gs.apply_play_packet(ClientboundPlayPacket::EntityProperties {
+            entity_id: 7,
+            properties: vec![EntityProperty {
+                key: "generic.maxHealth".to_owned(),
+                base: 40.0,
+                modifiers: Vec::new(),
+            }],
+        });
+        assert_eq!(gs.max_health, 40.0);
+        assert_eq!(gs.hud_vitals().max_health, 40.0);
+
+        // Another entity's maxHealth must not touch the local player.
+        gs.apply_play_packet(ClientboundPlayPacket::EntityProperties {
+            entity_id: 99,
+            properties: vec![EntityProperty {
+                key: "generic.maxHealth".to_owned(),
+                base: 100.0,
+                modifiers: Vec::new(),
+            }],
+        });
+        assert_eq!(gs.max_health, 40.0);
+    }
+
+    #[test]
+    fn absorption_effect_amplifier_drives_gold_hearts() {
+        let mut gs = GameState::empty_for_server(1.0);
+        gs.player.id = EntityId(7);
+        // Absorption II (amplifier 1) → 4 * (1 + 1) = 8 absorption health.
+        gs.apply_play_packet(ClientboundPlayPacket::EntityEffect {
+            entity_id: 7,
+            effect_id: POTION_ABSORPTION as i8,
+            amplifier: 1,
+            duration: 600,
+            hide_particles: 0,
+        });
+        assert_eq!(gs.hud_vitals().absorption, 8.0);
+
+        // Removing it clears the gold hearts.
+        gs.apply_play_packet(ClientboundPlayPacket::RemoveEntityEffect {
+            entity_id: 7,
+            effect_id: POTION_ABSORPTION as i8,
+        });
+        assert_eq!(gs.hud_vitals().absorption, 0.0);
+    }
+
+    #[test]
+    fn potion_effect_flags_thread_into_hud_vitals() {
+        let mut gs = GameState::empty_for_server(1.0);
+        gs.player.id = EntityId(7);
+        for id in [POTION_REGENERATION, POTION_HUNGER, POTION_POISON, POTION_WITHER] {
+            gs.apply_play_packet(ClientboundPlayPacket::EntityEffect {
+                entity_id: 7,
+                effect_id: id as i8,
+                amplifier: 0,
+                duration: 200,
+                hide_particles: 0,
+            });
+        }
+        let v = gs.hud_vitals();
+        assert!(v.regen && v.hunger_effect && v.poison && v.wither);
+        // The stored duration round-trips through the effect table.
+        assert_eq!(gs.effects[&POTION_POISON].duration, 200);
+
+        // Effects on a non-local entity are ignored.
+        gs.apply_play_packet(ClientboundPlayPacket::EntityEffect {
+            entity_id: 99,
+            effect_id: POTION_ABSORPTION as i8,
+            amplifier: 4,
+            duration: 200,
+            hide_particles: 0,
+        });
+        assert_eq!(gs.hud_vitals().absorption, 0.0);
+    }
+
+    #[test]
+    fn respawn_clears_effects_and_resets_max_health() {
+        use recraft_protocol::v1_8_9::packets::EntityProperty;
+        let mut gs = GameState::empty_for_server(1.0);
+        gs.player.id = EntityId(7);
+        gs.apply_play_packet(ClientboundPlayPacket::EntityProperties {
+            entity_id: 7,
+            properties: vec![EntityProperty {
+                key: "generic.maxHealth".to_owned(),
+                base: 30.0,
+                modifiers: Vec::new(),
+            }],
+        });
+        gs.apply_play_packet(ClientboundPlayPacket::EntityEffect {
+            entity_id: 7,
+            effect_id: POTION_ABSORPTION as i8,
+            amplifier: 0,
+            duration: 600,
+            hide_particles: 0,
+        });
+        assert_eq!(gs.max_health, 30.0);
+        assert!(!gs.effects.is_empty());
+
+        gs.apply_play_packet(ClientboundPlayPacket::Respawn {
+            dimension: 0,
+            difficulty: 0,
+            game_mode: 0,
+            level_type: "default".to_owned(),
+        });
+        assert_eq!(gs.max_health, 20.0);
+        assert!(gs.effects.is_empty());
+    }
+
+    #[test]
     fn attribute_operations_follow_vanilla_compute_value() {
         use recraft_protocol::v1_8_9::packets::{AttributeModifier, EntityProperty};
         let modifier = |amount: f64, operation: u8| AttributeModifier {
@@ -5046,8 +6891,9 @@ mod interaction_tests {
 
         // The invisible stand contributes no model geometry…
         let mut mesh = ModelMesh::new();
+        let mut glint = ModelMesh::new();
         let skins = std::collections::HashMap::new();
-        g.build_entity_model(&mut mesh, 1.0, 1.0, &skins, f64::INFINITY);
+        g.build_entity_model(&mut mesh, &mut glint, 1.0, 1.0, &skins, f64::INFINITY, false);
         assert!(mesh.is_empty(), "invisible entity must not render a model");
 
         // …but its floating-text plate is still emitted.
@@ -5083,7 +6929,8 @@ mod interaction_tests {
 
         // Bare invisible player: nothing renders.
         let mut bare = ModelMesh::new();
-        g.build_entity_model(&mut bare, 1.0, 1.0, &skins, f64::INFINITY);
+        let mut bare_glint = ModelMesh::new();
+        g.build_entity_model(&mut bare, &mut bare_glint, 1.0, 1.0, &skins, f64::INFINITY, false);
         assert!(bare.is_empty(), "invisible player with no armor renders nothing");
 
         // Give it an iron helmet (slot 4, id 306): the worn armor still shows.
@@ -5093,8 +6940,30 @@ mod interaction_tests {
             item: Some(SlotItem::new(306, 1, 0)),
         });
         let mut armored = ModelMesh::new();
-        g.build_entity_model(&mut armored, 1.0, 1.0, &skins, f64::INFINITY);
+        let mut armored_glint = ModelMesh::new();
+        g.build_entity_model(&mut armored, &mut armored_glint, 1.0, 1.0, &skins, f64::INFINITY, false);
         assert!(!armored.is_empty(), "invisible player must still show worn armor");
+        // The plain (unenchanted) helmet emits no glint geometry.
+        assert!(armored_glint.is_empty(), "unenchanted armor must not glint");
+
+        // Enchant the helmet (non-empty `ench` tag): now it glints.
+        use recraft_protocol::nbt::NbtTag;
+        let mut nbt = std::collections::HashMap::new();
+        let mut ench = std::collections::HashMap::new();
+        ench.insert("id".to_string(), NbtTag::Short(0));
+        ench.insert("lvl".to_string(), NbtTag::Short(4));
+        nbt.insert("ench".to_string(), NbtTag::List(vec![NbtTag::Compound(ench)]));
+        let mut helmet = SlotItem::new(306, 1, 0);
+        helmet.nbt = Some(nbt);
+        g.apply_play_packet(ClientboundPlayPacket::EntityEquipment {
+            entity_id: 8,
+            slot: 4,
+            item: Some(helmet),
+        });
+        let mut ench_mesh = ModelMesh::new();
+        let mut ench_glint = ModelMesh::new();
+        g.build_entity_model(&mut ench_mesh, &mut ench_glint, 1.0, 1.0, &skins, f64::INFINITY, false);
+        assert!(!ench_glint.is_empty(), "enchanted armor must emit glint geometry");
     }
 
     #[test]
@@ -5136,5 +7005,300 @@ mod interaction_tests {
             gs.pick_target(),
             Some(InteractionTarget::Entity { id: 7, .. })
         ));
+    }
+
+    #[test]
+    fn xp_orb_texture_cell_matches_vanilla_thresholds() {
+        assert_eq!(xp_orb_texture_cell(0), 0);
+        assert_eq!(xp_orb_texture_cell(2), 0);
+        assert_eq!(xp_orb_texture_cell(3), 1);
+        assert_eq!(xp_orb_texture_cell(6), 1);
+        assert_eq!(xp_orb_texture_cell(7), 2);
+        assert_eq!(xp_orb_texture_cell(16), 2);
+        assert_eq!(xp_orb_texture_cell(17), 3);
+        assert_eq!(xp_orb_texture_cell(37), 4);
+        assert_eq!(xp_orb_texture_cell(73), 5);
+        assert_eq!(xp_orb_texture_cell(149), 6);
+        assert_eq!(xp_orb_texture_cell(307), 7);
+        assert_eq!(xp_orb_texture_cell(617), 8);
+        assert_eq!(xp_orb_texture_cell(1237), 9);
+        assert_eq!(xp_orb_texture_cell(2477), 10);
+        assert_eq!(xp_orb_texture_cell(i16::MAX), 10);
+    }
+
+    #[test]
+    fn spawn_experience_orb_tracks_entity_and_xp() {
+        let mut g = GameState::empty_for_server(1.0);
+        g.apply_play_packet(ClientboundPlayPacket::SpawnExperienceOrb {
+            entity_id: 7,
+            x: 3.0,
+            y: 64.0,
+            z: -2.0,
+            count: 150,
+        });
+        let orb = g.world.entity(EntityId(7)).expect("orb spawned");
+        assert_eq!(orb.kind, EntityKind::ExperienceOrb);
+        assert_eq!(g.entity_xp.get(&EntityId(7)).copied(), Some(150));
+        // The renderer-facing list reports one billboard with cell-6 UVs.
+        let orbs = g.xp_orbs(1.0);
+        assert_eq!(orbs.len(), 1);
+        // count 150 → cell 6; despawn drops the tracking.
+        g.apply_play_packet(ClientboundPlayPacket::DestroyEntities { entity_ids: vec![7] });
+        assert!(g.entity_xp.get(&EntityId(7)).is_none());
+        assert!(g.xp_orbs(1.0).is_empty());
+    }
+
+    #[test]
+    fn falling_block_decodes_id_and_meta_from_data() {
+        let mut g = GameState::empty_for_server(1.0);
+        // data = id | meta << 12: stone-bricks (98) meta 3.
+        let data = 98 | (3 << 12);
+        g.apply_play_packet(ClientboundPlayPacket::SpawnObject {
+            entity_id: 7,
+            kind: 70,
+            x: 3.0,
+            y: 80.0,
+            z: 0.5,
+            yaw: 0.0,
+            pitch: 0.0,
+            data,
+            velocity: None,
+        });
+        let block = g.falling_blocks.get(&EntityId(7)).copied().expect("tracked");
+        assert_eq!(block, BlockState::new(98, 3));
+        let cubes = g.falling_block_cubes(1.0);
+        assert_eq!(cubes.len(), 1);
+        assert_eq!(cubes[0].block, BlockState::new(98, 3));
+    }
+
+    #[test]
+    fn primed_tnt_swells_and_flashes_with_its_fuse() {
+        let mut g = GameState::empty_for_server(1.0);
+        g.apply_play_packet(ClientboundPlayPacket::SpawnObject {
+            entity_id: 7,
+            kind: 50, // primed TNT
+            x: 0.5,
+            y: 80.0,
+            z: 0.5,
+            yaw: 0.0,
+            pitch: 0.0,
+            data: 0,
+            velocity: None,
+        });
+        // Fresh fuse (age 0 → fuse 80): a TNT block, no swell, flash window on
+        // (80 / 5 = 16, even).
+        let cubes = g.primed_tnt_cubes(0.0);
+        assert_eq!(cubes.len(), 1);
+        assert_eq!(cubes[0].block, BlockState::new(46, 0));
+        assert!((cubes[0].scale - 1.0).abs() < 1e-6, "no swell early in the fuse");
+        assert!(cubes[0].flash > 0.0, "fuse 80 is in a flash window");
+
+        // age 5 → fuse 75 (75 / 5 = 15, odd): between flash windows, still no swell.
+        let mut e = g.world.entity(EntityId(7)).unwrap().clone();
+        e.age = 5;
+        g.world.upsert_entity(e);
+        let cubes = g.primed_tnt_cubes(0.0);
+        assert_eq!(cubes[0].flash, 0.0, "fuse 75 is between flash windows");
+        assert!((cubes[0].scale - 1.0).abs() < 1e-6);
+
+        // age 78 → fuse 2 (< 10): swelling toward ×1.3.
+        let mut e = g.world.entity(EntityId(7)).unwrap().clone();
+        e.age = 78;
+        g.world.upsert_entity(e);
+        let cubes = g.primed_tnt_cubes(0.0);
+        assert!(
+            cubes[0].scale > 1.0 && cubes[0].scale <= 1.3,
+            "swells in the last 10 fuse ticks: {}",
+            cubes[0].scale
+        );
+    }
+
+    #[test]
+    fn projectile_kinds_map_to_item_sprites() {
+        assert_eq!(projectile_item_id(60), None); // arrow is a 3D model, not a sprite
+        assert_eq!(projectile_item_id(61), Some(332)); // snowball
+        assert_eq!(projectile_item_id(65), Some(368)); // ender pearl
+        // Falling block, item and armor stand are rendered elsewhere, not here.
+        assert_eq!(projectile_item_id(70), None);
+        assert_eq!(projectile_item_id(2), None);
+        assert_eq!(projectile_item_id(78), None);
+
+        // A spawned snowball surfaces in the projectile sprite list.
+        let mut g = GameState::empty_for_server(1.0);
+        g.apply_play_packet(ClientboundPlayPacket::SpawnObject {
+            entity_id: 7,
+            kind: 61,
+            x: 3.0,
+            y: 64.0,
+            z: 0.5,
+            yaw: 0.0,
+            pitch: 0.0,
+            data: 0,
+            velocity: None,
+        });
+        let sprites = g.projectiles(1.0);
+        assert_eq!(sprites.len(), 1);
+        assert_eq!(sprites[0].item.id, 332);
+    }
+
+    #[test]
+    fn note_block_action_plays_pitched_note_and_spawns_particle() {
+        let mut g = GameState::empty_for_server(1.0);
+        // instrument 2 (snare), note 12 → pitch 2^((12-12)/12) = 1.0.
+        g.apply_play_packet(ClientboundPlayPacket::BlockAction {
+            x: 1,
+            y: 65,
+            z: -2,
+            action_id: 2,
+            action_param: 12,
+            block_type: 25,
+        });
+        let sounds = g.take_sounds();
+        assert_eq!(sounds.len(), 1);
+        assert_eq!(sounds[0].event, "note.snare");
+        assert!((sounds[0].pitch - 1.0).abs() < 1e-6);
+        assert!((sounds[0].volume - 3.0).abs() < 1e-6);
+        // note 24 → pitch 2^(12/12) = 2.0; note 0 → 2^(-1) = 0.5.
+        for (note, expected) in [(24u8, 2.0_f32), (0, 0.5)] {
+            let mut g = GameState::empty_for_server(1.0);
+            g.apply_play_packet(ClientboundPlayPacket::BlockAction {
+                x: 0,
+                y: 0,
+                z: 0,
+                action_id: 0,
+                action_param: note,
+                block_type: 25,
+            });
+            let s = g.take_sounds();
+            assert!((s[0].pitch - expected).abs() < 1e-6, "note {note}");
+        }
+    }
+
+    #[test]
+    fn chest_block_action_opens_the_lid_and_plays_the_sound() {
+        let mut g = GameState::empty_for_server(1.0);
+        // A chest open (block type 54, action 1, viewers=1) arms the lid target
+        // and plays random.chestopen once.
+        g.apply_play_packet(ClientboundPlayPacket::BlockAction {
+            x: 0,
+            y: 0,
+            z: 0,
+            action_id: 1,
+            action_param: 1,
+            block_type: 54,
+        });
+        let sounds = g.take_sounds();
+        assert_eq!(sounds.len(), 1);
+        assert_eq!(sounds[0].event, "random.chestopen");
+        assert!(g.chest_open_targets.get(&[0, 0, 0]).copied().unwrap_or(0.0) > 0.0);
+        // Closing (viewers=0) plays the close sound and clears the target.
+        g.apply_play_packet(ClientboundPlayPacket::BlockAction {
+            x: 0,
+            y: 0,
+            z: 0,
+            action_id: 1,
+            action_param: 0,
+            block_type: 54,
+        });
+        let sounds = g.take_sounds();
+        assert_eq!(sounds.len(), 1);
+        assert_eq!(sounds[0].event, "random.chestclosed");
+    }
+
+    #[test]
+    fn adjacent_same_type_chests_render_one_large_model() {
+        let mut g = GameState::empty_for_server(1.0);
+        // Camera at the origin column looking +Z (yaw 0) at chests a few blocks
+        // ahead, so they sit inside the frustum and the distance cutoff.
+        g.camera.position = Vec3::new(0.5, 80.0, 0.0);
+
+        // A normal-chest pair adjacent along X (facing south, meta 3): the
+        // canonical half is the smaller-X one; both share chunk (0,0).
+        g.world.set_block(0, 79, 6, BlockState::new(54, 3));
+        g.world.set_block(1, 79, 6, BlockState::new(54, 3));
+
+        let mut mesh = ModelMesh::new();
+        g.build_chest_models(&mut mesh, 1.0, 0.0, 4096.0);
+        // One large chest = 3 boxes = 72 verts (two singles would be 144).
+        assert_eq!(
+            mesh.vertices.len(),
+            72,
+            "an adjacent same-type pair must emit one large model, not two singles"
+        );
+        // The model spans both cells along X (0..2), confirming the large box.
+        let lo = mesh.vertices.iter().map(|v| v.position[0]).fold(f32::MAX, f32::min);
+        let hi = mesh.vertices.iter().map(|v| v.position[0]).fold(f32::MIN, f32::max);
+        assert!(hi - lo > 1.5, "large chest must span two cells along X ({lo}..{hi})");
+
+        // A lone chest of the same type (no same-id X neighbour) stays single.
+        let mut g2 = GameState::empty_for_server(1.0);
+        g2.camera.position = Vec3::new(0.5, 80.0, 0.0);
+        g2.world.set_block(0, 79, 6, BlockState::new(54, 3));
+        let mut single = ModelMesh::new();
+        g2.build_chest_models(&mut single, 1.0, 0.0, 4096.0);
+        assert_eq!(single.vertices.len(), 72, "a lone chest must emit one single model");
+        let s_lo = single.vertices.iter().map(|v| v.position[0]).fold(f32::MAX, f32::min);
+        let s_hi = single.vertices.iter().map(|v| v.position[0]).fold(f32::MIN, f32::max);
+        assert!(s_hi - s_lo < 1.1, "single chest must fit in one cell ({s_lo}..{s_hi})");
+
+        // Two adjacent chests of DIFFERENT types (normal + trapped) do not pair:
+        // each renders its own single model (2 × 72 verts).
+        let mut g3 = GameState::empty_for_server(1.0);
+        g3.camera.position = Vec3::new(0.5, 80.0, 0.0);
+        g3.world.set_block(0, 79, 6, BlockState::new(54, 3));
+        g3.world.set_block(1, 79, 6, BlockState::new(146, 3));
+        let mut mixed = ModelMesh::new();
+        g3.build_chest_models(&mut mixed, 1.0, 0.0, 4096.0);
+        assert_eq!(mixed.vertices.len(), 144, "different-type neighbours stay two singles");
+    }
+
+    #[test]
+    fn piston_block_action_is_ignored() {
+        let mut g = GameState::empty_for_server(1.0);
+        // A piston extend (block type 33) carries no client sound/lid here.
+        g.apply_play_packet(ClientboundPlayPacket::BlockAction {
+            x: 0,
+            y: 0,
+            z: 0,
+            action_id: 0,
+            action_param: 1,
+            block_type: 33,
+        });
+        assert!(g.take_sounds().is_empty());
+    }
+
+    #[test]
+    fn boss_bar_reports_nearest_wither_health_fraction() {
+        use recraft_protocol::v1_8_9::packets::MetadataEntry;
+        let mut g = GameState::empty_for_server(1.0);
+        g.camera.position = Vec3::new(0.0, 70.0, 0.0);
+        // No boss in range yet.
+        assert!(g.boss_bar().is_none());
+        // A wither (mob type 64) close by, at half its 300 max health.
+        g.apply_play_packet(ClientboundPlayPacket::SpawnMob {
+            entity_id: 7,
+            kind: 64,
+            x: 5.0,
+            y: 70.0,
+            z: 0.0,
+            yaw: 0.0,
+            pitch: 0.0,
+            head_pitch: 0.0,
+            metadata: vec![],
+        });
+        // Health metadata (index 6, float) = 150 → fraction 0.5.
+        g.apply_play_packet(ClientboundPlayPacket::EntityMetadata {
+            entity_id: 7,
+            metadata: vec![MetadataEntry { index: 6, value: MetadataValue::Float(150.0) }],
+        });
+        let (name, fraction) = g.boss_bar().expect("wither in range");
+        assert_eq!(name, "Wither");
+        assert!((fraction - 0.5).abs() < 1e-6);
+        // A dead wither (0 health) drops off the bar.
+        g.apply_play_packet(ClientboundPlayPacket::EntityMetadata {
+            entity_id: 7,
+            metadata: vec![MetadataEntry { index: 6, value: MetadataValue::Float(0.0) }],
+        });
+        assert!(g.boss_bar().is_none());
     }
 }

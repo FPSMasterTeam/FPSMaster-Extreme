@@ -5,12 +5,14 @@ mod game;
 mod gui;
 mod item_renderer;
 mod network;
+mod particle;
 mod player_list;
 mod scoreboard;
 mod singleplayer;
 mod skin;
 mod servers;
 mod settings;
+mod sound;
 mod text_input;
 
 use std::{
@@ -39,7 +41,7 @@ use item_renderer::ItemRenderer;
 use network::{NetworkEvent, NetworkHandle};
 use recraft_protocol::{net::PremiumSession, v1_8_9::packets::ServerboundPacket};
 use recraft_render::{RenderStats, Renderer};
-use settings::{FpsCounter, Settings};
+use settings::{FpsCounter, GameAction, Keybinds, Settings};
 
 /// Dirty sections snapshotted and handed to the background mesher each frame.
 /// Sections of the same column share one snapshot clone (the only main-thread
@@ -106,10 +108,23 @@ struct App {
     /// Reused across frames so the per-frame entity rebuild keeps its vertex/index
     /// allocations instead of reallocating from empty each frame.
     entity_model: recraft_render::ModelMesh,
+    /// Enchanted worn-armor glint geometry (model-pass format), rebuilt alongside
+    /// `entity_model` and drawn additively with the scrolling glint texture.
+    entity_glint: recraft_render::ModelMesh,
     /// Fingerprint of the inputs that produced the currently-uploaded entity model
     /// + hand + nametags. When the next frame's fingerprint matches, the rebuild
     /// and GPU upload are skipped (the renderer keeps the previous mesh).
     last_entity_key: Option<u64>,
+    /// Audio backend: resolves `sounds.json` events and plays positioned/UI
+    /// sounds queued by the game. Silent if no output device is available.
+    sound: sound::SoundManager,
+    /// GUI/container interaction packets (ClickWindow, CloseWindow, …) produced
+    /// at frame time by screen input. Vanilla emits them inside `runTick` BEFORE
+    /// that tick's flying packet; we buffer them and flush right before
+    /// `send_movement` so Grim's Post check sees `click_window → flying →
+    /// transaction`, not the reverse (sending at frame time let a transaction
+    /// land between the last flying and the click → Post "click window v1.8").
+    pending_window_packets: Vec<ServerboundPacket>,
     quit: bool,
 }
 
@@ -362,7 +377,10 @@ impl ApplicationHandler for WinitApp {
             local_server: None,
             panorama_timer: 0.0,
             entity_model: recraft_render::ModelMesh::new(),
+            entity_glint: recraft_render::ModelMesh::new(),
             last_entity_key: None,
+            sound: sound::SoundManager::new(),
+            pending_window_packets: Vec::new(),
             quit: false,
         };
         renderer.upload_world(&app.game.world);
@@ -405,7 +423,8 @@ impl ApplicationHandler for WinitApp {
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state == ElementState::Pressed
                     && !event.repeat
-                    && matches!(event.physical_key, PhysicalKey::Code(KeyCode::F3))
+                    && matches!(event.physical_key, PhysicalKey::Code(code)
+                        if app.settings.keybinds.action_for(code) == Some(GameAction::Debug))
                     && app.in_world
                     && app
                         .screen
@@ -432,30 +451,29 @@ impl ApplicationHandler for WinitApp {
                     handle_actions(app, renderer, window, actions, &mut self.atlas_uv);
                 } else if app.in_world {
                     let pressed = event.state == ElementState::Pressed;
+                    let action = match event.physical_key {
+                        PhysicalKey::Code(code) => app.settings.keybinds.action_for(code),
+                        _ => None,
+                    };
                     if pressed
                         && matches!(event.physical_key, PhysicalKey::Code(KeyCode::Escape))
                     {
                         app.suspend_gameplay_input(&mut self.left_held, &mut self.right_held);
                         app.screen = Some(Box::new(GuiIngameMenu::new()));
-                    } else if pressed
-                        && matches!(event.physical_key, PhysicalKey::Code(KeyCode::KeyE))
-                    {
+                    } else if pressed && action == Some(GameAction::Inventory) {
                         app.suspend_gameplay_input(&mut self.left_held, &mut self.right_held);
                         app.game.open_player_inventory();
                         app.screen = Some(Box::new(GuiContainer::new()));
-                    } else if let Some(prefill) = chat_open_key(&event) {
+                    } else if let Some(prefill) = chat_open_key(&event, &app.settings.keybinds) {
                         app.suspend_gameplay_input(&mut self.left_held, &mut self.right_held);
                         app.game.chat.reset_recall();
                         app.screen = Some(Box::new(GuiChat::new(prefill)));
-                    } else if let Some(slot) = hotbar_slot_key(&event) {
+                    } else if let Some(slot) = hotbar_slot_key(&event, &app.settings.keybinds) {
                         self.slot_select = Some(slot);
-                    } else if matches!(
-                        event.physical_key,
-                        PhysicalKey::Code(KeyCode::Tab)
-                    ) {
+                    } else if action == Some(GameAction::PlayerList) {
                         app.tab_open = pressed;
                     } else {
-                        app.game.input.handle_key(event);
+                        app.game.input.handle_key(event, &app.settings.keybinds);
                     }
                 }
                 sync_cursor(window, &mut self.cursor_captured, app);
@@ -531,6 +549,13 @@ impl ApplicationHandler for WinitApp {
                             self.mouse_down_right = true;
                         }
                         let mut taken = app.screen.take();
+                        let (mx, my) = self.cursor_position;
+                        // Vanilla GuiScreen.mouseClicked plays gui.button.press for
+                        // a left-click that lands on an enabled button (client-only;
+                        // no server packet). Emit it centrally before dispatch.
+                        if is_left && taken.as_ref().is_some_and(|s| s.clicks_button(mx, my)) {
+                            app.game.queue_ui_sound("gui.button.press");
+                        }
                         let actions = if let Some(screen) = taken.as_mut() {
                             let mut ctx = ScreenCtx {
                                 game: &mut app.game,
@@ -539,7 +564,6 @@ impl ApplicationHandler for WinitApp {
                                 modifiers: self.modifiers,
                                 mouse: self.cursor_position,
                             };
-                            let (mx, my) = self.cursor_position;
                             if is_left {
                                 screen.mouse_clicked(mx, my, &mut ctx)
                             } else if is_right {
@@ -672,6 +696,7 @@ impl ApplicationHandler for WinitApp {
                     use_pressed: self.use_pressed,
                     left_held: self.left_held,
                     right_held: self.right_held,
+                    old_animations: app.settings.old_animations,
                 });
                 if let Some((actions, movement)) = app.game.tick(0.05) {
                     self.slot_select = None;
@@ -681,6 +706,13 @@ impl ApplicationHandler for WinitApp {
                     let abilities = app.game.take_abilities_packet();
                     if let Some(network) = &app.network {
                         if app.game.can_send_movement_packets() {
+                            // Frame-time GUI packets (ClickWindow, …) first, then
+                            // this tick's interactions, then abilities, then the
+                            // flying packet — all BEFORE movement, matching vanilla
+                            // runTick so Grim's Post check sees the right order.
+                            for packet in app.pending_window_packets.drain(..) {
+                                network.send_packet(packet);
+                            }
                             for packet in actions {
                                 network.send_packet(packet);
                             }
@@ -1057,10 +1089,12 @@ fn handle_actions(
             GuiAction::SetVolumetricLight(on) => renderer.set_volumetric_light_enabled(on),
             GuiAction::SaveSettings => app.settings.save(),
             GuiAction::SendPacket(packet) => {
-                if let Some(network) = &app.network {
-                    network.send_packet(packet);
-                }
+                // Buffered, not sent now: flushed just before the next tick's
+                // flying packet (see the tick loop) so the order matches vanilla
+                // runTick and Grim's Post check stays happy.
+                app.pending_window_packets.push(packet);
             }
+            GuiAction::OpenUrl(url) => open_url(&url),
             GuiAction::ReloadResourcePack(path) => {
                 log::info!("resource pack reload requested: {:?}", path);
                 *atlas_uv = renderer.reload_atlas(path);
@@ -1164,6 +1198,10 @@ fn pump_network(app: &mut App, window: &winit::window::Window, cursor_captured: 
         // World data has arrived: enter gameplay.
         app.connecting = false;
         app.in_world = true;
+        // Drop any GUI packets buffered by a previous session that never flushed
+        // (e.g. a container click right before disconnect) so they can't leak out
+        // on this session's first tick.
+        app.pending_window_packets.clear();
         app.screen = None;
     }
     sync_cursor(window, cursor_captured, app);
@@ -1348,6 +1386,82 @@ impl PassBench {
     }
 }
 
+/// Append a (vertices, indices) mesh onto an accumulator buffer, rebasing the
+/// indices onto the existing vertex count. Used to merge the dropped-item,
+/// projectile, falling-block and player-held geometry into the world-item pass.
+fn append_mesh(
+    vertices: &mut Vec<recraft_render::Vertex>,
+    indices: &mut Vec<u32>,
+    mesh: (Vec<recraft_render::Vertex>, Vec<u32>),
+) {
+    let base = vertices.len() as u32;
+    vertices.extend(mesh.0);
+    indices.extend(mesh.1.iter().map(|i| i + base));
+}
+
+/// Build and hand the renderer the inventory player-preview, or clear it when
+/// the player-inventory window isn't open (vanilla `GuiInventory`). The biped is
+/// built at feet origin with the body yaw and head pose set from the cursor; the
+/// whole-model lean and projection into the panel are done by the renderer.
+fn build_inventory_preview(
+    renderer: &mut Renderer,
+    app: &App,
+    width: i32,
+    height: i32,
+    cursor_position: (f64, f64),
+) {
+    use crate::container::WindowKind;
+    use recraft_core::EntityKind;
+    use recraft_render::EntityAnim;
+
+    // Only the player inventory shows the preview — server containers do not.
+    let open = matches!(
+        app.game.open_container().map(|c| c.kind),
+        Some(WindowKind::Player)
+    );
+    if !app.in_world || app.screen.is_none() || !open {
+        renderer.set_inventory_preview(None);
+        return;
+    }
+    let container = app.game.open_container().expect("player container open");
+
+    let scale = gui::gui_scale(width, height);
+    // Window origin (vanilla `guiLeft`/`guiTop`): the panel is centred.
+    let origin_px = (
+        (width - container.x_size * scale) / 2,
+        (height - container.y_size * scale) / 2,
+    );
+    let origin_gui = (origin_px.0 as f32 / scale as f32, origin_px.1 as f32 / scale as f32);
+    let mouse_gui = (
+        cursor_position.0 as f32 / scale as f32,
+        cursor_position.1 as f32 / scale as f32,
+    );
+    let pose = gui::inventory::preview_pose(mouse_gui, origin_gui);
+    let (scissor, anchor, pixels_per_block) = gui::inventory::preview_layout(origin_px, scale);
+
+    // Build the biped at feet origin, facing +z (toward the viewer); the body
+    // yaw turns it, the head tracks the cursor relative to the body. Crouch is
+    // never applied here (vanilla resets the pose for the preview).
+    let anim = EntityAnim {
+        net_head_yaw: pose.net_head_yaw,
+        head_pitch: pose.head_pitch,
+        ..Default::default()
+    };
+    let skin_row = app
+        .game
+        .local_skin_row(app.session_username().unwrap_or(&app.username), app.skin_manager.rows());
+    let mut mesh = recraft_render::ModelMesh::new();
+    mesh.push_entity(EntityKind::LocalPlayer, glam::Vec3::ZERO, pose.body_yaw, &anim, skin_row);
+
+    renderer.set_inventory_preview(Some(&recraft_render::InventoryPreview {
+        mesh: &mesh,
+        anchor,
+        pixels_per_block,
+        tilt_rad: pose.tilt.to_radians(),
+        scissor,
+    }));
+}
+
 /// Render one frame: world, entities + first-person hand, HUD and the open
 /// screen. Driven from `AboutToWait` so the frame rate is paced by our own
 /// vsync/FPS-cap logic instead of macOS Core Animation throttling.
@@ -1375,6 +1489,15 @@ fn render_frame(
     // number is actually shown: the F3 overlay, or a scripted benchmark run.
     renderer.set_gpu_timing(f3_debug || smoke_active || app.settings.adaptive_resolution);
 
+    // Render-distance safety net: free the GPU meshes of columns that drifted
+    // out of view (keeping their block data) so resident VRAM stays bounded even
+    // on servers that never send ChunkUnload. Runs only on a chunk-boundary
+    // crossing; any re-mesh it needs is queued through the dirty budget below.
+    let evicted = app.game.enforce_render_distance(app.settings.render_distance);
+    if !evicted.is_empty() {
+        renderer.drop_chunk_sections(&evicted);
+    }
+
     // Local block prediction gets submitted to the background mesher first, but
     // never rebuilt on the render thread; placing/breaking must not stall a
     // frame.
@@ -1397,6 +1520,15 @@ fn render_frame(
     let tick_alpha = (tick_accumulator / 0.05).clamp(0.0, 1.0);
     if app.in_world {
         app.game.update_camera(tick_alpha);
+        // Anchor the audio listener to the camera and play this frame's queued
+        // sounds (from packets and local block prediction).
+        app.sound.set_listener(sound::Listener {
+            position: app.game.camera.position,
+            yaw: app.game.camera.yaw,
+        });
+        for queued in app.game.take_sounds() {
+            app.sound.play(&queued);
+        }
         // Start skin downloads for newly-seen textured players, then upload any
         // that finished, so the entity model can sample their atlas rows.
         let new_skins: Vec<([u8; 16], String)> = app
@@ -1431,11 +1563,29 @@ fn render_frame(
             let first_person = app.game.first_person_view(tick_alpha);
             app.game.build_entity_model(
                 &mut app.entity_model,
+                &mut app.entity_glint,
                 tick_alpha,
                 app.settings.brightness,
                 app.skin_manager.rows(),
                 entity_max_dist_sq,
+                app.settings.old_animations,
             );
+            // Chest block-entities draw in the same model pass (entity atlas).
+            app.game.build_chest_models(
+                &mut app.entity_model,
+                app.settings.brightness,
+                tick_alpha,
+                entity_max_dist_sq,
+            );
+            // Signs, enchanting-table books and end-portal surfaces share the
+            // model pass too; sign text is drawn separately on the board faces.
+            let sign_texts = app.game.build_block_entity_models(
+                &mut app.entity_model,
+                app.settings.brightness,
+                tick_alpha,
+                entity_max_dist_sq,
+            );
+            renderer.set_sign_text(&sign_texts);
             if hud_visible {
                 // Light the first-person hand + held item by the lightmap at the eye,
                 // so they darken at night/in caves like the rest of the scene.
@@ -1451,38 +1601,80 @@ fn render_frame(
                     v.color[1] *= hand_light;
                     v.color[2] *= hand_light;
                 }
-                let (mut vertices, indices) =
-                    ItemRenderer::build_held_item(&app.game.camera, &first_person, atlas_uv);
-                for v in &mut vertices {
+                let mut held = ItemRenderer::build_held_item(
+                    &app.game.camera,
+                    &first_person,
+                    atlas_uv,
+                    app.settings.old_animations,
+                );
+                for v in &mut held.vertices {
                     v.color[0] *= hand_light;
                     v.color[1] *= hand_light;
                     v.color[2] *= hand_light;
                 }
-                renderer.set_first_person_item(&vertices, &indices);
+                renderer.set_first_person_item(&held.vertices, &held.indices);
+                renderer
+                    .set_first_person_item_glint(&held.glint_vertices, &held.glint_indices);
                 // 3D world-space player nametags (billboarded, depth-occluded).
                 let nametags = app.game.player_nametags(tick_alpha);
                 renderer.set_nametags(&app.game.camera, &nametags);
             } else {
                 renderer.set_first_person_item(&[], &[]);
+                renderer.set_first_person_item_glint(&[], &[]);
                 renderer.set_nametags(&app.game.camera, &[]);
             }
             renderer.upload_model(&app.entity_model);
+            renderer.set_entity_glint(&app.entity_glint);
         }
-        let dropped = app.game.dropped_items(tick_alpha);
-        let (mut item_vertices, mut item_indices) =
+        // Dropped items, projectile sprites and falling-block cubes all share
+        // the world-item pass (it binds the block/item atlas). Projectiles reuse
+        // the dropped-item sprite path mapped to an item id.
+        let mut dropped = app.game.dropped_items(tick_alpha);
+        dropped.extend(app.game.projectiles(tick_alpha));
+        let mut world_items =
             ItemRenderer::build_world_items(&app.game.camera, &dropped, atlas_uv);
-        let held = app.game.player_held_items(tick_alpha);
-        let (held_v, held_i) = ItemRenderer::build_player_held_items(&held, atlas_uv);
-        let base = item_vertices.len() as u32;
-        item_vertices.extend(held_v);
-        item_indices.extend(held_i.iter().map(|i| i + base));
-        renderer.set_world_items(&item_vertices, &item_indices);
+        let mut falling = app.game.falling_block_cubes(tick_alpha);
+        falling.extend(app.game.primed_tnt_cubes(tick_alpha));
+        append_mesh(
+            &mut world_items.vertices,
+            &mut world_items.indices,
+            ItemRenderer::build_falling_blocks(&falling, atlas_uv),
+        );
+        let held = app.game.player_held_items(tick_alpha, app.settings.old_animations);
+        world_items.extend(ItemRenderer::build_player_held_items(&held, atlas_uv));
+        renderer.set_world_items(&world_items.vertices, &world_items.indices);
+        renderer
+            .set_world_items_glint(&world_items.glint_vertices, &world_items.glint_indices);
+        // Particle billboards (rebuilt every frame; not cached by entity_key
+        // since particles move/age continuously).
+        let particles = app.game.particle_billboards(tick_alpha);
+        let (particle_v, particle_i) =
+            recraft_render::build_particle_mesh(&app.game.camera, &particles);
+        renderer.set_particles(&particle_v, &particle_i);
+        // Block-break debris (vanilla EntityDiggingFX): billboards sampling the
+        // broken block's terrain tile, drawn against the block atlas.
+        let debris = app.game.block_debris(tick_alpha);
+        let (debris_v, debris_i) =
+            ItemRenderer::build_block_particles(&app.game.camera, &debris, atlas_uv);
+        renderer.set_block_particles(&debris_v, &debris_i);
+        // Experience-orb billboards (colour-cycle continuously, so also rebuilt
+        // each frame against their own texture).
+        let orbs = app.game.xp_orbs(tick_alpha);
+        let (orb_v, orb_i) = recraft_render::build_particle_mesh(&app.game.camera, &orbs);
+        renderer.set_xp_orbs(&orb_v, &orb_i);
     } else {
         app.last_entity_key = None;
         renderer.upload_model(&recraft_render::ModelMesh::new());
+        renderer.set_entity_glint(&recraft_render::ModelMesh::new());
         renderer.set_first_person_item(&[], &[]);
+        renderer.set_first_person_item_glint(&[], &[]);
         renderer.set_world_items(&[], &[]);
+        renderer.set_world_items_glint(&[], &[]);
+        renderer.set_particles(&[], &[]);
+        renderer.set_block_particles(&[], &[]);
+        renderer.set_xp_orbs(&[], &[]);
         renderer.set_nametags(&app.game.camera, &[]);
+        renderer.set_sign_text(&[]);
     }
     // Mining crack overlay (vanilla destroy_stage_N textures over the dig target).
     renderer.set_break_overlay(app.game.breaking_overlay());
@@ -1492,6 +1684,12 @@ fn render_frame(
     let (width, height) = (size.width as i32, size.height as i32);
     let account_entries = app.account_entries();
     let mut ui = recraft_render::UiFrame::new();
+
+    // Inventory player preview (vanilla `GuiInventory.drawEntityOnScreen`): when
+    // the player-inventory window is open, render the local biped looking toward
+    // the cursor in the top-left panel. Built into its own short-lived mesh, then
+    // projected + scissored to the panel by the renderer.
+    build_inventory_preview(renderer, app, width, height, cursor_position);
 
     let App {
         screen,
@@ -1506,6 +1704,7 @@ fn render_frame(
     let hud = HudState {
         health: game.health(),
         food: game.food(),
+        vitals: game.hud_vitals(),
         armor: game.armor(),
         xp_bar: game.xp_bar(),
         xp_level: game.xp_level(),
@@ -1521,6 +1720,7 @@ fn render_frame(
         title: game.title_overlay(tick_accumulator / 0.05),
         screen_overlay: game.screen_overlay(),
         overlay_textures: &overlay_textures,
+        boss: game.boss_bar(),
     };
     let wants_panorama = screen
         .as_ref()
@@ -1557,6 +1757,7 @@ fn render_frame(
             &hud,
             chat_input,
             debug.as_ref(),
+            settings.show_fps,
             screen_open,
         );
     }
@@ -1795,6 +1996,7 @@ fn run_headless_interact(config: &LaunchConfig, seconds: f32) -> anyhow::Result<
                 use_pressed: false,
                 left_held: want_mine,
                 right_held: false,
+                old_animations: false,
             });
             if let Some((actions, movement)) = game.tick(0.05) {
                 if game.can_send_movement_packets() {
@@ -1899,35 +2101,66 @@ fn run_headless_smoke(config: &LaunchConfig, seconds: f32) -> anyhow::Result<()>
     }
 }
 
-/// Map a number-row key (1-9) to a 0-based hotbar slot.
-fn hotbar_slot_key(event: &winit::event::KeyEvent) -> Option<i32> {
+/// Map a hotbar key (defaults 1-9) to a 0-based hotbar slot via the keybinds.
+fn hotbar_slot_key(event: &winit::event::KeyEvent, keybinds: &Keybinds) -> Option<i32> {
     if event.state != ElementState::Pressed {
         return None;
     }
-    match event.physical_key {
-        PhysicalKey::Code(KeyCode::Digit1) => Some(0),
-        PhysicalKey::Code(KeyCode::Digit2) => Some(1),
-        PhysicalKey::Code(KeyCode::Digit3) => Some(2),
-        PhysicalKey::Code(KeyCode::Digit4) => Some(3),
-        PhysicalKey::Code(KeyCode::Digit5) => Some(4),
-        PhysicalKey::Code(KeyCode::Digit6) => Some(5),
-        PhysicalKey::Code(KeyCode::Digit7) => Some(6),
-        PhysicalKey::Code(KeyCode::Digit8) => Some(7),
-        PhysicalKey::Code(KeyCode::Digit9) => Some(8),
+    let PhysicalKey::Code(code) = event.physical_key else {
+        return None;
+    };
+    match keybinds.action_for(code) {
+        Some(GameAction::Hotbar1) => Some(0),
+        Some(GameAction::Hotbar2) => Some(1),
+        Some(GameAction::Hotbar3) => Some(2),
+        Some(GameAction::Hotbar4) => Some(3),
+        Some(GameAction::Hotbar5) => Some(4),
+        Some(GameAction::Hotbar6) => Some(5),
+        Some(GameAction::Hotbar7) => Some(6),
+        Some(GameAction::Hotbar8) => Some(7),
+        Some(GameAction::Hotbar9) => Some(8),
         _ => None,
     }
 }
 
 /// If this key press opens the chat box, the text to pre-fill it with:
-/// T opens empty, '/' opens with a leading slash for commands.
-fn chat_open_key(event: &winit::event::KeyEvent) -> Option<String> {
+/// the Chat bind opens empty, the Command bind opens with a leading slash.
+fn chat_open_key(event: &winit::event::KeyEvent, keybinds: &Keybinds) -> Option<String> {
     if event.state != ElementState::Pressed {
         return None;
     }
-    match event.physical_key {
-        PhysicalKey::Code(KeyCode::KeyT) => Some(String::new()),
-        PhysicalKey::Code(KeyCode::Slash) => Some("/".to_owned()),
+    let PhysicalKey::Code(code) = event.physical_key else {
+        return None;
+    };
+    match keybinds.action_for(code) {
+        Some(GameAction::Chat) => Some(String::new()),
+        Some(GameAction::Command) => Some("/".to_owned()),
         _ => None,
+    }
+}
+
+/// Open a URL from a chat `open_url` clickEvent using the OS opener. Only
+/// http(s) links are opened (vanilla refuses other schemes); failures are
+/// logged rather than surfaced.
+fn open_url(url: &str) {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        log::warn!("ignoring non-http chat url: {url}");
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    let opener = ("open", &[] as &[&str]);
+    #[cfg(target_os = "windows")]
+    let opener = ("cmd", &["/C", "start", ""] as &[&str]);
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let opener = ("xdg-open", &[] as &[&str]);
+
+    let (program, args) = opener;
+    let result = std::process::Command::new(program)
+        .args(args)
+        .arg(url)
+        .spawn();
+    if let Err(err) = result {
+        log::warn!("failed to open url {url}: {err}");
     }
 }
 

@@ -31,6 +31,12 @@ pub enum GuiTexture {
     BrewingStand,
     /// gui/container/enchanting_table.png — the enchantment window.
     EnchantingTable,
+    /// gui/container/anvil.png — the anvil repair/rename window.
+    Anvil,
+    /// gui/container/beacon.png — the beacon window (larger than 176×166).
+    Beacon,
+    /// gui/container/villager.png — the villager trading window.
+    Villager,
 }
 
 /// Loaded vanilla GUI textures (hotbar widget, status icons, inventory window)
@@ -50,6 +56,9 @@ pub struct GuiAtlas {
     pub crafting_table: Option<RgbaImage>,
     pub brewing_stand: Option<RgbaImage>,
     pub enchanting_table: Option<RgbaImage>,
+    pub anvil: Option<RgbaImage>,
+    pub beacon: Option<RgbaImage>,
+    pub villager: Option<RgbaImage>,
     /// The 16×16-tile block atlas, used as item-icon source for block items.
     blocks: Option<RgbaImage>,
     block_uv: AtlasUv,
@@ -77,6 +86,9 @@ impl GuiAtlas {
             crafting_table: crate::texture::load_gui_image("container/crafting_table"),
             brewing_stand: crate::texture::load_gui_image("container/brewing_stand"),
             enchanting_table: crate::texture::load_gui_image("container/enchanting_table"),
+            anvil: crate::texture::load_gui_image("container/anvil"),
+            beacon: crate::texture::load_gui_image("container/beacon"),
+            villager: crate::texture::load_gui_image("container/villager"),
             blocks,
             block_uv,
             items: ItemAtlasImage::load_default(),
@@ -97,13 +109,16 @@ impl GuiAtlas {
             GuiTexture::CraftingTable => self.crafting_table.as_ref(),
             GuiTexture::BrewingStand => self.brewing_stand.as_ref(),
             GuiTexture::EnchantingTable => self.enchanting_table.as_ref(),
+            GuiTexture::Anvil => self.anvil.as_ref(),
+            GuiTexture::Beacon => self.beacon.as_ref(),
+            GuiTexture::Villager => self.villager.as_ref(),
         }
     }
 
     /// The block-atlas source pixel rect for a block item id's top-face texture,
     /// or None when the id isn't a known (non-air) block.
     fn block_tile(&self, item_id: i16) -> Option<(u32, u32)> {
-        if item_id < 0 || item_id >= 256 {
+        if !(0..256).contains(&item_id) {
             return None;
         }
         let block = BlockState::new(item_id as u16, 0);
@@ -227,6 +242,17 @@ pub struct GuiBlockItem {
     pub meta: u8,
 }
 
+/// An enchanted item icon to overlay with the scrolling glint: a 3D block-icon
+/// cube (`block` set) shimmers over its cube geometry, anything else as a flat
+/// quad over its slot rect. Built into a clip-space glint mesh by the renderer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuiGlintItem {
+    pub dst: UiRect,
+    pub item_id: i16,
+    /// `Some((block_id, meta))` when the icon is a 3D block cube.
+    pub block: Option<(u16, u8)>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UiFrame {
     /// Background layer: drawn under the 3D block icons.
@@ -236,6 +262,13 @@ pub struct UiFrame {
     overlay: Vec<UiCommand>,
     /// 3D block icons, rendered by the GPU cube pass between the two layers.
     block_items: Vec<GuiBlockItem>,
+    /// Enchanted item icons to overlay with the scrolling glint (drawn over the
+    /// icons in the UI pass, additively, like the held/world item glint).
+    glint_items: Vec<GuiGlintItem>,
+    /// Crosshair layer: a single sprite drawn on its own GPU pass with the
+    /// vanilla inversion blend (`GL_ONE_MINUS_DST_COLOR`/`GL_ONE_MINUS_SRC_COLOR`)
+    /// so it shows as the inverse of the 3D scene behind it.
+    crosshair: Vec<UiCommand>,
 }
 
 impl UiFrame {
@@ -244,7 +277,11 @@ impl UiFrame {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.commands.is_empty() && self.overlay.is_empty() && self.block_items.is_empty()
+        self.commands.is_empty()
+            && self.overlay.is_empty()
+            && self.block_items.is_empty()
+            && self.glint_items.is_empty()
+            && self.crosshair.is_empty()
     }
 
     /// Background (under-cube) and foreground (over-cube) command layers.
@@ -258,6 +295,37 @@ impl UiFrame {
 
     pub fn block_items(&self) -> &[GuiBlockItem] {
         &self.block_items
+    }
+
+    pub fn glint_items(&self) -> &[GuiGlintItem] {
+        &self.glint_items
+    }
+
+    pub fn crosshair_commands(&self) -> &[UiCommand] {
+        &self.crosshair
+    }
+
+    /// Queue the vanilla crosshair: the 16×16 sprite at (0,0) of `gui/icons.png`,
+    /// drawn at `dst`. It goes on its own inversion-blend GPU layer, matching
+    /// vanilla `GuiIngame` (`drawTexturedModalRect(.., 0, 0, 16, 16)` under the
+    /// `ONE_MINUS_DST_COLOR`/`ONE_MINUS_SRC_COLOR` blend).
+    pub fn crosshair(&mut self, dst: UiRect) {
+        self.crosshair.push(UiCommand::Image {
+            dst,
+            texture: GuiTexture::Icons,
+            sx: 0,
+            sy: 0,
+            sw: 16,
+            sh: 16,
+        });
+    }
+
+    /// Queue an enchanted item icon's glint overlay. `block` carries the cube's
+    /// `(block_id, meta)` when the icon is a 3D block cube (so the glint hugs the
+    /// cube faces), otherwise the flat slot rect is used. Drawn additively over
+    /// the icon in the UI pass, matching the held/world item glint.
+    pub fn glint_item(&mut self, dst: UiRect, item_id: i16, block: Option<(u16, u8)>) {
+        self.glint_items.push(GuiGlintItem { dst, item_id, block });
     }
 
     /// Queue a 3D block icon (the GPU cube pass draws it; counts/highlights go

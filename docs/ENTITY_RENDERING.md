@@ -26,7 +26,7 @@
 |----|------|------|-------------|------|
 | 50 | Creeper 苦力怕 | ✅ 完整 | Creeper / creeper.png | |
 | 51 | Skeleton 骷髅 | ✅ 完整 | 人形(镜像左肢) / skeleton.png | 64×32 贴图 |
-| 54 | Zombie 僵尸 | ✅ 完整 | 人形(独立左肢) / zombie.png | 改用 64×64 独立左肢 |
+| 54 | Zombie 僵尸 | ✅ 完整 | 人形(镜像左肢) / zombie.png | 1.8 mob biped 镜像右肢；其 64×64 贴图的独立左肢区为空，故 separate=false |
 | 53 | Giant 巨人 | ⚠️ 近似 | 僵尸人形 / zombie.png | 未放大 |
 | 57 | Zombie Pigman 僵尸猪人 | ✅ 修复 | 人形 / zombie_pigman.png | 原来错误复用僵尸纹理 |
 | 120 | Villager 村民 | ✅ 新增 | 专属模型(大鼻子/长袍/抱臂) / villager.png | 原来强套 biped 致贴图错乱 |
@@ -65,8 +65,9 @@
 
 ## 已知限制 / 后续工作
 
-- **命中盒未按生物区分**：`entity_size()` 仍对所有 mob 返回 0.3×1.9，只影响攻击/交互的
-  瞄准射线，不影响渲染外观。蜘蛛/史莱姆等的命中盒偏大。
+- **命中盒已按生物区分**（T19，0.2.0）：`entity_size()` 现按 1.8.9 SpawnMob/SpawnObject
+  type id 返回各物种的 `setSize` 数值（蜘蛛 1.4×0.9、末影人 0.6×2.9、下落方块/TNT 0.98 等），
+  影响攻击/交互的瞄准射线与骑乘偏移。史莱姆/岩浆怪按 size=1 取值（未读 size 元数据）。
 - **无第二皮肤层**：玩家/人形未渲染帽子/外套 overlay 层。
 - **近似项**：牛无角/乳房、猪无鼻；snowman/bat/silverfish 的 UV 偏移为凭 vanilla 估算，
   颜色正确但贴图细节可能略偏；蜘蛛腿张角为静态近似。

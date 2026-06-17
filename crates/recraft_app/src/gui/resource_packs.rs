@@ -72,6 +72,10 @@ impl GuiResourcePacks {
 }
 
 impl GuiScreen for GuiResourcePacks {
+    fn clicks_button(&self, x: f64, y: f64) -> bool {
+        self.done.as_ref().is_some_and(|b| b.clicked(x, y))
+    }
+
     fn draw(&mut self, ui: &mut UiFrame, ctx: &DrawCtx) {
         draw_default_background(ui, ctx);
         let s = ctx.scale;

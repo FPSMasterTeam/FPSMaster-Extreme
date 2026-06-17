@@ -19,6 +19,8 @@ use crate::text_input::TextInput;
 pub struct HudState<'a> {
     pub health: f32,
     pub food: i32,
+    /// Heart/hunger animation state (saturation + the vanilla tick counters).
+    pub vitals: HudVitals,
     pub armor: i32,
     pub xp_bar: f32,
     pub xp_level: i32,
@@ -39,6 +41,40 @@ pub struct HudState<'a> {
     pub title: Option<TitleOverlay<'a>>,
     pub screen_overlay: ScreenOverlay,
     pub overlay_textures: &'a OverlayTextures,
+    /// Client-derived boss bar (vanilla `BossStatus`): the nearest wither /
+    /// ender dragon's display name and 0..1 health fraction, or `None` when no
+    /// boss is in range.
+    pub boss: Option<(String, f32)>,
+}
+
+/// Heart/hunger HUD animation inputs (vanilla `GuiIngame.renderPlayerStats`).
+/// All values are server-sourced except the tick counters, which are advanced
+/// per client tick in [`crate::game::GameState`].
+#[derive(Debug, Clone, Copy)]
+pub struct HudVitals {
+    /// Food saturation (vanilla `FoodStats.getSaturationLevel`): when 0 the
+    /// hunger haunches jiggle.
+    pub saturation: f32,
+    /// Max health attribute (vanilla `SharedMonsterAttributes.maxHealth`), 20 by
+    /// default; sets the heart-row count alongside absorption.
+    pub max_health: f32,
+    /// Absorption amount (gold hearts), drawn over the red hearts.
+    pub absorption: f32,
+    /// Vanilla `updateCounter`: free-running client-tick counter.
+    pub update_counter: i32,
+    /// Vanilla `healthUpdateCounter`: blink the heart row while it exceeds
+    /// `update_counter`.
+    pub health_update_counter: i64,
+    /// Vanilla `lastPlayerHealth` (`j`): the health drawn in the blink frame.
+    pub last_player_health: i32,
+    /// Regeneration effect active: a rolling heartbeat lifts one heart per tick.
+    pub regen: bool,
+    /// Hunger effect (food poisoning) active: the haunches use the rotten sprite.
+    pub hunger_effect: bool,
+    /// Poison effect active: hearts use the poison (greenish) sprite column.
+    pub poison: bool,
+    /// Wither effect active: hearts use the wither (dark) sprite column.
+    pub wither: bool,
 }
 
 /// Data for the F3 debug overlay: the player feet position (world coords),
@@ -61,7 +97,6 @@ const SLOT_PITCH: i32 = 20;
 /// Chat panel width in GUI pixels (vanilla chat is 320 wide when open).
 const CHAT_WIDTH_GUI: i32 = 320;
 
-const WHITE_DIM: UiColor = UiColor::rgba(235, 241, 232, 95);
 const MUTED: UiColor = UiColor::rgba(176, 190, 181, 255);
 const BLACK_120: UiColor = UiColor::rgba(0, 0, 0, 120);
 const BLACK_170: UiColor = UiColor::rgba(0, 0, 0, 170);
@@ -90,6 +125,9 @@ impl GuiIngame {
         hud: &HudState,
         chat_input: Option<&mut TextInput>,
         debug: Option<&DebugInfo>,
+        // Whether the "Show FPS" option is enabled. When set (and F3 is off) a
+        // small plain FPS readout is drawn top-left; otherwise nothing is.
+        show_fps: bool,
         // Whether a screen (inventory / pause / chat) is open. The HUD still draws
         // (over the screen's scrim) so the hotbar/status bars stay visible, but the
         // crosshair is hidden so it doesn't sit in the middle of the menu.
@@ -97,26 +135,34 @@ impl GuiIngame {
     ) {
         let scale = gui_scale(width, height);
 
-        draw_screen_overlay(ui, width, height, hud.screen_overlay, hud.overlay_textures);
+        draw_screen_overlay(
+            ui,
+            width,
+            height,
+            hud.screen_overlay,
+            hud.overlay_textures,
+            hud.vitals.update_counter,
+        );
 
-        // F3 replaces the small FPS readout with the full debug overlay.
+        // F3 shows the full debug overlay; otherwise the optional "Show FPS"
+        // readout is a small plain text line (no debug HUD by default).
         match debug {
             Some(info) => draw_debug_overlay(ui, width, scale, fps, chunk_count, info),
-            None => draw_fps_panel(ui, scale, fps, chunk_count),
+            None if show_fps => draw_fps_text(ui, scale, fps),
+            None => {}
         }
 
-        // Crosshair: 10 GUI px arms, 2 GUI px thick. Hidden while a screen is open.
+        // Crosshair (vanilla `GuiIngame`): the 16×16 `gui/icons.png` sprite at
+        // (0,0), drawn at center − 7 GUI px, on a dedicated inversion-blend pass
+        // (set up by the renderer) so it reads as the inverse of the scene
+        // behind it. Hidden while a screen is open.
         if !screen_open {
-            let center_x = width / 2;
-            let center_y = height / 2;
-            ui.rect(
-                UiRect::new(center_x - 5 * scale, center_y - scale, 10 * scale, 2 * scale),
-                WHITE_DIM,
-            );
-            ui.rect(
-                UiRect::new(center_x - scale, center_y - 5 * scale, 2 * scale, 10 * scale),
-                WHITE_DIM,
-            );
+            ui.crosshair(UiRect::new(
+                width / 2 - 7 * scale,
+                height / 2 - 7 * scale,
+                16 * scale,
+                16 * scale,
+            ));
         }
 
         // Chat is the bottom-most HUD layer: the status bars (health / hunger / XP)
@@ -125,6 +171,7 @@ impl GuiIngame {
         draw_chat(ui, width, height, hud, chat_input);
         draw_status_bars(ui, width, height, hud);
         draw_hotbar(ui, width, height, hud);
+        draw_boss_bar(ui, width, height, hud);
         draw_title(ui, width, height, hud);
         draw_action_bar(ui, width, height, hud);
         draw_sidebar(ui, width, height, hud);
@@ -136,13 +183,10 @@ fn gui_scale(width: i32, height: i32) -> i32 {
     super::gui_scale(width, height)
 }
 
-fn draw_fps_panel(ui: &mut UiFrame, scale: i32, fps: f32, chunk_count: usize) {
-    let fps_text = format!("FPS {:>3.0}", fps);
-    let chunks_text = format!("Chunks {chunk_count}");
-    let width = text_width(&fps_text, scale).max(text_width(&chunks_text, scale)) + 8 * scale;
-    ui.rect(UiRect::new(4 * scale, 4 * scale, width, 26 * scale), BLACK_170);
-    ui.text_shadowed(8 * scale, 8 * scale, scale, faded_white(1.0), fps_text);
-    ui.text_shadowed(8 * scale, 19 * scale, scale, MUTED, chunks_text);
+/// The optional "Show FPS" readout: a single small shadowed line in the
+/// top-left, no background plate (the full debug HUD is F3-only).
+fn draw_fps_text(ui: &mut UiFrame, scale: i32, fps: f32) {
+    ui.text_shadowed(4 * scale, 4 * scale, scale, faded_white(1.0), format!("FPS {:>3.0}", fps));
 }
 
 /// Per-line background behind the F3 text (vanilla draws a translucent plate).
@@ -337,43 +381,208 @@ fn draw_status_bars(ui: &mut UiFrame, width: i32, height: i32, hud: &HudState) {
         );
     }
 
-    // Health hearts, left-aligned over the left half.
-    let hp = hud.health.round().clamp(0.0, 20.0) as i32;
-    for i in 0..10 {
-        let dst = UiRect::new(layout.x0 + i * step, row_y, icon, icon);
-        ui.image(dst, GuiTexture::Icons, 16, 0, 9, 9); // empty container
-        match hp - i * 2 {
-            n if n >= 2 => ui.image(dst, GuiTexture::Icons, 52, 0, 9, 9), // full
-            1 => ui.image(dst, GuiTexture::Icons, 61, 0, 9, 9),           // half
-            _ => {}
-        }
-    }
+    // The status rows are positioned relative to the vanilla health/hunger row
+    // baseline `k1` (top of an icon). `step` is the GUI-pixel pitch in physical px.
+    let k1 = row_y;
+    let v = &hud.vitals;
 
-    // Armor bar, left-aligned above health (only when wearing armor).
+    // Vanilla renderPlayerStats values (port of the same names).
+    let health = hud.health.ceil().max(0.0) as i32; // `i`
+    let absorb = v.absorption.max(0.0); // `f1`
+    let max_health = v.max_health.max(0.0); // `f`
+    let total_half = ((max_health + absorb) / 2.0).ceil() as i32; // hearts incl. empties
+    let rows = heart_rows(max_health, absorb); // `l1`
+    let row_pitch = (10 - (rows - 2)).max(3); // `i2`, in GUI px
+    let row_step = row_pitch * scale; // physical px between heart rows
+
+    // `flag`: the heart row blinks the highlighted (white-outline) container while
+    // healthUpdateCounter is ahead of updateCounter, alternating every 3 ticks.
+    let highlight = health_highlight(v.health_update_counter, v.update_counter);
+    let j = v.last_player_health; // health drawn in the blink frame
+
+    // Regenerating heartbeat (vanilla `l2`): the active heart lifts 2px, rolling
+    // one heart per tick over `ceil(maxHealth + 5)` slots. -1 disables it.
+    let regen_step: i32 = if v.regen {
+        v.update_counter % (max_health + 5.0).ceil() as i32
+    } else {
+        -1
+    };
+
+    // A per-frame Java-Random seeded exactly like vanilla so the shake matches.
+    let mut rng = JavaRng::new(v.update_counter as i64 * 312871);
+
+    // Hunger effect (food poisoning) uses the rotten-haunch sprite row.
+    let hunger_effect = v.hunger_effect;
+
+    // Poison/wither tint the hearts by shifting to a different icons.png column
+    // (vanilla `j6`: +36 poison, +72 wither). Added to every heart sprite x.
+    let heart_tint: u32 = if v.poison {
+        36
+    } else if v.wither {
+        72
+    } else {
+        0
+    };
+
+    // Armor bar, left-aligned above the top heart row (only when wearing armor).
     let armor = hud.armor.clamp(0, 20);
     if armor > 0 {
-        let armor_y = row_y - 10 * scale;
+        let armor_y = k1 - (rows - 1) * row_step - 10 * scale;
         for i in 0..10 {
             let dst = UiRect::new(layout.x0 + i * step, armor_y, icon, icon);
-            ui.image(dst, GuiTexture::Icons, 16, 9, 9, 9); // empty
             match armor - i * 2 {
                 n if n >= 2 => ui.image(dst, GuiTexture::Icons, 34, 9, 9, 9), // full
                 1 => ui.image(dst, GuiTexture::Icons, 25, 9, 9, 9),           // half
-                _ => {}
+                _ => ui.image(dst, GuiTexture::Icons, 16, 9, 9, 9),           // empty
             }
         }
     }
 
-    // Hunger haunches, right-aligned (drawn right→left like vanilla).
+    // Health + absorption hearts, highest index first (vanilla draws i6 downward
+    // so the shake RNG is consumed in the same order). Each heart's container is
+    // either plain (16) or the blink frame (25); absorption draws gold hearts.
+    let mut absorb_left = absorb; // `f2`
+    for i6 in (0..total_half).rev() {
+        let container_u = if highlight { 25 } else { 16 };
+        let col = i6 % 10;
+        let row = i6 / 10; // `l3`
+        let x = layout.x0 + col * step;
+        let mut y = k1 - row * row_step;
+        // Heart bob when very low on health (regenerating jiggle).
+        if health <= 4 {
+            y += rng.next_int(2) * scale;
+        }
+        // Rolling regen heartbeat: the active heart lifts 2px.
+        if i6 == regen_step {
+            y -= 2 * scale;
+        }
+        let dst = UiRect::new(x, y, icon, icon);
+
+        ui.image(dst, GuiTexture::Icons, container_u, 0, 9, 9); // container
+
+        // Blink frame: redraw the pre-change health on top with the brighter
+        // sprites (vanilla `j`, sprite x offset by +18 from the normal hearts).
+        if highlight {
+            if let Some(u) = heart_sprite(j, i6) {
+                ui.image(dst, GuiTexture::Icons, u + 18 + heart_tint, 0, 9, 9);
+            }
+        }
+
+        if absorb_left > 0.0 {
+            // Gold absorption hearts (icons.png +144 full / +153 half).
+            if absorb_left == absorb && absorb % 2.0 == 1.0 {
+                ui.image(dst, GuiTexture::Icons, 169 + heart_tint, 0, 9, 9); // half
+            } else {
+                ui.image(dst, GuiTexture::Icons, 160 + heart_tint, 0, 9, 9); // full
+            }
+            absorb_left -= 2.0;
+        } else if let Some(u) = heart_sprite(health, i6) {
+            ui.image(dst, GuiTexture::Icons, u + heart_tint, 0, 9, 9);
+        }
+    }
+
+    // Hunger haunches, right-aligned (drawn right→left like vanilla). With the
+    // Hunger effect the container uses the rotten-haunch column (16 + 13*9) and
+    // the filled sprite shifts +36 (rotten); that effect is not plumbed, so they
+    // stay normal here.
     let food = hud.food.clamp(0, 20);
+    let container_u: u32 = if hunger_effect { 16 + 13 * 9 } else { 16 }; // `16 + j8*9`
+    let filled_u: u32 = if hunger_effect { 16 + 36 } else { 16 }; // `l7`
     let right = layout.x0 + layout.width - icon;
     for i in 0..10 {
-        let dst = UiRect::new(right - i * step, row_y, icon, icon);
-        ui.image(dst, GuiTexture::Icons, 16, 27, 9, 9); // empty container
+        let mut y = k1;
+        // Jiggle when saturation is exhausted, paced by the food level.
+        if v.saturation <= 0.0 && v.update_counter % (food * 3 + 1) == 0 {
+            y += (rng.next_int(3) - 1) * scale;
+        }
+        let dst = UiRect::new(right - i * step, y, icon, icon);
+        ui.image(dst, GuiTexture::Icons, container_u, 27, 9, 9); // empty container
         match food - i * 2 {
-            n if n >= 2 => ui.image(dst, GuiTexture::Icons, 52, 27, 9, 9), // full
-            1 => ui.image(dst, GuiTexture::Icons, 61, 27, 9, 9),           // half
+            n if n >= 2 => ui.image(dst, GuiTexture::Icons, filled_u + 36, 27, 9, 9), // full
+            1 => ui.image(dst, GuiTexture::Icons, filled_u + 45, 27, 9, 9),           // half
             _ => {}
+        }
+    }
+}
+
+/// Vanilla heart-row blink test (`renderPlayerStats` line 615): the highlighted
+/// (white-outline) heart container is drawn while `healthUpdateCounter` is still
+/// ahead of `updateCounter`, alternating on/off every 3 ticks.
+fn health_highlight(health_update_counter: i64, update_counter: i32) -> bool {
+    let uc = update_counter as i64;
+    health_update_counter > uc && (health_update_counter - uc) / 3 % 2 == 1
+}
+
+/// Heart-row blink duration for a health change from `old` to `new` (both
+/// ceil'd to half-hearts): 20 ticks on a decrease (damage), 10 on an increase
+/// (heal), `None` when unchanged. Vanilla seeds these from hurtResistantTime;
+/// recraft seeds them from the server's UpdateHealth instead.
+pub fn health_blink_window(old: i32, new: i32) -> Option<i32> {
+    use std::cmp::Ordering::*;
+    match new.cmp(&old) {
+        Less => Some(20),
+        Greater => Some(10),
+        Equal => None,
+    }
+}
+
+/// Number of heart rows for a given max-health + absorption (vanilla `l1`):
+/// `ceil((maxHealth + absorption) / 2 / 10)`, at least one row.
+fn heart_rows(max_health: f32, absorption: f32) -> i32 {
+    (((max_health + absorption) / 2.0 / 10.0).ceil() as i32).max(1)
+}
+
+/// The icons.png x-offset (within a 9px-tall heart band) for a half-heart slot
+/// at `index` given the current half-heart `health`: `None` empty, else the
+/// full (52) or half (61) sprite x. Mirrors the vanilla `i6*2+1` comparisons.
+fn heart_sprite(health: i32, index: i32) -> Option<u32> {
+    let half = index * 2 + 1;
+    if half < health {
+        Some(52) // full
+    } else if half == health {
+        Some(61) // half
+    } else {
+        None // empty
+    }
+}
+
+/// A `java.util.Random`-compatible LCG, used so the heart/hunger shake matches
+/// vanilla bit-for-bit (it seeds `rand` with `updateCounter * 312871` each frame
+/// and calls `nextInt`). Only the methods the HUD needs are implemented.
+struct JavaRng {
+    seed: i64,
+}
+
+impl JavaRng {
+    const MULTIPLIER: i64 = 0x5DEECE66D;
+    const ADDEND: i64 = 0xB;
+    const MASK: i64 = (1 << 48) - 1;
+
+    fn new(seed: i64) -> Self {
+        Self {
+            seed: (seed ^ Self::MULTIPLIER) & Self::MASK,
+        }
+    }
+
+    fn next(&mut self, bits: u32) -> i32 {
+        self.seed = (self.seed.wrapping_mul(Self::MULTIPLIER).wrapping_add(Self::ADDEND)) & Self::MASK;
+        (self.seed >> (48 - bits)) as i32
+    }
+
+    /// `java.util.Random.nextInt(bound)` for a positive `bound`.
+    fn next_int(&mut self, bound: i32) -> i32 {
+        debug_assert!(bound > 0);
+        if (bound & -bound) == bound {
+            // Power of two: take the high bits directly.
+            return ((bound as i64 * self.next(31) as i64) >> 31) as i32;
+        }
+        loop {
+            let bits = self.next(31);
+            let val = bits % bound;
+            // Reject values that would bias the modulo (Java's rejection step).
+            if bits - val + (bound - 1) >= 0 {
+                return val;
+            }
         }
     }
 }
@@ -392,12 +601,17 @@ pub(crate) fn draw_item_icon(
     text_scale: i32,
     overlay: bool,
 ) {
-    if let Some((block_id, meta)) = recraft_render::gui_item::is_block_icon(item.id, item.damage) {
+    let block = recraft_render::gui_item::is_block_icon(item.id, item.damage);
+    if let Some((block_id, meta)) = block {
         ui.block_item(rect, block_id, meta);
     } else if overlay {
         ui.overlay_item_icon(rect, item.id);
     } else {
         ui.item_icon(rect, item.id);
+    }
+    // Enchanted items shimmer with the scrolling glint, like held/world items.
+    if crate::item_renderer::is_enchanted(item) {
+        ui.glint_item(rect, item.id, block);
     }
     if item.count > 1 {
         let label = format!("{}", item.count);
@@ -475,6 +689,82 @@ fn draw_chat(ui: &mut UiFrame, width: i32, height: i32, hud: &HudState, input: O
         ui.text_shadowed(rect.x + pad, rect.y + scale, scale, faded_white(alpha), row);
         bottom = rect.y;
     }
+}
+
+/// Client-derived boss bar (vanilla `BossStatus`): a purple/pink bar centred at
+/// the top of the screen, its filled width scaled by the boss health fraction,
+/// with the boss name centred above it. 1.8 has no bossbar packet, so the data
+/// is reconstructed from the tracked entity health (see `GameState::boss_bar`).
+fn draw_boss_bar(ui: &mut UiFrame, width: i32, height: i32, hud: &HudState) {
+    let Some((name, fraction)) = &hud.boss else {
+        return;
+    };
+    let scale = gui_scale(width, height);
+    // Vanilla layout: a 182×5 bar at (width/2 - 91, 12) in GUI pixels.
+    const BAR_W: i32 = 182;
+    const BAR_H: i32 = 5;
+    let bar_w = BAR_W * scale;
+    let bar_h = BAR_H * scale;
+    let x = width / 2 - bar_w / 2;
+    let y = 12 * scale;
+    // Empty track then the pink/purple filled portion.
+    ui.rect(UiRect::new(x, y, bar_w, bar_h), UiColor::rgba(60, 20, 60, 200));
+    let fill_w = (bar_w as f32 * fraction.clamp(0.0, 1.0)).round() as i32;
+    if fill_w > 0 {
+        ui.rect(UiRect::new(x, y, fill_w, bar_h), UiColor::rgba(190, 70, 200, 230));
+    }
+    // Boss name centred just above the bar.
+    let name_w = text_width(name, scale);
+    ui.text_shadowed(
+        width / 2 - name_w / 2,
+        y - text_height(scale) - scale,
+        scale,
+        faded_white(1.0),
+        name.clone(),
+    );
+}
+
+/// Replay the open-chat row layout from [`draw_chat`] and return each clickable
+/// chat segment's on-screen rect plus its click event, so the open chat screen
+/// can hit-test a mouse click. Mirrors the geometry used when `input` is `Some`
+/// (the chat box is open).
+pub(crate) fn chat_click_regions(
+    width: i32,
+    height: i32,
+    chat: &ChatState,
+) -> Vec<(UiRect, chat::ClickEvent)> {
+    let scale = gui_scale(width, height);
+    let line_height = 10 * scale;
+    let pad = 2 * scale;
+    let chat_width = (CHAT_WIDTH_GUI * scale).min(width - 8 * scale);
+    let wrap_width = chat_width - 2 * pad;
+    let x = 2 * scale;
+
+    // The input bar occupies the bottom; backlog rows stack above it.
+    let mut bottom = height - 2 * scale - (line_height + 2 * pad) - 2 * scale;
+
+    let mut regions = Vec::new();
+    let mut emitted = 0;
+    for line in chat.lines().iter().rev() {
+        // Per-message wrapped rows: the first wrapped row is drawn topmost, so
+        // the last row (visually lowest) is laid out first going upward.
+        let spans = chat::clickable_spans(&line.segments, wrap_width, scale);
+        for row in spans.into_iter().rev() {
+            if emitted >= 20 {
+                return regions;
+            }
+            let row_y = bottom - line_height;
+            for span in row {
+                regions.push((
+                    UiRect::new(x + pad + span.x_start, row_y, span.x_end - span.x_start, line_height),
+                    span.event,
+                ));
+            }
+            bottom = row_y;
+            emitted += 1;
+        }
+    }
+    regions
 }
 
 /// Center-screen title + subtitle with vanilla fade timing.
@@ -738,6 +1028,9 @@ fn draw_screen_overlay(
     height: i32,
     overlay: ScreenOverlay,
     textures: &OverlayTextures,
+    // Free-running client-tick counter (vanilla `updateCounter`), used to cycle
+    // the animated fire overlay frames.
+    anim_tick: i32,
 ) {
     let full = UiRect::new(0, 0, width, height);
     match overlay {
@@ -755,7 +1048,10 @@ fn draw_screen_overlay(
             }
         }
         ScreenOverlay::Fire => {
-            if let Some(tex) = &textures.fire {
+            if !textures.fire.is_empty() {
+                // Vanilla cycles fire_layer_1 frames roughly every other tick.
+                let frame = (anim_tick.rem_euclid(textures.fire.len() as i32 * 2) / 2) as usize;
+                let tex = &textures.fire[frame];
                 // Two overlapping quads covering the lower ~60% of the screen,
                 // offset horizontally like vanilla's first-person fire.
                 let fire_h = height * 6 / 10;
@@ -770,5 +1066,101 @@ fn draw_screen_overlay(
                 ui.gradient_rect(fire_rect, UiColor::rgba(220, 130, 0, 180), UiColor::rgba(200, 60, 0, 220));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enchanted_slot_icon_queues_a_glint_overlay() {
+        use recraft_protocol::nbt::NbtTag;
+        let rect = UiRect::new(10, 10, 16, 16);
+
+        // A plain diamond sword: a flat icon, no glint queued.
+        let mut ui = UiFrame::new();
+        draw_item_icon(&mut ui, rect, &SlotItem::new(276, 1, 0), 2, false);
+        assert!(ui.glint_items().is_empty(), "unenchanted item must not glint");
+
+        // The same sword with a non-empty `ench` tag: a glint overlay is queued.
+        let mut sword = SlotItem::new(276, 1, 0);
+        let mut ench = std::collections::HashMap::new();
+        ench.insert("id".to_string(), NbtTag::Short(16));
+        ench.insert("lvl".to_string(), NbtTag::Short(5));
+        sword.nbt = Some(std::collections::HashMap::from([(
+            "ench".to_string(),
+            NbtTag::List(vec![NbtTag::Compound(ench)]),
+        )]));
+        let mut ui = UiFrame::new();
+        draw_item_icon(&mut ui, rect, &sword, 2, false);
+        assert_eq!(ui.glint_items().len(), 1, "enchanted item must queue a glint overlay");
+    }
+
+    #[test]
+    fn heart_rows_wrap_at_20() {
+        // Base health (20) fits in one row of 10 hearts.
+        assert_eq!(heart_rows(20.0, 0.0), 1);
+        // Just over 20 effective HP needs a second row; vanilla ceils.
+        assert_eq!(heart_rows(20.0, 1.0), 2);
+        assert_eq!(heart_rows(20.0, 20.0), 2);
+        assert_eq!(heart_rows(40.0, 1.0), 3);
+        // Zero still draws one (empty) row.
+        assert_eq!(heart_rows(0.0, 0.0), 1);
+    }
+
+    #[test]
+    fn heart_sprite_full_half_empty() {
+        // Full health: every one of the 10 hearts is full (sprite 52).
+        let health = 20;
+        for i in 0..10 {
+            assert_eq!(heart_sprite(health, i), Some(52));
+        }
+        // 7 half-hearts = 3 full + 1 half + 6 empty.
+        let health = 7;
+        assert_eq!(heart_sprite(health, 0), Some(52)); // full
+        assert_eq!(heart_sprite(health, 1), Some(52)); // full
+        assert_eq!(heart_sprite(health, 2), Some(52)); // full
+        assert_eq!(heart_sprite(health, 3), Some(61)); // half
+        assert_eq!(heart_sprite(health, 4), None); // empty
+        // No health: all empty.
+        assert_eq!(heart_sprite(0, 0), None);
+        // One half-heart only.
+        assert_eq!(heart_sprite(1, 0), Some(61));
+    }
+
+    #[test]
+    fn blink_window_only_on_change_and_direction() {
+        // Damage → 20-tick blink; heal → 10-tick; no change → none.
+        assert_eq!(health_blink_window(20, 10), Some(20));
+        assert_eq!(health_blink_window(10, 20), Some(10));
+        assert_eq!(health_blink_window(15, 15), None);
+        assert_eq!(health_blink_window(0, 0), None);
+    }
+
+    #[test]
+    fn health_highlight_alternates_every_three_ticks() {
+        // healthUpdateCounter not ahead → no highlight.
+        assert!(!health_highlight(5, 5));
+        assert!(!health_highlight(5, 10));
+        // Ahead by 1..3 ticks → first 3-tick block is off (even), then on.
+        let h = 30;
+        // delta = h - uc; (delta)/3 % 2 == 1 → on.
+        assert_eq!(health_highlight(h, 30 - 1), (1 / 3) % 2 == 1); // off
+        assert_eq!(health_highlight(h, 30 - 4), (4 / 3) % 2 == 1); // on
+        assert_eq!(health_highlight(h, 30 - 7), (7 / 3) % 2 == 1); // off
+    }
+
+    #[test]
+    fn java_rng_matches_reference_sequence() {
+        // java.util.Random(0).nextInt(2), first ten draws.
+        let mut r = JavaRng::new(0);
+        let got: Vec<i32> = (0..10).map(|_| r.next_int(2)).collect();
+        assert_eq!(got, vec![1, 1, 0, 1, 1, 0, 1, 0, 1, 1]);
+
+        // java.util.Random(0).nextInt(3), first ten draws.
+        let mut r = JavaRng::new(0);
+        let got: Vec<i32> = (0..10).map(|_| r.next_int(3)).collect();
+        assert_eq!(got, vec![0, 1, 1, 2, 2, 2, 2, 0, 0, 2]);
     }
 }

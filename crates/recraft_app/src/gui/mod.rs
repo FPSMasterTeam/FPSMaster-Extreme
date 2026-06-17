@@ -8,8 +8,10 @@
 
 pub mod accounts;
 pub mod chat_screen;
+pub mod controls;
 pub mod demo_select;
 pub mod edit_server;
+pub mod enchant;
 pub mod game_over;
 pub mod ingame;
 pub mod ingame_menu;
@@ -41,6 +43,13 @@ pub trait GuiScreen {
 
     fn mouse_clicked(&mut self, _x: f64, _y: f64, _ctx: &mut ScreenCtx) -> Vec<GuiAction> {
         Vec::new()
+    }
+
+    /// Whether a left-click at (x, y) lands on an activatable button, so the
+    /// host can play `gui.button.press` (vanilla plays it centrally in
+    /// `GuiScreen.mouseClicked` for the hit button). Default: no buttons.
+    fn clicks_button(&self, _x: f64, _y: f64) -> bool {
+        false
     }
 
     /// A right mouse press (most screens ignore it; the inventory uses it for
@@ -176,6 +185,8 @@ pub enum GuiAction {
     SaveSettings,
     /// Send a serverbound packet (inventory clicks, window close, …).
     SendPacket(ServerboundPacket),
+    /// Open a URL from a chat component's `open_url` clickEvent in the OS browser.
+    OpenUrl(String),
 }
 
 /// Immutable per-frame data screens draw from.

@@ -573,6 +573,284 @@ fn append_block<S: BlockSource>(
         RenderShape::Door => append_door(mesh, ctx, x, y, z, block),
         RenderShape::Piston => append_piston(mesh, ctx, x, y, z, block),
         RenderShape::PistonHead => append_piston_head(mesh, ctx, x, y, z, block),
+        RenderShape::Torch => append_torch(mesh, ctx, x, y, z, block),
+        RenderShape::Fluid => append_fluid(mesh, ctx, x, y, z, block),
+        RenderShape::Fire => append_fire(mesh, ctx, x, y, z, block),
+        RenderShape::Bed => append_bed(mesh, ctx, x, y, z, block),
+    }
+}
+
+/// Bed (id 26): a 9/16-tall directed block with two halves (foot / head).
+///
+/// Meta bits 0–1 encode facing (0=south, 1=west, 2=north, 3=east — the
+/// direction the HEAD faces). Bit 3 (0x8) selects the head half.
+///
+/// Geometry (from vanilla `bed_foot.json` / `bed_head.json`):
+/// - Main element: y 0..9/16, all four vertical sides rendered except the seam
+///   joining the two halves. The top face uses a facing-dependent 90° UV
+///   rotation (vanilla `"uv": [0,16,16,0], "rotation": 90`).
+/// - Planks underside: flat DOWN face at y=3/16 (oak planks texture).
+fn append_bed<S: BlockSource>(
+    mesh: &mut ChunkMesh,
+    ctx: &BlockCtx<S>,
+    x: i32,
+    y: i32,
+    z: i32,
+    block: BlockState,
+) {
+    let is_head = block.meta & 8 != 0;
+    let facing = block.meta & 3; // 0=south, 1=west, 2=north, 3=east
+
+    let top_tex: Option<&str> = Some(if is_head { "bed_head_top" } else { "bed_feet_top" });
+    let end_tex: Option<&str> = Some(if is_head { "bed_head_end" } else { "bed_feet_end" });
+    let side_tex: Option<&str> = Some(if is_head { "bed_head_side" } else { "bed_feet_side" });
+
+    // Facing direction vector (foot → head).
+    let facing_dir: [i32; 3] = match facing {
+        0 => [0, 0, 1],   // south
+        1 => [-1, 0, 0],  // west
+        2 => [0, 0, -1],  // north
+        _ => [1, 0, 0],   // east
+    };
+
+    // Foot block: end face is opposite to facing; head block: end = facing.
+    let end_normal: [i32; 3] = if is_head {
+        facing_dir
+    } else {
+        [-facing_dir[0], 0, -facing_dir[2]]
+    };
+    // The open seam side (faces the other bed half) is not rendered.
+    let open_normal: [i32; 3] = [-end_normal[0], 0, -end_normal[2]];
+
+    const TOP: f32 = 9.0 / 16.0; // vanilla setBedBounds height (0.5625)
+    let mn = [0.0f32, 0.0, 0.0];
+    let mx = [1.0f32, TOP, 1.0];
+    let alpha = 1.0;
+    let buffer = buffer_for(mesh, block);
+
+    // Vertical faces: the end face and the two sides perpendicular to facing.
+    for face in &FACES {
+        let n = face.normal;
+        if n[1] != 0 { continue; }       // top/bottom handled separately
+        if n == open_normal { continue; } // open seam side — not rendered
+        let texture = if n == end_normal { end_tex } else { side_tex };
+        let (nx, ny, nz) = (x + n[0], y + n[1], z + n[2]);
+        emit_face(buffer, ctx, face, x, y, z, mn, mx, texture, block, alpha, nx, ny, nz);
+    }
+
+    // Top face with facing-dependent 90° UV rotation.
+    {
+        let face = &FACES[2]; // UP face ([0,1,0])
+        warn_if_missing(ctx.atlas, block, "its top face", top_tex);
+        let rect = ctx.atlas.tile_rect(top_tex);
+        let front = [x, y + 1, z];
+        let mut corners = [[0.0f32; 3]; 4];
+        let mut uvs = [[0.0f32; 2]; 4];
+        let mut colors = [[0.0f32; 4]; 4];
+        let mut lights = [[0.0f32; 2]; 4];
+        let mut local = [[0.0f32; 2]; 4];
+        for (i, corner) in face.corners.iter().enumerate() {
+            let px = corner[0];
+            let pz = corner[2];
+            corners[i] = [x as f32 + px, y as f32 + TOP, z as f32 + pz];
+            let (u, v) = bed_top_uv(facing, px, pz);
+            local[i] = [u, v];
+            uvs[i] = rect_uv(rect, u, v);
+            if ctx.flat { continue; }
+            let (sky, blk, ao) = vertex_light(ctx, face.normal, front, *corner);
+            colors[i] = [face.light * ao, face.light * ao, face.light * ao, alpha];
+            lights[i] = [sky, blk];
+        }
+        if ctx.flat {
+            let (blk_l, sky_l) = ctx.source.light_at(front[0], front[1], front[2]);
+            let light = [sky_l as f32 / 15.0, blk_l as f32 / 15.0];
+            let color = [face.light, face.light, face.light, alpha];
+            push_greedy_quad(buffer, corners, local, [rect[0], rect[1]], color, light);
+        } else {
+            buffer.push_quad_smooth(corners, uvs, colors, lights);
+        }
+    }
+
+    // Planks underside (vanilla element 2): flat DOWN face at y=3/16.
+    {
+        let face = &FACES[3]; // DOWN face ([0,-1,0])
+        let pmn = [0.0f32, 3.0 / 16.0, 0.0];
+        let pmx = [1.0f32, 3.0 / 16.0, 1.0];
+        emit_face(buffer, ctx, face, x, y, z, pmn, pmx, Some("planks_oak"), block, alpha, x, y - 1, z);
+    }
+}
+
+/// UV mapping for the bed's top face. The vanilla model uses `"uv": [0,16,16,0],
+/// "rotation": 90`, then the blockstate applies a Y-rotation per facing direction.
+/// Composed, this maps (px, pz) ∈ {0,1}² to the following (u, v) in tile space:
+fn bed_top_uv(facing: u8, px: f32, pz: f32) -> (f32, f32) {
+    match facing {
+        0 => (1.0 - pz, px),        // south (model y=0)
+        1 => (1.0 - px, 1.0 - pz),  // west  (model y=90)
+        2 => (pz, 1.0 - px),        // north (model y=180)
+        _ => (px, pz),              // east  (model y=270)
+    }
+}
+
+/// Fire (`BlockFire`): tall crossed diagonal planes on the floor, plus a plane
+/// clinging to each adjacent solid wall (fire climbing it). 1.4 blocks tall,
+/// double-sided, full-bright. Frame animation (fire_layer_0/1 flicker) needs a
+/// texture-atlas animation clock the chunk shader doesn't have yet — deferred,
+/// so this renders a static (but correctly shaped, wall-aware) flame ⚠️.
+fn append_fire<S: BlockSource>(
+    mesh: &mut ChunkMesh,
+    ctx: &BlockCtx<S>,
+    x: i32,
+    y: i32,
+    z: i32,
+    block: BlockState,
+) {
+    let texture = block.texture_name(BlockFace::Side);
+    warn_if_missing(ctx.atlas, block, "its fire texture", texture);
+    let rect = ctx.atlas.tile_rect(texture);
+    // Corner order is [ground-a, ground-b, top-b, top-a]; map the ground edge to
+    // the texture bottom (v + h) and the top edge to the texture top (v) so the
+    // flame stands upright instead of upside-down.
+    let uv = inset_tile_uvs(
+        [
+            [rect[0], rect[1] + rect[3]],
+            [rect[0] + rect[2], rect[1] + rect[3]],
+            [rect[0] + rect[2], rect[1]],
+            [rect[0], rect[1]],
+        ],
+        ctx.atlas,
+    );
+    // Fire emits light; render near full-bright using its own cell light.
+    let light = face_light(ctx, x, y, z);
+    let color = [1.0, 1.0, 1.0, 1.0];
+    let (fx, fy, fz) = (x as f32, y as f32, z as f32);
+    const H: f32 = 1.4; // vanilla fire is 22.4px ≈ 1.4 blocks tall
+
+    let quad = |a: [f32; 3], b: [f32; 3]| {
+        // A vertical quad from ground edge (a→b) up to height H.
+        [
+            [fx + a[0], fy, fz + a[2]],
+            [fx + b[0], fy, fz + b[2]],
+            [fx + b[0], fy + H, fz + b[2]],
+            [fx + a[0], fy + H, fz + a[2]],
+        ]
+    };
+
+    let opaque = |dx: i32, dy: i32, dz: i32| neighbor_block(ctx, x + dx, y + dy, z + dz).is_opaque_cube();
+
+    // Planes clinging to adjacent solid walls.
+    let mut any_wall = false;
+    if opaque(-1, 0, 0) {
+        any_wall = true;
+        emit_double_sided(mesh, ctx, block, quad([0.05, 0.0, 0.0], [0.05, 0.0, 1.0]), uv, color, light);
+    }
+    if opaque(1, 0, 0) {
+        any_wall = true;
+        emit_double_sided(mesh, ctx, block, quad([0.95, 0.0, 1.0], [0.95, 0.0, 0.0]), uv, color, light);
+    }
+    if opaque(0, 0, -1) {
+        any_wall = true;
+        emit_double_sided(mesh, ctx, block, quad([1.0, 0.0, 0.05], [0.0, 0.0, 0.05]), uv, color, light);
+    }
+    if opaque(0, 0, 1) {
+        any_wall = true;
+        emit_double_sided(mesh, ctx, block, quad([0.0, 0.0, 0.95], [1.0, 0.0, 0.95]), uv, color, light);
+    }
+
+    // Floor fire (crossed diagonal planes) when sitting on a solid block or when
+    // there's no wall to cling to (so airborne fire still shows something).
+    if opaque(0, -1, 0) || !any_wall {
+        emit_double_sided(mesh, ctx, block, quad([0.1, 0.0, 0.1], [0.9, 0.0, 0.9]), uv, color, light);
+        emit_double_sided(mesh, ctx, block, quad([0.9, 0.0, 0.1], [0.1, 0.0, 0.9]), uv, color, light);
+    }
+}
+
+/// Vanilla `BlockLiquid` surface height for a fluid level (meta). Source (0) and
+/// falling (>=8) sit near the top; flowing levels 1-7 step down. (`1 -
+/// (level+1)/9`, the `getLiquidHeightPercent` shape, flattened per-block — the
+/// smooth four-corner slope from `BlockFluidRenderer.getFluidHeight` is a
+/// follow-up; flow-direction UV rotation is likewise omitted ⚠️.)
+fn fluid_surface_height(meta: u8) -> f32 {
+    let level = if meta >= 8 { 0 } else { meta };
+    1.0 - (level as f32 + 1.0) / 9.0
+}
+
+/// Water/lava (`BlockLiquid`): a box whose top sits at the level-derived surface
+/// height, so flowing fluid renders as the stepped "incomplete" blocks rather
+/// than full cubes. Faces cull against opaque neighbours; a same-fluid neighbour
+/// hides the shared part (a taller block still shows its exposed upper strip).
+fn append_fluid<S: BlockSource>(
+    mesh: &mut ChunkMesh,
+    ctx: &BlockCtx<S>,
+    x: i32,
+    y: i32,
+    z: i32,
+    block: BlockState,
+) {
+    let same_fluid = |b: BlockState| {
+        (block.is_water() && b.is_water()) || (block.is_lava() && b.is_lava())
+    };
+    // A continuous column (same fluid above) renders full height.
+    let above = neighbor_block(ctx, x, y + 1, z);
+    let height = if same_fluid(above) {
+        1.0
+    } else {
+        fluid_surface_height(block.meta)
+    };
+    let alpha = block.render_alpha();
+    let buffer = buffer_for(mesh, block);
+    for face in &FACES {
+        let (nx, ny, nz) = (x + face.normal[0], y + face.normal[1], z + face.normal[2]);
+        let neighbor = neighbor_block(ctx, nx, ny, nz);
+        if neighbor.is_opaque_cube() {
+            continue;
+        }
+        let mut mn = [0.0f32; 3];
+        let mx = [1.0f32, height, 1.0f32];
+        match face.normal {
+            [0, 1, 0] => {
+                // Top surface — hidden when the column continues upward.
+                if same_fluid(above) {
+                    continue;
+                }
+            }
+            [0, -1, 0] => {
+                // Bottom — hidden when fluid continues below.
+                if same_fluid(neighbor) {
+                    continue;
+                }
+            }
+            _ => {
+                if same_fluid(neighbor) {
+                    let n_above = neighbor_block(ctx, nx, ny + 1, nz);
+                    let n_height = if same_fluid(n_above) {
+                        1.0
+                    } else {
+                        fluid_surface_height(neighbor.meta)
+                    };
+                    if n_height >= height {
+                        continue; // fully hidden by an equal/taller neighbour
+                    }
+                    mn[1] = n_height; // only the exposed strip above the neighbour
+                }
+            }
+        }
+        emit_face(
+            buffer,
+            ctx,
+            face,
+            x,
+            y,
+            z,
+            mn,
+            mx,
+            block.texture_name(face.face),
+            block,
+            alpha,
+            nx,
+            ny,
+            nz,
+        );
     }
 }
 
@@ -796,7 +1074,7 @@ fn emit_face<S: BlockSource>(
         corners[i] = [x as f32 + px, y as f32 + py, z as f32 + pz];
         let (u, v) = face_uv(face.normal, px, py, pz);
         local[i] = [u, v];
-        uvs[i] = [rect[0] + u * rect[2], rect[1] + v * rect[3]];
+        uvs[i] = rect_uv(rect, u, v);
         // In flat mode the per-vertex smooth light below is unused (we shade flat).
         if ctx.flat {
             continue;
@@ -865,6 +1143,31 @@ fn lerp_axis(corner: f32, lo: f32, hi: f32) -> f32 {
     }
 }
 
+/// Vanilla per-position render offset for plants that declare an `OffsetType`:
+/// flowers and double plants (`XZ`) and tall grass/fern (`XYZ`). A deterministic
+/// hash of the block's world X/Z nudges the model up to ±0.25 horizontally (and
+/// tall grass 0..0.2 downward) so dense plant cover doesn't look gridded; every
+/// other plant stays centred. Mirrors `BlockModelRenderer.renderModelStandardQuads`
+/// — the `cross` model disables ambient occlusion, so vanilla always takes that
+/// y-independent hash path, which is also why a double plant's two halves line up.
+fn cross_plant_offset(id: u16, x: i32, z: i32) -> (f32, f32, f32) {
+    let xyz = match id {
+        31 => true,             // tall grass / fern
+        37 | 38 | 175 => false, // dandelion / small flowers / double plant
+        _ => return (0.0, 0.0, 0.0),
+    };
+    let mut k = (x.wrapping_mul(3129871) as i64) ^ (z as i64).wrapping_mul(116129781);
+    k = k.wrapping_mul(k).wrapping_mul(42317861).wrapping_add(k.wrapping_mul(11));
+    let ox = (((k >> 16) & 15) as f32 / 15.0 - 0.5) * 0.5;
+    let oz = (((k >> 24) & 15) as f32 / 15.0 - 0.5) * 0.5;
+    let oy = if xyz {
+        (((k >> 20) & 15) as f32 / 15.0 - 1.0) * 0.2
+    } else {
+        0.0
+    };
+    (ox, oy, oz)
+}
+
 /// Cross-shaped plant: two diagonal planes, each emitted double-sided so the
 /// plant is visible from every direction under back-face culling (the vanilla
 /// `cross` model likewise carries a face for each side of each plane).
@@ -881,8 +1184,9 @@ fn append_cross<S: BlockSource>(
     let color = [tint[0], tint[1], tint[2], block.render_alpha()];
     let texture = block.texture_name(BlockFace::Side);
     warn_if_missing(ctx.atlas, block, "its cross texture", texture);
-    let uvs = ctx.atlas.uv(texture);
-    let (fx, fy, fz) = (x as f32, y as f32, z as f32);
+    let uvs = inset_tile_uvs(ctx.atlas.uv(texture), ctx.atlas);
+    let (ox, oy, oz) = cross_plant_offset(block.id, x, z);
+    let (fx, fy, fz) = (x as f32 + ox, y as f32 + oy, z as f32 + oz);
     // Vanilla cross model: the diagonals are inset 0.8/16 from the corners
     // (rotated 45° with rescale), not stretched corner-to-corner.
     let lo = 0.05;
@@ -910,6 +1214,41 @@ fn append_cross<S: BlockSource>(
         buffer.push_quad_double_sided(q0, uvs, color, light);
         buffer.push_quad_double_sided(q1, uvs, color, light);
     }
+}
+
+/// Pull a full-tile UV quad in by half a texel on every side. With nearest
+/// filtering the raw tile bounds land exactly on the texel grid, so a fragment
+/// right at the quad edge floors into the neighbouring atlas tile — and since the
+/// quad carries a vertex tint (grass/foliage green, etc.), any opaque neighbour
+/// texel that bleeds in shows up as a shimmering bright speck along the edges.
+/// Sampling texel centres instead keeps every fetch inside the sprite. Used by
+/// the full-tile shapes (cross plants, ladders).
+fn inset_tile_uvs(uvs: [[f32; 2]; 4], atlas: &AtlasUv) -> [[f32; 2]; 4] {
+    let [du, dv] = atlas.tile_size();
+    let (hu, hv) = (du / 32.0, dv / 32.0); // half a texel (a tile is 16 texels)
+    let cu = (uvs[0][0] + uvs[2][0]) * 0.5;
+    let cv = (uvs[0][1] + uvs[1][1]) * 0.5;
+    let pull = |c: [f32; 2]| {
+        [
+            if c[0] < cu { c[0] + hu } else { c[0] - hu },
+            if c[1] < cv { c[1] + hv } else { c[1] - hv },
+        ]
+    };
+    [pull(uvs[0]), pull(uvs[1]), pull(uvs[2]), pull(uvs[3])]
+}
+
+/// Map an in-tile `(u, v)` fraction (0..1 over the box face) to an atlas UV,
+/// clamped half a texel inside the tile rect. Same fix as [`inset_tile_uvs`] but
+/// for the box/cube path, where faces spanning the full extent land on the tile
+/// edge and would otherwise floor into a neighbour (visible on cutout/translucent
+/// blocks: glass, stained glass, panes, iron bars, leaves). Interior crops
+/// (slabs, stairs) are untouched — only the 0/1 extremes get pulled in.
+fn rect_uv(rect: [f32; 4], u: f32, v: f32) -> [f32; 2] {
+    let (hu, hv) = (rect[2] / 32.0, rect[3] / 32.0); // half a texel
+    [
+        (rect[0] + u * rect[2]).clamp(rect[0] + hu, rect[0] + rect[2] - hu),
+        (rect[1] + v * rect[3]).clamp(rect[1] + hv, rect[1] + rect[3] - hv),
+    ]
 }
 
 /// Rail: a flat (or sloped) quad 1/16 above the floor. The texture's V axis
@@ -978,16 +1317,87 @@ fn append_rail<S: BlockSource>(
     let texture = block.texture_name(BlockFace::Top);
     warn_if_missing(ctx.atlas, block, "its rail texture", texture);
     let rect = ctx.atlas.tile_rect(texture);
-    let mut uvs = [
-        [rect[0], rect[1]],
-        [rect[0] + rect[2], rect[1]],
-        [rect[0] + rect[2], rect[1] + rect[3]],
-        [rect[0], rect[1] + rect[3]],
-    ];
+    let mut uvs = inset_tile_uvs(
+        [
+            [rect[0], rect[1]],
+            [rect[0] + rect[2], rect[1]],
+            [rect[0] + rect[2], rect[1] + rect[3]],
+            [rect[0], rect[1] + rect[3]],
+        ],
+        ctx.atlas,
+    );
     uvs.rotate_right(turns);
     // Double-sided so the track is visible from above and (through a glass
     // floor) below, under back-face culling.
     emit_double_sided(mesh, ctx, block, corners, uvs, color, light);
+}
+
+/// Torch / redstone torch (`BlockTorch`): a thin 2px post with the torch
+/// texture's centre column on its sides and the flame on its top. Floor torches
+/// (meta 0/5) stand vertical and centred; wall torches lean outward from the
+/// mounting wall chosen by meta 1-4 (EAST/WEST/SOUTH/NORTH). The lean is a
+/// faithful approximation of vanilla `renderTorchAtAngle` (exact angle ⚠️
+/// pixel-level); the position/wall side and the centre-column UV are exact.
+fn append_torch<S: BlockSource>(
+    mesh: &mut ChunkMesh,
+    ctx: &BlockCtx<S>,
+    x: i32,
+    y: i32,
+    z: i32,
+    block: BlockState,
+) {
+    let texture = block.texture_name(BlockFace::Side);
+    warn_if_missing(ctx.atlas, block, "its torch texture", texture);
+    let rect = ctx.atlas.tile_rect(texture);
+    // Sub-tile UV by pixel (16px tile): u for the centre column 7..9, v top→down.
+    // Clamp half a texel inside the tile so the full-height v 0/16 edges don't
+    // floor into the neighbouring atlas tile under nearest sampling (see rect_uv).
+    let (hu, hv) = (rect[2] / 32.0, rect[3] / 32.0);
+    let u = |px: f32| (rect[0] + (px / 16.0) * rect[2]).clamp(rect[0] + hu, rect[0] + rect[2] - hu);
+    let v = |px: f32| (rect[1] + (px / 16.0) * rect[3]).clamp(rect[1] + hv, rect[1] + rect[3] - hv);
+
+    // Torches are self-lit; render near full-bright (block-light 14 ≈ sky-less).
+    let light = face_light(ctx, x, y + 1, z);
+    let color = [1.0, 1.0, 1.0, block.render_alpha()];
+
+    // Bottom- and top-centre of the post in unit block space. Wall torches sit
+    // low against the wall and lean toward the cell centre as they rise.
+    let (bc, tc): ([f32; 3], [f32; 3]) = match block.meta & 7 {
+        1 => ([0.1, 0.2, 0.5], [0.5, 0.8, 0.5]), // EAST  → on -X wall, lean +x
+        2 => ([0.9, 0.2, 0.5], [0.5, 0.8, 0.5]), // WEST  → on +X wall, lean -x
+        3 => ([0.5, 0.2, 0.1], [0.5, 0.8, 0.5]), // SOUTH → on -Z wall, lean +z
+        4 => ([0.5, 0.2, 0.9], [0.5, 0.8, 0.5]), // NORTH → on +Z wall, lean -z
+        _ => ([0.5, 0.0, 0.5], [0.5, 0.625, 0.5]), // floor: vertical, 10/16 tall
+    };
+    let (fx, fy, fz) = (x as f32, y as f32, z as f32);
+    let hw = 1.0 / 16.0; // half the 2px post width
+    // Bottom and top square corners (NW, NE, SE, SW) around the centres.
+    let square = |c: [f32; 3]| {
+        [
+            [fx + c[0] - hw, fy + c[1], fz + c[2] - hw],
+            [fx + c[0] + hw, fy + c[1], fz + c[2] - hw],
+            [fx + c[0] + hw, fy + c[1], fz + c[2] + hw],
+            [fx + c[0] - hw, fy + c[1], fz + c[2] + hw],
+        ]
+    };
+    let b = square(bc);
+    let t = square(tc);
+
+    // Side faces sample the centre column (u 7..9), full height (v 0..16).
+    let side_uv = [[u(9.0), v(0.0)], [u(7.0), v(0.0)], [u(7.0), v(16.0)], [u(9.0), v(16.0)]];
+    // Four side quads (top edge from `t`, bottom edge from `b`), each wound CCW.
+    let sides = [
+        [t[0], t[3], b[3], b[0]], // -X
+        [t[2], t[1], b[1], b[2]], // +X
+        [t[1], t[0], b[0], b[1]], // -Z
+        [t[3], t[2], b[2], b[3]], // +Z
+    ];
+    for corners in sides {
+        emit_double_sided(mesh, ctx, block, corners, side_uv, color, light);
+    }
+    // Top face: the flame nub (u 7..9, v 6..8).
+    let top_uv = [[u(7.0), v(6.0)], [u(9.0), v(6.0)], [u(9.0), v(8.0)], [u(7.0), v(8.0)]];
+    emit_double_sided(mesh, ctx, block, [t[0], t[1], t[2], t[3]], top_uv, color, light);
 }
 
 fn append_ladder<S: BlockSource>(
@@ -1004,7 +1414,7 @@ fn append_ladder<S: BlockSource>(
     let color = [tint[0], tint[1], tint[2], block.render_alpha()];
     let texture = block.texture_name(BlockFace::Side);
     warn_if_missing(ctx.atlas, block, "its ladder texture", texture);
-    let uvs = ctx.atlas.uv(texture);
+    let uvs = inset_tile_uvs(ctx.atlas.uv(texture), ctx.atlas);
     // Double-sided so the rungs show under back-face culling regardless of which
     // way the single quad happens to wind.
     emit_double_sided(mesh, ctx, block, corners, uvs, color, light);
@@ -1981,10 +2391,89 @@ mod tests {
         let mut world = World::new();
         world.set_block(0, 0, 0, BlockState::new(38, 0));
         let mesh = build_world_mesh(&world, &atlas(), BiomeColors::default(), false, false);
+        // The flower carries a vanilla XZ position offset, so check the inset
+        // against the offset model origin rather than the raw block corner.
+        let (ox, _, oz) = cross_plant_offset(38, 0, 0);
         for v in &mesh.cutout.vertices {
             let p = vpos(v);
-            assert!(p[0] >= 0.05 - 0.02 && p[0] <= 0.95 + 0.02);
-            assert!(p[2] >= 0.05 - 0.02 && p[2] <= 0.95 + 0.02);
+            assert!(p[0] - ox >= 0.05 - 0.02 && p[0] - ox <= 0.95 + 0.02);
+            assert!(p[2] - oz >= 0.05 - 0.02 && p[2] - oz <= 0.95 + 0.02);
+        }
+    }
+
+    #[test]
+    fn cross_plant_uvs_stay_half_a_texel_inside_the_tile() {
+        // With nearest filtering, UVs sitting exactly on the tile edge floor into
+        // the neighbouring atlas tile; the green vertex tint then paints that bleed
+        // as shimmering bright-green specks. Every cross UV must stay ≥ half a texel
+        // inside its tile so no fetch escapes the sprite.
+        let uv = atlas();
+        let mut world = World::new();
+        world.set_block(0, 0, 0, BlockState::new(31, 1)); // tall grass
+        let mesh = build_world_mesh(&world, &uv, BiomeColors::default(), false, false);
+        let rect = uv.tile_rect(BlockState::new(31, 1).texture_name(BlockFace::Side));
+        let (half_u, half_v) = (rect[2] / 32.0, rect[3] / 32.0);
+        assert!(!mesh.cutout.vertices.is_empty());
+        for v in &mesh.cutout.vertices {
+            let u = v.uv[0] as f32 / 65535.0;
+            let w = v.uv[1] as f32 / 65535.0;
+            assert!(
+                u >= rect[0] + half_u - 1e-4 && u <= rect[0] + rect[2] - half_u + 1e-4,
+                "u {u} not inside tile {rect:?}"
+            );
+            assert!(
+                w >= rect[1] + half_v - 1e-4 && w <= rect[1] + rect[3] - half_v + 1e-4,
+                "v {w} not inside tile {rect:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cube_face_uvs_stay_half_a_texel_inside_the_tile() {
+        // emit_face maps full faces onto the tile edges; nearest sampling would
+        // floor into the neighbour tile, bleeding along edges of glass/leaves/
+        // panes/etc. Every face UV must stay ≥ half a texel inside its tile.
+        let uv = atlas();
+        let mut world = World::new();
+        world.set_block(0, 0, 0, BlockState::new(1, 0)); // stone: all six faces exposed
+        let mesh = build_world_mesh(&world, &uv, BiomeColors::default(), false, false);
+        let rect = uv.tile_rect(BlockState::new(1, 0).texture_name(BlockFace::Side));
+        let (half_u, half_v) = (rect[2] / 32.0, rect[3] / 32.0);
+        assert!(!mesh.solid.vertices.is_empty());
+        for v in &mesh.solid.vertices {
+            let u = v.uv[0] as f32 / 65535.0;
+            let w = v.uv[1] as f32 / 65535.0;
+            assert!(
+                u >= rect[0] + half_u - 1e-4 && u <= rect[0] + rect[2] - half_u + 1e-4,
+                "u {u} not inside tile {rect:?}"
+            );
+            assert!(
+                w >= rect[1] + half_v - 1e-4 && w <= rect[1] + rect[3] - half_v + 1e-4,
+                "v {w} not inside tile {rect:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn plant_offset_matches_vanilla_and_is_position_stable() {
+        // Flowers/double plants offset in XZ only; tall grass/fern also sink in Y.
+        // Values mirror BlockModelRenderer's y-independent hash at world (0,0,0),
+        // where the hash is 0 → the minimum corner of each range.
+        assert_eq!(cross_plant_offset(37, 0, 0), (-0.25, 0.0, -0.25));
+        assert_eq!(cross_plant_offset(175, 0, 0), (-0.25, 0.0, -0.25));
+        assert_eq!(cross_plant_offset(31, 0, 0), (-0.25, -0.2, -0.25));
+        // Non-offset cross plants (sapling, dead bush, mushroom, sugar cane) stay put.
+        for id in [6u16, 32, 39, 83] {
+            assert_eq!(cross_plant_offset(id, 5, -3), (0.0, 0.0, 0.0));
+        }
+        // Deterministic per world position and within the documented ranges.
+        for x in -40..40 {
+            for z in -40..40 {
+                let (ox, oy, oz) = cross_plant_offset(31, x, z);
+                assert_eq!((ox, oy, oz), cross_plant_offset(31, x, z));
+                assert!((-0.25..=0.25).contains(&ox) && (-0.25..=0.25).contains(&oz));
+                assert!((-0.2..=0.0).contains(&oy));
+            }
         }
     }
 

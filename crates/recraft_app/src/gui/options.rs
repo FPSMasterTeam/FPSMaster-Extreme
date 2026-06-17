@@ -91,6 +91,7 @@ pub struct GuiOptions {
     sensitivity_rect: UiRect,
     brightness_rect: UiRect,
     video_btn: Option<GuiButton>,
+    controls_btn: Option<GuiButton>,
     resource_packs_btn: Option<GuiButton>,
     done: Option<GuiButton>,
     dragging: Option<Slider>,
@@ -118,7 +119,8 @@ impl GuiOptions {
         let top = ctx.height / 4 - 16 * s;
         self.sensitivity_rect = UiRect::new(x, top, 200 * s, BUTTON_HEIGHT * s);
         self.brightness_rect = UiRect::new(x, top + 24 * s, 200 * s, BUTTON_HEIGHT * s);
-        self.video_btn = Some(GuiButton::at_px(x, top + 48 * s, 200 * s, s, "Video Settings..."));
+        self.video_btn = Some(GuiButton::at_px(x, top + 48 * s, 98 * s, s, "Video Settings..."));
+        self.controls_btn = Some(GuiButton::at_px(x + 102 * s, top + 48 * s, 98 * s, s, "Controls..."));
         self.resource_packs_btn =
             Some(GuiButton::at_px(x, top + 72 * s, 200 * s, s, "Resource Packs..."));
         // A gap above Done, echoing vanilla's separated bottom button.
@@ -139,6 +141,18 @@ impl GuiOptions {
 }
 
 impl GuiScreen for GuiOptions {
+    fn clicks_button(&self, x: f64, y: f64) -> bool {
+        [
+            self.video_btn.as_ref(),
+            self.controls_btn.as_ref(),
+            self.resource_packs_btn.as_ref(),
+            self.done.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|b| b.clicked(x, y))
+    }
+
     fn draw(&mut self, ui: &mut UiFrame, ctx: &DrawCtx) {
         self.layout(ctx);
         draw_default_background(ui, ctx);
@@ -160,6 +174,9 @@ impl GuiScreen for GuiOptions {
             &format!("Brightness: {}%", ctx.settings.clone().brightness_percent()),
         );
         if let Some(b) = &self.video_btn {
+            b.draw(ui, s, ctx.mouse, ctx.mouse_down);
+        }
+        if let Some(b) = &self.controls_btn {
             b.draw(ui, s, ctx.mouse, ctx.mouse_down);
         }
         if let Some(b) = &self.resource_packs_btn {
@@ -185,6 +202,14 @@ impl GuiScreen for GuiOptions {
             return vec![
                 GuiAction::SaveSettings,
                 GuiAction::SetScreen(Box::new(GuiVideoSettings::new(self.from_main_menu))),
+            ];
+        }
+        if self.controls_btn.as_ref().is_some_and(|b| b.clicked(x, y)) {
+            return vec![
+                GuiAction::SaveSettings,
+                GuiAction::SetScreen(Box::new(super::controls::GuiControls::new(
+                    self.from_main_menu,
+                ))),
             ];
         }
         if self.resource_packs_btn.as_ref().is_some_and(|b| b.clicked(x, y)) {
@@ -266,6 +291,8 @@ pub struct GuiVideoSettings {
     fullscreen: Option<GuiButton>,
     shaders_btn: Option<GuiButton>,
     smooth_light: Option<GuiButton>,
+    show_fps: Option<GuiButton>,
+    old_animations: Option<GuiButton>,
     done: Option<GuiButton>,
     dragging: Option<VideoSlider>,
     from_main_menu: bool,
@@ -303,8 +330,11 @@ impl GuiVideoSettings {
         self.fullscreen = Some(GuiButton::at_px(x + 102 * s, top + 120 * s, 98 * s, s, ""));
         self.shaders_btn = Some(GuiButton::at_px(x, top + 144 * s, 98 * s, s, "Shaders..."));
         self.smooth_light = Some(GuiButton::at_px(x + 102 * s, top + 144 * s, 98 * s, s, ""));
+        self.show_fps = Some(GuiButton::at_px(x, top + 168 * s, 98 * s, s, ""));
+        self.old_animations =
+            Some(GuiButton::at_px(x + 102 * s, top + 168 * s, 98 * s, s, ""));
         // A gap above Done, echoing vanilla's separated bottom button.
-        self.done = Some(GuiButton::at_px(x, top + 180 * s, 200 * s, s, "Done"));
+        self.done = Some(GuiButton::at_px(x, top + 192 * s, 200 * s, s, "Done"));
     }
 
     fn apply_drag(&mut self, x: f64, ctx: &mut ScreenCtx) {
@@ -324,6 +354,25 @@ impl GuiVideoSettings {
 }
 
 impl GuiScreen for GuiVideoSettings {
+    fn clicks_button(&self, x: f64, y: f64) -> bool {
+        [
+            self.vsync.as_ref(),
+            self.adaptive.as_ref(),
+            self.graphics.as_ref(),
+            self.mipmaps.as_ref(),
+            self.resolution.as_ref(),
+            self.fullscreen.as_ref(),
+            self.shaders_btn.as_ref(),
+            self.smooth_light.as_ref(),
+            self.show_fps.as_ref(),
+            self.old_animations.as_ref(),
+            self.done.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|b| b.clicked(x, y))
+    }
+
     fn draw(&mut self, ui: &mut UiFrame, ctx: &DrawCtx) {
         self.layout(ctx);
         draw_default_background(ui, ctx);
@@ -394,6 +443,20 @@ impl GuiScreen for GuiVideoSettings {
             );
             smooth.draw(ui, s, ctx.mouse, ctx.mouse_down);
         }
+        if let Some(show_fps) = &mut self.show_fps {
+            show_fps.label = format!(
+                "Show FPS: {}",
+                if ctx.settings.show_fps { "ON" } else { "OFF" }
+            );
+            show_fps.draw(ui, s, ctx.mouse, ctx.mouse_down);
+        }
+        if let Some(old_anim) = &mut self.old_animations {
+            old_anim.label = format!(
+                "Old Animations: {}",
+                if ctx.settings.old_animations { "ON" } else { "OFF" }
+            );
+            old_anim.draw(ui, s, ctx.mouse, ctx.mouse_down);
+        }
         if let Some(done) = &self.done {
             done.draw(ui, s, ctx.mouse, ctx.mouse_down);
         }
@@ -448,6 +511,14 @@ impl GuiScreen for GuiVideoSettings {
         if self.smooth_light.as_ref().is_some_and(|b| b.clicked(x, y)) {
             ctx.settings.smooth_lighting = !ctx.settings.smooth_lighting;
             return vec![GuiAction::SetSmoothLighting(ctx.settings.smooth_lighting)];
+        }
+        if self.show_fps.as_ref().is_some_and(|b| b.clicked(x, y)) {
+            ctx.settings.show_fps = !ctx.settings.show_fps;
+            return vec![GuiAction::SaveSettings];
+        }
+        if self.old_animations.as_ref().is_some_and(|b| b.clicked(x, y)) {
+            ctx.settings.old_animations = !ctx.settings.old_animations;
+            return vec![GuiAction::SaveSettings];
         }
         if self.done.as_ref().is_some_and(|b| b.clicked(x, y)) {
             return vec![GuiAction::SaveSettings, GuiAction::SetScreen(self.back_screen())];

@@ -178,6 +178,13 @@ pub enum ServerboundPacket {
         fly_speed: f32,
         walk_speed: f32,
     },
+    /// C14 TabComplete — ask the server to complete the chat-box text. The
+    /// chat box never carries a looked-at block, so `has_position` is always
+    /// false here and no block position is written.
+    TabComplete {
+        text: String,
+        has_position: bool,
+    },
 }
 
 /// Minimal Slot data for a held item in a block-placement packet.
@@ -469,6 +476,21 @@ pub enum ClientboundPlayPacket {
         sky_light_sent: bool,
         chunks: Vec<BulkChunkData>,
     },
+    /// S2A SpawnParticle: a client-side particle effect at a world position with
+    /// a spread box, a per-particle speed and a count. `args` carries the extra
+    /// VarInts some particle types need (e.g. block/item id for *_CRACK / DUST).
+    SpawnParticle {
+        particle_id: i32,
+        x: f32,
+        y: f32,
+        z: f32,
+        offset_x: f32,
+        offset_y: f32,
+        offset_z: f32,
+        speed: f32,
+        count: i32,
+        args: Vec<i32>,
+    },
     Disconnect {
         reason_json: String,
     },
@@ -494,6 +516,15 @@ pub enum ClientboundPlayPacket {
         head_pitch: f32,
         /// Trailing data-watcher metadata (sneak/name/age flags etc.).
         metadata: Vec<MetadataEntry>,
+    },
+    /// S11 SpawnExperienceOrb — a floating XP orb. `count` is the experience
+    /// value the orb carries (drives the sprite size in the renderer).
+    SpawnExperienceOrb {
+        entity_id: i32,
+        x: f64,
+        y: f64,
+        z: f64,
+        count: i16,
     },
     SpawnObject {
         entity_id: i32,
@@ -603,6 +634,20 @@ pub enum ClientboundPlayPacket {
         entity_id: i32,
         metadata: Vec<MetadataEntry>,
     },
+    /// S1D EntityEffect — a potion effect applied to an entity. `amplifier` is
+    /// the level minus one (Speed I = 0); `duration` is in ticks.
+    EntityEffect {
+        entity_id: i32,
+        effect_id: i8,
+        amplifier: i8,
+        duration: i32,
+        hide_particles: i8,
+    },
+    /// S1E RemoveEntityEffect — a potion effect cleared from an entity.
+    RemoveEntityEffect {
+        entity_id: i32,
+        effect_id: i8,
+    },
     /// S04 EntityEquipment — armor/held item on another entity. `slot` is
     /// 0 = held, 1-4 = boots/leggings/chest/helmet.
     EntityEquipment {
@@ -644,6 +689,52 @@ pub enum ClientboundPlayPacket {
     PlayerListHeaderFooter {
         header: String,
         footer: String,
+    },
+    /// S29 SoundEffect — a named sound event at a world position. Coordinates
+    /// arrive as ÷8 fixed-point and are converted to blocks here. `pitch` is
+    /// the raw wire byte (vanilla stores `playback_rate * 63`).
+    SoundEffect {
+        name: String,
+        x: f64,
+        y: f64,
+        z: f64,
+        volume: f32,
+        pitch: u8,
+    },
+    /// S24 BlockAction — a transient block animation/sound (note-block pluck,
+    /// piston extend/retract, chest lid). `action_id` and `action_param` are
+    /// block-type-specific (for a note block: instrument and note); `block_type`
+    /// is the block id the action applies to.
+    BlockAction {
+        x: i32,
+        y: i32,
+        z: i32,
+        action_id: u8,
+        action_param: u8,
+        block_type: i32,
+    },
+    /// S28 Effect — a hardcoded effect played by integer id (1000 click,
+    /// 1003 door toggle, 2001 block break with blockstate `data`, …). When
+    /// `disable_relative_volume` is set the sound plays at full volume.
+    Effect {
+        effect_id: i32,
+        x: i32,
+        y: i32,
+        z: i32,
+        data: i32,
+        disable_relative_volume: bool,
+    },
+    /// S3A TabComplete — the completion candidates for the last C14 request.
+    TabComplete {
+        matches: Vec<String>,
+    },
+    /// S33 UpdateSign — the four lines of text on a sign block-entity, each a
+    /// chat-JSON string, at the sign's block position.
+    UpdateSign {
+        x: i32,
+        y: i32,
+        z: i32,
+        lines: [String; 4],
     },
     Unknown {
         id: i32,
@@ -889,6 +980,12 @@ impl ServerboundPacket {
                 body.write_f32(walk_speed);
                 PacketFrame::new(0x13, body.into_inner())
             }
+            Self::TabComplete { text, has_position } => {
+                let mut body = PacketWriter::new();
+                body.write_string(&text);
+                body.write_bool(has_position);
+                PacketFrame::new(0x14, body.into_inner())
+            }
         }
     }
 }
@@ -1018,6 +1115,41 @@ impl ClientboundPlayPacket {
                 let (id, meta) = decode_legacy_block_state_id(body.read_var_i32()?)?;
                 Ok(Self::BlockChange { x, y, z, id, meta })
             }
+            0x2a => {
+                let particle_id = body.read_i32()?;
+                let _long_distance = body.read_bool()?;
+                let x = body.read_f32()?;
+                let y = body.read_f32()?;
+                let z = body.read_f32()?;
+                let offset_x = body.read_f32()?;
+                let offset_y = body.read_f32()?;
+                let offset_z = body.read_f32()?;
+                let speed = body.read_f32()?;
+                let count = body.read_i32()?;
+                // Extra VarInts: 2 for ITEM_CRACK (36), 1 for BLOCK_CRACK (37) /
+                // BLOCK_DUST (38), none otherwise (EnumParticleTypes.argumentCount).
+                let arg_count = match particle_id {
+                    36 => 2,
+                    37 | 38 => 1,
+                    _ => 0,
+                };
+                let mut args = Vec::with_capacity(arg_count);
+                for _ in 0..arg_count {
+                    args.push(body.read_var_i32()?);
+                }
+                Ok(Self::SpawnParticle {
+                    particle_id,
+                    x,
+                    y,
+                    z,
+                    offset_x,
+                    offset_y,
+                    offset_z,
+                    speed,
+                    count,
+                    args,
+                })
+            }
             0x26 => {
                 let sky_light_sent = body.read_bool()?;
                 let count = body.read_var_i32()? as usize;
@@ -1116,6 +1248,13 @@ impl ClientboundPlayPacket {
                     metadata,
                 })
             }
+            0x11 => Ok(Self::SpawnExperienceOrb {
+                entity_id: body.read_var_i32()?,
+                x: fixed_point(body.read_i32()?),
+                y: fixed_point(body.read_i32()?),
+                z: fixed_point(body.read_i32()?),
+                count: body.read_i16()?,
+            }),
             0x15 => Ok(Self::EntityRelativeMove {
                 entity_id: body.read_var_i32()?,
                 dx: fixed_point_delta(body.read_i8()?),
@@ -1382,6 +1521,17 @@ impl ClientboundPlayPacket {
                 entity_id: body.read_var_i32()?,
                 metadata: read_metadata(&mut body)?,
             }),
+            0x1d => Ok(Self::EntityEffect {
+                entity_id: body.read_var_i32()?,
+                effect_id: body.read_i8()?,
+                amplifier: body.read_i8()?,
+                duration: body.read_var_i32()?,
+                hide_particles: body.read_i8()?,
+            }),
+            0x1e => Ok(Self::RemoveEntityEffect {
+                entity_id: body.read_var_i32()?,
+                effect_id: body.read_i8()?,
+            }),
             0x38 => {
                 let action = body.read_var_i32()?;
                 let count = body.read_var_i32()?;
@@ -1401,6 +1551,63 @@ impl ClientboundPlayPacket {
                 header: body.read_string(32767)?,
                 footer: body.read_string(32767)?,
             }),
+            0x29 => Ok(Self::SoundEffect {
+                name: body.read_string(256)?,
+                x: body.read_i32()? as f64 / 8.0,
+                y: body.read_i32()? as f64 / 8.0,
+                z: body.read_i32()? as f64 / 8.0,
+                volume: body.read_f32()?,
+                pitch: body.read_u8()?,
+            }),
+            0x24 => {
+                let (x, y, z) = read_block_pos(&mut body)?;
+                let action_id = body.read_u8()?;
+                let action_param = body.read_u8()?;
+                let block_type = body.read_var_i32()?;
+                Ok(Self::BlockAction {
+                    x,
+                    y,
+                    z,
+                    action_id,
+                    action_param,
+                    block_type,
+                })
+            }
+            0x28 => {
+                let effect_id = body.read_i32()?;
+                let (x, y, z) = read_block_pos(&mut body)?;
+                let data = body.read_i32()?;
+                let disable_relative_volume = body.read_bool()?;
+                Ok(Self::Effect {
+                    effect_id,
+                    x,
+                    y,
+                    z,
+                    data,
+                    disable_relative_volume,
+                })
+            }
+            0x3a => {
+                let count = body.read_var_i32()?;
+                if count < 0 {
+                    return Err(ProtocolError::InvalidData("negative tab-complete count"));
+                }
+                let mut matches = Vec::with_capacity(count.min(1024) as usize);
+                for _ in 0..count {
+                    matches.push(body.read_string(32767)?);
+                }
+                Ok(Self::TabComplete { matches })
+            }
+            0x33 => {
+                let (x, y, z) = read_block_pos(&mut body)?;
+                let lines = [
+                    body.read_string(32767)?,
+                    body.read_string(32767)?,
+                    body.read_string(32767)?,
+                    body.read_string(32767)?,
+                ];
+                Ok(Self::UpdateSign { x, y, z, lines })
+            }
             id => Ok(Self::Unknown {
                 id,
                 body: frame.body,
@@ -1661,6 +1868,82 @@ mod tests {
     }
 
     #[test]
+    fn spawn_experience_orb_decodes_fixed_point_and_count() {
+        let mut body = PacketWriter::new();
+        body.write_var_i32(7);
+        body.write_i32(32 * 10); // x = 10.0
+        body.write_i32(32 * 64); // y = 64.0
+        body.write_i32(32 * -3); // z = -3.0
+        body.write_i16(150); // xp value
+        let packet =
+            ClientboundPlayPacket::from_frame(PacketFrame::new(0x11, body.into_inner())).unwrap();
+        match packet {
+            ClientboundPlayPacket::SpawnExperienceOrb {
+                entity_id,
+                x,
+                y,
+                z,
+                count,
+            } => {
+                assert_eq!(entity_id, 7);
+                assert!((x - 10.0).abs() < 1e-9);
+                assert!((y - 64.0).abs() < 1e-9);
+                assert!((z + 3.0).abs() < 1e-9);
+                assert_eq!(count, 150);
+            }
+            other => panic!("expected SpawnExperienceOrb, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn block_action_decodes_position_and_note() {
+        let mut body = PacketWriter::new();
+        body.write_bytes(&encoded_block_pos(1, 65, -2));
+        body.write_u8(2); // instrument (snare)
+        body.write_u8(12); // note
+        body.write_var_i32(25); // note block
+        let packet =
+            ClientboundPlayPacket::from_frame(PacketFrame::new(0x24, body.into_inner())).unwrap();
+        assert_eq!(
+            packet,
+            ClientboundPlayPacket::BlockAction {
+                x: 1,
+                y: 65,
+                z: -2,
+                action_id: 2,
+                action_param: 12,
+                block_type: 25,
+            }
+        );
+    }
+
+    #[test]
+    fn update_sign_decodes_position_and_four_lines() {
+        let mut body = PacketWriter::new();
+        body.write_bytes(&encoded_block_pos(7, 64, -3));
+        body.write_string("{\"text\":\"line0\"}");
+        body.write_string("{\"text\":\"line1\"}");
+        body.write_string("");
+        body.write_string("{\"text\":\"line3\"}");
+        let packet =
+            ClientboundPlayPacket::from_frame(PacketFrame::new(0x33, body.into_inner())).unwrap();
+        assert_eq!(
+            packet,
+            ClientboundPlayPacket::UpdateSign {
+                x: 7,
+                y: 64,
+                z: -3,
+                lines: [
+                    "{\"text\":\"line0\"}".to_owned(),
+                    "{\"text\":\"line1\"}".to_owned(),
+                    "".to_owned(),
+                    "{\"text\":\"line3\"}".to_owned(),
+                ],
+            }
+        );
+    }
+
+    #[test]
     fn destroy_entities_decodes_id_list() {
         let mut body = PacketWriter::new();
         body.write_var_i32(2);
@@ -1834,6 +2117,44 @@ mod tests {
     }
 
     #[test]
+    fn clientbound_entity_effect_decodes_fields() {
+        let mut body = PacketWriter::new();
+        body.write_var_i32(7); // entity id
+        body.write_i8(22); // absorption
+        body.write_i8(1); // amplifier (level II)
+        body.write_var_i32(600); // duration ticks
+        body.write_i8(0); // hide particles
+        let packet =
+            ClientboundPlayPacket::from_frame(PacketFrame::new(0x1d, body.into_inner())).unwrap();
+        assert_eq!(
+            packet,
+            ClientboundPlayPacket::EntityEffect {
+                entity_id: 7,
+                effect_id: 22,
+                amplifier: 1,
+                duration: 600,
+                hide_particles: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn clientbound_remove_entity_effect_decodes_fields() {
+        let mut body = PacketWriter::new();
+        body.write_var_i32(7); // entity id
+        body.write_i8(19); // poison
+        let packet =
+            ClientboundPlayPacket::from_frame(PacketFrame::new(0x1e, body.into_inner())).unwrap();
+        assert_eq!(
+            packet,
+            ClientboundPlayPacket::RemoveEntityEffect {
+                entity_id: 7,
+                effect_id: 19,
+            }
+        );
+    }
+
+    #[test]
     fn clientbound_abilities_decodes_flags_and_speeds() {
         let mut body = PacketWriter::new();
         body.write_u8(0x0d); // invulnerable + allow flying + creative, not flying
@@ -1883,6 +2204,36 @@ mod tests {
         let mut reader = PacketReader::new(&frame.body);
         assert_eq!(reader.read_string(100).unwrap(), "hello");
         assert!(reader.is_empty());
+    }
+
+    #[test]
+    fn serverbound_tab_complete_writes_text_and_flag() {
+        let frame = ServerboundPacket::TabComplete {
+            text: "/te".to_owned(),
+            has_position: false,
+        }
+        .into_frame();
+        assert_eq!(frame.id, 0x14);
+        let mut reader = PacketReader::new(&frame.body);
+        assert_eq!(reader.read_string(100).unwrap(), "/te");
+        assert!(!reader.read_bool().unwrap());
+        assert!(reader.is_empty());
+    }
+
+    #[test]
+    fn clientbound_tab_complete_decodes_match_list() {
+        let mut body = PacketWriter::new();
+        body.write_var_i32(2);
+        body.write_string("/tell");
+        body.write_string("/time");
+        let packet =
+            ClientboundPlayPacket::from_frame(PacketFrame::new(0x3a, body.into_inner())).unwrap();
+        assert_eq!(
+            packet,
+            ClientboundPlayPacket::TabComplete {
+                matches: vec!["/tell".to_owned(), "/time".to_owned()],
+            }
+        );
     }
 
     #[test]

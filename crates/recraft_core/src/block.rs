@@ -76,6 +76,20 @@ impl BlockState {
         if self.id == 166 {
             return RenderShape::None;
         }
+        // Water/lava render as a level-dependent fluid surface, not a full cube.
+        if self.is_water() || self.is_lava() {
+            return RenderShape::Fluid;
+        }
+        // Fire is tall crossed planes plus faces clinging to adjacent walls.
+        if self.id == 51 {
+            return RenderShape::Fire;
+        }
+        // Chests (normal 54, ender 130, trapped 146) are block-entities: the
+        // chunk mesher skips them and the renderer draws the dedicated chest
+        // model with its own entity texture instead of a terrain box.
+        if matches!(self.id, 54 | 130 | 146) {
+            return RenderShape::None;
+        }
         match self.shape() {
             Shape::Cross => RenderShape::Cross,
             Shape::Rail => RenderShape::Rail,
@@ -85,6 +99,8 @@ impl BlockState {
             Shape::Door => RenderShape::Door,
             Shape::Piston => RenderShape::Piston,
             Shape::PistonHead => RenderShape::PistonHead,
+            Shape::Torch => RenderShape::Torch,
+            Shape::Bed => RenderShape::Bed,
             _ => RenderShape::Boxes,
         }
     }
@@ -293,6 +309,10 @@ impl BlockState {
             }
             // Pistons collide as full cubes (the head's gaps are non-walkable).
             Shape::Piston | Shape::PistonHead => CollisionBoxes::one(FULL_CUBE),
+            // Torches have no collision; the mesher builds the leaning post.
+            Shape::Torch => CollisionBoxes::none(),
+            // Bed: vanilla setBedBounds gives a 9/16-tall flat box.
+            Shape::Bed => CollisionBoxes::one(box3(0.0, 0.0, 0.0, 1.0, 0.5625, 1.0)),
         }
     }
 }
@@ -347,6 +367,14 @@ pub enum RenderShape {
     Door,
     Piston,
     PistonHead,
+    /// Torch / redstone torch: a thin post, floor-standing or wall-leaning.
+    Torch,
+    /// Water/lava: a surface whose height depends on the fluid level (meta).
+    Fluid,
+    /// Fire: tall crossed planes (floor) plus planes against adjacent walls.
+    Fire,
+    /// Bed: 9/16-tall directional block with head/foot halves and a rotated top.
+    Bed,
 }
 
 /// An axis-aligned box in unit (0..1) block space.

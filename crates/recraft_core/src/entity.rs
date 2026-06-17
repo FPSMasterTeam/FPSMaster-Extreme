@@ -12,6 +12,9 @@ pub enum EntityKind {
     RemotePlayer,
     Mob(u8),
     Object(u8),
+    /// A floating experience orb (S11 SpawnExperienceOrb), rendered as a
+    /// colour-cycling billboard rather than an articulated model.
+    ExperienceOrb,
 }
 
 #[derive(Debug, Clone)]
@@ -76,11 +79,22 @@ pub struct EntityState {
     pub is_swinging: bool,
     /// Entity metadata flag (index 0 bit 0x02): drives the crouch pose.
     pub sneaking: bool,
+    /// Entity metadata index 0 bit 0x10: the entity is using/holding its item
+    /// (eating, drinking, drawing a bow, or blocking with a sword). Combined
+    /// with the held item's use action it drives the third-person blocking pose.
+    pub using_item: bool,
     /// Ticks since the entity was first tracked, for the dropped-item bob/spin.
     pub age: u32,
     /// Vanilla `hurtTime`: counts down from 10 to 0 after a damage animation,
     /// driving the red overlay flash in the renderer.
     pub hurt_time: u8,
+    /// Vanilla death state: set when the entity dies (EntityStatus 3 or health
+    /// ≤ 0). While set, `death_time` increments each tick (capped at 20),
+    /// driving the fall-over rotation and keeping the red overlay on.
+    pub dead: bool,
+    /// Vanilla `deathTime`: 0 until death, then counts UP to 20 over the death
+    /// animation (the body tips onto its side, the corpse stays red).
+    pub death_time: u8,
     /// Entity metadata index 0 bit 0x01: the entity is on fire.
     pub on_fire: bool,
     /// Entity metadata index 0 bit 0x20: the entity is invisible. The renderer
@@ -91,6 +105,10 @@ pub struct EntityState {
     /// mobs.
     pub custom_name: Option<String>,
     pub custom_name_visible: bool,
+    /// Living-entity health (metadata index 6, a float in 1.8). Drives the
+    /// client-derived boss bar for withers / ender dragons. `None` until a
+    /// health metadata update arrives.
+    pub health: Option<f32>,
 }
 
 /// Vanilla `getArmSwingAnimationEnd` with no haste: a swing runs 6 ticks.
@@ -155,12 +173,16 @@ impl EntityState {
             swing_progress_int: 0,
             is_swinging: false,
             sneaking: false,
+            using_item: false,
             age: 0,
             hurt_time: 0,
+            dead: false,
+            death_time: 0,
             on_fire: false,
             invisible: false,
             custom_name: None,
             custom_name_visible: false,
+            health: None,
         }
     }
 
@@ -231,6 +253,14 @@ impl EntityState {
         self.hurt_time = 10;
     }
 
+    /// Begin the death animation (EntityStatus 3, or health reaching 0). From
+    /// here `tick_interpolation` runs `death_time` up to 20; idempotent so a
+    /// second death signal doesn't restart it. The fall-over tilt is derived
+    /// from `death_time` in the renderer (`death_roll_radians`).
+    pub fn start_death(&mut self) {
+        self.dead = true;
+    }
+
     /// Trigger the arm-swing animation (S0B Animation 0 from the server), the
     /// same restart gate vanilla uses so held swings flow into each other.
     pub fn start_swing(&mut self) {
@@ -278,6 +308,11 @@ impl EntityState {
         self.tick_swing();
         if self.hurt_time > 0 {
             self.hurt_time -= 1;
+        }
+        // Vanilla `onDeathUpdate`: once dead, deathTime counts up to 20 (after
+        // which the server removes the entity), driving the fall-over tilt.
+        if self.dead && self.death_time < 20 {
+            self.death_time += 1;
         }
     }
 
@@ -360,15 +395,79 @@ impl EntityState {
     }
 }
 
-/// Approximate (half-width, height) bounding sizes per entity kind. Mob sizes
-/// are simplified to the common humanoid box; objects use a small cube.
+/// (half-width, height) bounding sizes per entity kind, in blocks. Values are
+/// the vanilla 1.8.9 `Entity.setSize(width, height)` numbers (half-width =
+/// width / 2), keyed by the 1.8 SpawnMob / SpawnObject network type id. These
+/// drive the attack/interact ray-cast box, so the targeting box matches vanilla
+/// per species rather than a single humanoid approximation.
 fn entity_size(kind: EntityKind) -> (f64, f64) {
     match kind {
         EntityKind::LocalPlayer | EntityKind::RemotePlayer => (0.3, 1.8),
-        EntityKind::Mob(_) => (0.3, 1.9),
-        // Armor stand (object type 78): vanilla box is 0.5 wide, 1.975 tall.
-        EntityKind::Object(78) => (0.25, 1.975),
-        EntityKind::Object(_) => (0.125, 0.25),
+        EntityKind::Mob(id) => mob_size(id),
+        EntityKind::Object(id) => object_size(id),
+        EntityKind::ExperienceOrb => (0.25, 0.25),
+    }
+}
+
+/// Vanilla mob `setSize` by 1.8 SpawnMob type id (half-width, height). Mobs that
+/// don't override `setSize` use the `Entity` default 0.6×1.8 (creeper, blaze).
+/// Slime/magma-cube scale with a metadata size we don't track, so they use the
+/// size-1 box (0.51), matching the fixed-size render placeholder.
+fn mob_size(id: u8) -> (f64, f64) {
+    match id {
+        50 => (0.3, 1.8),         // creeper (Entity default)
+        51 => (0.3, 1.95),        // skeleton
+        52 => (0.7, 0.9),         // spider
+        53 => (1.8, 10.8),        // giant (zombie 0.6×1.8 ×6)
+        54 => (0.3, 1.95),        // zombie
+        55 => (0.255, 0.51),      // slime (size 1)
+        56 => (2.0, 4.0),         // ghast
+        57 => (0.3, 1.95),        // zombie pigman
+        58 => (0.3, 2.9),         // enderman
+        59 => (0.35, 0.5),        // cave spider
+        60 => (0.2, 0.3),         // silverfish
+        61 => (0.3, 1.8),         // blaze (Entity default)
+        62 => (0.255, 0.51),      // magma cube (size 1)
+        63 => (8.0, 8.0),         // ender dragon
+        64 => (0.45, 3.5),        // wither
+        65 => (0.25, 0.9),        // bat
+        66 => (0.3, 1.95),        // witch
+        67 => (0.2, 0.3),         // endermite
+        68 => (0.425, 0.85),      // guardian
+        90 => (0.45, 0.9),        // pig
+        91 => (0.45, 1.3),        // sheep
+        92 => (0.45, 1.3),        // cow
+        93 => (0.2, 0.7),         // chicken
+        94 => (0.475, 0.95),      // squid
+        95 => (0.3, 0.8),         // wolf
+        96 => (0.45, 1.3),        // mooshroom
+        97 => (0.35, 1.9),        // snowman
+        98 => (0.3, 0.7),         // ocelot
+        99 => (0.7, 2.9),         // iron golem
+        100 => (0.7, 1.6),        // horse
+        101 => (0.3, 0.7),        // rabbit
+        120 => (0.3, 1.8),        // villager
+        _ => (0.3, 1.8),          // unknown mob: humanoid default
+    }
+}
+
+/// Vanilla object/projectile `setSize` by 1.8 SpawnObject type id (half-width,
+/// height). Unknown objects fall back to a small item-sized box.
+fn object_size(id: u8) -> (f64, f64) {
+    match id {
+        1 => (0.75, 0.6),         // boat
+        2 => (0.125, 0.25),       // dropped item stack
+        10 => (0.49, 0.7),        // minecart
+        50 => (0.49, 0.98),       // primed TNT
+        51 => (1.0, 2.0),         // ender crystal
+        60 => (0.25, 0.5),        // arrow
+        63 => (0.5, 1.0),         // fireball (ghast)
+        64 | 66 => (0.156_25, 0.312_5), // small fireball / wither skull
+        70 => (0.49, 0.98),       // falling block
+        78 => (0.25, 1.975),      // armor stand
+        // snowball, egg, ender pearl/eye, potion, exp bottle, firework, hook:
+        61 | 62 | 65 | 72 | 73 | 75 | 76 | 90 => (0.125, 0.25),
+        _ => (0.125, 0.25),
     }
 }
 
@@ -378,6 +477,28 @@ mod tests {
 
     fn mob_at(position: DVec3) -> EntityState {
         EntityState::new_remote(EntityId(1), EntityKind::Mob(54), position, 0.0, 0.0)
+    }
+
+    #[test]
+    fn death_starts_and_counts_death_time_up_to_twenty() {
+        let mut e = mob_at(DVec3::ZERO);
+        assert!(!e.dead && e.death_time == 0, "alive mob isn't dying");
+        // Ticking while alive never advances death_time.
+        e.tick_interpolation();
+        assert_eq!(e.death_time, 0);
+
+        e.start_death();
+        assert!(e.dead);
+        for expected in 1..=20 {
+            e.tick_interpolation();
+            assert_eq!(e.death_time, expected, "deathTime increments each tick");
+        }
+        // Caps at 20 (the server removes the corpse around here).
+        e.tick_interpolation();
+        assert_eq!(e.death_time, 20, "deathTime saturates at 20");
+        // A second death signal doesn't restart the animation.
+        e.start_death();
+        assert_eq!(e.death_time, 20);
     }
 
     #[test]
@@ -462,6 +583,38 @@ mod tests {
         entity.tick_interpolation(); // previous = 0, current = 1
         let mid = entity.render_position(0.5);
         assert!((mid.x - 0.5).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn mob_boxes_match_vanilla_setsize_per_species() {
+        // Spider is wide and short (1.4×0.9), not the humanoid default.
+        let spider = EntityState::new_remote(EntityId(1), EntityKind::Mob(52), DVec3::ZERO, 0.0, 0.0);
+        assert!((spider.size().0 - 0.7).abs() < 1e-9);
+        assert!((spider.size().1 - 0.9).abs() < 1e-9);
+        // Enderman is tall (0.6×2.9).
+        let enderman = EntityState::new_remote(EntityId(2), EntityKind::Mob(58), DVec3::ZERO, 0.0, 0.0);
+        assert!((enderman.size().1 - 2.9).abs() < 1e-9);
+        // The aabb tracks the per-species half-width.
+        let spider2 = EntityState::new_remote(EntityId(3), EntityKind::Mob(52), DVec3::new(5.0, 64.0, 5.0), 0.0, 0.0);
+        assert!((spider2.aabb.min.x - (5.0 - 0.7)).abs() < 1e-9);
+        assert!((spider2.aabb.max.y - (64.0 + 0.9)).abs() < 1e-9);
+        // Unknown mob ids fall back to the humanoid default.
+        let unknown = EntityState::new_remote(EntityId(4), EntityKind::Mob(199), DVec3::ZERO, 0.0, 0.0);
+        assert_eq!(unknown.size(), (0.3, 1.8));
+    }
+
+    #[test]
+    fn object_boxes_match_vanilla_per_type() {
+        // Falling block / TNT are near-full cubes (0.98), not tiny.
+        let falling = EntityState::new_remote(EntityId(1), EntityKind::Object(70), DVec3::ZERO, 0.0, 0.0);
+        assert!((falling.size().0 - 0.49).abs() < 1e-9);
+        assert!((falling.size().1 - 0.98).abs() < 1e-9);
+        // Armor stand keeps its dedicated box.
+        let stand = EntityState::new_remote(EntityId(2), EntityKind::Object(78), DVec3::ZERO, 0.0, 0.0);
+        assert_eq!(stand.size(), (0.25, 1.975));
+        // Dropped items stay item-sized.
+        let item = EntityState::new_remote(EntityId(3), EntityKind::Object(2), DVec3::ZERO, 0.0, 0.0);
+        assert_eq!(item.size(), (0.125, 0.25));
     }
 
     #[test]

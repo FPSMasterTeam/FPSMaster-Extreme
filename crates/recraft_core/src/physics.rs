@@ -205,7 +205,12 @@ impl Default for PlayerPhysicsConfig {
     fn default() -> Self {
         Self {
             gravity: 0.08,
-            jump_velocity: 0.42,
+            // Vanilla `jump()` does `motionY = (double)getJumpUpwardsMotion()`,
+            // and `getJumpUpwardsMotion()` returns the FLOAT `0.42F`. Promoting
+            // that float to double yields 0.41999998688697815, not the double
+            // 0.42 — using 0.42 makes every jump a hair too high (Grim's
+            // JumpPower mirrors the float `0.42F`).
+            jump_velocity: 0.419_999_986_886_978_15,
             air_drag_y: 0.9800000190734863,
             step_height: 0.6,
             air_acceleration: 0.02,
@@ -258,7 +263,9 @@ impl PlayerPhysics {
         // held jump only adds 0.04 buoyancy; otherwise a grounded jump assigns
         // the 0.42 launch (plus the sprint boost).
         if input.jump && !input.flying && (in_water || in_lava) {
-            velocity.y += 0.04;
+            // Vanilla in-fluid held-jump buoyancy is `(double)0.04F`
+            // (0.03999999910593033), not the double 0.04.
+            velocity.y += 0.039_999_999_105_930_33;
         } else if input.jump && player.on_ground {
             velocity.y = self.config.jump_velocity;
             if input.sprint {
@@ -695,6 +702,84 @@ fn web_aware_move(
     result
 }
 
+/// Vanilla `EntityItem.onUpdate` physics for a dropped item (object type 2).
+/// Apply gravity (`-0.04`), move with world collision (no step-up), then
+/// horizontal drag (`0.98`, scaled by the supporting block's slipperiness on
+/// the ground), vertical drag (`0.98`) and the `-0.5` ground bounce. Running
+/// this client-side each tick makes a freshly-dropped item arc immediately
+/// instead of freezing at its spawn height until the next server position
+/// packet; server updates still correct the position via the normal lerp path.
+///
+/// Advances `previous_position`/`age` like `tick_interpolation` so the render
+/// interpolation and the dropped-item bob/spin stay continuous.
+pub fn tick_item(world: &World, item: &mut EntityState) {
+    item.previous_position = item.position;
+    item.age = item.age.wrapping_add(1);
+
+    // Gravity is applied before the move in vanilla.
+    item.velocity.y -= 0.04;
+    let result = move_with_collisions(world, item.aabb, item.velocity, 0.0, item.on_ground);
+    item.position = result.feet;
+    item.on_ground = result.on_ground;
+    item.velocity = result.velocity;
+
+    let horizontal = if item.on_ground {
+        block_below_slipperiness(world, item.position, item.aabb) as f64 * 0.98
+    } else {
+        0.98
+    };
+    item.velocity.x *= horizontal;
+    item.velocity.y *= 0.98;
+    item.velocity.z *= horizontal;
+    if item.on_ground {
+        item.velocity.y *= -0.5;
+    }
+    item.sync_aabb_to_position();
+}
+
+/// Vanilla projectile flight (`EntityThrowable` / `EntityArrow`): move by the
+/// motion, orient yaw/pitch to it, then apply air `drag` and `gravity`. Running
+/// this client-side each tick makes a thrown snowball / ender pearl / arrow arc
+/// immediately at zero latency instead of stuttering between sparse server
+/// position packets; the server still corrects drift through the normal lerp.
+///
+/// `collide` arrows stop dead on the first block they would enter (vanilla
+/// `inGround` — the killed motion then ends the local simulation); throwables
+/// fly freely because the server despawns them on impact. Advances
+/// `previous_position`/`age` so the render interpolation stays continuous.
+pub fn tick_projectile(world: &World, e: &mut EntityState, gravity: f64, drag: f64, collide: bool) {
+    e.previous_position = e.position;
+    e.prev_yaw = e.yaw;
+    e.prev_pitch = e.pitch;
+    e.age = e.age.wrapping_add(1);
+
+    if collide {
+        // Arrow: a tiny swept box; any contact sticks it in place.
+        let result = move_with_collisions(world, e.aabb, e.velocity, 0.0, false);
+        if result.collided_horizontally || result.on_ground {
+            e.position = result.feet;
+            e.velocity = DVec3::ZERO;
+            e.sync_aabb_to_position();
+            return;
+        }
+        e.position = result.feet;
+    } else {
+        // Throwable: free flight (no block collision; the server removes it on hit).
+        e.position += e.velocity;
+    }
+
+    // Orient to the motion that just moved it (vanilla atan2 yaw/pitch).
+    let horizontal = (e.velocity.x * e.velocity.x + e.velocity.z * e.velocity.z).sqrt();
+    if horizontal > 1.0e-7 || e.velocity.y.abs() > 1.0e-7 {
+        e.yaw = e.velocity.x.atan2(e.velocity.z).to_degrees() as f32;
+        e.pitch = e.velocity.y.atan2(horizontal).to_degrees() as f32;
+    }
+
+    e.velocity *= drag;
+    e.velocity.y -= gravity;
+    e.sync_aabb_to_position();
+}
+
 /// Slipperiness of the block supporting the player. Vanilla samples one block
 /// below `floor(boundingBox.minY)` in the feet column.
 fn block_below_slipperiness(world: &World, position: DVec3, aabb: Aabb) -> f32 {
@@ -922,7 +1007,7 @@ mod tests {
     use glam::DVec3;
 
     use super::*;
-    use crate::{BlockState, EntityId};
+    use crate::{BlockState, EntityId, EntityKind};
 
     #[test]
     fn falling_player_lands_on_solid_block() {
@@ -935,6 +1020,95 @@ mod tests {
 
         assert!(player.on_ground);
         assert!((player.position.y - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn dropped_item_falls_under_gravity_and_settles_on_ground() {
+        let mut world = World::new();
+        world.set_block(0, 0, 0, BlockState::STONE);
+        let mut item =
+            EntityState::new_remote(EntityId(7), EntityKind::Object(2), DVec3::new(0.5, 4.0, 0.5), 0.0, 0.0);
+
+        // One tick applies gravity and moves the item down (no stall).
+        let start_y = item.position.y;
+        tick_item(&world, &mut item);
+        assert!(item.position.y < start_y, "item should start falling immediately");
+        assert!(item.velocity.y < 0.0, "downward velocity accumulates");
+        assert_eq!(item.previous_position.y, start_y, "render-interp prev tracks last tick");
+
+        // It eventually rests on top of the block (box bottom at y=1).
+        for _ in 0..200 {
+            tick_item(&world, &mut item);
+        }
+        assert!(item.on_ground, "item should land");
+        assert!((item.position.y - 1.0).abs() < 0.05, "rests on the block top: {}", item.position.y);
+    }
+
+    #[test]
+    fn dropped_item_keeps_horizontal_motion_with_drag() {
+        let world = World::new(); // empty: item flies freely
+        let mut item =
+            EntityState::new_remote(EntityId(8), EntityKind::Object(2), DVec3::new(0.0, 64.0, 0.0), 0.0, 0.0);
+        item.velocity = DVec3::new(0.5, 0.0, 0.0);
+        tick_item(&world, &mut item);
+        assert!(item.position.x > 0.0, "horizontal velocity carries the item");
+        // Air drag 0.98 reduces horizontal speed below the initial 0.5.
+        assert!(item.velocity.x < 0.5 && item.velocity.x > 0.45);
+    }
+
+    #[test]
+    fn thrown_snowball_arcs_under_gravity_and_drag() {
+        let world = World::new(); // empty: free flight
+        let mut ball = EntityState::new_remote(
+            EntityId(9),
+            EntityKind::Object(61),
+            DVec3::new(0.0, 64.0, 0.0),
+            0.0,
+            0.0,
+        );
+        ball.velocity = DVec3::new(0.6, 0.4, 0.0);
+        tick_projectile(&world, &mut ball, 0.03, 0.99, false);
+        // Moved by the pre-drag motion this tick.
+        assert!((ball.position.x - 0.6).abs() < 1.0e-9);
+        assert!((ball.position.y - 64.4).abs() < 1.0e-9);
+        // Air drag 0.99 then gravity 0.03 on the vertical.
+        assert!((ball.velocity.x - 0.6 * 0.99).abs() < 1.0e-9);
+        assert!((ball.velocity.y - (0.4 * 0.99 - 0.03)).abs() < 1.0e-9);
+        // Yaw points along +x motion (atan2(vx, vz) = 90°).
+        assert!((ball.yaw - 90.0).abs() < 1.0e-3);
+    }
+
+    #[test]
+    fn arrow_sticks_into_a_wall_and_stops() {
+        let mut world = World::new();
+        world.set_block(1, 64, 0, BlockState::STONE);
+        let mut arrow = EntityState::new_remote(
+            EntityId(10),
+            EntityKind::Object(60),
+            DVec3::new(0.0, 64.4, 0.5),
+            0.0,
+            0.0,
+        );
+        arrow.velocity = DVec3::new(1.5, 0.0, 0.0); // flying +x into the stone
+        tick_projectile(&world, &mut arrow, 0.05, 0.99, true);
+        assert_eq!(arrow.velocity, DVec3::ZERO, "arrow stops dead in the block");
+        assert!(arrow.position.x < 1.0, "arrow stops at the block face");
+    }
+
+    #[test]
+    fn arrow_flies_freely_in_open_air() {
+        let world = World::new();
+        let mut arrow = EntityState::new_remote(
+            EntityId(11),
+            EntityKind::Object(60),
+            DVec3::new(0.0, 64.0, 0.0),
+            0.0,
+            0.0,
+        );
+        arrow.velocity = DVec3::new(2.0, 0.0, 0.0);
+        tick_projectile(&world, &mut arrow, 0.05, 0.99, true);
+        assert!(arrow.position.x > 1.5, "arrow advances through open air");
+        assert!((arrow.velocity.x - 2.0 * 0.99).abs() < 1.0e-9);
     }
 
     #[test]
@@ -973,6 +1147,18 @@ mod tests {
 
         assert!((player.position.y - 1.42).abs() < 0.001);
         assert!((player.velocity.y - 0.3332).abs() < 0.001);
+    }
+
+    #[test]
+    fn jump_velocity_matches_vanilla_float_promotion() {
+        // Vanilla `jump()` does `motionY = (double)getJumpUpwardsMotion()`, and
+        // that method returns the FLOAT `0.42F`; promoted to double it is
+        // 0.41999998688697815, NOT the double 0.42. Pin the exact bits so a
+        // "round number" edit can't silently make every jump a hair too high
+        // (the loose-tolerance jump test above wouldn't catch the ~1.3e-8 drift).
+        let v = PlayerPhysics::default().config.jump_velocity;
+        assert_eq!(v, 0.41999998688697815, "jump velocity must be (double)0.42F");
+        assert_ne!(v, 0.42, "the plain double 0.42 is too high");
     }
 
     #[test]
