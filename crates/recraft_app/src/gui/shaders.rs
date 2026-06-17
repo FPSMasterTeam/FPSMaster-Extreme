@@ -82,6 +82,27 @@ fn on_off(b: bool) -> &'static str {
 }
 
 impl GuiScreen for GuiShaders {
+    fn clicks_button(&self, x: f64, y: f64) -> bool {
+        [
+            self.shaders.as_ref(),
+            self.shadows.as_ref(),
+            self.specular.as_ref(),
+            self.fog.as_ref(),
+            self.bloom.as_ref(),
+            self.volumetric.as_ref(),
+            self.vignette.as_ref(),
+            self.chromatic.as_ref(),
+            self.dof.as_ref(),
+            self.motion_blur.as_ref(),
+            self.auto_exposure.as_ref(),
+            self.clouds.as_ref(),
+            self.done.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|b| b.clicked(x, y))
+    }
+
     fn draw(&mut self, ui: &mut recraft_render::UiFrame, ctx: &DrawCtx) {
         self.layout(ctx);
         draw_default_background(ui, ctx);

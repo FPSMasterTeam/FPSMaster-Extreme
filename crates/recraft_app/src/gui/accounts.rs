@@ -62,6 +62,10 @@ impl GuiAccounts {
 }
 
 impl GuiScreen for GuiAccounts {
+    fn clicks_button(&self, x: f64, y: f64) -> bool {
+        self.buttons.iter().any(|b| b.clicked(x, y))
+    }
+
     fn draw(&mut self, ui: &mut UiFrame, ctx: &DrawCtx) {
         self.layout(ctx);
         draw_default_background(ui, ctx);
@@ -232,6 +236,10 @@ impl GuiAddToken {
 }
 
 impl GuiScreen for GuiAddToken {
+    fn clicks_button(&self, x: f64, y: f64) -> bool {
+        self.buttons.iter().any(|b| b.clicked(x, y))
+    }
+
     fn draw(&mut self, ui: &mut UiFrame, ctx: &DrawCtx) {
         self.layout(ctx);
         draw_default_background(ui, ctx);

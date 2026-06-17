@@ -57,6 +57,11 @@ impl GuiControls {
 }
 
 impl GuiScreen for GuiControls {
+    fn clicks_button(&self, x: f64, y: f64) -> bool {
+        self.done.as_ref().is_some_and(|b| b.clicked(x, y))
+            || self.row_buttons.iter().any(|(_, r)| r.contains(x, y))
+    }
+
     fn draw(&mut self, ui: &mut UiFrame, ctx: &DrawCtx) {
         draw_default_background(ui, ctx);
         let s = ctx.scale;

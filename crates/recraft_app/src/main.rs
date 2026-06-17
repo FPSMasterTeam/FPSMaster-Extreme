@@ -541,6 +541,13 @@ impl ApplicationHandler for WinitApp {
                             self.mouse_down_right = true;
                         }
                         let mut taken = app.screen.take();
+                        let (mx, my) = self.cursor_position;
+                        // Vanilla GuiScreen.mouseClicked plays gui.button.press for
+                        // a left-click that lands on an enabled button (client-only;
+                        // no server packet). Emit it centrally before dispatch.
+                        if is_left && taken.as_ref().is_some_and(|s| s.clicks_button(mx, my)) {
+                            app.game.queue_ui_sound("gui.button.press");
+                        }
                         let actions = if let Some(screen) = taken.as_mut() {
                             let mut ctx = ScreenCtx {
                                 game: &mut app.game,
@@ -549,7 +556,6 @@ impl ApplicationHandler for WinitApp {
                                 modifiers: self.modifiers,
                                 mouse: self.cursor_position,
                             };
-                            let (mx, my) = self.cursor_position;
                             if is_left {
                                 screen.mouse_clicked(mx, my, &mut ctx)
                             } else if is_right {

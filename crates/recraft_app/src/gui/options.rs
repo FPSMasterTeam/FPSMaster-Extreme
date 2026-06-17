@@ -141,6 +141,18 @@ impl GuiOptions {
 }
 
 impl GuiScreen for GuiOptions {
+    fn clicks_button(&self, x: f64, y: f64) -> bool {
+        [
+            self.video_btn.as_ref(),
+            self.controls_btn.as_ref(),
+            self.resource_packs_btn.as_ref(),
+            self.done.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|b| b.clicked(x, y))
+    }
+
     fn draw(&mut self, ui: &mut UiFrame, ctx: &DrawCtx) {
         self.layout(ctx);
         draw_default_background(ui, ctx);
@@ -342,6 +354,25 @@ impl GuiVideoSettings {
 }
 
 impl GuiScreen for GuiVideoSettings {
+    fn clicks_button(&self, x: f64, y: f64) -> bool {
+        [
+            self.vsync.as_ref(),
+            self.adaptive.as_ref(),
+            self.graphics.as_ref(),
+            self.mipmaps.as_ref(),
+            self.resolution.as_ref(),
+            self.fullscreen.as_ref(),
+            self.shaders_btn.as_ref(),
+            self.smooth_light.as_ref(),
+            self.show_fps.as_ref(),
+            self.old_animations.as_ref(),
+            self.done.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|b| b.clicked(x, y))
+    }
+
     fn draw(&mut self, ui: &mut UiFrame, ctx: &DrawCtx) {
         self.layout(ctx);
         draw_default_background(ui, ctx);

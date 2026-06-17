@@ -1989,9 +1989,12 @@ impl ModelMesh {
         let base = Vec3::new(cell[0] as f32, cell[1] as f32, cell[2] as f32);
         let anchor = base + Vec3::new(0.5, 0.75 * f, 0.5);
         // Same model transform as push_sign, applied to a model-px point on the
-        // board front face (z = -1.05, just proud of the -1..+1 board).
+        // board front face (z = -1.05, just proud of the -1..+1 board). The
+        // model-px coords convert to blocks with the renderSign 0.0625 (which
+        // push_sign folds into its box bounds) before the render scale f and the
+        // model-space y/z flip — without it the basis was 16× too big and high.
         let place = |m: Vec3| {
-            let s = Vec3::new(m.x * f, -m.y * f, -m.z * f) + wall_off;
+            let s = Vec3::new(m.x, -m.y, -m.z) * (0.0625 * f) + wall_off;
             anchor + rotate_y(s, sy, cy)
         };
         let center = place(Vec3::new(0.0, -8.0, -1.05));
@@ -2908,6 +2911,25 @@ mod tests {
             top.uv[1],
             bottom.uv[1]
         );
+    }
+
+    /// The sign-text basis must sit ON the board, not 16× too high/big. Guards
+    /// the model-px→block `0.0625` in `place` (without it the centre floated
+    /// ~5.3 blocks up and the board read as huge).
+    #[test]
+    fn sign_text_basis_sits_on_the_board() {
+        let (center, _right, _up, half_w, half_h) =
+            ModelMesh::sign_text_basis([0, 64, 0], 0, SignKind::Standing);
+        // Board centre sits ~0.83 above the cell base (the broken basis put it
+        // ~5.3 blocks up, floating in the sky).
+        assert!(
+            (center.y - 64.83).abs() < 0.05,
+            "sign text centre should sit on the board (~64.83), got {}",
+            center.y
+        );
+        // Board half-extents: ~0.5 wide, ~0.25 tall (24×12 model px × 0.0625 × f / 2).
+        assert!((half_w - 0.5).abs() < 0.02, "half_w should be ~0.5, got {half_w}");
+        assert!((half_h - 0.25).abs() < 0.02, "half_h should be ~0.25, got {half_h}");
     }
 
     /// The enchanting-table book cover must read upright. coverRight's printed

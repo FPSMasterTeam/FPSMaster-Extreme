@@ -1104,6 +1104,17 @@ impl GameState {
         });
     }
 
+    /// Queue a non-positional UI sound (vanilla `PositionedSoundRecord.create`,
+    /// unattenuated, e.g. `gui.button.press`).
+    pub fn queue_ui_sound(&mut self, event: impl Into<String>) {
+        self.sound_queue.push(QueuedSound {
+            event: event.into(),
+            position: None,
+            volume: 1.0,
+            pitch: 1.0,
+        });
+    }
+
     // ─── Window interaction (vanilla Container.slotClick via container.rs) ─────
 
     /// Open the player inventory window (E key) — vanilla `ContainerPlayer`.
@@ -1280,6 +1291,30 @@ impl GameState {
                 self.use_item_ticks = 0;
             } else {
                 self.use_item_ticks += 1;
+                // Vanilla EntityPlayer.updateItemUse: while eating/drinking, the
+                // chew/gulp sound fires every 4 ticks from tick 8 (itemInUseCount
+                // <= 25 && % 4 == 0, counting down from 32). The local player's
+                // playSound is client-only — the server never echoes it; only the
+                // finishing `random.burp` comes back over S29. Emit at the eye
+                // (listener) position; SoundManager picks the ogg variant.
+                if matches!(self.use_action, ItemUseAction::Eat | ItemUseAction::Drink)
+                    && self.use_item_ticks >= 8
+                    && self.use_item_ticks % 4 == 0
+                {
+                    let h = hash2d(self.hud_update_counter as i32, self.use_item_ticks, 0x9e37);
+                    let pos = self.camera.position;
+                    if self.use_action == ItemUseAction::Drink {
+                        let pitch = (h & 0xff) as f32 / 255.0 * 0.1 + 0.9;
+                        self.queue_sound("random.drink", pos, 0.5, pitch);
+                    } else {
+                        let vol = if h & 1 == 0 { 0.5 } else { 1.0 };
+                        let pitch = (((h >> 8) & 0xff) as f32 - ((h >> 16) & 0xff) as f32)
+                            / 255.0
+                            * 0.2
+                            + 1.0;
+                        self.queue_sound("random.eat", pos, vol, pitch);
+                    }
+                }
             }
         }
 
@@ -5097,6 +5132,30 @@ mod interaction_tests {
                 ..Default::default()
             },
         )
+    }
+
+    #[test]
+    fn eating_plays_chew_sound_every_four_ticks_from_tick_eight() {
+        let mut g = GameState::empty_for_server(1.0);
+        g.inventory[36] = Some(item(297, 1)); // bread (EAT) in hotbar slot 0
+        // Right-click in air starts the use (sendUseItem sets use_action = Eat).
+        use_item(&mut g);
+        let _ = g.take_sounds(); // drop any press-tick sounds
+        let mut eat_ticks = Vec::new();
+        for _ in 0..30 {
+            act(
+                &mut g,
+                TickActions {
+                    right_held: true,
+                    ..Default::default()
+                },
+            );
+            if g.take_sounds().iter().any(|s| s.event == "random.eat") {
+                eat_ticks.push(g.use_item_ticks);
+            }
+        }
+        // Vanilla itemInUseCount <= 25 && % 4 == 0, counting down from 32.
+        assert_eq!(eat_ticks, vec![8, 12, 16, 20, 24, 28]);
     }
 
     #[test]

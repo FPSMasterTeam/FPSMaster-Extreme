@@ -147,6 +147,10 @@ impl GuiDisconnected {
 }
 
 impl GuiScreen for GuiDisconnected {
+    fn clicks_button(&self, x: f64, y: f64) -> bool {
+        self.buttons.iter().any(|b| b.clicked(x, y))
+    }
+
     fn draw(&mut self, ui: &mut UiFrame, ctx: &DrawCtx) {
         let s = ctx.scale;
         self.buttons = vec![GuiButton::at_px(
@@ -203,6 +207,10 @@ impl GuiStartingServer {
 }
 
 impl GuiScreen for GuiStartingServer {
+    fn clicks_button(&self, x: f64, y: f64) -> bool {
+        self.cancel.as_ref().is_some_and(|b| b.clicked(x, y))
+    }
+
     fn draw(&mut self, ui: &mut UiFrame, ctx: &DrawCtx) {
         let s = ctx.scale;
         let cancel = GuiButton::at_px(

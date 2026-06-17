@@ -17,6 +17,10 @@ impl GuiGameOver {
 }
 
 impl GuiScreen for GuiGameOver {
+    fn clicks_button(&self, x: f64, y: f64) -> bool {
+        self.buttons.iter().any(|b| b.clicked(x, y))
+    }
+
     fn draw(&mut self, ui: &mut UiFrame, ctx: &DrawCtx) {
         let s = ctx.scale;
         let x = (ctx.width - 200 * s) / 2;

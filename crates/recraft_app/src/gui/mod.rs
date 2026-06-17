@@ -45,6 +45,13 @@ pub trait GuiScreen {
         Vec::new()
     }
 
+    /// Whether a left-click at (x, y) lands on an activatable button, so the
+    /// host can play `gui.button.press` (vanilla plays it centrally in
+    /// `GuiScreen.mouseClicked` for the hit button). Default: no buttons.
+    fn clicks_button(&self, _x: f64, _y: f64) -> bool {
+        false
+    }
+
     /// A right mouse press (most screens ignore it; the inventory uses it for
     /// half-pickup / place-one / right paint-drag).
     fn mouse_right_clicked(&mut self, _x: f64, _y: f64, _ctx: &mut ScreenCtx) -> Vec<GuiAction> {

@@ -47,6 +47,10 @@ impl GuiMainMenu {
 }
 
 impl GuiScreen for GuiMainMenu {
+    fn clicks_button(&self, x: f64, y: f64) -> bool {
+        self.buttons.iter().any(|b| b.clicked(x, y))
+    }
+
     fn draw(&mut self, ui: &mut UiFrame, ctx: &DrawCtx) {
         self.layout(ctx);
 
