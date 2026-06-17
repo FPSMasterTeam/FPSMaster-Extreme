@@ -595,12 +595,15 @@ fn append_fire<S: BlockSource>(
     let texture = block.texture_name(BlockFace::Side);
     warn_if_missing(ctx.atlas, block, "its fire texture", texture);
     let rect = ctx.atlas.tile_rect(texture);
+    // Corner order is [ground-a, ground-b, top-b, top-a]; map the ground edge to
+    // the texture bottom (v + h) and the top edge to the texture top (v) so the
+    // flame stands upright instead of upside-down.
     let uv = inset_tile_uvs(
         [
-            [rect[0], rect[1]],
-            [rect[0] + rect[2], rect[1]],
-            [rect[0] + rect[2], rect[1] + rect[3]],
             [rect[0], rect[1] + rect[3]],
+            [rect[0] + rect[2], rect[1] + rect[3]],
+            [rect[0] + rect[2], rect[1]],
+            [rect[0], rect[1]],
         ],
         ctx.atlas,
     );
