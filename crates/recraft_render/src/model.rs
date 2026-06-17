@@ -1554,6 +1554,52 @@ impl ModelMesh {
             self.push_parts(&parts, &boot_poses, mat.layer1 as u32, feet, yaw_degrees);
         }
     }
+
+    /// Append the enchantment-glint geometry for worn armor into `self` (a
+    /// dedicated glint mesh): the same armor boxes as [`push_armor`], but only
+    /// for the slots flagged in `enchanted` (helmet/chest/legs/boots map to
+    /// equipment slots 4/3/2/1). The renderer re-draws this additively with the
+    /// scrolling glint texture, masked to the armor silhouette by the entity
+    /// atlas — mirroring the held/world item glint.
+    pub fn push_armor_glint(
+        &mut self,
+        equipment: &[Option<i16>; 5],
+        enchanted: &[bool; 5],
+        anim: &EntityAnim,
+        feet: Vec3,
+        yaw_degrees: f32,
+    ) {
+        let poses = humanoid_poses(anim);
+
+        if enchanted[4] {
+            if let Some(mat) = equipment[4].and_then(armor_material) {
+                let parts = helmet_parts();
+                let helmet_pose = [poses[5]]; // head pose
+                self.push_parts(&parts, &helmet_pose, mat.layer1 as u32, feet, yaw_degrees);
+            }
+        }
+        if enchanted[3] {
+            if let Some(mat) = equipment[3].and_then(armor_material) {
+                let parts = chestplate_parts();
+                let chest_poses = [poses[2], poses[3], poses[4]]; // body, right arm, left arm
+                self.push_parts(&parts, &chest_poses, mat.layer1 as u32, feet, yaw_degrees);
+            }
+        }
+        if enchanted[2] {
+            if let Some(mat) = equipment[2].and_then(armor_material) {
+                let parts = leggings_parts();
+                let leg_poses = [poses[2], poses[0], poses[1]]; // body, right leg, left leg
+                self.push_parts(&parts, &leg_poses, mat.layer2 as u32, feet, yaw_degrees);
+            }
+        }
+        if enchanted[1] {
+            if let Some(mat) = equipment[1].and_then(armor_material) {
+                let parts = boots_parts();
+                let boot_poses = [poses[0], poses[1]]; // right leg, left leg
+                self.push_parts(&parts, &boot_poses, mat.layer1 as u32, feet, yaw_degrees);
+            }
+        }
+    }
 }
 
 // ─── Held item hand frame ───────────────────────────────────────────────────

@@ -554,6 +554,8 @@ pub struct Renderer {
     cutout_pipeline: wgpu::RenderPipeline,
     /// No-cull cutout variant for the isometric GUI block-icon cubes.
     gui_cube_pipeline: wgpu::RenderPipeline,
+    /// Item glint targeting the swapchain (the UI pass), over enchanted icons.
+    gui_glint_pipeline: wgpu::RenderPipeline,
     item_pipeline: wgpu::RenderPipeline,
     /// First-person held item: drawn on top (depth test always passes).
     first_person_item_pipeline: wgpu::RenderPipeline,
@@ -584,6 +586,10 @@ pub struct Renderer {
     /// Glint geometry (a subset of the held / world items that are enchanted).
     first_person_item_glint: Option<DynamicMesh>,
     world_items_glint: Option<DynamicMesh>,
+    /// Entity-armor glint: the enchanted worn-armor boxes, in model-pass vertex
+    /// format, drawn additively after the entity model pass.
+    entity_glint_pipeline: wgpu::RenderPipeline,
+    entity_glint: Option<DynamicMesh>,
     /// Crack overlay over the block being mined (vanilla destroy_stage_N).
     break_overlay: Option<DynamicMesh>,
     last_break_overlay: Option<(i32, i32, i32, u8)>,
@@ -633,6 +639,9 @@ pub struct Renderer {
     gui_camera_bind_group: wgpu::BindGroup,
     /// 3D block-icon geometry for this frame (block atlas textured, clip-space).
     gui_item_mesh: Option<DynamicMesh>,
+    /// Clip-space glint geometry for enchanted GUI item icons, drawn additively
+    /// with the scrolling glint texture over the icons in the UI pass.
+    gui_glint_mesh: Option<DynamicMesh>,
     /// World-space billboarded player nametags (vanilla `drawNameplate`): the
     /// rasterized-name texture, its bind group/sampler, the quad mesh and the
     /// caches that avoid re-rasterizing a static name set.
@@ -983,6 +992,10 @@ impl Renderer {
         let sky_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("sky-shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader/sky.wgsl").into()),
+        });
+        let model_glint_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("model-glint-shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shader/model_glint.wgsl").into()),
         });
         let glint_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("glint-shader"),
@@ -2188,6 +2201,127 @@ impl Renderer {
             multiview_mask: None,
         });
 
+        // GUI item-icon glint: the same `Vertex` glint shader, but its colour
+        // target is the swapchain (`surface_format`) since it draws in the UI
+        // pass over the item icons. Same layout/blend as the world item glint.
+        let gui_glint_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("gui-glint-pipeline"),
+            layout: Some(&glint_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &glint_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[Vertex::layout()],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &glint_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_format,
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::SrcAlpha,
+                            dst_factor: wgpu::BlendFactor::One,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                        alpha: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::One,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                    }),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            cache: None,
+            multiview_mask: None,
+        });
+
+        // Entity-armor glint: the same additive scrolling sheen, but consuming
+        // the model-pass vertex layout and masking against the entity atlas
+        // (group 1). Group 0 camera, group 2 the scroll uniform, group 3 the
+        // glint texture — drawn right after the entity model pass.
+        let entity_glint_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("entity-glint-pipeline-layout"),
+                bind_group_layouts: &[
+                    Some(&camera_layout),
+                    Some(&entity_texture_layout),
+                    Some(&glint_uniform_layout),
+                    Some(&texture_layout),
+                ],
+                immediate_size: 0,
+            });
+        let entity_glint_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("entity-glint-pipeline"),
+                layout: Some(&entity_glint_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &model_glint_shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[ModelVertex::layout()],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &model_glint_shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: Some(wgpu::BlendState {
+                            color: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::SrcAlpha,
+                                dst_factor: wgpu::BlendFactor::One,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                            alpha: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::One,
+                                dst_factor: wgpu::BlendFactor::One,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                        }),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: Some(false),
+                    depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                cache: None,
+                multiview_mask: None,
+            });
+
         let ui_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("ui-pipeline-layout"),
             bind_group_layouts: &[Some(&ui_bind_group_layout)],
@@ -2802,6 +2936,7 @@ impl Renderer {
             flat_pipeline,
             cutout_pipeline,
             gui_cube_pipeline,
+            gui_glint_pipeline,
             item_pipeline,
             first_person_item_pipeline,
             transparent_pipeline,
@@ -2819,6 +2954,8 @@ impl Renderer {
             glint_uniform_bind_group,
             first_person_item_glint: None,
             world_items_glint: None,
+            entity_glint_pipeline,
+            entity_glint: None,
             break_overlay: None,
             last_break_overlay: None,
             particles: None,
@@ -2847,6 +2984,7 @@ impl Renderer {
             ui_overlay_cache: None,
             gui_camera_bind_group,
             gui_item_mesh: None,
+            gui_glint_mesh: None,
             nametag_mesh: None,
             nametag_texture,
             nametag_bind_group,
@@ -3611,6 +3749,22 @@ impl Renderer {
             bytemuck::cast_slice(&mesh.indices),
             mesh.indices.len() as u32,
             "model",
+        );
+    }
+
+    /// Replace this frame's entity-armor glint geometry: the enchanted worn
+    /// armor in model-pass vertex format, drawn additively with the scrolling
+    /// glint texture right after the entity model pass. Pass an empty mesh when
+    /// no visible armor is enchanted.
+    pub fn set_entity_glint(&mut self, mesh: &ModelMesh) {
+        fill_dynamic_mesh(
+            &self.device,
+            &self.queue,
+            &mut self.entity_glint,
+            bytemuck::cast_slice(&mesh.vertices),
+            bytemuck::cast_slice(&mesh.indices),
+            mesh.indices.len() as u32,
+            "entity-glint",
         );
     }
 
@@ -5059,6 +5213,22 @@ impl Renderer {
                 draw_calls += 1;
             }
 
+            // Enchantment glint over enchanted worn armor, re-drawn additively
+            // with the scrolling glint texture (masked to the armor silhouette
+            // by the entity atlas). Drawn right after the entity model so the
+            // sheen lays over it without writing depth.
+            if let Some(glint) = self.entity_glint.as_ref().filter(|m| m.index_count > 0) {
+                pass.set_pipeline(&self.entity_glint_pipeline);
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                pass.set_bind_group(1, &self.entity_bind_group, &[]);
+                pass.set_bind_group(2, &self.glint_uniform_bind_group, &[]);
+                pass.set_bind_group(3, &self.glint_bind_group, &[]);
+                pass.set_vertex_buffer(0, glint.vertex_buffer.slice(..));
+                pass.set_index_buffer(glint.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..glint.index_count, 0, 0..1);
+                draw_calls += 1;
+            }
+
             // Billboarded player nametags (depth-tested against the world).
             if let Some(mesh) = self.nametag_mesh.as_ref().filter(|m| m.index_count > 0) {
                 pass.set_pipeline(&self.model_pipeline);
@@ -5507,6 +5677,20 @@ impl Renderer {
                 up.set_scissor_rect(0, 0, self.config.width, self.config.height);
                 draw_calls += 1;
             }
+            // Enchantment glint over enchanted item icons (block cubes and flat
+            // sprites), additive with the scrolling glint texture — drawn under
+            // the overlay layer so stack counts / tooltips stay on top.
+            if let Some(glint) = self.gui_glint_mesh.as_ref().filter(|m| m.index_count > 0) {
+                up.set_pipeline(&self.gui_glint_pipeline);
+                up.set_bind_group(0, &self.gui_camera_bind_group, &[]);
+                up.set_bind_group(1, &self.texture_bind_groups[self.mipmap_levels as usize], &[]);
+                up.set_bind_group(2, &self.glint_uniform_bind_group, &[]);
+                up.set_bind_group(3, &self.glint_bind_group, &[]);
+                up.set_vertex_buffer(0, glint.vertex_buffer.slice(..));
+                up.set_index_buffer(glint.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                up.draw_indexed(0..glint.index_count, 0, 0..1);
+                draw_calls += 1;
+            }
             // UI foreground layer (counts, hover, carried stack) over the cubes.
             if let Some(cache) = &self.ui_overlay_cache {
                 up.set_pipeline(&self.ui_pipeline);
@@ -5618,6 +5802,42 @@ impl Renderer {
             bytemuck::cast_slice(&indices),
             indices.len() as u32,
             "gui-block-items",
+        );
+
+        // Enchanted item icons: a clip-space glint overlay per slot — the cube
+        // faces for block icons, a flat sprite quad otherwise — drawn additively
+        // with the scrolling glint texture over the icons (vanilla `renderEffect`).
+        let mut glint_v: Vec<Vertex> = Vec::new();
+        let mut glint_i: Vec<u32> = Vec::new();
+        for item in ui.glint_items() {
+            match item.block {
+                Some((block_id, meta)) => crate::gui_item::append_block_icon(
+                    &mut glint_v,
+                    &mut glint_i,
+                    recraft_core::BlockState::new(block_id, meta),
+                    item.dst,
+                    surface,
+                    &self.atlas_uv,
+                    &self.biome_colors,
+                ),
+                None => crate::gui_item::append_flat_item_glint(
+                    &mut glint_v,
+                    &mut glint_i,
+                    item.item_id,
+                    item.dst,
+                    surface,
+                    &self.atlas_uv,
+                ),
+            }
+        }
+        fill_dynamic_mesh(
+            &self.device,
+            &self.queue,
+            &mut self.gui_glint_mesh,
+            bytemuck::cast_slice(&glint_v),
+            bytemuck::cast_slice(&glint_i),
+            glint_i.len() as u32,
+            "gui-item-glint",
         );
     }
 }

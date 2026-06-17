@@ -108,6 +108,9 @@ struct App {
     /// Reused across frames so the per-frame entity rebuild keeps its vertex/index
     /// allocations instead of reallocating from empty each frame.
     entity_model: recraft_render::ModelMesh,
+    /// Enchanted worn-armor glint geometry (model-pass format), rebuilt alongside
+    /// `entity_model` and drawn additively with the scrolling glint texture.
+    entity_glint: recraft_render::ModelMesh,
     /// Fingerprint of the inputs that produced the currently-uploaded entity model
     /// + hand + nametags. When the next frame's fingerprint matches, the rebuild
     /// and GPU upload are skipped (the renderer keeps the previous mesh).
@@ -367,6 +370,7 @@ impl ApplicationHandler for WinitApp {
             local_server: None,
             panorama_timer: 0.0,
             entity_model: recraft_render::ModelMesh::new(),
+            entity_glint: recraft_render::ModelMesh::new(),
             last_entity_key: None,
             sound: sound::SoundManager::new(),
             quit: false,
@@ -1523,6 +1527,7 @@ fn render_frame(
             let first_person = app.game.first_person_view(tick_alpha);
             app.game.build_entity_model(
                 &mut app.entity_model,
+                &mut app.entity_glint,
                 tick_alpha,
                 app.settings.brightness,
                 app.skin_manager.rows(),
@@ -1579,6 +1584,7 @@ fn render_frame(
                 renderer.set_nametags(&app.game.camera, &[]);
             }
             renderer.upload_model(&app.entity_model);
+            renderer.set_entity_glint(&app.entity_glint);
         }
         // Dropped items, projectile sprites and falling-block cubes all share
         // the world-item pass (it binds the block/item atlas). Projectiles reuse
@@ -1612,6 +1618,7 @@ fn render_frame(
     } else {
         app.last_entity_key = None;
         renderer.upload_model(&recraft_render::ModelMesh::new());
+        renderer.set_entity_glint(&recraft_render::ModelMesh::new());
         renderer.set_first_person_item(&[], &[]);
         renderer.set_first_person_item_glint(&[], &[]);
         renderer.set_world_items(&[], &[]);

@@ -39,7 +39,7 @@ use winit::{
 
 use crate::chat::{self, ChatState};
 use crate::container::{max_stack, stackable, Container};
-use crate::item_renderer::{DroppedItem, FallingBlock, PlayerHeldItem};
+use crate::item_renderer::{is_enchanted, DroppedItem, FallingBlock, PlayerHeldItem};
 use crate::particle::ParticleSystem;
 use crate::player_list::PlayerList;
 use crate::scoreboard::Scoreboard;
@@ -1565,9 +1565,11 @@ impl GameState {
     /// overlay is drawn by the renderer from `breaking_overlay()`.
     /// `tick_alpha` interpolates entity positions between simulation ticks
     /// (vanilla partialTicks) so movement stays smooth at any frame rate.
+    #[allow(clippy::too_many_arguments)]
     pub fn build_entity_model(
         &self,
         mesh: &mut ModelMesh,
+        glint: &mut ModelMesh,
         tick_alpha: f32,
         brightness: f32,
         skin_rows: &std::collections::HashMap<[u8; 16], u32>,
@@ -1575,6 +1577,7 @@ impl GameState {
         old_animations: bool,
     ) {
         mesh.clear();
+        glint.clear();
         let sun_b = recraft_render::sky::sun_brightness(self.world_time(tick_alpha));
         // Cull entities outside the view frustum up front: most mobs in a loaded
         // world are off-screen at any moment, and building each one's articulated
@@ -1666,6 +1669,15 @@ impl GameState {
                     ];
                     if ids[1].is_some() || ids[2].is_some() || ids[3].is_some() || ids[4].is_some() {
                         mesh.push_armor(&ids, &anim, feet, body_yaw);
+                        // Enchanted armor pieces shimmer like enchanted items:
+                        // emit those boxes into the glint mesh for the additive
+                        // glint pass.
+                        let enchanted: [bool; 5] = std::array::from_fn(|i| {
+                            slots[i].as_ref().is_some_and(is_enchanted)
+                        });
+                        if enchanted[1] || enchanted[2] || enchanted[3] || enchanted[4] {
+                            glint.push_armor_glint(&ids, &enchanted, &anim, feet, body_yaw);
+                        }
                     }
                 }
             }
@@ -5831,8 +5843,9 @@ mod interaction_tests {
 
         // The invisible stand contributes no model geometry…
         let mut mesh = ModelMesh::new();
+        let mut glint = ModelMesh::new();
         let skins = std::collections::HashMap::new();
-        g.build_entity_model(&mut mesh, 1.0, 1.0, &skins, f64::INFINITY, false);
+        g.build_entity_model(&mut mesh, &mut glint, 1.0, 1.0, &skins, f64::INFINITY, false);
         assert!(mesh.is_empty(), "invisible entity must not render a model");
 
         // …but its floating-text plate is still emitted.
@@ -5868,7 +5881,8 @@ mod interaction_tests {
 
         // Bare invisible player: nothing renders.
         let mut bare = ModelMesh::new();
-        g.build_entity_model(&mut bare, 1.0, 1.0, &skins, f64::INFINITY, false);
+        let mut bare_glint = ModelMesh::new();
+        g.build_entity_model(&mut bare, &mut bare_glint, 1.0, 1.0, &skins, f64::INFINITY, false);
         assert!(bare.is_empty(), "invisible player with no armor renders nothing");
 
         // Give it an iron helmet (slot 4, id 306): the worn armor still shows.
@@ -5878,8 +5892,30 @@ mod interaction_tests {
             item: Some(SlotItem::new(306, 1, 0)),
         });
         let mut armored = ModelMesh::new();
-        g.build_entity_model(&mut armored, 1.0, 1.0, &skins, f64::INFINITY, false);
+        let mut armored_glint = ModelMesh::new();
+        g.build_entity_model(&mut armored, &mut armored_glint, 1.0, 1.0, &skins, f64::INFINITY, false);
         assert!(!armored.is_empty(), "invisible player must still show worn armor");
+        // The plain (unenchanted) helmet emits no glint geometry.
+        assert!(armored_glint.is_empty(), "unenchanted armor must not glint");
+
+        // Enchant the helmet (non-empty `ench` tag): now it glints.
+        use recraft_protocol::nbt::NbtTag;
+        let mut nbt = std::collections::HashMap::new();
+        let mut ench = std::collections::HashMap::new();
+        ench.insert("id".to_string(), NbtTag::Short(0));
+        ench.insert("lvl".to_string(), NbtTag::Short(4));
+        nbt.insert("ench".to_string(), NbtTag::List(vec![NbtTag::Compound(ench)]));
+        let mut helmet = SlotItem::new(306, 1, 0);
+        helmet.nbt = Some(nbt);
+        g.apply_play_packet(ClientboundPlayPacket::EntityEquipment {
+            entity_id: 8,
+            slot: 4,
+            item: Some(helmet),
+        });
+        let mut ench_mesh = ModelMesh::new();
+        let mut ench_glint = ModelMesh::new();
+        g.build_entity_model(&mut ench_mesh, &mut ench_glint, 1.0, 1.0, &skins, f64::INFINITY, false);
+        assert!(!ench_glint.is_empty(), "enchanted armor must emit glint geometry");
     }
 
     #[test]

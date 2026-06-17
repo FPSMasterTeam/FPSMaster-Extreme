@@ -582,12 +582,17 @@ pub(crate) fn draw_item_icon(
     text_scale: i32,
     overlay: bool,
 ) {
-    if let Some((block_id, meta)) = recraft_render::gui_item::is_block_icon(item.id, item.damage) {
+    let block = recraft_render::gui_item::is_block_icon(item.id, item.damage);
+    if let Some((block_id, meta)) = block {
         ui.block_item(rect, block_id, meta);
     } else if overlay {
         ui.overlay_item_icon(rect, item.id);
     } else {
         ui.item_icon(rect, item.id);
+    }
+    // Enchanted items shimmer with the scrolling glint, like held/world items.
+    if crate::item_renderer::is_enchanted(item) {
+        ui.glint_item(rect, item.id, block);
     }
     if item.count > 1 {
         let label = format!("{}", item.count);
@@ -1048,6 +1053,30 @@ fn draw_screen_overlay(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enchanted_slot_icon_queues_a_glint_overlay() {
+        use recraft_protocol::nbt::NbtTag;
+        let rect = UiRect::new(10, 10, 16, 16);
+
+        // A plain diamond sword: a flat icon, no glint queued.
+        let mut ui = UiFrame::new();
+        draw_item_icon(&mut ui, rect, &SlotItem::new(276, 1, 0), 2, false);
+        assert!(ui.glint_items().is_empty(), "unenchanted item must not glint");
+
+        // The same sword with a non-empty `ench` tag: a glint overlay is queued.
+        let mut sword = SlotItem::new(276, 1, 0);
+        let mut ench = std::collections::HashMap::new();
+        ench.insert("id".to_string(), NbtTag::Short(16));
+        ench.insert("lvl".to_string(), NbtTag::Short(5));
+        sword.nbt = Some(std::collections::HashMap::from([(
+            "ench".to_string(),
+            NbtTag::List(vec![NbtTag::Compound(ench)]),
+        )]));
+        let mut ui = UiFrame::new();
+        draw_item_icon(&mut ui, rect, &sword, 2, false);
+        assert_eq!(ui.glint_items().len(), 1, "enchanted item must queue a glint overlay");
+    }
 
     #[test]
     fn heart_rows_wrap_at_20() {

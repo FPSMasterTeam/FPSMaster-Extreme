@@ -141,6 +141,52 @@ pub fn append_block_icon(
     }
 }
 
+/// Append a flat item-icon's glint quad (clip-space `Vertex`es) for slot `rect`:
+/// an axis-aligned quad covering the slot, textured with the item sprite's
+/// block-atlas tile so the glint shader's alpha cutout masks the shimmer to the
+/// sprite silhouette (the same `items/{name}` tile the world item glint uses).
+pub fn append_flat_item_glint(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+    item_id: i16,
+    rect: UiRect,
+    surface: (f32, f32),
+    atlas: &AtlasUv,
+) {
+    let Some(name) = crate::texture::item_texture_name(item_id) else {
+        return;
+    };
+    let name = format!("items/{name}");
+    if atlas.is_missing_tile(Some(&name)) {
+        return;
+    }
+    let r = atlas.tile_rect(Some(&name));
+    // Slot rect → clip space (identity GUI camera, +y up like the cube path).
+    let to_clip = |x: f32, y: f32| {
+        [x / surface.0 * 2.0 - 1.0, 1.0 - y / surface.1 * 2.0, 0.0]
+    };
+    let (x0, y0) = (rect.x as f32, rect.y as f32);
+    let (x1, y1) = ((rect.x + rect.width) as f32, (rect.y + rect.height) as f32);
+    let corners = [(x0, y0), (x0, y1), (x1, y1), (x1, y0)];
+    // UV order matching the corners (top-left, bottom-left, bottom-right, top-right).
+    let uvs = [
+        [r[0], r[1]],
+        [r[0], r[1] + r[3]],
+        [r[0] + r[2], r[1] + r[3]],
+        [r[0] + r[2], r[1]],
+    ];
+    let base = vertices.len() as u32;
+    for ((cx, cy), uv) in corners.iter().zip(uvs) {
+        vertices.push(Vertex {
+            position: to_clip(*cx, *cy),
+            color: [1.0, 1.0, 1.0, 1.0],
+            uv,
+            light: FULLBRIGHT,
+        });
+    }
+    indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+}
+
 /// Vanilla element UV mapping within a tile (v grows downward), matching the
 /// world mesher so partial boxes (slabs/stairs) sample the correct sub-region.
 fn face_uv(normal: [i32; 3], px: f32, py: f32, pz: f32) -> (f32, f32) {
@@ -174,6 +220,30 @@ mod tests {
         assert!(is_block_icon(1, 0).is_some()); // stone
         assert!(is_block_icon(0, 0).is_none()); // air
         assert!(is_block_icon(300, 0).is_none()); // not a block id
+    }
+
+    #[test]
+    fn enchanted_flat_item_emits_a_clip_space_glint_quad() {
+        let atlas = TextureAtlasImage::load_default().uv_table();
+        let (mut v, mut i) = (Vec::new(), Vec::new());
+        // A diamond sword (id 276) is a flat item icon; its glint is one quad
+        // covering the slot, textured with the item's block-atlas sprite.
+        append_flat_item_glint(&mut v, &mut i, 276, UiRect::new(100, 100, 32, 32), (800.0, 600.0), &atlas);
+        assert_eq!(v.len(), 4);
+        assert_eq!(i.len(), 6);
+        for vert in &v {
+            assert!((-1.0..=1.0).contains(&vert.position[0]), "{:?}", vert.position);
+            assert!((-1.0..=1.0).contains(&vert.position[1]), "{:?}", vert.position);
+        }
+    }
+
+    #[test]
+    fn unknown_item_emits_no_glint() {
+        let atlas = TextureAtlasImage::load_default().uv_table();
+        let (mut v, mut i) = (Vec::new(), Vec::new());
+        // An id with no item texture name produces nothing (no cutout to mask).
+        append_flat_item_glint(&mut v, &mut i, 30000, UiRect::new(0, 0, 16, 16), (800.0, 600.0), &atlas);
+        assert!(v.is_empty() && i.is_empty());
     }
 
     #[test]

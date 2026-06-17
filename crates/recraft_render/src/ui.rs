@@ -118,7 +118,7 @@ impl GuiAtlas {
     /// The block-atlas source pixel rect for a block item id's top-face texture,
     /// or None when the id isn't a known (non-air) block.
     fn block_tile(&self, item_id: i16) -> Option<(u32, u32)> {
-        if item_id < 0 || item_id >= 256 {
+        if !(0..256).contains(&item_id) {
             return None;
         }
         let block = BlockState::new(item_id as u16, 0);
@@ -242,6 +242,17 @@ pub struct GuiBlockItem {
     pub meta: u8,
 }
 
+/// An enchanted item icon to overlay with the scrolling glint: a 3D block-icon
+/// cube (`block` set) shimmers over its cube geometry, anything else as a flat
+/// quad over its slot rect. Built into a clip-space glint mesh by the renderer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuiGlintItem {
+    pub dst: UiRect,
+    pub item_id: i16,
+    /// `Some((block_id, meta))` when the icon is a 3D block cube.
+    pub block: Option<(u16, u8)>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UiFrame {
     /// Background layer: drawn under the 3D block icons.
@@ -251,6 +262,9 @@ pub struct UiFrame {
     overlay: Vec<UiCommand>,
     /// 3D block icons, rendered by the GPU cube pass between the two layers.
     block_items: Vec<GuiBlockItem>,
+    /// Enchanted item icons to overlay with the scrolling glint (drawn over the
+    /// icons in the UI pass, additively, like the held/world item glint).
+    glint_items: Vec<GuiGlintItem>,
 }
 
 impl UiFrame {
@@ -259,7 +273,10 @@ impl UiFrame {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.commands.is_empty() && self.overlay.is_empty() && self.block_items.is_empty()
+        self.commands.is_empty()
+            && self.overlay.is_empty()
+            && self.block_items.is_empty()
+            && self.glint_items.is_empty()
     }
 
     /// Background (under-cube) and foreground (over-cube) command layers.
@@ -273,6 +290,18 @@ impl UiFrame {
 
     pub fn block_items(&self) -> &[GuiBlockItem] {
         &self.block_items
+    }
+
+    pub fn glint_items(&self) -> &[GuiGlintItem] {
+        &self.glint_items
+    }
+
+    /// Queue an enchanted item icon's glint overlay. `block` carries the cube's
+    /// `(block_id, meta)` when the icon is a 3D block cube (so the glint hugs the
+    /// cube faces), otherwise the flat slot rect is used. Drawn additively over
+    /// the icon in the UI pass, matching the held/world item glint.
+    pub fn glint_item(&mut self, dst: UiRect, item_id: i16, block: Option<(u16, u8)>) {
+        self.glint_items.push(GuiGlintItem { dst, item_id, block });
     }
 
     /// Queue a 3D block icon (the GPU cube pass draws it; counts/highlights go
