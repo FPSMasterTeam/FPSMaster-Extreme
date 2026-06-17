@@ -1716,6 +1716,25 @@ const LARGE_CHEST_BOXES: [ChestBox; 3] = [
 /// Lid model pixel rotation point (`chestLid.rotationPoint`), scaled to blocks.
 const CHEST_LID_PIVOT_PX: [f32; 3] = [1.0, 7.0, 15.0];
 
+/// Bake the vanilla chest renderer's `scale(1,-1,-1)` (about the cell centre)
+/// into a model-space point so the geometry lives in engine space (+y up, +z
+/// front) like every mob box. Vanilla flips Y/Z then re-centres into the cell;
+/// the net effect on a block-space coordinate is `y → 1-y`, `z → 1-z`.
+fn chest_flip(p: Vec3) -> Vec3 {
+    Vec3::new(p.x, 1.0 - p.y, 1.0 - p.z)
+}
+
+/// Flip a raw model-space box `(lo, hi)` into engine space. Because the Y and Z
+/// axes negate, their min/max swap; X is untouched. The result is a genuine
+/// +y-top / +z-front box, so `box_region`/`plane_frac` give the right-side-up
+/// vanilla texture rects with no per-vertex flip.
+fn chest_flip_bounds(lo: Vec3, hi: Vec3) -> (Vec3, Vec3) {
+    (
+        Vec3::new(lo.x, 1.0 - hi.y, 1.0 - hi.z),
+        Vec3::new(hi.x, 1.0 - lo.y, 1.0 - lo.z),
+    )
+}
+
 /// Yaw (degrees) a chest's block metadata 2..5 rotates the model by, matching the
 /// `j` in `TileEntityChestRenderer` (2→180, 3→0, 4→90, 5→-90; other meta → 0).
 fn chest_yaw_degrees(meta: u8) -> f32 {
@@ -1740,9 +1759,12 @@ impl ModelMesh {
         let f = 1.0 - (1.0 - lid_angle.clamp(0.0, 1.0)).powi(3);
         let lid_rot = -(f * std::f32::consts::FRAC_PI_2);
         let (slr, clr) = lid_rot.sin_cos();
-        let pivot = Vec3::from(CHEST_LID_PIVOT_PX) * 0.0625;
+        // Hinge pivot in engine space (the vanilla→engine Y/Z flip baked in).
+        let pivot = chest_flip(Vec3::from(CHEST_LID_PIVOT_PX) * 0.0625);
 
-        let yaw = chest_yaw_degrees(meta).to_radians();
+        // The vanilla scale(1,-1,-1) is folded into the box coordinates (see
+        // `chest_flip`), so the yaw conjugates to `rotate_y(-yaw)`.
+        let yaw = -chest_yaw_degrees(meta).to_radians();
         let (sy, cy) = yaw.sin_cos();
         let base = Vec3::new(cell[0] as f32, cell[1] as f32, cell[2] as f32);
 
@@ -1750,24 +1772,27 @@ impl ModelMesh {
         let origin = [ox as f32, oy as f32];
 
         for b in &CHEST_BOXES {
-            // Axis-aligned box bounds in 1/16-block model space.
+            // Box bounds in engine space: build the raw model box, then flip Y/Z
+            // into engine space (min/max swap on the negated axes) so the visible
+            // faces keep their genuine +y-top / +z-front texture rects — the same
+            // convention every mob box uses.
             let rp = Vec3::from(b.rp);
-            let lo = (rp + Vec3::from(b.off)) * 0.0625;
-            let hi = (rp + Vec3::from(b.off) + Vec3::from(b.size)) * 0.0625;
+            let raw_lo = (rp + Vec3::from(b.off)) * 0.0625;
+            let raw_hi = (rp + Vec3::from(b.off) + Vec3::from(b.size)) * 0.0625;
+            let (lo, hi) = chest_flip_bounds(raw_lo, raw_hi);
             let region = box_region(b.tex[0], b.tex[1], b.size[0], b.size[1], b.size[2]);
             let lid = b.lid;
             self.push_textured_box(lo, hi, &region, origin, 1.0, &|m| {
-                // Lid parts hinge about the rear-top pivot (X rotation).
+                // Lid parts hinge about the rear-top pivot (X rotation, unchanged
+                // by the flip since both Y and Z negate). Then recentre, yaw, and
+                // place at the cell — no scale flip; it's baked into the bounds.
                 let m = if lid {
                     rotate_x(m - pivot, slr, clr) + pivot
                 } else {
                     m
                 };
-                // Chest renderer GL chain: recentre, yaw about Y, then
-                // scale(1,-1,-1) and place at (cell_x, cell_y+1, cell_z+1).
                 let a = m - Vec3::splat(0.5);
-                let r = rotate_y(a, sy, cy) + Vec3::splat(0.5);
-                base + Vec3::new(r.x, 1.0 - r.y, 1.0 - r.z)
+                base + rotate_y(a, sy, cy) + Vec3::splat(0.5)
             });
         }
     }
@@ -1784,20 +1809,22 @@ impl ModelMesh {
         let f = 1.0 - (1.0 - lid_angle.clamp(0.0, 1.0)).powi(3);
         let lid_rot = -(f * std::f32::consts::FRAC_PI_2);
         let (slr, clr) = lid_rot.sin_cos();
-        let pivot = Vec3::from(CHEST_LID_PIVOT_PX) * 0.0625;
+        let pivot = chest_flip(Vec3::from(CHEST_LID_PIVOT_PX) * 0.0625);
 
-        let yaw = chest_yaw_degrees(meta).to_radians();
+        let yaw = -chest_yaw_degrees(meta).to_radians();
         let (sy, cy) = yaw.sin_cos();
         let base = Vec3::new(cell[0] as f32, cell[1] as f32, cell[2] as f32);
 
-        // The 30-px model extends along +X in model space. After yaw + the
-        // (1,-1,-1) scale, two of the four facings flip it onto the −axis; a
-        // post-yaw shift moves it back so the model always spans the canonical
-        // cell plus its +X/+Z partner. (Vanilla keys this off meta 2/5 in GL's
-        // rotation handedness; the equivalent here is meta 2 → +X, meta 4 → −Z.)
+        // The 30-px model extends along +X in model space. Two of the four
+        // facings would land it on the −axis; a post-yaw shift moves it back so
+        // the model always spans the canonical cell plus its +X/+Z partner.
+        // (Vanilla keys this off meta 2/5 in GL's rotation handedness; the
+        // equivalent here is meta 2 → +X, meta 4 → −Z.) The shift acts in world
+        // axes after the yaw, so the Z/Y flip baked into the bounds negates its
+        // Z component (meta 4: −Z → +Z).
         let pre = match meta {
             2 => Vec3::new(1.0, 0.0, 0.0),
-            4 => Vec3::new(0.0, 0.0, -1.0),
+            4 => Vec3::new(0.0, 0.0, 1.0),
             _ => Vec3::ZERO,
         };
 
@@ -1806,8 +1833,9 @@ impl ModelMesh {
 
         for b in &LARGE_CHEST_BOXES {
             let rp = Vec3::from(b.rp);
-            let lo = (rp + Vec3::from(b.off)) * 0.0625;
-            let hi = (rp + Vec3::from(b.off) + Vec3::from(b.size)) * 0.0625;
+            let raw_lo = (rp + Vec3::from(b.off)) * 0.0625;
+            let raw_hi = (rp + Vec3::from(b.off) + Vec3::from(b.size)) * 0.0625;
+            let (lo, hi) = chest_flip_bounds(raw_lo, raw_hi);
             let region = box_region(b.tex[0], b.tex[1], b.size[0], b.size[1], b.size[2]);
             let lid = b.lid;
             self.push_textured_box(lo, hi, &region, origin, 1.0, &|m| {
@@ -1816,12 +1844,8 @@ impl ModelMesh {
                 } else {
                     m
                 };
-                // recentre, yaw, apply the partner shift (vanilla pushes it
-                // after the rotate so it acts in world axes), then scale(1,-1,-1)
-                // and place at (cell_x, cell_y+1, cell_z+1).
                 let a = m - Vec3::splat(0.5);
-                let r = rotate_y(a, sy, cy) + pre + Vec3::splat(0.5);
-                base + Vec3::new(r.x, 1.0 - r.y, 1.0 - r.z)
+                base + rotate_y(a, sy, cy) + pre + Vec3::splat(0.5)
             });
         }
     }
@@ -2485,6 +2509,56 @@ mod tests {
                 "chest kind sampled outside its slot"
             );
         }
+    }
+
+    /// The closed lid is textured right-side up: its world-UP-facing face is the
+    /// box's genuine +y (top) face, so it samples the `box_region` "top" rect and
+    /// its V runs the same way as a known-correct mob box's top face — not the
+    /// flipped "bottom" rect that the old per-vertex scale(1,-1,-1) produced.
+    #[test]
+    fn chest_lid_top_face_is_textured_upright() {
+        let mut mesh = ModelMesh::new();
+        // meta 3 (south) → yaw 0, so engine space maps straight to world axes.
+        mesh.push_chest([0, 0, 0], 3, 0.0, ChestKind::Normal);
+
+        // The lid is part 0 (verts 0..24). Face index 1 (top, +y) is verts 4..8.
+        let top: Vec<_> = mesh.vertices[4..8].to_vec();
+        // It is the highest face of the lid: all four verts share the lid's max Y.
+        let lid_max_y = mesh.vertices[0..24]
+            .iter()
+            .map(|v| v.position[1])
+            .fold(f32::MIN, f32::max);
+        assert!(
+            top.iter().all(|v| (v.position[1] - lid_max_y).abs() < 1e-6),
+            "lid face 1 must be the world-up face"
+        );
+
+        // It samples the chest's TOP rect box_region(0,0,14,5,14)[1] = [14,0,28,14],
+        // relative to the chest-normal slot origin — never the bottom rect [28..42].
+        let (ox, oy) = entity_slot_origin(EntitySlot::ChestNormal);
+        let u_lo = (ox as f32 + 14.0) / ENTITY_ATLAS_WIDTH as f32;
+        let u_hi = (ox as f32 + 28.0) / ENTITY_ATLAS_WIDTH as f32;
+        let v_lo = oy as f32 / ENTITY_ATLAS_HEIGHT as f32;
+        let v_hi = (oy as f32 + 14.0) / ENTITY_ATLAS_HEIGHT as f32;
+        for v in &top {
+            assert!(
+                (u_lo - 1e-6..=u_hi + 1e-6).contains(&v.uv[0]),
+                "lid top u {} outside the top rect — wrong box_region face",
+                v.uv[0]
+            );
+            assert!((v_lo - 1e-6..=v_hi + 1e-6).contains(&v.uv[1]));
+        }
+
+        // The V coordinate increases as world-z decreases, matching plane_frac's
+        // top-face convention (fv = 1 - fz). Pick the two verts at the z extremes.
+        let front = top.iter().min_by(|a, b| a.position[2].total_cmp(&b.position[2])).unwrap();
+        let back = top.iter().max_by(|a, b| a.position[2].total_cmp(&b.position[2])).unwrap();
+        assert!(
+            front.uv[1] > back.uv[1],
+            "lid top V must grow toward -z (not vertically flipped): front {} back {}",
+            front.uv[1],
+            back.uv[1]
+        );
     }
 
     /// The large (double) chest emits three well-formed boxes sampling the
