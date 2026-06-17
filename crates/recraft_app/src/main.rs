@@ -682,6 +682,7 @@ impl ApplicationHandler for WinitApp {
                     use_pressed: self.use_pressed,
                     left_held: self.left_held,
                     right_held: self.right_held,
+                    old_animations: app.settings.old_animations,
                 });
                 if let Some((actions, movement)) = app.game.tick(0.05) {
                     self.slot_select = None;
@@ -1565,8 +1566,12 @@ fn render_frame(
                     v.color[1] *= hand_light;
                     v.color[2] *= hand_light;
                 }
-                let mut held =
-                    ItemRenderer::build_held_item(&app.game.camera, &first_person, atlas_uv);
+                let mut held = ItemRenderer::build_held_item(
+                    &app.game.camera,
+                    &first_person,
+                    atlas_uv,
+                    app.settings.old_animations,
+                );
                 for v in &mut held.vertices {
                     v.color[0] *= hand_light;
                     v.color[1] *= hand_light;
@@ -1948,6 +1953,7 @@ fn run_headless_interact(config: &LaunchConfig, seconds: f32) -> anyhow::Result<
                 use_pressed: false,
                 left_held: want_mine,
                 right_held: false,
+                old_animations: false,
             });
             if let Some((actions, movement)) = game.tick(0.05) {
                 if game.can_send_movement_packets() {

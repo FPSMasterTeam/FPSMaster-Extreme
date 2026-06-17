@@ -131,6 +131,7 @@ impl ItemRenderer {
         camera: &Camera,
         view: &FirstPersonView,
         atlas: &AtlasUv,
+        old_animations: bool,
     ) -> ItemGeometry {
         let mut out = ItemGeometry::default();
         let mut vertices = Vec::new();
@@ -145,7 +146,15 @@ impl ItemRenderer {
         let mut m = first_person_base(view);
         match view.use_action {
             ItemUseAction::Block => {
-                transform_first_person_item(&mut m, view.equip_progress, 0.0);
+                // 1.8 locks the arm while blocking: no swing. 1.7 (old_animations)
+                // kept the swing playing during a block — layer the same swing
+                // translation + rotations vanilla uses for a free swing onto the
+                // block pose so a left-click visibly swings while right-blocking.
+                let swing = if old_animations { view.swing_progress } else { 0.0 };
+                if old_animations {
+                    do_item_used_transformations(&mut m, swing);
+                }
+                transform_first_person_item(&mut m, view.equip_progress, swing);
                 do_block_transformations(&mut m);
             }
             ItemUseAction::Eat | ItemUseAction::Drink => {
@@ -790,9 +799,73 @@ mod tests {
         }
     }
 
+    /// A blocking-sword first-person view with the given swing progress.
+    fn blocking_view(swing: f32) -> FirstPersonView {
+        FirstPersonView {
+            item: Some(SlotItem::new(276, 1, 0)),
+            equip_progress: 0.0,
+            swing_progress: swing,
+            arm_lag_pitch: 0.0,
+            arm_lag_yaw: 0.0,
+            use_action: crate::game::ItemUseAction::Block,
+            use_ticks: 1.0,
+        }
+    }
+
+    fn centroid(g: &ItemGeometry) -> Vec3 {
+        g.vertices.iter().map(|v| Vec3::from(v.position)).sum::<Vec3>() / g.vertices.len() as f32
+    }
+
+    #[test]
+    fn block_pose_anchors_at_the_vanilla_block_transform() {
+        // transformFirstPersonItem(0,0) then doBlockTransformations applied to the
+        // model center must reproduce the vanilla 1.8 block pose exactly: the
+        // generated-sprite center maps through the documented chain. Compare a
+        // direct matrix replay against build_held_item's geometry centroid.
+        let mut m = first_person_base(&blocking_view(0.0));
+        transform_first_person_item(&mut m, 0.0, 0.0);
+        do_block_transformations(&mut m);
+        gl_scale(&mut m, 2.0, 2.0, 2.0);
+        apply_first_person_display(&mut m);
+        finish_item_model(&mut m);
+        let center = m.transform_point3(Vec3::new(0.5, 0.5, 8.0 / 16.0));
+        let g = ItemRenderer::build_held_item(&camera(), &blocking_view(0.0), &atlas(), false);
+        let world_center = view_to_world(&camera(), center);
+        assert!(
+            (centroid(&g) - world_center).length() < 0.05,
+            "block-pose centroid {:?} vs anchor {world_center:?}",
+            centroid(&g)
+        );
+    }
+
+    #[test]
+    fn swing_while_blocking_only_moves_with_old_animations() {
+        let cam = camera();
+        let uv = atlas();
+        let rest = ItemRenderer::build_held_item(&cam, &blocking_view(0.0), &uv, false);
+
+        // 1.8: a swing in progress does NOT move the blocking sword (arm locked).
+        let locked = ItemRenderer::build_held_item(&cam, &blocking_view(0.5), &uv, false);
+        assert!(
+            (centroid(&rest) - centroid(&locked)).length() < 1.0e-6,
+            "1.8 block pose must ignore swing_progress"
+        );
+
+        // 1.7 (old_animations): the same swing visibly displaces the hand.
+        let swung = ItemRenderer::build_held_item(&cam, &blocking_view(0.5), &uv, true);
+        assert!(
+            (centroid(&rest) - centroid(&swung)).length() > 0.02,
+            "1.7 must apply the swing while blocking"
+        );
+        // With no swing, old_animations on matches the rest block pose (the swing
+        // transforms collapse to identity at swing=0).
+        let on_rest = ItemRenderer::build_held_item(&cam, &blocking_view(0.0), &uv, true);
+        assert!((centroid(&rest) - centroid(&on_rest)).length() < 1.0e-6);
+    }
+
     #[test]
     fn block_items_build_a_textured_cube() {
-        let g = ItemRenderer::build_held_item(&camera(), &view(Some(1)), &atlas());
+        let g = ItemRenderer::build_held_item(&camera(), &view(Some(1)), &atlas(), false);
         assert_eq!(g.vertices.len(), 24);
         assert_eq!(g.indices.len(), 36);
         // A plain stone block is not enchanted → no glint geometry.
@@ -802,7 +875,7 @@ mod tests {
     #[test]
     fn sprite_items_build_extruded_geometry() {
         let uv = atlas();
-        let g = ItemRenderer::build_held_item(&camera(), &view(Some(276)), &uv);
+        let g = ItemRenderer::build_held_item(&camera(), &view(Some(276)), &uv, false);
         // Front + back quads (8 verts) plus extruded silhouette edges; every
         // face is a quad, so verts are a multiple of 4 and indices = 6/quad.
         assert!(g.vertices.len() >= 8, "at least the front/back faces");
@@ -813,7 +886,7 @@ mod tests {
 
     #[test]
     fn flat_blocks_hold_as_sprites() {
-        let g = ItemRenderer::build_held_item(&camera(), &view(Some(50)), &atlas());
+        let g = ItemRenderer::build_held_item(&camera(), &view(Some(50)), &atlas(), false);
         assert!(
             g.vertices.len() >= 8 && g.vertices.len() % 4 == 0,
             "torch should render as an extruded sprite"
@@ -822,13 +895,13 @@ mod tests {
 
     #[test]
     fn barrier_item_builds_nothing() {
-        let g = ItemRenderer::build_held_item(&camera(), &view(Some(166)), &atlas());
+        let g = ItemRenderer::build_held_item(&camera(), &view(Some(166)), &atlas(), false);
         assert!(g.vertices.is_empty() && g.indices.is_empty());
     }
 
     #[test]
     fn empty_hand_builds_nothing() {
-        let g = ItemRenderer::build_held_item(&camera(), &view(None), &atlas());
+        let g = ItemRenderer::build_held_item(&camera(), &view(None), &atlas(), false);
         assert!(g.vertices.is_empty() && g.indices.is_empty());
     }
 
@@ -853,7 +926,7 @@ mod tests {
             use_action: crate::game::ItemUseAction::None,
             use_ticks: 0.0,
         };
-        let g = ItemRenderer::build_held_item(&camera(), &v, &atlas());
+        let g = ItemRenderer::build_held_item(&camera(), &v, &atlas(), false);
         assert_eq!(g.glint_vertices.len(), g.vertices.len());
         assert_eq!(g.glint_indices.len(), g.indices.len());
         assert!(!g.glint_vertices.is_empty());

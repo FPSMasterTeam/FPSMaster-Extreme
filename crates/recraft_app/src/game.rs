@@ -80,6 +80,9 @@ pub struct TickActions {
     pub use_pressed: bool,
     pub left_held: bool,
     pub right_held: bool,
+    /// 1.7-style animations: lets a sword swing/attack fire while blocking
+    /// (right-click held). Off keeps the 1.8 lock (the block swallows attacks).
+    pub old_animations: bool,
 }
 
 #[derive(Default)]
@@ -1282,12 +1285,17 @@ impl GameState {
 
         // `if (isUsingItem()) { ... } else { ... }` — while an item is in use
         // (sword block), attack/use presses are swallowed; otherwise they drive
-        // clickMouse / rightClickMouse.
+        // clickMouse / rightClickMouse. With old_animations on, 1.7 let a
+        // left-click attack still fire while right-click-blocking, so the attack
+        // press is honoured here (use/pick stay drained — the block keeps them).
         if self.is_using_item() {
             if !a.right_held {
                 self.on_stopped_using_item(&mut out);
             }
-            // attack/use/pick presses are drained (ignored) this tick.
+            if a.old_animations && a.attack_pressed {
+                self.click_mouse(&mut out);
+            }
+            // remaining use/pick presses are drained (ignored) this tick.
         } else {
             if a.attack_pressed {
                 self.click_mouse(&mut out);
@@ -5334,6 +5342,52 @@ mod interaction_tests {
             "got {stop:?}"
         );
         assert_eq!(gs.use_action, ItemUseAction::None);
+    }
+
+    #[test]
+    fn attack_while_blocking_swings_only_with_old_animations() {
+        // Enter the sword block, aiming at air.
+        let mut gs = looking_along_x();
+        gs.inventory[36] = Some(SlotItem::new(276, 1, 0));
+        use_item(&mut gs);
+        assert_eq!(gs.use_action, ItemUseAction::Block);
+
+        // 1.8 default: a left-click while blocking is swallowed — no swing.
+        let p = act(
+            &mut gs,
+            TickActions {
+                attack_pressed: true,
+                left_held: true,
+                right_held: true,
+                old_animations: false,
+                ..Default::default()
+            },
+        );
+        assert!(
+            !p.iter().any(|x| matches!(x, ServerboundPacket::SwingArm)),
+            "1.8 must not swing while blocking, got {p:?}"
+        );
+        assert!(!gs.is_swinging);
+        assert_eq!(gs.use_action, ItemUseAction::Block, "still blocking");
+
+        // 1.7 (old_animations): the same left-click fires the attack swing while
+        // the block is held — SwingArm goes out and the local swing starts.
+        let p = act(
+            &mut gs,
+            TickActions {
+                attack_pressed: true,
+                left_held: true,
+                right_held: true,
+                old_animations: true,
+                ..Default::default()
+            },
+        );
+        assert!(
+            p.iter().any(|x| matches!(x, ServerboundPacket::SwingArm)),
+            "1.7 must swing while blocking, got {p:?}"
+        );
+        assert!(gs.is_swinging);
+        assert_eq!(gs.use_action, ItemUseAction::Block, "block is not released");
     }
 
     #[test]
