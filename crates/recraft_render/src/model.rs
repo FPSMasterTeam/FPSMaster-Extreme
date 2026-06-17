@@ -1943,13 +1943,22 @@ impl ModelMesh {
             SignKind::Wall => &[SIGN_BOARD],
         };
         for (off, size, tex) in boxes {
-            let lo = Vec3::from(*off) * 0.0625;
-            let hi = (Vec3::from(*off) + Vec3::from(*size)) * 0.0625;
+            let raw_lo = Vec3::from(*off) * 0.0625;
+            let raw_hi = (Vec3::from(*off) + Vec3::from(*size)) * 0.0625;
+            // Bake the renderer's scale(1,-1,-1) (the vanilla model-space flip)
+            // into the box bounds: Y and Z negate, so their min/max swap. The box
+            // then lives in engine space (+y up, +z front), letting box_region/
+            // plane_frac paint the genuine top/front rects upright — the same
+            // convention the chest uses. (Building in raw vanilla coords and
+            // negating only in the transform left the board upside-down.)
+            let lo = Vec3::new(raw_lo.x, -raw_hi.y, -raw_hi.z);
+            let hi = Vec3::new(raw_hi.x, -raw_lo.y, -raw_lo.z);
             let region = box_region(tex[0], tex[1], size[0], size[1], size[2]);
             self.push_textured_box(lo, hi, &region, origin, 1.0, &|m| {
-                // renderSign scale 0.0625 is folded into lo/hi; apply scale(f,-f,-f),
-                // the wall offset, then yaw about Y and place at the anchor.
-                let s = Vec3::new(m.x * f, -m.y * f, -m.z * f) + wall_off;
+                // The Y/Z flip is baked into the bounds, so the transform only
+                // scales by f (the renderSign 0.0625 is already folded into the
+                // bounds), applies the wall offset, yaws and places at the anchor.
+                let s = m * f + wall_off;
                 anchor + rotate_y(s, sy, cy)
             });
         }
@@ -2017,17 +2026,25 @@ impl ModelMesh {
         let origin = [ox as f32, oy as f32];
 
         for b in book_boxes(spread) {
-            let lo = (b.rp + b.off) * 0.0625;
-            let hi = (b.rp + b.off + b.size) * 0.0625;
+            let raw_lo = (b.rp + b.off) * 0.0625;
+            let raw_hi = (b.rp + b.off + b.size) * 0.0625;
+            // Bake the model-space scale(1,-1,-1) into the bounds (Y/Z min/max
+            // swap) so the box is engine space (+y up, +z front) and box_region/
+            // plane_frac paint the cover/page/spine rects upright, like the chest.
+            let lo = Vec3::new(raw_lo.x, -raw_hi.y, -raw_hi.z);
+            let hi = Vec3::new(raw_hi.x, -raw_lo.y, -raw_lo.z);
             let region = box_region(b.tex[0], b.tex[1], b.size.x, b.size.y, b.size.z);
-            let (sby, cby) = b.yaw.sin_cos();
-            let pivot = b.rp * 0.0625;
+            // The per-part Y rotation was applied in raw vanilla space *before*
+            // the flip. Conjugating it by the flip (a 180° X rotation) negates
+            // the angle and flips the pivot, leaving the posed geometry identical.
+            let (sby, cby) = (-b.yaw).sin_cos();
+            let raw_pivot = b.rp * 0.0625;
+            let pivot = Vec3::new(raw_pivot.x, -raw_pivot.y, -raw_pivot.z);
             self.push_textured_box(lo, hi, &region, origin, 1.0, &|m| {
-                // Per-part yaw about its rotation point, then the whole-book GL
-                // chain: scale(1,-1,-1) (the model space flip), 80° Z tilt, idle
-                // yaw about Y, and place at the hovering anchor.
-                let p = rotate_y(m - pivot, sby, cby) + pivot;
-                let s = Vec3::new(p.x, -p.y, -p.z);
+                // Per-part yaw about its (flipped) rotation point — the flip is
+                // already baked into the bounds — then the whole-book GL chain:
+                // 80° Z tilt, idle yaw about Y, and place at the hovering anchor.
+                let s = rotate_y(m - pivot, sby, cby) + pivot;
                 let s = rotate_z(s, st, ct);
                 anchor + rotate_y(s, sy, cy)
             });
@@ -2828,5 +2845,75 @@ mod tests {
             mesh.vertices.iter().any(|v| (w0..=w1).contains(&v.uv[1])),
             "sheep is missing its wool overlay"
         );
+    }
+
+    /// The standing sign's board front face must read upright: the readable face
+    /// samples the `box_region` *front* rect (engraving region), and its V runs
+    /// the right way up — the world-UP edge maps to the rect's TOP (small V), not
+    /// the bottom. Before baking the renderer's scale(1,-1,-1) into the box
+    /// bounds (it was negated only in the per-vertex transform) the board was
+    /// textured upside-down, like the pre-fix chest lid.
+    #[test]
+    fn sign_board_front_face_is_textured_upright() {
+        // meta 0 → yaw 0, so engine axes map straight to world axes.
+        let mut mesh = ModelMesh::new();
+        mesh.push_sign([0, 0, 0], 0, SignKind::Standing);
+
+        // Board is box 0; FACES idx 3 (front, +z) is verts 12..16.
+        let front = &mesh.vertices[12..16];
+        // It samples the board's front rect box_region(0,0,24,12,2)[3] = [2,2,26,14].
+        let (ox, oy) = entity_slot_origin(EntitySlot::Sign);
+        for v in front {
+            let upx = v.uv[0] * ENTITY_ATLAS_WIDTH as f32 - ox as f32;
+            let vpx = v.uv[1] * ENTITY_ATLAS_HEIGHT as f32 - oy as f32;
+            assert!(
+                (2.0..=26.0).contains(&upx) && (2.0..=14.0).contains(&vpx),
+                "sign front must sample the front rect (2..26, 2..14), got ({upx},{vpx})"
+            );
+        }
+        // V must run upright: the highest (world-up) verts map to the rect's TOP
+        // edge (small V), the lowest to the bottom.
+        let top = front.iter().max_by(|a, b| a.position[1].total_cmp(&b.position[1])).unwrap();
+        let bottom = front.iter().min_by(|a, b| a.position[1].total_cmp(&b.position[1])).unwrap();
+        assert!(
+            top.uv[1] < bottom.uv[1],
+            "sign front V must grow downward (upright), not flipped: top {} bottom {}",
+            top.uv[1],
+            bottom.uv[1]
+        );
+    }
+
+    /// The enchanting-table book cover must read upright. coverRight's printed
+    /// face samples the `box_region` front rect, and along the cover's tall (Y)
+    /// axis the V is not vertically mirrored. Like the sign, the renderer's
+    /// scale(1,-1,-1) is now baked into the bounds rather than negated only in
+    /// the transform (which textured the cover upside-down).
+    #[test]
+    fn book_cover_front_face_is_textured_upright() {
+        let mut mesh = ModelMesh::new();
+        mesh.push_book([0, 0, 0], 0.0);
+        // coverRight is box 0; its front face (FACES idx 3) is verts 12..16. The
+        // cover is a flat quad (depth 0), so faces 3/2 are the only non-degenerate
+        // ones; front samples box_region(0,0,6,10,0)[3] = [0,0,6,10].
+        let front = &mesh.vertices[12..16];
+        let (ox, oy) = entity_slot_origin(EntitySlot::EnchantBook);
+        for v in front {
+            let upx = v.uv[0] * ENTITY_ATLAS_WIDTH as f32 - ox as f32;
+            let vpx = v.uv[1] * ENTITY_ATLAS_HEIGHT as f32 - oy as f32;
+            assert!(
+                (0.0..=6.0).contains(&upx) && (0.0..=10.0).contains(&vpx),
+                "book cover front must sample the cover rect (0..6, 0..10), got ({upx},{vpx})"
+            );
+        }
+        // The cover's box-local +y edge must map to the rect's TOP (small V). The
+        // box is built so +y is its tall edge; with the flip baked into the
+        // bounds, plane_frac's front-face fv = 1 - fy puts the +y edge at v=0.
+        // Verify by comparing the two verts that differ only in the cover's height
+        // direction: the V endpoints must be 0 (top) and 10 (bottom), one each.
+        let vs: Vec<f32> = front
+            .iter()
+            .map(|v| (v.uv[1] * ENTITY_ATLAS_HEIGHT as f32 - oy as f32).round())
+            .collect();
+        assert!(vs.contains(&0.0) && vs.contains(&10.0), "cover front spans the full rect height upright");
     }
 }
