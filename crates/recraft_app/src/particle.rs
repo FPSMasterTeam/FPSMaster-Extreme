@@ -4,15 +4,22 @@
 //! turned into [`ParticleBillboard`]s (interpolated position + sprite UV + tint
 //! + size) each frame.
 //!
-//! Simplifications vs. vanilla (acceptable for the MVP):
-//! - No world collision: every particle is treated as `no_clip`, so motion is
-//!   never stopped by blocks and ground friction is never applied. The motions
-//!   themselves (gravity, drag, rise) match vanilla.
-//! - Block-break particles are a generic grey puff rather than block-texture
-//!   crack sprites (sampling the block atlas would need the block-atlas bind
-//!   group, which the particle draw doesn't bind).
+//! Two streams live here:
+//! - The packet/`particles.png` stream ([`Particle`]), turned into
+//!   [`ParticleBillboard`]s the renderer draws against the particle sheet.
+//! - The block-break debris stream ([`BlockParticle`], vanilla
+//!   `EntityDiggingFX`), which samples the BROKEN block's terrain tile. It can't
+//!   reuse [`ParticleBillboard`] (that binds the particle sheet), so it is
+//!   exposed as [`BlockDebris`] for the item renderer to billboard against the
+//!   block atlas — the same atlas the dropped-item/falling-block passes use.
+//!
+//! Simplification vs. vanilla (acceptable for the MVP): no world collision —
+//! every particle is treated as `no_clip`, so motion is never stopped by blocks
+//! and ground friction is never applied. The motions themselves (gravity, drag,
+//! rise) match vanilla.
 
 use glam::Vec3;
+use recraft_core::BlockState;
 use recraft_render::ParticleBillboard;
 
 /// The vanilla particle-sheet sub-tile span: a tile nominally spans 1/16 of the
@@ -66,9 +73,40 @@ enum GrowKind {
     Lava,
 }
 
+/// A live block-break debris particle (vanilla `EntityDiggingFX`): a tiny quad
+/// of the broken block's terrain texture flying outward and falling. Physics
+/// mirror a generic gravity particle (gravity 0.04, drag 0.98, no_clip).
+#[derive(Debug, Clone)]
+struct BlockParticle {
+    pos: Vec3,
+    prev_pos: Vec3,
+    vel: Vec3,
+    age: i32,
+    max_age: i32,
+    /// The broken block whose top-face tile this debris samples.
+    block: BlockState,
+    /// Top-left corner of the 1/4-tile sub-region (in tile-fraction 0..0.75)
+    /// this debris shows — vanilla `EntityDiggingFX` picks a random quarter of
+    /// the block texture per particle.
+    uv_off: [f32; 2],
+}
+
+/// One block-debris quad to draw this frame: its interpolated world position,
+/// half-extent (world units), the broken block (its top-face tile is sampled),
+/// and the 1/4-tile sub-region offset. The renderer billboards it against the
+/// block atlas (see [`crate::item_renderer::ItemRenderer::build_block_particles`]).
+#[derive(Debug, Clone, Copy)]
+pub struct BlockDebris {
+    pub world_pos: Vec3,
+    pub size: f32,
+    pub block: BlockState,
+    pub uv_off: [f32; 2],
+}
+
 /// All live particles, ticked once per game tick.
 pub struct ParticleSystem {
     particles: Vec<Particle>,
+    block_particles: Vec<BlockParticle>,
     rng: Rng,
 }
 
@@ -76,6 +114,7 @@ impl ParticleSystem {
     pub fn new() -> Self {
         Self {
             particles: Vec::new(),
+            block_particles: Vec::new(),
             // A fixed seed keeps spawns deterministic across runs; particle
             // jitter is cosmetic so the exact stream doesn't matter.
             rng: Rng::new(0x9E37_79B9_7F4A_7C15),
@@ -95,11 +134,25 @@ impl ParticleSystem {
             p.vel *= p.drag;
         }
         self.particles.retain(|p| p.age < p.max_age);
+        // Block-break debris: vanilla EntityDiggingFX physics (gravity 0.04,
+        // drag 0.98, no_clip).
+        for p in &mut self.block_particles {
+            p.prev_pos = p.pos;
+            p.age += 1;
+            p.vel.y -= 0.04;
+            p.pos += p.vel;
+            p.vel *= 0.98;
+        }
+        self.block_particles.retain(|p| p.age < p.max_age);
         // Bound the working set so a particle storm can't grow without limit.
         const MAX_PARTICLES: usize = 4000;
         if self.particles.len() > MAX_PARTICLES {
             let drop = self.particles.len() - MAX_PARTICLES;
             self.particles.drain(0..drop);
+        }
+        if self.block_particles.len() > MAX_PARTICLES {
+            let drop = self.block_particles.len() - MAX_PARTICLES;
+            self.block_particles.drain(0..drop);
         }
     }
 
@@ -145,24 +198,59 @@ impl ParticleSystem {
         }
     }
 
-    /// Spawn a small grey block-break puff (~8 particles) when a block is mined.
-    /// MVP stand-in for vanilla's 64 block-texture `EntityDiggingFX` (see module
-    /// docs): a generic smoke puff that reads as debris without atlas sampling.
-    pub fn spawn_block_break(&mut self, block_x: i32, block_y: i32, block_z: i32) {
-        let base = Vec3::new(block_x as f32, block_y as f32, block_z as f32);
-        for _ in 0..8 {
-            let off = Vec3::new(self.rng.next_f32(), self.rng.next_f32(), self.rng.next_f32());
-            let p_pos = base + off;
-            // Motion points outward from the block centre, like EntityDiggingFX.
-            let p_vel = (off - Vec3::splat(0.5)) * 0.2;
-            let mut particle = self.make_particle(38, p_pos, p_vel, Vec3::ZERO);
-            // Grey debris tint and a small, fixed-size sprite.
-            let grey = self.rng.next_f32() * 0.3 + 0.4;
-            particle.color = [grey, grey, grey];
-            particle.scale = self.rng.next_f32() * 0.5 + 0.5;
-            particle.grows_then = GrowKind::None;
-            self.particles.push(particle);
+    /// Spawn a burst of block-texture debris when `block` is fully mined
+    /// (vanilla `RenderGlobal.addBlockDestroyEffects`). Each particle samples a
+    /// random 1/4-tile sub-region of the block's top-face texture and flies
+    /// outward from the block centre while falling — a clearly-visible,
+    /// client-side debris effect. No-op for air.
+    pub fn spawn_block_debris(&mut self, block_x: i32, block_y: i32, block_z: i32, block: BlockState) {
+        if block.is_air() {
+            return;
         }
+        let base = Vec3::new(block_x as f32, block_y as f32, block_z as f32);
+        // Vanilla spawns a 4×4×4 grid (64) on a full break; ~24 reads as a dense
+        // burst without flooding the working set.
+        const COUNT: usize = 24;
+        for _ in 0..COUNT {
+            let off = Vec3::new(self.rng.next_f32(), self.rng.next_f32(), self.rng.next_f32());
+            let pos = base + off;
+            // motion = (offset_from_centre) * a small speed, like EntityDiggingFX
+            // (which seeds motion from the particle's offset within the block).
+            let vel = (off - Vec3::splat(0.5)) * 0.4;
+            // A random quarter of the tile (offset 0, 0.25, 0.5, 0.75 per axis).
+            let uv_off = [
+                (self.rng.next_f32() * 4.0).floor() / 4.0,
+                (self.rng.next_f32() * 4.0).floor() / 4.0,
+            ];
+            // EntityDiggingFX lifetime: (4 / (rand*0.9 + 0.1)).
+            let max_age = (4.0 / (self.rng.next_f32() * 0.9 + 0.1)) as i32;
+            self.block_particles.push(BlockParticle {
+                pos,
+                prev_pos: pos,
+                vel,
+                age: 0,
+                max_age: max_age.max(1),
+                block,
+                uv_off,
+            });
+        }
+    }
+
+    /// This frame's block-break debris (interpolated by `tick_alpha`), for the
+    /// item renderer to billboard against the block atlas.
+    pub fn block_debris(&self, tick_alpha: f32) -> Vec<BlockDebris> {
+        let a = tick_alpha.clamp(0.0, 1.0);
+        self.block_particles
+            .iter()
+            .map(|p| BlockDebris {
+                world_pos: p.prev_pos.lerp(p.pos, a),
+                // Vanilla EntityDiggingFX half-extent ≈ 0.1 * particleScale; the
+                // base particleScale is ~0.1..0.2, so ~0.05 world units here.
+                size: 0.06,
+                block: p.block,
+                uv_off: p.uv_off,
+            })
+            .collect()
     }
 
     /// Build this frame's billboards, interpolating each particle between its
@@ -539,12 +627,47 @@ mod tests {
     }
 
     #[test]
-    fn block_break_spawns_a_puff() {
+    fn block_debris_spawns_a_burst_with_quarter_tile_uvs() {
         let mut sys = ParticleSystem::new();
-        sys.spawn_block_break(10, 64, -3);
-        assert_eq!(sys.particles.len(), 8);
-        let bb = sys.billboards(0.0);
-        assert_eq!(bb.len(), 8);
+        sys.spawn_block_debris(10, 64, -3, BlockState::STONE);
+        // A dense burst, kept on its own stream (not the particles.png list).
+        assert_eq!(sys.block_particles.len(), 24);
+        assert!(sys.particles.is_empty());
+        let debris = sys.block_debris(0.0);
+        assert_eq!(debris.len(), 24);
+        for d in &debris {
+            // Each samples one quarter of the tile: offset ∈ {0, .25, .5, .75}
+            // on each axis, so the +0.25 sub-rect always stays inside the tile.
+            for off in d.uv_off {
+                assert!((0.0..=0.75).contains(&off), "uv_off {off} outside tile");
+                assert_eq!(off * 4.0, (off * 4.0).round(), "uv_off {off} not a quarter step");
+            }
+            assert_eq!(d.block, BlockState::STONE);
+        }
+    }
+
+    #[test]
+    fn block_debris_air_is_a_noop() {
+        let mut sys = ParticleSystem::new();
+        sys.spawn_block_debris(0, 0, 0, BlockState::AIR);
+        assert!(sys.block_particles.is_empty());
+    }
+
+    #[test]
+    fn block_debris_falls_and_expires() {
+        let mut sys = ParticleSystem::new();
+        sys.spawn_block_debris(0, 64, 0, BlockState::STONE);
+        let y0 = sys.block_particles[0].pos.y;
+        for _ in 0..3 {
+            sys.tick();
+        }
+        // Gravity pulls debris down over a few ticks.
+        assert!(sys.block_particles[0].pos.y < y0 + 0.1);
+        // Tick well past the max lifetime — all debris must be gone.
+        for _ in 0..60 {
+            sys.tick();
+        }
+        assert!(sys.block_particles.is_empty());
     }
 
     #[test]

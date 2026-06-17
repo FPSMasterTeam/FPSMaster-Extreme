@@ -1615,6 +1615,12 @@ fn render_frame(
         let (particle_v, particle_i) =
             recraft_render::build_particle_mesh(&app.game.camera, &particles);
         renderer.set_particles(&particle_v, &particle_i);
+        // Block-break debris (vanilla EntityDiggingFX): billboards sampling the
+        // broken block's terrain tile, drawn against the block atlas.
+        let debris = app.game.block_debris(tick_alpha);
+        let (debris_v, debris_i) =
+            ItemRenderer::build_block_particles(&app.game.camera, &debris, atlas_uv);
+        renderer.set_block_particles(&debris_v, &debris_i);
         // Experience-orb billboards (colour-cycle continuously, so also rebuilt
         // each frame against their own texture).
         let orbs = app.game.xp_orbs(tick_alpha);
@@ -1629,6 +1635,7 @@ fn render_frame(
         renderer.set_world_items(&[], &[]);
         renderer.set_world_items_glint(&[], &[]);
         renderer.set_particles(&[], &[]);
+        renderer.set_block_particles(&[], &[]);
         renderer.set_xp_orbs(&[], &[]);
         renderer.set_nametags(&app.game.camera, &[]);
         renderer.set_sign_text(&[]);

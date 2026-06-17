@@ -2037,6 +2037,12 @@ impl GameState {
         self.particles.billboards(tick_alpha)
     }
 
+    /// This frame's block-break debris (vanilla `EntityDiggingFX`), for the item
+    /// renderer to billboard against the block atlas.
+    pub fn block_debris(&self, tick_alpha: f32) -> Vec<crate::particle::BlockDebris> {
+        self.particles.block_debris(tick_alpha)
+    }
+
     /// This frame's experience-orb billboards (vanilla `RenderXPOrb`): a
     /// camera-facing quad sampling `experience_orb.png`, the sprite cell chosen
     /// by the orb's xp value, colour-cycling through the green/red rainbow over
@@ -2806,7 +2812,7 @@ impl GameState {
             // On a real break (not air): a debris puff (vanilla
             // addBlockDestroyEffects) and the block's dig sound (vol 1, pitch 0.8).
             if !old.is_air() {
-                self.particles.spawn_block_break(x, y, z);
+                self.particles.spawn_block_debris(x, y, z, old);
                 let pos = Vec3::new(x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5);
                 self.queue_sound(dig_sound_for_block(old.id), pos, 1.0, 0.8);
             }

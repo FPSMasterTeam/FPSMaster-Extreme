@@ -595,6 +595,10 @@ pub struct Renderer {
     last_break_overlay: Option<(i32, i32, i32, u8)>,
     /// Camera-facing particle billboards (vanilla EntityFX), rebuilt each frame.
     particles: Option<DynamicMesh>,
+    /// Camera-facing block-break debris (vanilla EntityDiggingFX) sampling the
+    /// block atlas, rebuilt each frame. Drawn with the overlay pipeline + block
+    /// atlas, like the dropped items.
+    block_particles: Option<DynamicMesh>,
     /// Camera-facing experience-orb billboards (vanilla RenderXPOrb), per frame.
     xp_orbs: Option<DynamicMesh>,
     /// `particles.png` texture+sampler, bound at group 1 (same layout as the
@@ -2959,6 +2963,7 @@ impl Renderer {
             break_overlay: None,
             last_break_overlay: None,
             particles: None,
+            block_particles: None,
             xp_orbs: None,
             particle_bind_group,
             xp_orb_bind_group,
@@ -4081,6 +4086,21 @@ impl Renderer {
             bytemuck::cast_slice(indices),
             indices.len() as u32,
             "particles",
+        );
+    }
+
+    /// Replace this frame's block-break debris billboards (vanilla
+    /// EntityDiggingFX), textured from the block atlas. Drawn alpha-blended in
+    /// the world right after the particle billboards. Pass empty slices to clear.
+    pub fn set_block_particles(&mut self, vertices: &[Vertex], indices: &[u32]) {
+        fill_dynamic_mesh(
+            &self.device,
+            &self.queue,
+            &mut self.block_particles,
+            bytemuck::cast_slice(vertices),
+            bytemuck::cast_slice(indices),
+            indices.len() as u32,
+            "block-particles",
         );
     }
 
@@ -5295,6 +5315,25 @@ impl Renderer {
                 pass.set_vertex_buffer(0, particles.vertex_buffer.slice(..));
                 pass.set_index_buffer(particles.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..particles.index_count, 0, 0..1);
+                draw_calls += 1;
+            }
+
+            // Block-break debris billboards, sampled from the BLOCK atlas (the
+            // broken block's terrain tile) — vanilla EntityDiggingFX. Drawn with
+            // the overlay pipeline (alpha-blended, depth-tested, no depth write)
+            // but bound to the block atlas instead of particles.png, like the
+            // dropped items.
+            if let Some(debris) = self.block_particles.as_ref().filter(|m| m.index_count > 0) {
+                pass.set_pipeline(&self.overlay_pipeline);
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                pass.set_bind_group(
+                    1,
+                    &self.texture_bind_groups[self.mipmap_levels as usize],
+                    &[],
+                );
+                pass.set_vertex_buffer(0, debris.vertex_buffer.slice(..));
+                pass.set_index_buffer(debris.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..debris.index_count, 0, 0..1);
                 draw_calls += 1;
             }
 

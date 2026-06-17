@@ -323,6 +323,66 @@ impl ItemRenderer {
         (vertices, indices)
     }
 
+    /// Build camera-facing quads for this frame's block-break debris (vanilla
+    /// `EntityDiggingFX`): each is a tiny billboard sampling a 1/4-tile
+    /// sub-region of the broken block's top-face terrain tile, into the same
+    /// block-atlas buffer the dropped items use. The quad is wound CCW toward
+    /// the camera so the alpha-blended overlay pipeline (back-face culling)
+    /// keeps it — matching the particle billboard winding.
+    pub fn build_block_particles(
+        camera: &Camera,
+        debris: &[crate::particle::BlockDebris],
+        atlas: &AtlasUv,
+    ) -> (Vec<Vertex>, Vec<u32>) {
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+        let forward = camera.direction();
+        let right = forward.cross(Vec3::Y).normalize_or_zero();
+        let up = right.cross(forward).normalize_or_zero();
+
+        for d in debris {
+            if d.block.is_air() {
+                continue;
+            }
+            let rect = atlas.tile_rect(d.block.texture_name(BlockFace::Top));
+            // Sample the 1/4-tile sub-region selected at spawn (uv_off ∈ 0..0.75
+            // per axis), staying inside the tile.
+            let (u0, v0) = (
+                rect[0] + d.uv_off[0] * rect[2],
+                rect[1] + d.uv_off[1] * rect[3],
+            );
+            let (du, dv) = (rect[2] * 0.25, rect[3] * 0.25);
+            // UV per corner in the build_particle_mesh corner order
+            // (bottom-left, top-left, top-right, bottom-right).
+            let uvs = [
+                [u0, v0 + dv],
+                [u0, v0],
+                [u0 + du, v0],
+                [u0 + du, v0 + dv],
+            ];
+            let center = d.world_pos;
+            let h = d.size;
+            let corners = [
+                center - right * h - up * h,
+                center - right * h + up * h,
+                center + right * h + up * h,
+                center + right * h - up * h,
+            ];
+            let tint = tint3(d.block.tint(BlockFace::Top));
+            let base = vertices.len() as u32;
+            for (corner, uv) in corners.iter().zip(uvs) {
+                vertices.push(Vertex {
+                    position: (*corner).into(),
+                    color: [tint[0], tint[1], tint[2], 1.0],
+                    uv,
+                    light: recraft_render::FULLBRIGHT,
+                });
+            }
+            indices.extend_from_slice(&[base, base + 2, base + 1, base, base + 3, base + 2]);
+        }
+        (vertices, indices)
+    }
+
     /// Build geometry for items held by other players. Each item is positioned
     /// at the player's right hand and oriented along the arm, replicating
     /// vanilla's `LayerHeldItem` third-person appearance.
@@ -972,6 +1032,58 @@ mod tests {
     fn no_dropped_items_builds_nothing() {
         let g = ItemRenderer::build_world_items(&camera(), &[], &atlas());
         assert!(g.vertices.is_empty() && g.indices.is_empty());
+    }
+
+    #[test]
+    fn block_debris_builds_one_quad_each_within_the_block_tile() {
+        let uv = atlas();
+        let debris = vec![
+            crate::particle::BlockDebris {
+                world_pos: Vec3::new(0.0, 64.0, -3.0),
+                size: 0.06,
+                block: BlockState::STONE,
+                uv_off: [0.0, 0.0],
+            },
+            crate::particle::BlockDebris {
+                world_pos: Vec3::new(1.0, 64.0, -3.0),
+                size: 0.06,
+                block: BlockState::STONE,
+                uv_off: [0.75, 0.5],
+            },
+        ];
+        let (v, i) = ItemRenderer::build_block_particles(&camera(), &debris, &uv);
+        // One camera-facing quad per debris particle.
+        assert_eq!(v.len(), 8);
+        assert_eq!(i.len(), 12);
+        // Every sampled UV must land inside the broken block's top-face tile.
+        let rect = uv.tile_rect(BlockState::STONE.texture_name(BlockFace::Top));
+        for vert in &v {
+            let [u, w] = vert.uv;
+            assert!(
+                u >= rect[0] - 1e-6 && u <= rect[0] + rect[2] + 1e-6,
+                "u {u} outside tile [{}, {}]",
+                rect[0],
+                rect[0] + rect[2]
+            );
+            assert!(
+                w >= rect[1] - 1e-6 && w <= rect[1] + rect[3] + 1e-6,
+                "v {w} outside tile [{}, {}]",
+                rect[1],
+                rect[1] + rect[3]
+            );
+        }
+    }
+
+    #[test]
+    fn air_block_debris_builds_nothing() {
+        let debris = vec![crate::particle::BlockDebris {
+            world_pos: Vec3::new(0.0, 64.0, -3.0),
+            size: 0.06,
+            block: BlockState::AIR,
+            uv_off: [0.0, 0.0],
+        }];
+        let (v, i) = ItemRenderer::build_block_particles(&camera(), &debris, &atlas());
+        assert!(v.is_empty() && i.is_empty());
     }
 
     #[test]

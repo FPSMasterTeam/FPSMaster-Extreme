@@ -56,7 +56,11 @@ pub fn build_particle_mesh(
                 light: FULLBRIGHT,
             });
         }
-        indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        // The overlay pipeline back-face culls (CCW front). Across this
+        // billboard's right/up basis the camera-facing side is clockwise, so it
+        // must be wound (0,2,1)/(0,3,2) to present as the front face — otherwise
+        // every particle (and xp orb) is culled and nothing draws.
+        indices.extend_from_slice(&[base, base + 2, base + 1, base, base + 3, base + 2]);
     }
 
     (vertices, indices)
@@ -98,5 +102,73 @@ mod tests {
         let centroid: Vec3 =
             vertices.iter().map(|v| Vec3::from(v.position)).sum::<Vec3>() / vertices.len() as f32;
         assert!((centroid - Vec3::new(0.0, 70.0, -3.0)).length() < 1.0e-5);
+    }
+
+    /// The particle tiles the simulation samples for the always-on effects must
+    /// land on non-transparent texels of `particles.png`, or those particles
+    /// draw as fully transparent quads (invisible). Guarded: when the asset
+    /// isn't found (no resource pack in the test env) the check is skipped, so
+    /// this only fails when a real sheet maps a sampled tile to empty space.
+    #[test]
+    fn sampled_particle_tiles_are_opaque() {
+        let Some(img) =
+            crate::texture::load_asset_image("assets/minecraft/textures/particle/particles.png")
+        else {
+            eprintln!("particles.png not found; skipping opacity check");
+            return;
+        };
+        let (w, h) = (img.width(), img.height());
+        // The sheet is a 16×16 tile grid (vanilla particles.png).
+        let cols = 16u32;
+        let tile = w / cols;
+        let opaque_frac = |index: u32| {
+            let (ox, oy) = (index % cols * tile, index / cols * tile);
+            let mut opaque = 0u32;
+            for ty in 0..tile {
+                for tx in 0..tile {
+                    let px = img.get_pixel(ox + tx, oy + ty);
+                    if px.0[3] > 127 {
+                        opaque += 1;
+                    }
+                }
+            }
+            opaque as f32 / (tile * tile) as f32
+        };
+        assert!(w == h && tile >= 1, "unexpected particles.png shape {w}x{h}");
+        // CRIT (65) and FLAME (48): substantial opaque content.
+        assert!(opaque_frac(65) > 0.2, "crit tile 65 nearly empty");
+        assert!(opaque_frac(48) > 0.2, "flame tile 48 nearly empty");
+        // SMOKE animates frames 7→0 over its life; frame 7 (its first/biggest
+        // frame, tile 7) carries the bulk of the puff.
+        assert!(opaque_frac(7) > 0.2, "smoke first frame (tile 7) nearly empty");
+    }
+
+    /// The billboard must present its CAMERA-FACING side as the front face, or
+    /// the overlay pipeline's back-face culling drops every particle/xp orb.
+    /// Reproduce the GPU winding test: project a particle directly ahead of the
+    /// camera and assert the first triangle is CCW in NDC (positive signed
+    /// area), matching the cube faces that survive the same cull.
+    #[test]
+    fn billboard_faces_camera_as_front_face() {
+        let mut cam = camera();
+        cam.yaw = -90.0;
+        cam.pitch = 0.0;
+        // Place the particle 3 blocks straight ahead of the camera.
+        let p = ParticleBillboard {
+            world_pos: (cam.position + cam.direction() * 3.0).into(),
+            ..billboard()
+        };
+        let (vertices, indices) = build_particle_mesh(&cam, &[p]);
+        let vp = cam.view_projection();
+        let ndc = |i: u32| {
+            let c = vp * Vec3::from(vertices[i as usize].position).extend(1.0);
+            glam::Vec2::new(c.x / c.w, c.y / c.w)
+        };
+        let (a, b, c) = (ndc(indices[0]), ndc(indices[1]), ndc(indices[2]));
+        let signed_area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+        assert!(
+            signed_area > 0.0,
+            "front face (CCW in NDC) required, got signed area {signed_area}"
+        );
     }
 }
