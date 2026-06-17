@@ -203,6 +203,26 @@ fn effective_attribute_value(
     d1.max(0.0)
 }
 
+/// One active potion effect on the local player (S1D EntityEffect). Only the
+/// amplifier feeds the HUD (absorption hearts, the heart tint); duration is
+/// kept for completeness but not ticked down — the server resends.
+#[derive(Debug, Clone, Copy)]
+struct ActiveEffect {
+    amplifier: i8,
+    /// Remaining ticks as last reported by the server. Stored for the complete
+    /// effect model but not consumed yet (effects are not ticked down — the
+    /// server resends them); kept for a future client-side expiry.
+    #[allow(dead_code)]
+    duration: i32,
+}
+
+// Potion effect ids that drive the health HUD (vanilla `Potion`).
+const POTION_REGENERATION: u8 = 10;
+const POTION_HUNGER: u8 = 17;
+const POTION_POISON: u8 = 19;
+const POTION_WITHER: u8 = 20;
+const POTION_ABSORPTION: u8 = 22;
+
 /// Snapshot driving the first-person hand/item rendering for one frame
 /// (vanilla ItemRenderer inputs at a given partialTicks).
 #[derive(Debug, Clone)]
@@ -409,6 +429,13 @@ pub struct GameState {
     needs_respawn: bool,
     /// Last server-reported health (20 == full). Drives the death screen.
     health: f32,
+    /// The local player's `generic.maxHealth` attribute (vanilla 20), from S20
+    /// EntityProperties; sets the heart-row count alongside absorption.
+    max_health: f32,
+    /// The local player's active potion effects, keyed by effect id (S1D
+    /// EntityEffect / S1E RemoveEntityEffect). The server resends them, so they
+    /// are kept until removed or until a respawn, without ticking down.
+    effects: std::collections::HashMap<u8, ActiveEffect>,
     /// Last server-reported food level.
     food: i32,
     /// Last server-reported food saturation (drives the hunger-bar jiggle).
@@ -711,6 +738,8 @@ impl GameState {
             freeze_movement_after_teleport: false,
             needs_respawn: false,
             health: 20.0,
+            max_health: 20.0,
+            effects: std::collections::HashMap::new(),
             food: 20,
             saturation: 5.0,
             health_received: false,
@@ -892,17 +921,23 @@ impl GameState {
     /// food saturation plus the tick counters that drive the heart-shake RNG and
     /// the heart-row blink/highlight.
     pub fn hud_vitals(&self) -> crate::gui::ingame::HudVitals {
+        // Absorption hearts come from the Absorption effect (vanilla
+        // PotionAbsorption): 4 * (amplifier + 1) health points.
+        let absorption = self
+            .effects
+            .get(&POTION_ABSORPTION)
+            .map_or(0.0, |e| 4.0 * (e.amplifier as f32 + 1.0));
         crate::gui::ingame::HudVitals {
             saturation: self.saturation,
-            // Absorption and max-health are not plumbed: the server carries
-            // absorption only in EntityProperties/metadata (not parsed for the
-            // local player), and UpdateHealth has no absorption field. Default to
-            // the vanilla base 20 HP / 0 absorption.
-            max_health: 20.0,
-            absorption: 0.0,
+            max_health: self.max_health,
+            absorption,
             update_counter: self.hud_update_counter,
             health_update_counter: self.health_update_counter,
             last_player_health: self.last_player_health,
+            regen: self.effects.contains_key(&POTION_REGENERATION),
+            hunger_effect: self.effects.contains_key(&POTION_HUNGER),
+            poison: self.effects.contains_key(&POTION_POISON),
+            wither: self.effects.contains_key(&POTION_WITHER),
         }
     }
 
@@ -3115,6 +3150,8 @@ impl GameState {
                 self.needs_respawn = false;
                 self.is_dead = false;
                 self.health = 20.0;
+                self.max_health = 20.0;
+                self.effects.clear();
                 self.position_synced = false;
                 self.pending_confirm = false;
                 self.player.velocity = DVec3::ZERO;
@@ -3492,16 +3529,52 @@ impl GameState {
                 entity_id,
                 properties,
             } => {
-                // Only the local player's movement speed feeds the prediction;
+                // Only the local player's attributes feed the HUD/prediction;
                 // other entities' attributes aren't modeled.
                 if entity_id == self.player.id.0 {
                     for property in &properties {
-                        if property.key == "generic.movementSpeed" {
-                            self.walk_speed_attribute =
-                                effective_attribute_value(property, &SPRINT_SPEED_BOOST_UUID)
-                                    as f32;
+                        match property.key.as_str() {
+                            "generic.movementSpeed" => {
+                                self.walk_speed_attribute =
+                                    effective_attribute_value(property, &SPRINT_SPEED_BOOST_UUID)
+                                        as f32;
+                            }
+                            "generic.maxHealth" => {
+                                self.max_health =
+                                    effective_attribute_value(property, &[0u8; 16]) as f32;
+                            }
+                            _ => {}
                         }
                     }
+                }
+                false
+            }
+            ClientboundPlayPacket::EntityEffect {
+                entity_id,
+                effect_id,
+                amplifier,
+                duration,
+                ..
+            } => {
+                // Track only the local player's effects (the HUD reads them for
+                // absorption hearts, the regen heartbeat and the heart tint).
+                if entity_id == self.player.id.0 {
+                    self.effects.insert(
+                        effect_id as u8,
+                        ActiveEffect {
+                            amplifier,
+                            duration,
+                        },
+                    );
+                }
+                false
+            }
+            ClientboundPlayPacket::RemoveEntityEffect {
+                entity_id,
+                effect_id,
+            } => {
+                if entity_id == self.player.id.0 {
+                    self.effects.remove(&(effect_id as u8));
                 }
                 false
             }
@@ -5752,6 +5825,118 @@ mod interaction_tests {
             }],
         });
         assert!((gs.walk_speed_attribute - 0.12).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn max_health_attribute_feeds_hud_vitals() {
+        use recraft_protocol::v1_8_9::packets::EntityProperty;
+        let mut gs = GameState::empty_for_server(1.0);
+        gs.player.id = EntityId(7);
+        gs.apply_play_packet(ClientboundPlayPacket::EntityProperties {
+            entity_id: 7,
+            properties: vec![EntityProperty {
+                key: "generic.maxHealth".to_owned(),
+                base: 40.0,
+                modifiers: Vec::new(),
+            }],
+        });
+        assert_eq!(gs.max_health, 40.0);
+        assert_eq!(gs.hud_vitals().max_health, 40.0);
+
+        // Another entity's maxHealth must not touch the local player.
+        gs.apply_play_packet(ClientboundPlayPacket::EntityProperties {
+            entity_id: 99,
+            properties: vec![EntityProperty {
+                key: "generic.maxHealth".to_owned(),
+                base: 100.0,
+                modifiers: Vec::new(),
+            }],
+        });
+        assert_eq!(gs.max_health, 40.0);
+    }
+
+    #[test]
+    fn absorption_effect_amplifier_drives_gold_hearts() {
+        let mut gs = GameState::empty_for_server(1.0);
+        gs.player.id = EntityId(7);
+        // Absorption II (amplifier 1) → 4 * (1 + 1) = 8 absorption health.
+        gs.apply_play_packet(ClientboundPlayPacket::EntityEffect {
+            entity_id: 7,
+            effect_id: POTION_ABSORPTION as i8,
+            amplifier: 1,
+            duration: 600,
+            hide_particles: 0,
+        });
+        assert_eq!(gs.hud_vitals().absorption, 8.0);
+
+        // Removing it clears the gold hearts.
+        gs.apply_play_packet(ClientboundPlayPacket::RemoveEntityEffect {
+            entity_id: 7,
+            effect_id: POTION_ABSORPTION as i8,
+        });
+        assert_eq!(gs.hud_vitals().absorption, 0.0);
+    }
+
+    #[test]
+    fn potion_effect_flags_thread_into_hud_vitals() {
+        let mut gs = GameState::empty_for_server(1.0);
+        gs.player.id = EntityId(7);
+        for id in [POTION_REGENERATION, POTION_HUNGER, POTION_POISON, POTION_WITHER] {
+            gs.apply_play_packet(ClientboundPlayPacket::EntityEffect {
+                entity_id: 7,
+                effect_id: id as i8,
+                amplifier: 0,
+                duration: 200,
+                hide_particles: 0,
+            });
+        }
+        let v = gs.hud_vitals();
+        assert!(v.regen && v.hunger_effect && v.poison && v.wither);
+        // The stored duration round-trips through the effect table.
+        assert_eq!(gs.effects[&POTION_POISON].duration, 200);
+
+        // Effects on a non-local entity are ignored.
+        gs.apply_play_packet(ClientboundPlayPacket::EntityEffect {
+            entity_id: 99,
+            effect_id: POTION_ABSORPTION as i8,
+            amplifier: 4,
+            duration: 200,
+            hide_particles: 0,
+        });
+        assert_eq!(gs.hud_vitals().absorption, 0.0);
+    }
+
+    #[test]
+    fn respawn_clears_effects_and_resets_max_health() {
+        use recraft_protocol::v1_8_9::packets::EntityProperty;
+        let mut gs = GameState::empty_for_server(1.0);
+        gs.player.id = EntityId(7);
+        gs.apply_play_packet(ClientboundPlayPacket::EntityProperties {
+            entity_id: 7,
+            properties: vec![EntityProperty {
+                key: "generic.maxHealth".to_owned(),
+                base: 30.0,
+                modifiers: Vec::new(),
+            }],
+        });
+        gs.apply_play_packet(ClientboundPlayPacket::EntityEffect {
+            entity_id: 7,
+            effect_id: POTION_ABSORPTION as i8,
+            amplifier: 0,
+            duration: 600,
+            hide_particles: 0,
+        });
+        assert_eq!(gs.max_health, 30.0);
+        assert!(!gs.effects.is_empty());
+
+        gs.apply_play_packet(ClientboundPlayPacket::Respawn {
+            dimension: 0,
+            difficulty: 0,
+            game_mode: 0,
+            level_type: "default".to_owned(),
+        });
+        assert_eq!(gs.max_health, 20.0);
+        assert!(gs.effects.is_empty());
     }
 
     #[test]

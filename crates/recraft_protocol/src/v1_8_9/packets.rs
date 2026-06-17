@@ -634,6 +634,20 @@ pub enum ClientboundPlayPacket {
         entity_id: i32,
         metadata: Vec<MetadataEntry>,
     },
+    /// S1D EntityEffect — a potion effect applied to an entity. `amplifier` is
+    /// the level minus one (Speed I = 0); `duration` is in ticks.
+    EntityEffect {
+        entity_id: i32,
+        effect_id: i8,
+        amplifier: i8,
+        duration: i32,
+        hide_particles: i8,
+    },
+    /// S1E RemoveEntityEffect — a potion effect cleared from an entity.
+    RemoveEntityEffect {
+        entity_id: i32,
+        effect_id: i8,
+    },
     /// S04 EntityEquipment — armor/held item on another entity. `slot` is
     /// 0 = held, 1-4 = boots/leggings/chest/helmet.
     EntityEquipment {
@@ -1507,6 +1521,17 @@ impl ClientboundPlayPacket {
                 entity_id: body.read_var_i32()?,
                 metadata: read_metadata(&mut body)?,
             }),
+            0x1d => Ok(Self::EntityEffect {
+                entity_id: body.read_var_i32()?,
+                effect_id: body.read_i8()?,
+                amplifier: body.read_i8()?,
+                duration: body.read_var_i32()?,
+                hide_particles: body.read_i8()?,
+            }),
+            0x1e => Ok(Self::RemoveEntityEffect {
+                entity_id: body.read_var_i32()?,
+                effect_id: body.read_i8()?,
+            }),
             0x38 => {
                 let action = body.read_var_i32()?;
                 let count = body.read_var_i32()?;
@@ -2087,6 +2112,44 @@ mod tests {
                         operation: 2,
                     }],
                 }],
+            }
+        );
+    }
+
+    #[test]
+    fn clientbound_entity_effect_decodes_fields() {
+        let mut body = PacketWriter::new();
+        body.write_var_i32(7); // entity id
+        body.write_i8(22); // absorption
+        body.write_i8(1); // amplifier (level II)
+        body.write_var_i32(600); // duration ticks
+        body.write_i8(0); // hide particles
+        let packet =
+            ClientboundPlayPacket::from_frame(PacketFrame::new(0x1d, body.into_inner())).unwrap();
+        assert_eq!(
+            packet,
+            ClientboundPlayPacket::EntityEffect {
+                entity_id: 7,
+                effect_id: 22,
+                amplifier: 1,
+                duration: 600,
+                hide_particles: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn clientbound_remove_entity_effect_decodes_fields() {
+        let mut body = PacketWriter::new();
+        body.write_var_i32(7); // entity id
+        body.write_i8(19); // poison
+        let packet =
+            ClientboundPlayPacket::from_frame(PacketFrame::new(0x1e, body.into_inner())).unwrap();
+        assert_eq!(
+            packet,
+            ClientboundPlayPacket::RemoveEntityEffect {
+                entity_id: 7,
+                effect_id: 19,
             }
         );
     }

@@ -67,6 +67,14 @@ pub struct HudVitals {
     pub health_update_counter: i64,
     /// Vanilla `lastPlayerHealth` (`j`): the health drawn in the blink frame.
     pub last_player_health: i32,
+    /// Regeneration effect active: a rolling heartbeat lifts one heart per tick.
+    pub regen: bool,
+    /// Hunger effect (food poisoning) active: the haunches use the rotten sprite.
+    pub hunger_effect: bool,
+    /// Poison effect active: hearts use the poison (greenish) sprite column.
+    pub poison: bool,
+    /// Wither effect active: hearts use the wither (dark) sprite column.
+    pub wither: bool,
 }
 
 /// Data for the F3 debug overlay: the player feet position (world coords),
@@ -394,16 +402,29 @@ fn draw_status_bars(ui: &mut UiFrame, width: i32, height: i32, hud: &HudState) {
     let highlight = health_highlight(v.health_update_counter, v.update_counter);
     let j = v.last_player_health; // health drawn in the blink frame
 
-    // Regenerating heartbeat is not plumbed (no potion effects); vanilla raises the
-    // heart at `regen_step` by 2px. -1 disables it here.
-    let regen_step: i32 = -1; // `l2`
+    // Regenerating heartbeat (vanilla `l2`): the active heart lifts 2px, rolling
+    // one heart per tick over `ceil(maxHealth + 5)` slots. -1 disables it.
+    let regen_step: i32 = if v.regen {
+        v.update_counter % (max_health + 5.0).ceil() as i32
+    } else {
+        -1
+    };
 
     // A per-frame Java-Random seeded exactly like vanilla so the shake matches.
     let mut rng = JavaRng::new(v.update_counter as i64 * 312871);
 
-    // Hunger effect (food poisoning) uses the rotten-haunch sprite row; potion
-    // effects are not plumbed, so the normal haunches are always drawn.
-    let hunger_effect = false;
+    // Hunger effect (food poisoning) uses the rotten-haunch sprite row.
+    let hunger_effect = v.hunger_effect;
+
+    // Poison/wither tint the hearts by shifting to a different icons.png column
+    // (vanilla `j6`: +36 poison, +72 wither). Added to every heart sprite x.
+    let heart_tint: u32 = if v.poison {
+        36
+    } else if v.wither {
+        72
+    } else {
+        0
+    };
 
     // Armor bar, left-aligned above the top heart row (only when wearing armor).
     let armor = hud.armor.clamp(0, 20);
@@ -445,20 +466,20 @@ fn draw_status_bars(ui: &mut UiFrame, width: i32, height: i32, hud: &HudState) {
         // sprites (vanilla `j`, sprite x offset by +18 from the normal hearts).
         if highlight {
             if let Some(u) = heart_sprite(j, i6) {
-                ui.image(dst, GuiTexture::Icons, u + 18, 0, 9, 9);
+                ui.image(dst, GuiTexture::Icons, u + 18 + heart_tint, 0, 9, 9);
             }
         }
 
         if absorb_left > 0.0 {
             // Gold absorption hearts (icons.png +144 full / +153 half).
             if absorb_left == absorb && absorb % 2.0 == 1.0 {
-                ui.image(dst, GuiTexture::Icons, 169, 0, 9, 9); // half
+                ui.image(dst, GuiTexture::Icons, 169 + heart_tint, 0, 9, 9); // half
             } else {
-                ui.image(dst, GuiTexture::Icons, 160, 0, 9, 9); // full
+                ui.image(dst, GuiTexture::Icons, 160 + heart_tint, 0, 9, 9); // full
             }
             absorb_left -= 2.0;
         } else if let Some(u) = heart_sprite(health, i6) {
-            ui.image(dst, GuiTexture::Icons, u, 0, 9, 9);
+            ui.image(dst, GuiTexture::Icons, u + heart_tint, 0, 9, 9);
         }
     }
 

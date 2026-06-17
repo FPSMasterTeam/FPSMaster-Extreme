@@ -1024,6 +1024,31 @@ fn lerp_axis(corner: f32, lo: f32, hi: f32) -> f32 {
     }
 }
 
+/// Vanilla per-position render offset for plants that declare an `OffsetType`:
+/// flowers and double plants (`XZ`) and tall grass/fern (`XYZ`). A deterministic
+/// hash of the block's world X/Z nudges the model up to ±0.25 horizontally (and
+/// tall grass 0..0.2 downward) so dense plant cover doesn't look gridded; every
+/// other plant stays centred. Mirrors `BlockModelRenderer.renderModelStandardQuads`
+/// — the `cross` model disables ambient occlusion, so vanilla always takes that
+/// y-independent hash path, which is also why a double plant's two halves line up.
+fn cross_plant_offset(id: u16, x: i32, z: i32) -> (f32, f32, f32) {
+    let xyz = match id {
+        31 => true,             // tall grass / fern
+        37 | 38 | 175 => false, // dandelion / small flowers / double plant
+        _ => return (0.0, 0.0, 0.0),
+    };
+    let mut k = (x.wrapping_mul(3129871) as i64) ^ (z as i64).wrapping_mul(116129781);
+    k = k.wrapping_mul(k).wrapping_mul(42317861).wrapping_add(k.wrapping_mul(11));
+    let ox = (((k >> 16) & 15) as f32 / 15.0 - 0.5) * 0.5;
+    let oz = (((k >> 24) & 15) as f32 / 15.0 - 0.5) * 0.5;
+    let oy = if xyz {
+        (((k >> 20) & 15) as f32 / 15.0 - 1.0) * 0.2
+    } else {
+        0.0
+    };
+    (ox, oy, oz)
+}
+
 /// Cross-shaped plant: two diagonal planes, each emitted double-sided so the
 /// plant is visible from every direction under back-face culling (the vanilla
 /// `cross` model likewise carries a face for each side of each plane).
@@ -1041,7 +1066,8 @@ fn append_cross<S: BlockSource>(
     let texture = block.texture_name(BlockFace::Side);
     warn_if_missing(ctx.atlas, block, "its cross texture", texture);
     let uvs = ctx.atlas.uv(texture);
-    let (fx, fy, fz) = (x as f32, y as f32, z as f32);
+    let (ox, oy, oz) = cross_plant_offset(block.id, x, z);
+    let (fx, fy, fz) = (x as f32 + ox, y as f32 + oy, z as f32 + oz);
     // Vanilla cross model: the diagonals are inset 0.8/16 from the corners
     // (rotated 45° with rescale), not stretched corner-to-corner.
     let lo = 0.05;
@@ -2205,10 +2231,36 @@ mod tests {
         let mut world = World::new();
         world.set_block(0, 0, 0, BlockState::new(38, 0));
         let mesh = build_world_mesh(&world, &atlas(), BiomeColors::default(), false, false);
+        // The flower carries a vanilla XZ position offset, so check the inset
+        // against the offset model origin rather than the raw block corner.
+        let (ox, _, oz) = cross_plant_offset(38, 0, 0);
         for v in &mesh.cutout.vertices {
             let p = vpos(v);
-            assert!(p[0] >= 0.05 - 0.02 && p[0] <= 0.95 + 0.02);
-            assert!(p[2] >= 0.05 - 0.02 && p[2] <= 0.95 + 0.02);
+            assert!(p[0] - ox >= 0.05 - 0.02 && p[0] - ox <= 0.95 + 0.02);
+            assert!(p[2] - oz >= 0.05 - 0.02 && p[2] - oz <= 0.95 + 0.02);
+        }
+    }
+
+    #[test]
+    fn plant_offset_matches_vanilla_and_is_position_stable() {
+        // Flowers/double plants offset in XZ only; tall grass/fern also sink in Y.
+        // Values mirror BlockModelRenderer's y-independent hash at world (0,0,0),
+        // where the hash is 0 → the minimum corner of each range.
+        assert_eq!(cross_plant_offset(37, 0, 0), (-0.25, 0.0, -0.25));
+        assert_eq!(cross_plant_offset(175, 0, 0), (-0.25, 0.0, -0.25));
+        assert_eq!(cross_plant_offset(31, 0, 0), (-0.25, -0.2, -0.25));
+        // Non-offset cross plants (sapling, dead bush, mushroom, sugar cane) stay put.
+        for id in [6u16, 32, 39, 83] {
+            assert_eq!(cross_plant_offset(id, 5, -3), (0.0, 0.0, 0.0));
+        }
+        // Deterministic per world position and within the documented ranges.
+        for x in -40..40 {
+            for z in -40..40 {
+                let (ox, oy, oz) = cross_plant_offset(31, x, z);
+                assert_eq!((ox, oy, oz), cross_plant_offset(31, x, z));
+                assert!((-0.25..=0.25).contains(&ox) && (-0.25..=0.25).contains(&oz));
+                assert!((-0.2..=0.0).contains(&oy));
+            }
         }
     }
 
