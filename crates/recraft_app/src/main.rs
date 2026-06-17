@@ -1536,6 +1536,15 @@ fn render_frame(
                 tick_alpha,
                 entity_max_dist_sq,
             );
+            // Signs, enchanting-table books and end-portal surfaces share the
+            // model pass too; sign text is drawn separately on the board faces.
+            let sign_texts = app.game.build_block_entity_models(
+                &mut app.entity_model,
+                app.settings.brightness,
+                tick_alpha,
+                entity_max_dist_sq,
+            );
+            renderer.set_sign_text(&sign_texts);
             if hud_visible {
                 // Light the first-person hand + held item by the lightmap at the eye,
                 // so they darken at night/in caves like the rest of the scene.
@@ -1610,6 +1619,7 @@ fn render_frame(
         renderer.set_particles(&[], &[]);
         renderer.set_xp_orbs(&[], &[]);
         renderer.set_nametags(&app.game.camera, &[]);
+        renderer.set_sign_text(&[]);
     }
     // Mining crack overlay (vanilla destroy_stage_N textures over the dig target).
     renderer.set_break_overlay(app.game.breaking_overlay());

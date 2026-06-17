@@ -500,6 +500,22 @@ struct DebugSkip {
 /// The biped is built at feet origin with its body yaw and head pose already
 /// baked in; the renderer projects it into the panel box and scissors to it.
 /// All pixel measurements are physical (framebuffer) pixels.
+/// One sign block-entity's text to draw flat on its board (vanilla
+/// `TileEntitySignRenderer`'s per-line `drawString`). The four lines are already
+/// flattened (§-coded) text; the placement basis comes from
+/// [`crate::ModelMesh::sign_text_basis`].
+pub struct SignTextDraw {
+    pub lines: [String; 4],
+    /// Board front-face centre in world space.
+    pub center: Vec3,
+    /// Unit vectors spanning the board face (left→right, bottom→top).
+    pub right: Vec3,
+    pub up: Vec3,
+    /// Board half-extents in blocks (matching `right`/`up`).
+    pub half_width: f32,
+    pub half_height: f32,
+}
+
 pub struct InventoryPreview<'a> {
     /// The posed local-player biped (feet at y=0, +y up, +z front toward viewer).
     pub mesh: &'a ModelMesh,
@@ -626,6 +642,15 @@ pub struct Renderer {
     nametag_sampler: wgpu::Sampler,
     nametag_tex_size: (u32, u32),
     nametag_last_names: Vec<String>,
+    /// World-fixed sign block-entity text (vanilla `TileEntitySignRenderer`'s
+    /// per-line `drawString`): rasterized lines on their own texture, drawn as
+    /// quads laid flat on each sign's board face. Shares the nametag sampler and
+    /// the model pass's texture layout.
+    sign_text_mesh: Option<DynamicMesh>,
+    sign_text_texture: wgpu::Texture,
+    sign_text_bind_group: wgpu::BindGroup,
+    sign_text_tex_size: (u32, u32),
+    sign_text_last: Vec<[String; 4]>,
     /// The model pass's group-1 layout (texture+sampler), retained so the
     /// nametag bind group can be rebuilt when its texture grows.
     model_texture_layout: wgpu::BindGroupLayout,
@@ -2208,6 +2233,10 @@ impl Renderer {
         });
         let (nametag_texture, nametag_bind_group) =
             create_nametag_resources(&device, &entity_texture_layout, &nametag_sampler, 1, 1);
+        // Sign text reuses the same text-atlas mechanism (its own texture, the
+        // shared nametag sampler and the model texture layout).
+        let (sign_text_texture, sign_text_bind_group) =
+            create_nametag_resources(&device, &entity_texture_layout, &nametag_sampler, 1, 1);
 
         let gpu_timer = timestamps_enabled.then(|| {
             let query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
@@ -2808,6 +2837,11 @@ impl Renderer {
             nametag_sampler,
             nametag_tex_size: (1, 1),
             nametag_last_names: Vec::new(),
+            sign_text_mesh: None,
+            sign_text_texture,
+            sign_text_bind_group,
+            sign_text_tex_size: (1, 1),
+            sign_text_last: Vec::new(),
             model_texture_layout: entity_texture_layout,
             gui_atlas,
             depth_tex,
@@ -4145,6 +4179,123 @@ impl Renderer {
     }
 
 
+    /// Build and upload this frame's sign block-entity text (vanilla
+    /// `TileEntitySignRenderer`): the four §-coded lines of each visible sign,
+    /// rasterized onto a shared texture and drawn as quads laid flat on the
+    /// board face (depth-tested against the world, so terrain occludes them).
+    /// Pass an empty slice to hide them.
+    pub fn set_sign_text(&mut self, signs: &[SignTextDraw]) {
+        if signs.is_empty() {
+            if let Some(mesh) = &mut self.sign_text_mesh {
+                mesh.index_count = 0;
+            }
+            return;
+        }
+        const SCALE: i32 = 1;
+        let line_h = (8 * SCALE) as u32;
+        let font = crate::font::font();
+        // Each sign gets one texture row block of 4 lines; the texture is as wide
+        // as the widest line across all signs.
+        let mut max_w = 1u32;
+        for s in signs {
+            for line in &s.lines {
+                max_w = max_w.max(font.text_width(line, SCALE).max(1) as u32);
+            }
+        }
+        let tex_w = max_w;
+        let tex_h = line_h * 4 * signs.len() as u32;
+
+        let lines_now: Vec<[String; 4]> = signs.iter().map(|s| s.lines.clone()).collect();
+        if lines_now != self.sign_text_last || self.sign_text_tex_size != (tex_w, tex_h) {
+            let mut pixels = vec![0u8; (tex_w * tex_h * 4) as usize];
+            for (i, s) in signs.iter().enumerate() {
+                for (j, line) in s.lines.iter().enumerate() {
+                    let y = (line_h * (4 * i as u32 + j as u32)) as i32;
+                    font.draw(
+                        &mut pixels, tex_w, tex_h, 0, y, SCALE, [0, 0, 0, 255], false, line,
+                    );
+                }
+            }
+            if self.sign_text_tex_size != (tex_w, tex_h) {
+                let (texture, bind_group) = create_nametag_resources(
+                    &self.device,
+                    &self.model_texture_layout,
+                    &self.nametag_sampler,
+                    tex_w,
+                    tex_h,
+                );
+                self.sign_text_texture = texture;
+                self.sign_text_bind_group = bind_group;
+                self.sign_text_tex_size = (tex_w, tex_h);
+            }
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.sign_text_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &pixels,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4 * tex_w),
+                    rows_per_image: Some(tex_h),
+                },
+                wgpu::Extent3d {
+                    width: tex_w,
+                    height: tex_h,
+                    depth_or_array_layers: 1,
+                },
+            );
+            self.sign_text_last = lines_now;
+        }
+
+        // Vanilla packs four 10px-tall lines into the board face; the board is
+        // ~16px tall in model px. Map line height to ~0.18 of the board height so
+        // four lines fill the readable area, and lay them out top-to-bottom.
+        let mut vertices: Vec<ModelVertex> = Vec::new();
+        let mut indices: Vec<u32> = Vec::new();
+        for (i, s) in signs.iter().enumerate() {
+            // World units per text px so four lines span ~0.72 of the board.
+            let world_per_px = (s.half_height * 2.0 * 0.18) / line_h as f32;
+            for (j, line) in s.lines.iter().enumerate() {
+                let w = font.text_width(line, SCALE).max(0) as f32;
+                if w <= 0.0 {
+                    continue;
+                }
+                let half_w = w * world_per_px * 0.5;
+                let half_h = line_h as f32 * world_per_px * 0.5;
+                // Centre each line; stack the four down from near the top.
+                let row = j as f32 - 1.5; // -1.5,-0.5,0.5,1.5 about the board centre
+                let line_gap = line_h as f32 * world_per_px * 1.25;
+                let center = s.center + s.up * (-row * line_gap);
+                let v0 = (line_h * (4 * i as u32 + j as u32)) as f32 / tex_h as f32;
+                let v1 = (line_h * (4 * i as u32 + j as u32 + 1)) as f32 / tex_h as f32;
+                let u1 = w / tex_w as f32;
+                push_billboard(
+                    &mut vertices,
+                    &mut indices,
+                    center,
+                    s.right,
+                    s.up,
+                    half_w,
+                    half_h,
+                    [[0.0, v0], [u1, v0], [u1, v1], [0.0, v1]],
+                    [1.0, 1.0, 1.0, 1.0],
+                );
+            }
+        }
+        fill_dynamic_mesh(
+            &self.device,
+            &self.queue,
+            &mut self.sign_text_mesh,
+            bytemuck::cast_slice(&vertices),
+            bytemuck::cast_slice(&indices),
+            indices.len() as u32,
+            "sign-text",
+        );
+    }
+
     pub fn render(&mut self, camera: &Camera) -> Result<(), RendererError> {
         self.render_inner(camera, None, None)
     }
@@ -4845,6 +4996,17 @@ impl Renderer {
                 pass.set_pipeline(&self.model_pipeline);
                 pass.set_bind_group(0, &self.camera_bind_group, &[]);
                 pass.set_bind_group(1, &self.nametag_bind_group, &[]);
+                pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+                draw_calls += 1;
+            }
+
+            // World-fixed sign block-entity text on the board faces.
+            if let Some(mesh) = self.sign_text_mesh.as_ref().filter(|m| m.index_count > 0) {
+                pass.set_pipeline(&self.model_pipeline);
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                pass.set_bind_group(1, &self.sign_text_bind_group, &[]);
                 pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                 pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..mesh.index_count, 0, 0..1);

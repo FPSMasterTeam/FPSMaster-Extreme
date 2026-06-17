@@ -1705,6 +1705,223 @@ impl ModelMesh {
     }
 }
 
+// ─── Sign block-entity ─────────────────────────────────────────────────────────
+
+/// Which sign block-entity is being drawn (vanilla standing_sign / wall_sign).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignKind {
+    /// Standing sign (block 63): on a post, yaw from meta 0..15 → meta*22.5°.
+    Standing,
+    /// Wall sign (block 68): mounted flat on a wall face, no post, meta 2..5.
+    Wall,
+}
+
+/// The `TileEntitySignRenderer` render scale `f = 2/3`.
+const SIGN_RENDER_SCALE: f32 = 0.6666667;
+
+/// Vanilla `ModelSign` boxes in model pixels (rotation point at origin): the
+/// 24×12×2 board at tex(0,0) and the 2×14×2 post at tex(0,14).
+const SIGN_BOARD: ([f32; 3], [f32; 3], [f32; 2]) = ([-12.0, -14.0, -1.0], [24.0, 12.0, 2.0], [0.0, 0.0]);
+const SIGN_POST: ([f32; 3], [f32; 3], [f32; 2]) = ([-1.0, -2.0, -1.0], [2.0, 14.0, 2.0], [0.0, 14.0]);
+
+/// Yaw (degrees) a standing sign rotates by for its 0..15 metadata: vanilla
+/// `meta * 360 / 16` rotated by `-f1`, so the model turns clockwise with meta.
+fn standing_sign_yaw(meta: u8) -> f32 {
+    -(meta as f32 % 16.0) * 360.0 / 16.0
+}
+
+/// Yaw (degrees) a wall sign rotates by for its 2..5 facing metadata (rotated
+/// by `-f2`); mirrors the chest facing (2→south through −180, 4/5→±90).
+fn wall_sign_yaw(meta: u8) -> f32 {
+    match meta {
+        2 => -180.0,
+        4 => -90.0,
+        5 => 90.0,
+        _ => 0.0, // 3 and any unexpected meta
+    }
+}
+
+impl ModelMesh {
+    /// Append a sign block-entity (vanilla `ModelSign` + `TileEntitySignRenderer`)
+    /// at world cell `cell`, oriented by its block `meta`. Standing signs sit on a
+    /// post and turn by `meta*22.5°`; wall signs drop the post and mount flat on
+    /// the wall face (meta 2..5). Built in 1/16-block model space, scaled by the
+    /// `f = 2/3` render scale (with `scale(1,-1,-1)`), yawed and placed at the cell
+    /// centre `+0.75*f` up. Samples the `entity/sign.png` slot.
+    pub fn push_sign(&mut self, cell: [i32; 3], meta: u8, kind: SignKind) {
+        let (yaw_deg, wall_off) = match kind {
+            SignKind::Standing => (standing_sign_yaw(meta), Vec3::ZERO),
+            // Wall signs translate (0,-0.3125,-0.4375) in the yawed frame.
+            SignKind::Wall => (wall_sign_yaw(meta), Vec3::new(0.0, -0.3125, -0.4375)),
+        };
+        let yaw = yaw_deg.to_radians();
+        let (sy, cy) = yaw.sin_cos();
+        let f = SIGN_RENDER_SCALE;
+        let base = Vec3::new(cell[0] as f32, cell[1] as f32, cell[2] as f32);
+        let anchor = base + Vec3::new(0.5, 0.75 * f, 0.5);
+
+        let (ox, oy) = entity_slot_origin(EntitySlot::Sign);
+        let origin = [ox as f32, oy as f32];
+
+        // Board always; post only for standing signs.
+        let boxes: &[([f32; 3], [f32; 3], [f32; 2])] = match kind {
+            SignKind::Standing => &[SIGN_BOARD, SIGN_POST],
+            SignKind::Wall => &[SIGN_BOARD],
+        };
+        for (off, size, tex) in boxes {
+            let lo = Vec3::from(*off) * 0.0625;
+            let hi = (Vec3::from(*off) + Vec3::from(*size)) * 0.0625;
+            let region = box_region(tex[0], tex[1], size[0], size[1], size[2]);
+            self.push_textured_box(lo, hi, &region, origin, 1.0, &|m| {
+                // renderSign scale 0.0625 is folded into lo/hi; apply scale(f,-f,-f),
+                // the wall offset, then yaw about Y and place at the anchor.
+                let s = Vec3::new(m.x * f, -m.y * f, -m.z * f) + wall_off;
+                anchor + rotate_y(s, sy, cy)
+            });
+        }
+    }
+
+    /// World-space placement of a sign's text plane: `(center, right, up,
+    /// half_width, half_height)` for the board's readable front face, derived
+    /// from the same transform [`push_sign`] uses. `right`/`up` are unit vectors
+    /// spanning the board; the half-extents are the board's half-size in blocks.
+    /// The text renderer lays the four lines out within this rect.
+    pub fn sign_text_basis(
+        cell: [i32; 3],
+        meta: u8,
+        kind: SignKind,
+    ) -> (Vec3, Vec3, Vec3, f32, f32) {
+        let (yaw_deg, wall_off) = match kind {
+            SignKind::Standing => (standing_sign_yaw(meta), Vec3::ZERO),
+            SignKind::Wall => (wall_sign_yaw(meta), Vec3::new(0.0, -0.3125, -0.4375)),
+        };
+        let yaw = yaw_deg.to_radians();
+        let (sy, cy) = yaw.sin_cos();
+        let f = SIGN_RENDER_SCALE;
+        let base = Vec3::new(cell[0] as f32, cell[1] as f32, cell[2] as f32);
+        let anchor = base + Vec3::new(0.5, 0.75 * f, 0.5);
+        // Same model transform as push_sign, applied to a model-px point on the
+        // board front face (z = -1.05, just proud of the -1..+1 board).
+        let place = |m: Vec3| {
+            let s = Vec3::new(m.x * f, -m.y * f, -m.z * f) + wall_off;
+            anchor + rotate_y(s, sy, cy)
+        };
+        let center = place(Vec3::new(0.0, -8.0, -1.05));
+        let right_edge = place(Vec3::new(12.0, -8.0, -1.05));
+        let top_edge = place(Vec3::new(0.0, -14.0, -1.05));
+        let right_vec = right_edge - center;
+        let up_vec = top_edge - center;
+        (
+            center,
+            right_vec.normalize_or_zero(),
+            up_vec.normalize_or_zero(),
+            right_vec.length(),
+            up_vec.length(),
+        )
+    }
+
+    /// Append the floating enchanting-table book (vanilla `ModelBook` via
+    /// `TileEntityEnchantmentTableRenderer`) above the table at world cell `cell`.
+    /// `time` is a free-running tick counter (`tickCount + partialTicks`): it
+    /// drives a gentle vertical hover and a slow yaw, with the book held slightly
+    /// open. Page-open / page-flip state is simplified to a fixed small spread.
+    /// Samples the `entity/enchanting_table_book.png` slot.
+    pub fn push_book(&mut self, cell: [i32; 3], time: f32) {
+        // Vanilla: translate(x+0.5, y+0.75, z+0.5), then hover sin(t*0.1)*0.01,
+        // yaw by -bookRotation, tilt 80° about Z, render at scale 0.0625.
+        let hover = 0.1 + (time * 0.1).sin() * 0.01;
+        let base = Vec3::new(cell[0] as f32, cell[1] as f32, cell[2] as f32);
+        let anchor = base + Vec3::new(0.5, 0.75 + hover, 0.5);
+        let yaw = (time * 0.02).sin() * 0.5; // gentle idle turn (radians)
+        let (sy, cy) = yaw.sin_cos();
+        let tilt = 80.0_f32.to_radians();
+        let (st, ct) = tilt.sin_cos();
+        // Held a touch open and fluttering, so the page seam reads as a book.
+        let spread = 1.0 + (time * 0.13).sin() * 0.1;
+
+        let (ox, oy) = entity_slot_origin(EntitySlot::EnchantBook);
+        let origin = [ox as f32, oy as f32];
+
+        for b in book_boxes(spread) {
+            let lo = (b.rp + b.off) * 0.0625;
+            let hi = (b.rp + b.off + b.size) * 0.0625;
+            let region = box_region(b.tex[0], b.tex[1], b.size.x, b.size.y, b.size.z);
+            let (sby, cby) = b.yaw.sin_cos();
+            let pivot = b.rp * 0.0625;
+            self.push_textured_box(lo, hi, &region, origin, 1.0, &|m| {
+                // Per-part yaw about its rotation point, then the whole-book GL
+                // chain: scale(1,-1,-1) (the model space flip), 80° Z tilt, idle
+                // yaw about Y, and place at the hovering anchor.
+                let p = rotate_y(m - pivot, sby, cby) + pivot;
+                let s = Vec3::new(p.x, -p.y, -p.z);
+                let s = rotate_z(s, st, ct);
+                anchor + rotate_y(s, sy, cy)
+            });
+        }
+    }
+
+    /// Append the end-portal surface (block 119): a flat near-black quad at the
+    /// top of the block cell. Vanilla draws an animated star-field shader; this
+    /// MVP is a solid dark quad (the shader is deferred). Samples the white texel
+    /// tinted dark, so it needs no dedicated texture slot.
+    pub fn push_end_portal(&mut self, cell: [i32; 3]) {
+        // Vanilla `TileEntityEndPortalRenderer` draws the surface at y = 0.75.
+        let y = cell[1] as f32 + 0.75;
+        let x0 = cell[0] as f32;
+        let z0 = cell[2] as f32;
+        let x1 = x0 + 1.0;
+        let z1 = z0 + 1.0;
+        let color = [0.02, 0.02, 0.07, 1.0];
+        let base = self.vertices.len() as u32;
+        let corners = [
+            [x0, y, z0],
+            [x0, y, z1],
+            [x1, y, z1],
+            [x1, y, z0],
+        ];
+        for position in corners {
+            self.vertices.push(ModelVertex {
+                position,
+                color,
+                uv: ENTITY_WHITE_UV,
+            });
+        }
+        self.indices
+            .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
+}
+
+/// One `ModelBook` part in model pixels: rotation point, `addBox` offset, size,
+/// texture-offset and the part's Y rotation (radians). Built for a given page
+/// `spread` (0 = closed, 1 = fully open) following vanilla `ModelBook`.
+struct BookBox {
+    rp: Vec3,
+    off: Vec3,
+    size: Vec3,
+    tex: [f32; 2],
+    yaw: f32,
+}
+
+/// The seven `ModelBook` boxes posed for a static `spread` (no animation inputs):
+/// covers, spine and the two page leaves opened symmetrically by `spread`.
+fn book_boxes(spread: f32) -> [BookBox; 5] {
+    // Vanilla setRotationAngles with limbSwing≈0: f = 1.25 * bookSpread.
+    let f = 1.25 * spread;
+    let px = f.sin();
+    [
+        // coverRight: rp(0,0,-1), addBox(-6,-5,0, 6,10,0) tex(0,0), yaw = PI + f.
+        BookBox { rp: Vec3::new(0.0, 0.0, -1.0), off: Vec3::new(-6.0, -5.0, 0.0), size: Vec3::new(6.0, 10.0, 0.0), tex: [0.0, 0.0], yaw: std::f32::consts::PI + f },
+        // coverLeft: rp(0,0,1), addBox(0,-5,0, 6,10,0) tex(16,0), yaw = -f.
+        BookBox { rp: Vec3::new(0.0, 0.0, 1.0), off: Vec3::new(0.0, -5.0, 0.0), size: Vec3::new(6.0, 10.0, 0.0), tex: [16.0, 0.0], yaw: -f },
+        // bookSpine: addBox(-1,-5,0, 2,10,0) tex(12,0), yaw = PI/2 (fixed).
+        BookBox { rp: Vec3::ZERO, off: Vec3::new(-1.0, -5.0, 0.0), size: Vec3::new(2.0, 10.0, 0.0), tex: [12.0, 0.0], yaw: std::f32::consts::FRAC_PI_2 },
+        // pagesRight: addBox(0,-4,-0.99, 5,8,1) tex(0,10), yaw = f, rpX = sin(f).
+        BookBox { rp: Vec3::new(px, 0.0, 0.0), off: Vec3::new(0.0, -4.0, -0.99), size: Vec3::new(5.0, 8.0, 1.0), tex: [0.0, 10.0], yaw: f },
+        // pagesLeft: addBox(0,-4,-0.01, 5,8,1) tex(12,10), yaw = -f, rpX = sin(f).
+        BookBox { rp: Vec3::new(px, 0.0, 0.0), off: Vec3::new(0.0, -4.0, -0.01), size: Vec3::new(5.0, 8.0, 1.0), tex: [12.0, 10.0], yaw: -f },
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2145,6 +2362,84 @@ mod tests {
                 mesh.vertices.iter().all(|v| (v0 - 1e-6..=v1 + 1e-6).contains(&v.uv[1])),
                 "chest kind sampled outside its slot"
             );
+        }
+    }
+
+    /// A standing sign emits a well-formed board + post sampling its own slot,
+    /// sized to a single block cell; a wall sign drops the post (one box only).
+    #[test]
+    fn sign_emits_board_and_post_in_its_slot() {
+        let mut standing = ModelMesh::new();
+        standing.push_sign([10, 64, -7], 4, SignKind::Standing);
+        // 2 boxes (board + post) × 6 faces × 4 verts.
+        assert_eq!(standing.vertices.len(), 48);
+        assert_well_formed(&standing);
+        assert!(standing.vertices.iter().any(|v| v.uv != ENTITY_WHITE_UV));
+        let (v0, v1) = slot_v_range(EntitySlot::Sign);
+        let (ox, _) = entity_slot_origin(EntitySlot::Sign);
+        let (u0, u1) = (
+            ox as f32 / ENTITY_ATLAS_WIDTH as f32,
+            (ox + ENTITY_SLOT_PX) as f32 / ENTITY_ATLAS_WIDTH as f32,
+        );
+        assert!(
+            standing.vertices.iter().all(|v| {
+                (v0 - 1e-6..=v1 + 1e-6).contains(&v.uv[1])
+                    && (u0 - 1e-6..=u1 + 1e-6).contains(&v.uv[0])
+            }),
+            "sign sampled outside its slot"
+        );
+        // Every vertex stays within (roughly) the cell footprint.
+        for v in &standing.vertices {
+            assert!((9.0..=12.0).contains(&v.position[0]));
+            assert!((63.0..=66.0).contains(&v.position[1]));
+            assert!((-8.0..=-5.0).contains(&v.position[2]));
+        }
+        // The wall sign omits the post: one box (board) only.
+        let mut wall = ModelMesh::new();
+        wall.push_sign([0, 0, 0], 2, SignKind::Wall);
+        assert_eq!(wall.vertices.len(), 24);
+        assert_well_formed(&wall);
+    }
+
+    /// The enchanting-table book emits a well-formed model from its own slot and
+    /// hovers (its geometry shifts as the time counter advances).
+    #[test]
+    fn book_emits_geometry_and_hovers() {
+        let build = |t: f32| {
+            let mut mesh = ModelMesh::new();
+            mesh.push_book([0, 64, 0], t);
+            mesh
+        };
+        let a = build(0.0);
+        assert_well_formed(&a);
+        assert!(a.vertices.iter().any(|v| v.uv != ENTITY_WHITE_UV));
+        let (v0, v1) = slot_v_range(EntitySlot::EnchantBook);
+        assert!(
+            a.vertices.iter().all(|v| (v0 - 1e-6..=v1 + 1e-6).contains(&v.uv[1])),
+            "book sampled outside its slot"
+        );
+        let b = build(40.0);
+        let moved = a
+            .vertices
+            .iter()
+            .zip(&b.vertices)
+            .any(|(p, q)| (Vec3::from(p.position) - Vec3::from(q.position)).length() > 1e-4);
+        assert!(moved, "the book must animate over time");
+    }
+
+    /// The end-portal surface is a single flat dark quad at the top of the cell.
+    #[test]
+    fn end_portal_is_a_flat_quad_at_cell_top() {
+        let mut mesh = ModelMesh::new();
+        mesh.push_end_portal([5, 64, -2]);
+        assert_eq!(mesh.vertices.len(), 4);
+        assert_eq!(mesh.indices.len(), 6);
+        // All four corners sit on the same horizontal plane at y = cell + 0.75.
+        assert!(mesh.vertices.iter().all(|v| (v.position[1] - 64.75).abs() < 1e-6));
+        // A dark, opaque surface.
+        for v in &mesh.vertices {
+            assert!(v.color[0] < 0.2 && v.color[1] < 0.2 && v.color[2] < 0.3);
+            assert_eq!(v.color[3], 1.0);
         }
     }
 

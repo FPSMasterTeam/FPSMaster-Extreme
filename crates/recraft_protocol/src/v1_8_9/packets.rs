@@ -714,6 +714,14 @@ pub enum ClientboundPlayPacket {
     TabComplete {
         matches: Vec<String>,
     },
+    /// S33 UpdateSign — the four lines of text on a sign block-entity, each a
+    /// chat-JSON string, at the sign's block position.
+    UpdateSign {
+        x: i32,
+        y: i32,
+        z: i32,
+        lines: [String; 4],
+    },
     Unknown {
         id: i32,
         body: Vec<u8>,
@@ -1565,6 +1573,16 @@ impl ClientboundPlayPacket {
                 }
                 Ok(Self::TabComplete { matches })
             }
+            0x33 => {
+                let (x, y, z) = read_block_pos(&mut body)?;
+                let lines = [
+                    body.read_string(32767)?,
+                    body.read_string(32767)?,
+                    body.read_string(32767)?,
+                    body.read_string(32767)?,
+                ];
+                Ok(Self::UpdateSign { x, y, z, lines })
+            }
             id => Ok(Self::Unknown {
                 id,
                 body: frame.body,
@@ -1870,6 +1888,32 @@ mod tests {
                 action_id: 2,
                 action_param: 12,
                 block_type: 25,
+            }
+        );
+    }
+
+    #[test]
+    fn update_sign_decodes_position_and_four_lines() {
+        let mut body = PacketWriter::new();
+        body.write_bytes(&encoded_block_pos(7, 64, -3));
+        body.write_string("{\"text\":\"line0\"}");
+        body.write_string("{\"text\":\"line1\"}");
+        body.write_string("");
+        body.write_string("{\"text\":\"line3\"}");
+        let packet =
+            ClientboundPlayPacket::from_frame(PacketFrame::new(0x33, body.into_inner())).unwrap();
+        assert_eq!(
+            packet,
+            ClientboundPlayPacket::UpdateSign {
+                x: 7,
+                y: 64,
+                z: -3,
+                lines: [
+                    "{\"text\":\"line0\"}".to_owned(),
+                    "{\"text\":\"line1\"}".to_owned(),
+                    "".to_owned(),
+                    "{\"text\":\"line3\"}".to_owned(),
+                ],
             }
         );
     }

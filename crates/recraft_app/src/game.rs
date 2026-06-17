@@ -29,7 +29,9 @@ use recraft_protocol::v1_8_9::{
         TitleAction, UseEntityKind,
     },
 };
-use recraft_render::{held_item_frame, Camera, ChestKind, EntityAnim, ModelMesh};
+use recraft_render::{
+    held_item_frame, Camera, ChestKind, EntityAnim, ModelMesh, SignKind, SignTextDraw,
+};
 use winit::{
     event::{ElementState, KeyEvent},
     keyboard::{KeyCode, PhysicalKey},
@@ -486,6 +488,9 @@ pub struct GameState {
     /// Per-chest lid-open TARGET (1 while a viewer has it open, 0 otherwise),
     /// set by the S24 BlockAction viewer count; `chest_lid_angles` eases toward it.
     chest_open_targets: std::collections::HashMap<[i32; 3], f32>,
+    /// Sign block-entity text, keyed by world block position: the four lines
+    /// flattened from their chat-JSON (S33 UpdateSign).
+    signs: std::collections::HashMap<[i32; 3], [String; 4]>,
     // Smoothed 0..1 view-state amounts, advanced once per physics tick so the
     // sneak camera dip and sprint FOV widen ease in/out instead of snapping.
     sneak_amount: f32,
@@ -735,6 +740,7 @@ impl GameState {
             pending_block_changes: std::collections::HashMap::new(),
             chest_lid_angles: std::collections::HashMap::new(),
             chest_open_targets: std::collections::HashMap::new(),
+            signs: std::collections::HashMap::new(),
             sneak_amount: 0.0,
             previous_sneak_amount: 0.0,
             sprint_amount: 0.0,
@@ -1770,6 +1776,106 @@ impl GameState {
         }
     }
 
+    /// Append the sign, enchanting-table-book and end-portal block-entities near
+    /// the camera to the entity model, and return the sign-text draws for the
+    /// renderer's world-space text pass. Mirrors [`Self::build_chest_models`]:
+    /// loaded chunks within `max_dist_sq` are scanned, each block-entity is
+    /// distance + frustum culled and lit by the world lightmap. The book hover
+    /// is driven by the world time (the same source folded into the entity
+    /// fingerprint, so the book's phase matches the rebuild cadence).
+    pub fn build_block_entity_models(
+        &self,
+        mesh: &mut ModelMesh,
+        brightness: f32,
+        tick_alpha: f32,
+        max_dist_sq: f64,
+    ) -> Vec<SignTextDraw> {
+        let time = self.world_time(tick_alpha) as f32;
+        let sun_b = recraft_render::sky::sun_brightness(self.world_time(tick_alpha));
+        let frustum = self.camera.frustum();
+        let cam = self.camera.position;
+        let max_chunk_dist = (max_dist_sq.sqrt() / 16.0).ceil() as i32 + 1;
+        let cam_cx = (cam.x.floor() as i32).div_euclid(16);
+        let cam_cz = (cam.z.floor() as i32).div_euclid(16);
+        let mut sign_texts = Vec::new();
+
+        for chunk in self.world.chunks() {
+            let cpos = chunk.position;
+            if (cpos.x - cam_cx).abs() > max_chunk_dist || (cpos.z - cam_cz).abs() > max_chunk_dist {
+                continue;
+            }
+            for section in chunk.sections() {
+                let base_y = section.y() * 16;
+                for ly in 0..16u8 {
+                    for lz in 0..16u8 {
+                        for lx in 0..16u8 {
+                            let block = section.get(lx, ly, lz);
+                            // Signs (63 standing, 68 wall), enchanting table (116)
+                            // and end portal (119) are the only block-entities here.
+                            if !matches!(block.id, 63 | 68 | 116 | 119) {
+                                continue;
+                            }
+                            let wx = cpos.x * 16 + lx as i32;
+                            let wy = base_y + ly as i32;
+                            let wz = cpos.z * 16 + lz as i32;
+                            let cx = wx as f64 + 0.5;
+                            let cy = wy as f64 + 0.5;
+                            let cz = wz as f64 + 0.5;
+                            let d = (cx - cam.x as f64).powi(2)
+                                + (cy - cam.y as f64).powi(2)
+                                + (cz - cam.z as f64).powi(2);
+                            if d > max_dist_sq {
+                                continue;
+                            }
+                            let min = Vec3::new(wx as f32, wy as f32, wz as f32);
+                            let max = min + Vec3::ONE;
+                            if !frustum.intersects_aabb(min, max) {
+                                continue;
+                            }
+                            let center = Vec3::new(cx as f32, cy as f32, cz as f32);
+                            let factor = entity_light(&self.world, center, sun_b, brightness);
+                            let start = mesh.vertices.len();
+                            let cell = [wx, wy, wz];
+                            match block.id {
+                                63 | 68 => {
+                                    let kind = if block.id == 63 {
+                                        SignKind::Standing
+                                    } else {
+                                        SignKind::Wall
+                                    };
+                                    mesh.push_sign(cell, block.meta, kind);
+                                    if let Some(lines) = self.signs.get(&cell) {
+                                        if lines.iter().any(|l| !l.is_empty()) {
+                                            let (c, right, up, hw, hh) =
+                                                ModelMesh::sign_text_basis(cell, block.meta, kind);
+                                            sign_texts.push(SignTextDraw {
+                                                lines: lines.clone(),
+                                                center: c,
+                                                right,
+                                                up,
+                                                half_width: hw,
+                                                half_height: hh,
+                                            });
+                                        }
+                                    }
+                                }
+                                116 => mesh.push_book(cell, time),
+                                119 => mesh.push_end_portal(cell),
+                                _ => unreachable!(),
+                            }
+                            for v in &mut mesh.vertices[start..] {
+                                v.color[0] *= factor;
+                                v.color[1] *= factor;
+                                v.color[2] *= factor;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        sign_texts
+    }
+
     /// Ease each tracked chest lid toward its target (1 = open while viewers > 0,
     /// 0 = closed) at vanilla's 0.1/tick, pruning fully-closed entries. The open
     /// target comes from the S24 BlockAction viewer count; until that packet is
@@ -2113,6 +2219,23 @@ impl GameState {
                 ^ ((angle * 64.0) as u64).wrapping_mul(0x9e37_79b9);
         }
         mix(chest_acc);
+        // Sign text (order-independent): fold each sign's position and a hash of
+        // its lines so a new/edited sign re-triggers the block-entity rebuild.
+        let mut sign_acc: u64 = 0;
+        for (&[x, y, z], lines) in &self.signs {
+            let mut s = (x as u32 as u64) ^ ((z as u32 as u64) << 21) ^ ((y as u64) << 42);
+            for line in lines {
+                for b in line.as_bytes() {
+                    s = (s ^ *b as u64).wrapping_mul(0x0000_0100_0000_01b3);
+                }
+            }
+            sign_acc ^= s;
+        }
+        mix(sign_acc);
+        // Coarse book-hover timer (world time advances ~20/sec): quantized to a
+        // few steps per second so the floating book animates without forcing a
+        // per-frame rebuild. Idle scenes with a frozen sky still update slowly.
+        mix((self.world_time(tick_alpha) / 4.0) as u64);
         h
     }
 
@@ -3383,6 +3506,13 @@ impl GameState {
             }
             ClientboundPlayPacket::TabComplete { matches } => {
                 self.chat.set_completions(matches);
+                false
+            }
+            ClientboundPlayPacket::UpdateSign { x, y, z, lines } => {
+                // Store the four lines flattened from chat-JSON, keyed by block
+                // position; the sign block-entity renderer draws them in world.
+                let text = lines.map(|line| chat::flatten_chat_json(&line));
+                self.signs.insert([x, y, z], text);
                 false
             }
             ClientboundPlayPacket::ScoreboardObjective {
