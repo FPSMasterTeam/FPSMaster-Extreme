@@ -1802,8 +1802,52 @@ impl GameState {
                                 .get(&[wx, wy, wz])
                                 .copied()
                                 .unwrap_or(0.0);
+                            // Pairing: a chest pairs with a same-id chest on the
+                            // axis perpendicular to its facing (meta 2/3 face
+                            // N/S → pair on X; 4/5 face E/W → pair on Z). Ender
+                            // chests (130) are never double. The canonical half
+                            // (smaller X/Z, vanilla's adjacentChestXNeg/ZNeg ==
+                            // null) renders the large model; the other half is
+                            // skipped. Single chests keep push_chest.
+                            let axis = match (kind, block.meta) {
+                                (ChestKind::Ender, _) => None,
+                                (_, 2 | 3) => Some([1i32, 0, 0]),
+                                (_, 4 | 5) => Some([0i32, 0, 1]),
+                                _ => None,
+                            };
+                            let partner = axis.and_then(|d| {
+                                let pos = self.world.block_at(wx + d[0], wy + d[1], wz + d[2]);
+                                let neg = self.world.block_at(wx - d[0], wy - d[1], wz - d[2]);
+                                if neg.id == block.id {
+                                    // Neighbour on −axis renders the pair; skip.
+                                    Some(None)
+                                } else if pos.id == block.id {
+                                    // This is the canonical half; partner at +axis.
+                                    Some(Some([wx + d[0], wy + d[1], wz + d[2]]))
+                                } else {
+                                    None
+                                }
+                            });
                             let start = mesh.vertices.len();
-                            mesh.push_chest([wx, wy, wz], block.meta, lid, kind);
+                            match partner {
+                                // Other half of a pair — the canonical half draws it.
+                                Some(None) => continue,
+                                // Canonical half: one large model, lid shared (max).
+                                Some(Some(p)) => {
+                                    let partner_lid = self
+                                        .chest_lid_angles
+                                        .get(&p)
+                                        .copied()
+                                        .unwrap_or(0.0);
+                                    mesh.push_large_chest(
+                                        [wx, wy, wz],
+                                        block.meta,
+                                        lid.max(partner_lid),
+                                        kind,
+                                    );
+                                }
+                                None => mesh.push_chest([wx, wy, wz], block.meta, lid, kind),
+                            }
                             // Light the chest by the lightmap at its centre, like mobs.
                             let factor = entity_light(
                                 &self.world,
@@ -6298,6 +6342,53 @@ mod interaction_tests {
         let sounds = g.take_sounds();
         assert_eq!(sounds.len(), 1);
         assert_eq!(sounds[0].event, "random.chestclosed");
+    }
+
+    #[test]
+    fn adjacent_same_type_chests_render_one_large_model() {
+        let mut g = GameState::empty_for_server(1.0);
+        // Camera at the origin column looking +Z (yaw 0) at chests a few blocks
+        // ahead, so they sit inside the frustum and the distance cutoff.
+        g.camera.position = Vec3::new(0.5, 80.0, 0.0);
+
+        // A normal-chest pair adjacent along X (facing south, meta 3): the
+        // canonical half is the smaller-X one; both share chunk (0,0).
+        g.world.set_block(0, 79, 6, BlockState::new(54, 3));
+        g.world.set_block(1, 79, 6, BlockState::new(54, 3));
+
+        let mut mesh = ModelMesh::new();
+        g.build_chest_models(&mut mesh, 1.0, 0.0, 4096.0);
+        // One large chest = 3 boxes = 72 verts (two singles would be 144).
+        assert_eq!(
+            mesh.vertices.len(),
+            72,
+            "an adjacent same-type pair must emit one large model, not two singles"
+        );
+        // The model spans both cells along X (0..2), confirming the large box.
+        let lo = mesh.vertices.iter().map(|v| v.position[0]).fold(f32::MAX, f32::min);
+        let hi = mesh.vertices.iter().map(|v| v.position[0]).fold(f32::MIN, f32::max);
+        assert!(hi - lo > 1.5, "large chest must span two cells along X ({lo}..{hi})");
+
+        // A lone chest of the same type (no same-id X neighbour) stays single.
+        let mut g2 = GameState::empty_for_server(1.0);
+        g2.camera.position = Vec3::new(0.5, 80.0, 0.0);
+        g2.world.set_block(0, 79, 6, BlockState::new(54, 3));
+        let mut single = ModelMesh::new();
+        g2.build_chest_models(&mut single, 1.0, 0.0, 4096.0);
+        assert_eq!(single.vertices.len(), 72, "a lone chest must emit one single model");
+        let s_lo = single.vertices.iter().map(|v| v.position[0]).fold(f32::MAX, f32::min);
+        let s_hi = single.vertices.iter().map(|v| v.position[0]).fold(f32::MIN, f32::max);
+        assert!(s_hi - s_lo < 1.1, "single chest must fit in one cell ({s_lo}..{s_hi})");
+
+        // Two adjacent chests of DIFFERENT types (normal + trapped) do not pair:
+        // each renders its own single model (2 × 72 verts).
+        let mut g3 = GameState::empty_for_server(1.0);
+        g3.camera.position = Vec3::new(0.5, 80.0, 0.0);
+        g3.world.set_block(0, 79, 6, BlockState::new(54, 3));
+        g3.world.set_block(1, 79, 6, BlockState::new(146, 3));
+        let mut mixed = ModelMesh::new();
+        g3.build_chest_models(&mut mixed, 1.0, 0.0, 4096.0);
+        assert_eq!(mixed.vertices.len(), 144, "different-type neighbours stay two singles");
     }
 
     #[test]

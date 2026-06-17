@@ -1666,6 +1666,16 @@ impl ChestKind {
             ChestKind::Ender => EntitySlot::ChestEnder,
         }
     }
+
+    /// Atlas slot for the large (double) chest texture. Ender chests are never
+    /// double, so they fall back to the single ender slot.
+    fn double_slot(self) -> EntitySlot {
+        match self {
+            ChestKind::Normal => EntitySlot::ChestNormalDouble,
+            ChestKind::Trapped => EntitySlot::ChestTrappedDouble,
+            ChestKind::Ender => EntitySlot::ChestEnder,
+        }
+    }
 }
 
 /// Vanilla `ModelChest` box, in model pixels: the rotation point, the `addBox`
@@ -1689,6 +1699,18 @@ const CHEST_BOXES: [ChestBox; 3] = [
     ChestBox { rp: [8.0, 7.0, 15.0], off: [-1.0, -2.0, -15.0], size: [2.0, 4.0, 1.0], tex: [0.0, 0.0], lid: true },
     // chestBelow: tex(0,19), addBox(0,0,0, 14,10,14), rp(1,6,1)
     ChestBox { rp: [1.0, 6.0, 1.0], off: [0.0, 0.0, 0.0], size: [14.0, 10.0, 14.0], tex: [0.0, 19.0], lid: false },
+];
+
+/// The three `ModelLargeChest` parts, ported 1:1 from vanilla. Same structure
+/// as [`CHEST_BOXES`] but 30 px wide (spanning two block cells along the model's
+/// X axis) and sampling the 128×64 `*_double` texture; the knob's rp.x is 16.
+const LARGE_CHEST_BOXES: [ChestBox; 3] = [
+    // chestLid: tex(0,0), addBox(0,-5,-14, 30,5,14), rp(1,7,15)
+    ChestBox { rp: [1.0, 7.0, 15.0], off: [0.0, -5.0, -14.0], size: [30.0, 5.0, 14.0], tex: [0.0, 0.0], lid: true },
+    // chestKnob: tex(0,0), addBox(-1,-2,-15, 2,4,1), rp(16,7,15)
+    ChestBox { rp: [16.0, 7.0, 15.0], off: [-1.0, -2.0, -15.0], size: [2.0, 4.0, 1.0], tex: [0.0, 0.0], lid: true },
+    // chestBelow: tex(0,19), addBox(0,0,0, 30,10,14), rp(1,6,1)
+    ChestBox { rp: [1.0, 6.0, 1.0], off: [0.0, 0.0, 0.0], size: [30.0, 10.0, 14.0], tex: [0.0, 19.0], lid: false },
 ];
 
 /// Lid model pixel rotation point (`chestLid.rotationPoint`), scaled to blocks.
@@ -1745,6 +1767,60 @@ impl ModelMesh {
                 // scale(1,-1,-1) and place at (cell_x, cell_y+1, cell_z+1).
                 let a = m - Vec3::splat(0.5);
                 let r = rotate_y(a, sy, cy) + Vec3::splat(0.5);
+                base + Vec3::new(r.x, 1.0 - r.y, 1.0 - r.z)
+            });
+        }
+    }
+
+    /// Append the large (double) chest block-entity, ported from vanilla
+    /// `ModelLargeChest` + `TileEntityChestRenderer`. The model is anchored on
+    /// the canonical half — vanilla renders the double chest from the half with
+    /// no chest at -X/-Z (`adjacentChestXNeg`/`ZNeg == null`) — given by `cell`
+    /// and `meta`; its 30-px-wide boxes extend into the +X/+Z partner. The
+    /// renderer's pre-yaw translate (meta 2 → +X, meta 5 → −Z) keeps the seam
+    /// aligned so the model spans exactly the two block cells. Lid eased like a
+    /// single chest; samples the 128×64 `*_double` slot.
+    pub fn push_large_chest(&mut self, cell: [i32; 3], meta: u8, lid_angle: f32, kind: ChestKind) {
+        let f = 1.0 - (1.0 - lid_angle.clamp(0.0, 1.0)).powi(3);
+        let lid_rot = -(f * std::f32::consts::FRAC_PI_2);
+        let (slr, clr) = lid_rot.sin_cos();
+        let pivot = Vec3::from(CHEST_LID_PIVOT_PX) * 0.0625;
+
+        let yaw = chest_yaw_degrees(meta).to_radians();
+        let (sy, cy) = yaw.sin_cos();
+        let base = Vec3::new(cell[0] as f32, cell[1] as f32, cell[2] as f32);
+
+        // The 30-px model extends along +X in model space. After yaw + the
+        // (1,-1,-1) scale, two of the four facings flip it onto the −axis; a
+        // post-yaw shift moves it back so the model always spans the canonical
+        // cell plus its +X/+Z partner. (Vanilla keys this off meta 2/5 in GL's
+        // rotation handedness; the equivalent here is meta 2 → +X, meta 4 → −Z.)
+        let pre = match meta {
+            2 => Vec3::new(1.0, 0.0, 0.0),
+            4 => Vec3::new(0.0, 0.0, -1.0),
+            _ => Vec3::ZERO,
+        };
+
+        let (ox, oy) = entity_slot_origin(kind.double_slot());
+        let origin = [ox as f32, oy as f32];
+
+        for b in &LARGE_CHEST_BOXES {
+            let rp = Vec3::from(b.rp);
+            let lo = (rp + Vec3::from(b.off)) * 0.0625;
+            let hi = (rp + Vec3::from(b.off) + Vec3::from(b.size)) * 0.0625;
+            let region = box_region(b.tex[0], b.tex[1], b.size[0], b.size[1], b.size[2]);
+            let lid = b.lid;
+            self.push_textured_box(lo, hi, &region, origin, 1.0, &|m| {
+                let m = if lid {
+                    rotate_x(m - pivot, slr, clr) + pivot
+                } else {
+                    m
+                };
+                // recentre, yaw, apply the partner shift (vanilla pushes it
+                // after the rotate so it acts in world axes), then scale(1,-1,-1)
+                // and place at (cell_x, cell_y+1, cell_z+1).
+                let a = m - Vec3::splat(0.5);
+                let r = rotate_y(a, sy, cy) + pre + Vec3::splat(0.5);
                 base + Vec3::new(r.x, 1.0 - r.y, 1.0 - r.z)
             });
         }
@@ -2408,6 +2484,55 @@ mod tests {
                 mesh.vertices.iter().all(|v| (v0 - 1e-6..=v1 + 1e-6).contains(&v.uv[1])),
                 "chest kind sampled outside its slot"
             );
+        }
+    }
+
+    /// The large (double) chest emits three well-formed boxes sampling the
+    /// 128×64 `*_double` slot, and spans exactly the canonical cell plus its
+    /// +X/+Z partner for every facing.
+    #[test]
+    fn large_chest_emits_three_boxes_spanning_two_cells() {
+        let mut mesh = ModelMesh::new();
+        mesh.push_large_chest([10, 64, -7], 3, 0.0, ChestKind::Normal);
+        assert_eq!(mesh.vertices.len(), 72);
+        assert_eq!(mesh.indices.len(), 108);
+        assert_well_formed(&mesh);
+        assert!(mesh.vertices.iter().any(|v| v.uv != ENTITY_WHITE_UV));
+
+        // UVs stay inside the double slot's full 128px width and its V range.
+        let (v0, v1) = slot_v_range(EntitySlot::ChestNormalDouble);
+        let (ox, _) = entity_slot_origin(EntitySlot::ChestNormalDouble);
+        let (u0, u1) = (
+            ox as f32 / ENTITY_ATLAS_WIDTH as f32,
+            (ox + ENTITY_SLOT_PX) as f32 / ENTITY_ATLAS_WIDTH as f32,
+        );
+        assert!(
+            mesh.vertices.iter().all(|v| {
+                (v0 - 1e-6..=v1 + 1e-6).contains(&v.uv[1])
+                    && (u0 - 1e-6..=u1 + 1e-6).contains(&v.uv[0])
+            }),
+            "large chest sampled outside its slot"
+        );
+
+        // For every facing the model spans the canonical cell and its partner
+        // (+X for meta 2/3, +Z for meta 4/5) — never the cell on the other side.
+        let cell = [10i32, 64, -7];
+        for (meta, axis) in [(2u8, 0usize), (3, 0), (4, 2), (5, 2)] {
+            let mut m = ModelMesh::new();
+            m.push_large_chest(cell, meta, 0.0, ChestKind::Normal);
+            let lo = m.vertices.iter().map(|v| v.position[axis]).fold(f32::MAX, f32::min);
+            let hi = m.vertices.iter().map(|v| v.position[axis]).fold(f32::MIN, f32::max);
+            let c = cell[axis] as f32;
+            // Spans canonical cell c .. partner c+2, never c-1.
+            assert!(lo >= c - 0.001, "meta {meta} leaks into the −axis cell ({lo} < {c})");
+            assert!(hi <= c + 2.001, "meta {meta} overruns the partner ({hi} > {c}+2)");
+            assert!(hi - lo > 1.5, "meta {meta} must span two cells along the pairing axis");
+            // The off-axis horizontal extent stays within one cell.
+            let off = if axis == 0 { 2 } else { 0 };
+            let olo = m.vertices.iter().map(|v| v.position[off]).fold(f32::MAX, f32::min);
+            let ohi = m.vertices.iter().map(|v| v.position[off]).fold(f32::MIN, f32::max);
+            assert!(ohi - olo <= 1.001, "meta {meta} too wide off-axis");
+            assert!((cell[off] as f32 - 0.001..=cell[off] as f32 + 1.001).contains(&olo));
         }
     }
 

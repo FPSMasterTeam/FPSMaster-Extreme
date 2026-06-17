@@ -1603,7 +1603,7 @@ pub const ENTITY_SLOT_PX: u32 = 128;
 
 /// Number of fixed slots stacked at the top of the entity atlas (one per
 /// [`EntitySlot`], including the trailing guaranteed-white slot).
-pub const ENTITY_SLOT_COUNT: u32 = 47;
+pub const ENTITY_SLOT_COUNT: u32 = 49;
 
 /// Extra 64x64 rows reserved below the fixed slots for per-player downloaded
 /// skins, allocated at runtime by the skin loader.
@@ -1715,12 +1715,16 @@ pub enum EntitySlot {
     ChestNormal = 41,
     ChestTrapped = 42,
     ChestEnder = 43,
+    /// Double-chest textures (entity/chest/{normal,trapped}_double.png, 128x64):
+    /// fill the full 128px slot width, sampled by the large-chest model.
+    ChestNormalDouble = 44,
+    ChestTrappedDouble = 45,
     /// Sign block-entity texture (entity/sign.png, 64x32).
-    Sign = 44,
+    Sign = 46,
     /// Enchanting-table book block-entity (entity/enchanting_table_book.png, 64x32).
-    EnchantBook = 45,
+    EnchantBook = 47,
     /// Guaranteed opaque-white slot sampled by solid-color geometry.
-    White = 46,
+    White = 48,
 }
 
 /// Pixel origin (top-left corner) of an entity atlas slot.
@@ -1743,11 +1747,13 @@ pub const ENTITY_WHITE_UV: [f32; 2] = {
 /// The 1.8 entity textures loaded into each mob slot, plus the procedural
 /// fallback tint used when the asset is missing. The player slot is handled
 /// separately (normalize_skin / procedural_skin).
-const MOB_SLOT_ASSETS: [(EntitySlot, &str, [u8; 3]); 35] = [
+const MOB_SLOT_ASSETS: [(EntitySlot, &str, [u8; 3]); 37] = [
     (EntitySlot::ArmorStand, "armorstand/wood", [150, 120, 75]),
     (EntitySlot::ChestNormal, "chest/normal", [162, 114, 51]),
     (EntitySlot::ChestTrapped, "chest/trapped", [162, 80, 51]),
     (EntitySlot::ChestEnder, "chest/ender", [40, 80, 76]),
+    (EntitySlot::ChestNormalDouble, "chest/normal_double", [162, 114, 51]),
+    (EntitySlot::ChestTrappedDouble, "chest/trapped_double", [162, 80, 51]),
     (EntitySlot::Sign, "sign", [156, 127, 78]),
     (EntitySlot::EnchantBook, "enchanting_table_book", [120, 30, 30]),
     (EntitySlot::Zombie, "zombie/zombie", [88, 124, 80]),
@@ -2425,6 +2431,8 @@ mod tests {
             EntitySlot::ChestNormal,
             EntitySlot::ChestTrapped,
             EntitySlot::ChestEnder,
+            EntitySlot::ChestNormalDouble,
+            EntitySlot::ChestTrappedDouble,
             EntitySlot::Sign,
             EntitySlot::EnchantBook,
             EntitySlot::White,
