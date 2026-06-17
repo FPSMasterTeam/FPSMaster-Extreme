@@ -654,12 +654,29 @@ fn vpivot(rp: [f32; 3]) -> Vec3 {
 }
 
 /// Same as [`vbox`] but for a part rendered lying on its back (vanilla
-/// `rotateAngleX = PI/2`): the texture's front/back map to the box's top/bottom
-/// and its top/bottom to the z faces, like the quadruped body. The world box is
-/// built directly from `(min, max)` in engine px.
+/// `rotateAngleX = +PI/2`, e.g. the quadruped body), baked as a static box.
+/// Rotating the upright box +90° about X in the engine frame (`(x,y,z) →
+/// (x,-z,y)`) maps the box's local faces onto the world faces:
+///   world top(+y)    ← local back  (rect `b[2]`)
+///   world bottom(-y) ← local front (rect `b[3]`)
+///   world back(-z)   ← local bottom(rect `b[0]`)
+///   world front(+z)  ← local top   (rect `b[1]`)
+/// and the x-faces (`b[4]`, `b[5]`) stay put. The rotation also turns each
+/// face's in-plane texture axes, which the upright [`plane_frac`] does not
+/// account for, so the top/bottom/back rects are flipped here to land the right
+/// way up (verified texel-exact against vanilla `ModelBox` + the GL rotation):
+/// top needs a U-flip, bottom a V-flip, back a U-flip, front is already upright.
+/// The x-end-caps (`b[4]`/`b[5]`) would additionally need a 90° transpose that a
+/// `[x0,y0,x1,y1]` rect cannot encode; they are left as-is (the prior behaviour).
 fn vbox_prone(min: [f32; 3], max: [f32; 3], tex: [f32; 2], size: [f32; 3]) -> Part {
     let b = box_region(tex[0], tex[1], size[0], size[1], size[2]);
-    (min, max, [b[2], b[3], b[0], b[1], b[4], b[5]])
+    let flip_u = |r: [f32; 4]| [r[2], r[1], r[0], r[3]];
+    let flip_v = |r: [f32; 4]| [r[0], r[3], r[2], r[1]];
+    (
+        min,
+        max,
+        [flip_v(b[3]), flip_u(b[2]), flip_u(b[0]), b[1], b[4], b[5]],
+    )
 }
 
 /// Walk-cycle leg/arm angle: `cos(limbSwing*0.6662 + phase) * scale * amount`.
@@ -2686,6 +2703,63 @@ mod tests {
             assert!(v.color[0] < 0.2 && v.color[1] < 0.2 && v.color[2] < 0.3);
             assert_eq!(v.color[3], 1.0);
         }
+    }
+
+    /// The prone quadruped body (vanilla `body.rotateAngleX = +PI/2`) is baked
+    /// as a static box, so its world-UP face must carry the texture rect that
+    /// vanilla lands there after the rotation — the box's *back* rect `b[2]`,
+    /// not the *front* rect `b[3]` the old code used (which read reversed). The
+    /// V must also run head→tail (front of the animal at the rect's top edge),
+    /// matching the upright convention rather than being vertically mirrored.
+    #[test]
+    fn prone_body_top_face_uses_the_back_rect_unmirrored() {
+        // Build a pig at yaw 0 so engine axes map straight onto world axes.
+        let mut mesh = ModelMesh::new();
+        mesh.push_entity(EntityKind::Mob(90), Vec3::ZERO, 0.0, &EntityAnim::default(), None);
+
+        // pig_parts order: 4 legs, body, head, snout. The body is part 4
+        // (verts 96..120); FACES idx 1 (world +y top) is verts 100..104.
+        let body = &mesh.vertices[96..120];
+        let top = &mesh.vertices[100..104];
+        // It is the body's highest face: all four verts share the body's max Y.
+        let body_max_y = body.iter().map(|v| v.position[1]).fold(f32::MIN, f32::max);
+        assert!(
+            top.iter().all(|v| (v.position[1] - body_max_y).abs() < 1e-6),
+            "body face 1 must be the world-up face"
+        );
+
+        // The body box is box_region(28,8, 10,16,8). Its *back* rect b[2] is the
+        // 10×16 rect at texel [54,16,64,32]; its *front* rect b[3] is the 10×8
+        // strip at [36,16,46,24]. The prone top must sample the back rect.
+        let (ox, oy) = entity_slot_origin(EntitySlot::Pig);
+        let back_u = (ox as f32 + 54.0..=ox as f32 + 64.0);
+        let back_v = (oy as f32 + 16.0..=oy as f32 + 32.0);
+        for v in top {
+            let upx = v.uv[0] * ENTITY_ATLAS_WIDTH as f32;
+            let vpx = v.uv[1] * ENTITY_ATLAS_HEIGHT as f32;
+            assert!(
+                back_u.contains(&upx) && back_v.contains(&vpx),
+                "prone top must sample the back rect b[2] (54..64, 16..32), got ({upx},{vpx}) \
+                 — the old code wrongly used the front rect b[3]"
+            );
+        }
+
+        // Within the face, V must grow toward the back of the animal (-z): the
+        // head end (+z, front) sits at the rect's top edge (small V), the tail
+        // (-z) at the bottom. This is the same direction an upright box's top
+        // face runs (fv = 1 - fz), proving the rect is not vertically flipped.
+        let front = top.iter().min_by(|a, b| a.position[2].total_cmp(&b.position[2])).unwrap();
+        let back = top.iter().max_by(|a, b| a.position[2].total_cmp(&b.position[2])).unwrap();
+        // `front`/`back` here are the -z/+z verts; +z is the animal's head.
+        let head = back; // larger z = front of the animal = head
+        let tail = front;
+        assert!(
+            head.uv[1] < tail.uv[1],
+            "prone top V must run head(+z)→tail(-z) like an upright top face, \
+             not mirrored: head {} tail {}",
+            head.uv[1],
+            tail.uv[1]
+        );
     }
 
     /// The sheep is drawn as a body layer plus an inflated wool overlay, so its

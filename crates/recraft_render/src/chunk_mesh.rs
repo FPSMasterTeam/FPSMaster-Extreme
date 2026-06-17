@@ -1092,9 +1092,30 @@ fn append_cross<S: BlockSource>(
         push_greedy_quad_double_sided(buffer, q0, ruv, origin, color, light);
         push_greedy_quad_double_sided(buffer, q1, ruv, origin, color, light);
     } else {
+        let uvs = inset_tile_uvs(uvs, ctx.atlas);
         buffer.push_quad_double_sided(q0, uvs, color, light);
         buffer.push_quad_double_sided(q1, uvs, color, light);
     }
+}
+
+/// Pull a full-tile UV quad in by half a texel on every side. With nearest
+/// filtering the raw tile bounds land exactly on the texel grid, so a fragment
+/// right at the quad edge floors into the neighbouring atlas tile. Cross plants
+/// carry a green vertex tint, so any opaque neighbour texel that bleeds in shows
+/// up as a shimmering bright-green speck tracing the crossed planes' edges.
+/// Sampling texel centres keeps every fetch inside the sprite.
+fn inset_tile_uvs(uvs: [[f32; 2]; 4], atlas: &AtlasUv) -> [[f32; 2]; 4] {
+    let [du, dv] = atlas.tile_size();
+    let (hu, hv) = (du / 32.0, dv / 32.0); // half a texel (a tile is 16 texels)
+    let cu = (uvs[0][0] + uvs[2][0]) * 0.5;
+    let cv = (uvs[0][1] + uvs[1][1]) * 0.5;
+    let pull = |c: [f32; 2]| {
+        [
+            if c[0] < cu { c[0] + hu } else { c[0] - hu },
+            if c[1] < cv { c[1] + hv } else { c[1] - hv },
+        ]
+    };
+    [pull(uvs[0]), pull(uvs[1]), pull(uvs[2]), pull(uvs[3])]
 }
 
 /// Rail: a flat (or sloped) quad 1/16 above the floor. The texture's V axis
@@ -2238,6 +2259,33 @@ mod tests {
             let p = vpos(v);
             assert!(p[0] - ox >= 0.05 - 0.02 && p[0] - ox <= 0.95 + 0.02);
             assert!(p[2] - oz >= 0.05 - 0.02 && p[2] - oz <= 0.95 + 0.02);
+        }
+    }
+
+    #[test]
+    fn cross_plant_uvs_stay_half_a_texel_inside_the_tile() {
+        // With nearest filtering, UVs sitting exactly on the tile edge floor into
+        // the neighbouring atlas tile; the green vertex tint then paints that bleed
+        // as shimmering bright-green specks. Every cross UV must stay ≥ half a texel
+        // inside its tile so no fetch escapes the sprite.
+        let uv = atlas();
+        let mut world = World::new();
+        world.set_block(0, 0, 0, BlockState::new(31, 1)); // tall grass
+        let mesh = build_world_mesh(&world, &uv, BiomeColors::default(), false, false);
+        let rect = uv.tile_rect(BlockState::new(31, 1).texture_name(BlockFace::Side));
+        let (half_u, half_v) = (rect[2] / 32.0, rect[3] / 32.0);
+        assert!(!mesh.cutout.vertices.is_empty());
+        for v in &mesh.cutout.vertices {
+            let u = v.uv[0] as f32 / 65535.0;
+            let w = v.uv[1] as f32 / 65535.0;
+            assert!(
+                u >= rect[0] + half_u - 1e-4 && u <= rect[0] + rect[2] - half_u + 1e-4,
+                "u {u} not inside tile {rect:?}"
+            );
+            assert!(
+                w >= rect[1] + half_v - 1e-4 && w <= rect[1] + rect[3] - half_v + 1e-4,
+                "v {w} not inside tile {rect:?}"
+            );
         }
     }
 
