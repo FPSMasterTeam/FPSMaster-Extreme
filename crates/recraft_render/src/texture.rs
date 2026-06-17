@@ -1610,7 +1610,7 @@ pub const ENTITY_SLOT_PX: u32 = 128;
 
 /// Number of fixed slots stacked at the top of the entity atlas (one per
 /// [`EntitySlot`], including the trailing guaranteed-white slot).
-pub const ENTITY_SLOT_COUNT: u32 = 49;
+pub const ENTITY_SLOT_COUNT: u32 = 50;
 
 /// Extra 64x64 rows reserved below the fixed slots for per-player downloaded
 /// skins, allocated at runtime by the skin loader.
@@ -1730,8 +1730,10 @@ pub enum EntitySlot {
     Sign = 46,
     /// Enchanting-table book block-entity (entity/enchanting_table_book.png, 64x32).
     EnchantBook = 47,
+    /// Arrow projectile (entity/arrow.png, 32x32).
+    Arrow = 48,
     /// Guaranteed opaque-white slot sampled by solid-color geometry.
-    White = 48,
+    White = 49,
 }
 
 /// Pixel origin (top-left corner) of an entity atlas slot.
@@ -1754,7 +1756,7 @@ pub const ENTITY_WHITE_UV: [f32; 2] = {
 /// The 1.8 entity textures loaded into each mob slot, plus the procedural
 /// fallback tint used when the asset is missing. The player slot is handled
 /// separately (normalize_skin / procedural_skin).
-const MOB_SLOT_ASSETS: [(EntitySlot, &str, [u8; 3]); 37] = [
+const MOB_SLOT_ASSETS: [(EntitySlot, &str, [u8; 3]); 38] = [
     (EntitySlot::ArmorStand, "armorstand/wood", [150, 120, 75]),
     (EntitySlot::ChestNormal, "chest/normal", [162, 114, 51]),
     (EntitySlot::ChestTrapped, "chest/trapped", [162, 80, 51]),
@@ -1792,6 +1794,7 @@ const MOB_SLOT_ASSETS: [(EntitySlot, &str, [u8; 3]); 37] = [
     (EntitySlot::Guardian, "guardian", [156, 142, 124]),
     (EntitySlot::Wither, "wither/wither", [60, 60, 60]),
     (EntitySlot::Rabbit, "rabbit/brown", [150, 110, 78]),
+    (EntitySlot::Arrow, "arrow", [180, 180, 180]),
 ];
 
 /// RGBA pixels for the entity atlas sampled by the model pass: a vertical
@@ -2442,6 +2445,7 @@ mod tests {
             EntitySlot::ChestTrappedDouble,
             EntitySlot::Sign,
             EntitySlot::EnchantBook,
+            EntitySlot::Arrow,
             EntitySlot::White,
         ];
         let mut seen = std::collections::HashSet::new();

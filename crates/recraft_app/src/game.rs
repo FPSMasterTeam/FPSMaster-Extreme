@@ -256,6 +256,11 @@ pub enum ItemUseAction {
 }
 
 /// Standing eye height above the feet, in blocks (vanilla 1.8).
+/// Extra chunk rings kept meshed beyond the render distance before the
+/// render-distance safety net drops a column's GPU mesh, so chunks at the very
+/// edge don't evict/re-mesh while the player jitters across a boundary.
+const RESIDENCY_MARGIN: i32 = 2;
+
 const STANDING_EYE_HEIGHT: f64 = 1.62;
 /// How far the camera drops below the standing eye height while sneaking.
 const SNEAK_EYE_DROP: f64 = 0.08;
@@ -507,6 +512,14 @@ pub struct GameState {
     /// the background mesher before ordinary dirty sections, but never rebuilt on
     /// the render thread.
     urgent_remesh: HashSet<SectionPos>,
+    /// Columns whose GPU meshes were dropped by the render-distance safety net
+    /// (their block data is kept in `world`). Re-meshed when the player walks
+    /// back into range; pruned when the server unloads them. Bounds GPU memory
+    /// on servers that never send ChunkUnload. See `enforce_render_distance`.
+    evicted_columns: HashSet<ChunkPos>,
+    /// Player chunk at the last `enforce_render_distance` pass, so the scan runs
+    /// only when crossing a chunk boundary.
+    last_residency_chunk: Option<ChunkPos>,
     /// Block changes received for chunks that weren't loaded yet, replayed once
     /// the chunk arrives (otherwise spawn-platform blocks can be lost).
     pending_block_changes: std::collections::HashMap<ChunkPos, Vec<(i32, i32, i32, BlockState)>>,
@@ -665,6 +678,18 @@ fn hurt_camera_roll(hurt_time: u8, alpha: f32) -> f32 {
     -(f * 14.0).to_radians()
 }
 
+/// Vanilla `RendererLivingEntity` death fall-over tilt, in radians, for a
+/// `death_time` (0 while alive, counting up to 20) and partial-tick alpha:
+/// `sqrt(min((death_time + alpha - 1)/20 · 1.6, 1)) · 90°`. 0 until the entity
+/// has been dead at least a tick.
+fn death_roll_radians(death_time: u8, alpha: f32) -> f32 {
+    if death_time == 0 {
+        return 0.0;
+    }
+    let f = ((death_time as f32 + alpha - 1.0) / 20.0 * 1.6).max(0.0).sqrt().min(1.0);
+    f * 90.0_f32.to_radians()
+}
+
 /// Vanilla `RenderPlayer.setModelVisibilities` arm state for a remote player:
 /// 0 = empty hand, 1 = holding an item, 3 = blocking (using a sword). Drives the
 /// third-person held-arm / blocking pose (`ModelBiped.heldItemRight`).
@@ -792,6 +817,8 @@ impl GameState {
             vehicles: std::collections::HashMap::new(),
             dirty_chunks: HashSet::new(),
             urgent_remesh: HashSet::new(),
+            evicted_columns: HashSet::new(),
+            last_residency_chunk: None,
             pending_block_changes: std::collections::HashMap::new(),
             chest_lid_angles: std::collections::HashMap::new(),
             chest_open_targets: std::collections::HashMap::new(),
@@ -1421,28 +1448,51 @@ impl GameState {
         // items with no pending server correction run local EntityItem physics
         // instead, so a freshly-dropped item arcs immediately rather than
         // stalling in the air until the next position packet (T7).
+        // Entities with no pending server correction run local physics this tick
+        // (zero-latency motion): dropped items always, projectiles while they
+        // still carry motion. Everything else lerps toward the server target.
         let player_id = self.player.id;
+        let locally_simulated = |e: &EntityState| -> bool {
+            if e.id == player_id || e.position_increments != 0 {
+                return false;
+            }
+            match e.kind {
+                EntityKind::Object(2) => true, // dropped item
+                EntityKind::Object(kind) => {
+                    projectile_physics(kind).is_some() && e.velocity.length_squared() > 1.0e-6
+                }
+                _ => false,
+            }
+        };
         for entity in self.world.entities_mut() {
-            let item_simulating =
-                entity.kind == EntityKind::Object(2) && entity.position_increments == 0;
-            if entity.id != player_id && !item_simulating {
+            if entity.id != player_id && !locally_simulated(entity) {
                 entity.tick_interpolation();
             }
         }
-        let simulating_items: Vec<EntityId> = self
+        let simulating: Vec<EntityId> = self
             .world
             .entities()
-            .filter(|e| {
-                e.id != player_id
-                    && e.kind == EntityKind::Object(2)
-                    && e.position_increments == 0
-            })
+            .filter(|e| locally_simulated(e))
             .map(|e| e.id)
             .collect();
-        for id in simulating_items {
-            if let Some(mut item) = self.world.entity(id).cloned() {
-                recraft_core::physics::tick_item(&self.world, &mut item);
-                self.world.upsert_entity(item);
+        for id in simulating {
+            if let Some(mut e) = self.world.entity(id).cloned() {
+                match e.kind {
+                    EntityKind::Object(2) => recraft_core::physics::tick_item(&self.world, &mut e),
+                    EntityKind::Object(kind) => {
+                        if let Some((gravity, drag, collide)) = projectile_physics(kind) {
+                            recraft_core::physics::tick_projectile(
+                                &self.world,
+                                &mut e,
+                                gravity,
+                                drag,
+                                collide,
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+                self.world.upsert_entity(e);
             }
         }
 
@@ -1761,6 +1811,7 @@ impl GameState {
                 sneaking: entity.sneaking,
                 held_item_right,
                 old_animations,
+                death_roll: death_roll_radians(entity.death_time, tick_alpha),
             };
             let start = mesh.vertices.len();
             // Invisible entities (metadata flag 0x20) render no body model — but
@@ -1802,10 +1853,11 @@ impl GameState {
             let center = Vec3::new(feet.x, feet.y + height as f32 * 0.5, feet.z);
             let factor = entity_light(&self.world, center, sun_b, brightness);
             // Vanilla damage flash (RendererLivingEntity.setBrightness): while
-            // hurtTime > 0 the model colour is lerped toward pure red at a
-            // constant 0.3 strength (GL_INTERPOLATE with (1,0,0,0.3)) — held for
-            // the whole hurt animation, not faded, then snapped off.
-            let hurt = entity.hurt_time > 0;
+            // `hurtTime > 0 || deathTime > 0` the model colour is lerped toward
+            // pure red at a constant 0.3 strength (GL_INTERPOLATE with
+            // (1,0,0,0.3)) — held for the whole hurt animation AND the whole
+            // death animation, so the corpse stays red.
+            let hurt = entity.hurt_time > 0 || entity.death_time > 0;
             for v in &mut mesh.vertices[start..] {
                 v.color[0] *= factor;
                 v.color[1] *= factor;
@@ -2164,10 +2216,10 @@ impl GameState {
     }
 
     /// This frame's projectile sprites: SpawnObject kinds mapped to an item id
-    /// and rendered as 2D item-sprite billboards through the dropped-item path.
-    /// Arrows are emitted as a thin elongated billboard (a full 3D model is
-    /// deferred). Kinds already handled elsewhere (item=2, falling block=70,
-    /// armor stand=78) are skipped.
+    /// and rendered as 2D item-sprite billboards through the dropped-item path
+    /// (snowball, egg, ender pearl, …). Kinds rendered elsewhere — the arrow
+    /// (3D model in the entity pass), item=2, falling block=70, armor stand=78 —
+    /// are skipped.
     pub fn projectiles(&self, tick_alpha: f32) -> Vec<DroppedItem> {
         let mut sprites = Vec::new();
         for entity in self.world.entities() {
@@ -2258,6 +2310,7 @@ impl GameState {
                 sneaking: entity.sneaking,
                 held_item_right: held_item_right_state(Some(item), entity.using_item),
                 old_animations,
+                death_roll: death_roll_radians(entity.death_time, tick_alpha),
             };
             let attach = arm_attach(feet, body_yaw, &anim);
             // Sample the lightmap at the rendered hand (bottom-centre of the arm).
@@ -2360,6 +2413,9 @@ impl GameState {
             mix(qa(lsa));
             mix(qa(e.render_swing(tick_alpha)));
             mix(e.hurt_time as u64);
+            // Death animation advances every tick (and the roll per frame), so
+            // fold it in or the cached model would freeze mid-fall.
+            mix(qa(death_roll_radians(e.death_time, tick_alpha)));
             mix((e.using_item as u64) << 3 | (e.sneaking as u64) << 2 | (e.invisible as u64) << 1 | e.custom_name_visible as u64);
             if let Some(name) = &e.custom_name {
                 for b in name.as_bytes() {
@@ -2742,7 +2798,7 @@ impl GameState {
                 z,
                 face,
             });
-            let ticks = block_break_ticks(self.world.block_at(x, y, z));
+            let ticks = self.block_break_ticks(self.world.block_at(x, y, z));
             if ticks <= 1.0 {
                 // Instant break (hardness ~0): START alone destroys it.
                 self.breaking = None;
@@ -2766,6 +2822,75 @@ impl GameState {
         self.breaking
             .as_ref()
             .is_some_and(|b| b.x == x && b.y == y && b.z == z && b.item.as_ref() == self.held_item())
+    }
+
+    /// Vanilla `EntityPlayer.getBreakSpeed`: the held tool's dig speed against
+    /// `block` — its raw strength times the efficiency enchant, haste / mining
+    /// fatigue, and the in-air penalty. (Underwater Aqua-Affinity is not
+    /// modelled.)
+    fn break_speed(&self, block: BlockState) -> f32 {
+        let item = self.held_item();
+        let mut f = item.map_or(1.0, |it| tool_strength(it, block));
+        // Efficiency adds (level² + 1), but only to a tool already effective here.
+        if f > 1.0 {
+            if let Some(level) = item.map(efficiency_level).filter(|l| *l > 0) {
+                f += (level * level + 1) as f32;
+            }
+        }
+        // Haste (potion id 3) speeds up; mining fatigue (id 4) cripples.
+        if let Some(e) = self.effects.get(&3) {
+            f *= 1.0 + (e.amplifier as f32 + 1.0) * 0.2;
+        }
+        if let Some(e) = self.effects.get(&4) {
+            f *= match e.amplifier {
+                0 => 0.3,
+                1 => 0.09,
+                2 => 0.0027,
+                _ => 0.000_81,
+            };
+        }
+        if !self.player.on_ground {
+            f /= 5.0;
+        }
+        f.max(0.0)
+    }
+
+    /// Vanilla `EntityPlayer.canHarvestBlock`: true when the block needs no tool
+    /// (its material is hand-harvestable) or the held pickaxe is the right class
+    /// and tier. Drives the `/30` vs `/100` dig divisor (and, server-side, drops).
+    fn can_harvest_block(&self, block: BlockState) -> bool {
+        if !block_needs_tool(block.id) {
+            return true;
+        }
+        matches!(
+            self.held_item().map(|it| tool_props(it.id)),
+            Some(Some((ToolClass::Pickaxe, _, level))) if level >= block_harvest_level(block.id)
+        )
+    }
+
+    /// Number of 20 Hz ticks to break `block` in survival, matching vanilla's
+    /// `Block.getPlayerRelativeBlockHardness` (`break_speed / hardness / divisor`,
+    /// divisor 30 when harvestable else 100; the block breaks once the summed
+    /// per-tick progress reaches 1). `INFINITY` for unbreakable blocks; 1 for an
+    /// instant break. The server (Grim FastBreak) predicts this exactly, so it
+    /// must match to keep digging legal.
+    fn block_break_ticks(&self, block: BlockState) -> f32 {
+        let hardness = block_hardness(block.id);
+        if hardness < 0.0 {
+            return f32::INFINITY; // unbreakable (bedrock, etc.)
+        }
+        let speed = self.break_speed(block);
+        if speed <= 0.0 {
+            return f32::INFINITY;
+        }
+        let divisor = if self.can_harvest_block(block) { 30.0 } else { 100.0 };
+        // Per-tick progress; ≥1 means the click alone destroys it (hardness 0, or
+        // a very fast tool).
+        let per_tick = speed / hardness / divisor;
+        if per_tick >= 1.0 {
+            return 1.0;
+        }
+        (1.0 / per_tick).ceil().max(1.0)
     }
 
     /// Vanilla `PlayerControllerMP.onPlayerDamageBlock`: advance the held dig.
@@ -3460,7 +3585,7 @@ impl GameState {
                 yaw,
                 pitch,
                 data,
-                ..
+                velocity,
             } => {
                 self.spawn_remote_entity(
                     entity_id,
@@ -3471,6 +3596,14 @@ impl GameState {
                     yaw,
                     pitch,
                 );
+                // Seed the spawn velocity (present when data != 0, e.g. a thrown
+                // projectile) so the client can simulate the flight locally
+                // instead of waiting on server position packets.
+                if let Some((vx, vy, vz)) = velocity {
+                    if let Some(entity) = self.remote_entity_mut(entity_id) {
+                        entity.velocity = DVec3::new(vx, vy, vz);
+                    }
+                }
                 // Falling block (kind 70): the blockstate is packed into the
                 // data int (low 12 bits id, next 4 bits meta).
                 if kind == 70 {
@@ -3862,6 +3995,12 @@ impl GameState {
                         self.queue_sound("game.player.hurt", pos, 1.0, 1.0);
                     }
                 }
+                // Status 3 (death): start the fall-over + red-corpse animation.
+                if status == 3 {
+                    if let Some(entity) = self.world.entity_mut(EntityId(entity_id)) {
+                        entity.start_death();
+                    }
+                }
                 false
             }
             ClientboundPlayPacket::EntityMetadata {
@@ -4044,8 +4183,14 @@ impl GameState {
                 }
                 (6, MetadataValue::Float(health)) => {
                     // Living-entity health (drives the client-derived boss bar).
+                    // Health reaching 0 is the other death signal besides
+                    // EntityStatus 3 (some servers only send one), so kick off the
+                    // death animation here too — `start_death` is idempotent.
                     if let Some(entity) = self.remote_entity_mut(entity_id) {
                         entity.health = Some(*health);
+                        if *health <= 0.0 {
+                            entity.start_death();
+                        }
                     }
                 }
                 (10, MetadataValue::Slot(Some(item))) => {
@@ -4074,15 +4219,39 @@ impl GameState {
         }
     }
 
-    /// Drain up to `max` dirty sections, nearest to the player first, leaving the
+    /// Drain this frame's dirty sections: every GPU-mesh removal (unloaded
+    /// column) plus up to `max` real (re)mesh sections nearest the player, the
     /// rest queued for following frames. Bounds the per-frame mesh-rebuild cost
-    /// so a join-time burst of chunks doesn't stall rendering.
+    /// so a join-time burst of chunks doesn't stall rendering, while never
+    /// deferring removals (which would leak their GPU mesh while exploring).
     pub fn take_dirty_chunks_budget(&mut self, max: usize) -> Vec<SectionPos> {
-        if max == 0 || self.dirty_chunks.is_empty() {
+        if self.dirty_chunks.is_empty() {
             return Vec::new();
         }
+        // Sections whose column is no longer loaded are GPU-mesh *removals*: the
+        // server unloaded the chunk and `world` already dropped it, so applying
+        // one only frees a buffer slot (no meshing). They sit at the far edge of
+        // view, so the nearest-first budget below would starve them during
+        // sustained exploration — the GPU mesh leaks until the player stops and
+        // the dirty set finally drains, which is the out-of-memory path. Drain
+        // every removal each frame; spend `max` only on real (re)mesh work.
+        let removals: Vec<SectionPos> = self
+            .dirty_chunks
+            .iter()
+            .copied()
+            .filter(|p| self.world.chunk(p.chunk()).is_none())
+            .collect();
+        for p in &removals {
+            self.dirty_chunks.remove(p);
+        }
+        let mut out = removals;
+
+        if max == 0 || self.dirty_chunks.is_empty() {
+            return out;
+        }
         if self.dirty_chunks.len() <= max {
-            return self.dirty_chunks.drain().collect();
+            out.extend(self.dirty_chunks.drain());
+            return out;
         }
         let pcx = (self.player.position.x.floor() as i32).div_euclid(16);
         let pcy = (self.player.position.y.floor() as i32).div_euclid(16);
@@ -4098,7 +4267,66 @@ impl GameState {
         for p in &all {
             self.dirty_chunks.remove(p);
         }
-        all
+        out.extend(all);
+        out
+    }
+
+    /// Render-distance safety net: bound resident GPU mesh memory to the client's
+    /// view, independent of whether the server ever unloads. Columns that drift
+    /// beyond `render_distance + RESIDENCY_MARGIN` (Chebyshev, chunks) have their
+    /// GPU meshes dropped — their block data stays in `world`, so re-entering the
+    /// area re-meshes without a server round-trip and never shows a hole. Columns
+    /// that come back into range are re-queued for meshing through the normal
+    /// dirty budget. Runs only when the player crosses a chunk boundary. Returns
+    /// the sections whose GPU mesh the caller should free.
+    pub fn enforce_render_distance(&mut self, render_distance: u32) -> Vec<SectionPos> {
+        let cx = (self.player.position.x.floor() as i32).div_euclid(16);
+        let cz = (self.player.position.z.floor() as i32).div_euclid(16);
+        let here = ChunkPos::new(cx, cz);
+        if self.last_residency_chunk == Some(here) {
+            return Vec::new();
+        }
+        self.last_residency_chunk = Some(here);
+        let keep = render_distance as i32 + RESIDENCY_MARGIN;
+        let chebyshev = |c: ChunkPos| (c.x - cx).abs().max((c.z - cz).abs());
+
+        // Previously-evicted columns that returned to range (re-mesh) or that the
+        // server has since unloaded (just forget them).
+        let returning: Vec<ChunkPos> = self
+            .evicted_columns
+            .iter()
+            .copied()
+            .filter(|&c| chebyshev(c) <= keep || self.world.chunk(c).is_none())
+            .collect();
+        for c in returning {
+            self.evicted_columns.remove(&c);
+            if let Some(chunk) = self.world.chunk(c) {
+                if chebyshev(c) <= keep {
+                    let ys: Vec<i32> = chunk.sections().map(|s| s.y()).collect();
+                    for y in ys {
+                        self.dirty_chunks.insert(SectionPos::new(c.x, y, c.z));
+                    }
+                }
+            }
+        }
+
+        // Drop the GPU meshes of in-world columns that drifted out of range.
+        let mut removals = Vec::new();
+        let to_evict: Vec<ChunkPos> = self
+            .world
+            .chunks()
+            .map(|chunk| chunk.position)
+            .filter(|&c| chebyshev(c) > keep && !self.evicted_columns.contains(&c))
+            .collect();
+        for c in to_evict {
+            self.evicted_columns.insert(c);
+            for y in 0..16 {
+                removals.push(SectionPos::new(c.x, y, c.z));
+            }
+            // Cancel any queued (re)mesh work for a column we're dropping.
+            self.dirty_chunks.retain(|s| s.x != c.x || s.z != c.z);
+        }
+        removals
     }
 
     /// Mark every loaded section dirty so the whole world re-meshes — used when a
@@ -4331,12 +4559,30 @@ fn xp_orb_cell_uv(cell: u32) -> [[f32; 2]; 4] {
     [[u1, v1], [u1, v0], [u0, v0], [u0, v1]]
 }
 
+/// Vanilla flight physics for a locally-simulated SpawnObject `kind`, as
+/// `(gravity, drag, collides)`: the per-tick downward pull, the air-resistance
+/// multiplier and whether a block hit sticks it. `None` for kinds that aren't
+/// simulated client-side (self-propelled fireballs/fireworks, the eye of ender,
+/// the fishing bobber — left on server interpolation).
+///
+/// Throwables share `EntityThrowable` (drag 0.99): snowball/egg/ender pearl/
+/// potion fall at 0.03, the thrown exp bottle at 0.07. Arrows fall at 0.05 and
+/// stick into blocks.
+fn projectile_physics(kind: u8) -> Option<(f64, f64, bool)> {
+    Some(match kind {
+        60 => (0.05, 0.99, true),           // arrow
+        61 | 62 | 65 | 73 => (0.03, 0.99, false), // snowball / egg / ender pearl / potion
+        75 => (0.07, 0.99, false),          // bottle o' enchanting
+        _ => return None,
+    })
+}
+
 /// The item id whose sprite stands in for a SpawnObject projectile `kind`
 /// (vanilla projectile render textures), or `None` for kinds rendered
-/// elsewhere or not handled. Arrow (60) maps to the arrow item (262).
+/// elsewhere or not handled. The arrow (60) is drawn as a 3D model, not a sprite.
 fn projectile_item_id(kind: u8) -> Option<i16> {
     Some(match kind {
-        60 => 262, // arrow (rendered as a thin sprite; 3D model deferred)
+        // Arrow (60) is drawn as a 3D model in the entity model pass, not a sprite.
         61 => 332, // snowball
         62 => 344, // egg
         64 => 385, // small fireball / fire charge
@@ -4420,28 +4666,125 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
 }
 
-/// Number of 20 Hz ticks to break a block by hand in survival, matching vanilla's
-/// `Block.getPlayerRelativeBlockHardness`. Returns INFINITY for unbreakable blocks.
-///
-/// Per-tick damage = digSpeed / hardness / divisor, where digSpeed = 1 (bare hand,
-/// standing) and divisor = 30 if the block is hand-harvestable or 100 if it needs a
-/// tool (stone/ore/metal take 5x longer by hand). Ticks = ceil(1 / damage). The
-/// server (Grim FastBreak) predicts exactly this, so an under-estimate breaks "too
-/// fast" and flags; matching it keeps breaking legal.
-fn block_break_ticks(block: BlockState) -> f32 {
-    let hardness = block_hardness(block.id);
-    if hardness < 0.0 {
-        return f32::INFINITY; // unbreakable (bedrock, etc.)
+/// The five 1.8 tool item classes that affect mining.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolClass {
+    Pickaxe,
+    Axe,
+    Shovel,
+    Sword,
+    Shears,
+}
+
+/// Vanilla tool item id → (class, `efficiencyOnProperMaterial`, harvest level).
+/// Efficiency by tier: wood 2, stone 4, iron 6, diamond 8, gold 12; harvest level
+/// wood/gold 0, stone 1, iron 2, diamond 3. Swords/shears use a special speed
+/// curve (see [`tool_strength`]); the efficiency here is unused for them.
+fn tool_props(id: i16) -> Option<(ToolClass, f32, u8)> {
+    use ToolClass::*;
+    Some(match id {
+        269 => (Shovel, 2.0, 0),
+        270 => (Pickaxe, 2.0, 0),
+        271 => (Axe, 2.0, 0),
+        268 => (Sword, 2.0, 0),
+        273 => (Shovel, 4.0, 1),
+        274 => (Pickaxe, 4.0, 1),
+        275 => (Axe, 4.0, 1),
+        272 => (Sword, 4.0, 1),
+        256 => (Shovel, 6.0, 2),
+        257 => (Pickaxe, 6.0, 2),
+        258 => (Axe, 6.0, 2),
+        267 => (Sword, 6.0, 2),
+        277 => (Shovel, 8.0, 3),
+        278 => (Pickaxe, 8.0, 3),
+        279 => (Axe, 8.0, 3),
+        276 => (Sword, 8.0, 3),
+        284 => (Shovel, 12.0, 0),
+        285 => (Pickaxe, 12.0, 0),
+        286 => (Axe, 12.0, 0),
+        283 => (Sword, 12.0, 0),
+        359 => (Shears, 1.0, 0),
+        _ => return None,
+    })
+}
+
+/// The tool class that speeds up a block (vanilla `ItemTool.getStrVsBlock`'s
+/// material/effective-block check), or `None` if no held tool is effective.
+/// Grouped by the block's 1.8 material: pickaxe for rock/ore/metal, shovel for
+/// soft ground, axe for wood. Swords/shears/web are handled in [`tool_strength`].
+fn block_tool_class(id: u16) -> Option<ToolClass> {
+    use ToolClass::*;
+    // Only confident rock/wood/ground material matches are listed — over-claiming
+    // would make the client predict a faster break than the server (an anticheat
+    // flag), so unsure blocks fall through to None (bare-hand speed, which is safe).
+    match id {
+        // Rock / ore / metal — pickaxe.
+        1 | 4 | 14 | 15 | 16 | 21 | 22 | 23 | 24 | 41 | 42 | 43 | 44 | 45 | 48 | 49 | 52 | 56 | 57
+        | 61 | 62 | 67 | 70 | 73 | 74 | 77 | 79 | 87 | 98 | 101 | 108 | 109 | 112 | 113 | 114 | 116
+        | 118 | 121 | 129 | 130 | 133 | 139 | 145 | 152 | 153 | 155 | 156 | 158 | 159 | 168 | 172
+        | 173 | 174 | 179 | 180 | 181 | 182 => Some(Pickaxe),
+        27 | 28 | 66 | 157 => Some(Pickaxe), // rails
+        // Soft ground — shovel.
+        2 | 3 | 12 | 13 | 60 | 78 | 80 | 82 | 88 | 110 => Some(Shovel),
+        // Wood / plant / vine — axe (planks, logs, bookshelf, chest, crafting
+        // table, jukebox, note block, pumpkin, melon, ladder, signs, fences/
+        // gates, doors, trapdoor, daylight sensor, vines).
+        5 | 17 | 25 | 47 | 53 | 54 | 58 | 63 | 64 | 65 | 68 | 84 | 85 | 86 | 91 | 96 | 103 | 106
+        | 107 | 125 | 126 | 134 | 135 | 136 | 146 | 151 | 162 | 163 | 164 | 183..=197 => Some(Axe),
+        _ => None,
     }
-    if hardness == 0.0 {
-        return 1.0; // instant-break blocks (plants, snow layer) finish in one tick
+}
+
+/// Minimum harvest level a pickaxe must have to harvest a tool-required block
+/// (vanilla `setHarvestLevel`): 1 = stone, 2 = iron, 3 = diamond; default 0
+/// (wood/gold suffices). Only consulted for [`block_needs_tool`] blocks.
+fn block_harvest_level(id: u16) -> u8 {
+    match id {
+        49 => 3,                                         // obsidian → diamond
+        14 | 41 | 56 | 57 | 73 | 74 | 129 | 133 | 152 => 2, // gold/diamond/redstone/emerald ore + their blocks
+        15 | 21 | 22 | 42 => 1,                          // iron/lapis ore, lapis & iron blocks → stone
+        _ => 0,
     }
-    let divisor = if block_needs_tool(block.id) {
-        100.0
-    } else {
-        30.0
+}
+
+/// Efficiency-enchant level on a stack (enchant id 32 in the `ench` NBT list),
+/// or 0 when absent.
+fn efficiency_level(item: &SlotItem) -> i32 {
+    let Some(nbt) = item.nbt.as_ref() else {
+        return 0;
     };
-    (hardness * divisor).ceil().max(1.0)
+    let Some(ench) = nbt.get("ench").and_then(|t| t.as_list()) else {
+        return 0;
+    };
+    for entry in ench {
+        if let Some(c) = entry.as_compound() {
+            if c.get("id").and_then(|t| t.as_short()) == Some(32) {
+                return c.get("lvl").and_then(|t| t.as_short()).unwrap_or(0) as i32;
+            }
+        }
+    }
+    0
+}
+
+/// Vanilla `ItemStack.getStrVsBlock`: the held tool's raw speed multiplier
+/// against `block` before enchants/potions. Pickaxe/axe/shovel give their tier
+/// efficiency on an effective block (else 1); a sword is 15× on cobweb and 1.5×
+/// elsewhere; shears are 15× on cobweb/leaves, 5× on wool, 1× otherwise.
+fn tool_strength(item: &SlotItem, block: BlockState) -> f32 {
+    if is_sword(item.id) {
+        return if block.id == 30 { 15.0 } else { 1.5 };
+    }
+    if item.id == 359 {
+        return match block.id {
+            30 | 18 | 161 => 15.0, // cobweb, leaves, leaves2
+            35 => 5.0,             // wool
+            _ => 1.0,
+        };
+    }
+    match tool_props(item.id) {
+        Some((class, efficiency, _)) if block_tool_class(block.id) == Some(class) => efficiency,
+        _ => 1.0,
+    }
 }
 
 /// Whether the block requires a tool to harvest at full speed (vanilla material
@@ -5158,6 +5501,22 @@ mod interaction_tests {
     use recraft_core::{BlockState, EntityId, EntityKind};
 
     #[test]
+    fn death_roll_follows_the_vanilla_fall_over_curve() {
+        let quarter = 90.0_f32.to_radians();
+        // Alive (deathTime 0) → upright, no matter the partial tick.
+        assert_eq!(death_roll_radians(0, 0.0), 0.0);
+        assert_eq!(death_roll_radians(0, 0.5), 0.0);
+        // First death tick starts at 0 and grows monotonically.
+        assert_eq!(death_roll_radians(1, 0.0), 0.0);
+        assert!(death_roll_radians(5, 0.0) > 0.0);
+        assert!(death_roll_radians(10, 0.0) > death_roll_radians(5, 0.0));
+        // sqrt arg hits 1 once (deathTime-1)/20*1.6 ≥ 1, i.e. deathTime ≥ 13.5,
+        // so by tick 14 the body is fully on its side (90°) and stays clamped.
+        assert!((death_roll_radians(14, 0.0) - quarter).abs() < 1e-6);
+        assert!((death_roll_radians(20, 0.0) - quarter).abs() < 1e-6);
+    }
+
+    #[test]
     fn hurt_camera_roll_matches_the_vanilla_curve() {
         // No hurt → no roll; an expired/zero timer → no roll.
         assert_eq!(hurt_camera_roll(0, 0.0), 0.0);
@@ -5171,6 +5530,124 @@ mod interaction_tests {
         for t in 0..=10u8 {
             assert!(hurt_camera_roll(t, 0.0).abs() <= 14.0_f32.to_radians() + 1.0e-6);
         }
+    }
+
+    #[test]
+    fn dirty_budget_never_starves_chunk_removals() {
+        let mut gs = GameState::empty_for_server(1.0);
+        gs.player.position = DVec3::new(0.0, 64.0, 0.0); // chunk (0,0)
+        gs.world.set_block(5, 64, 7, BlockState::STONE); // loads chunk (0,0)
+
+        // A near remesh (loaded column) and a far removal (the server unloaded
+        // chunk (50,50), so its column is gone). With max=1 the nearest-first
+        // budget would, before the fix, spend its one slot on the near remesh
+        // and leave the far removal queued — its GPU mesh would leak.
+        let near = SectionPos::new(0, 4, 0);
+        let far_removal = SectionPos::new(50, 4, 50);
+        gs.dirty_chunks.insert(near);
+        gs.dirty_chunks.insert(far_removal);
+
+        let taken = gs.take_dirty_chunks_budget(1);
+        assert!(
+            taken.contains(&far_removal),
+            "removal must be drained regardless of the nearest-first budget"
+        );
+        assert!(taken.contains(&near), "the budget should still take the near remesh");
+        assert!(gs.dirty_chunks.is_empty(), "nothing left queued");
+    }
+
+    #[test]
+    fn render_distance_evicts_far_chunks_keeps_data_and_remeshes_on_return() {
+        let mut gs = GameState::empty_for_server(1.0);
+        gs.world.set_block(5, 64, 5, BlockState::STONE); // chunk (0,0)
+        gs.world.set_block(20 * 16 + 5, 64, 5, BlockState::STONE); // chunk (20,0)
+
+        // Player in chunk (0,0), render distance 4 → keep radius 4 + 2 = 6.
+        gs.player.position = DVec3::new(0.5, 64.0, 0.5);
+        gs.dirty_chunks.clear();
+        let removals = gs.enforce_render_distance(4);
+
+        // The far column is dropped (all 16 sections), the near one kept.
+        let far = ChunkPos::new(20, 0);
+        assert_eq!(removals.iter().filter(|s| s.x == 20 && s.z == 0).count(), 16);
+        assert!(!removals.iter().any(|s| s.x == 0 && s.z == 0));
+        assert!(gs.evicted_columns.contains(&far));
+        // Block data stays in the world, so returning never shows a hole.
+        assert!(gs.world.chunk(far).is_some());
+
+        // Standing still (same chunk) is a no-op.
+        assert!(gs.enforce_render_distance(4).is_empty());
+
+        // Walk to the far column: it returns to range (re-queued for meshing),
+        // and the origin column is now the one evicted.
+        gs.player.position = DVec3::new(20.0 * 16.0 + 0.5, 64.0, 0.5);
+        gs.dirty_chunks.clear();
+        let removals = gs.enforce_render_distance(4);
+        assert!(!gs.evicted_columns.contains(&far));
+        assert!(gs.dirty_chunks.iter().any(|s| s.x == 20 && s.z == 0));
+        assert!(removals.iter().any(|s| s.x == 0 && s.z == 0));
+        assert!(gs.evicted_columns.contains(&ChunkPos::new(0, 0)));
+    }
+
+    #[test]
+    fn pickaxe_mines_stone_far_faster_than_bare_hand() {
+        let mut gs = GameState::empty_for_server(1.0);
+        gs.player.on_ground = true;
+        let stone = BlockState::new(1, 0);
+        // Bare hand on stone: needs a tool → divisor 100, speed 1 → 1.5·100 = 150.
+        assert_eq!(gs.block_break_ticks(stone), 150.0);
+        // Diamond pickaxe (eff 8), harvestable → divisor 30 → ceil(1.5·30/8) = 6.
+        gs.inventory[36] = Some(SlotItem::new(278, 1, 0));
+        assert_eq!(gs.block_break_ticks(stone), 6.0);
+        // Wooden pickaxe (eff 2) → ceil(1.5·30/2) = 23.
+        gs.inventory[36] = Some(SlotItem::new(270, 1, 0));
+        assert_eq!(gs.block_break_ticks(stone), 23.0);
+    }
+
+    #[test]
+    fn obsidian_needs_a_diamond_pickaxe_to_harvest() {
+        let mut gs = GameState::empty_for_server(1.0);
+        gs.player.on_ground = true;
+        let obsidian = BlockState::new(49, 0); // hardness 50, harvest level 3
+        // Stone pickaxe (tier 1 < 3): can't harvest → divisor 100, speed 4 → 1250.
+        gs.inventory[36] = Some(SlotItem::new(274, 1, 0));
+        assert_eq!(gs.block_break_ticks(obsidian), 1250.0);
+        // Diamond pickaxe (tier 3): harvestable → divisor 30, speed 8 → ceil(187.5)=188.
+        gs.inventory[36] = Some(SlotItem::new(278, 1, 0));
+        assert_eq!(gs.block_break_ticks(obsidian), 188.0);
+    }
+
+    #[test]
+    fn haste_and_air_penalty_scale_the_dig_speed() {
+        let mut gs = GameState::empty_for_server(1.0);
+        let stone = BlockState::new(1, 0);
+        gs.inventory[36] = Some(SlotItem::new(278, 1, 0)); // diamond pickaxe
+        gs.player.on_ground = true;
+        assert_eq!(gs.block_break_ticks(stone), 6.0);
+        // Haste I: speed ×1.2 → ceil(1.5·30/9.6) = 5.
+        gs.effects.insert(3, ActiveEffect { amplifier: 0, duration: 0 });
+        assert_eq!(gs.block_break_ticks(stone), 5.0);
+        // Mining in the air divides speed by 5 (vanilla !onGround): 8/5 = 1.6 → ceil(28.125)=29.
+        gs.effects.clear();
+        gs.player.on_ground = false;
+        assert_eq!(gs.block_break_ticks(stone), 29.0);
+    }
+
+    #[test]
+    fn shovel_and_sword_have_their_own_speed_curves() {
+        let mut gs = GameState::empty_for_server(1.0);
+        gs.player.on_ground = true;
+        // Diamond shovel on dirt (hand-harvestable, hardness 0.5): eff 8, /30 → ceil(1.875)=2.
+        let dirt = BlockState::new(3, 0);
+        gs.inventory[36] = Some(SlotItem::new(277, 1, 0));
+        assert_eq!(gs.block_break_ticks(dirt), 2.0);
+        // A pickaxe is NOT effective on dirt → speed 1 → ceil(0.5·30)=15.
+        gs.inventory[36] = Some(SlotItem::new(278, 1, 0));
+        assert_eq!(gs.block_break_ticks(dirt), 15.0);
+        // Sword shreds cobweb (15×); web hardness 4, hand-harvestable → ceil(4·30/15)=8.
+        let web = BlockState::new(30, 0);
+        gs.inventory[36] = Some(SlotItem::new(276, 1, 0));
+        assert_eq!(gs.block_break_ticks(web), 8.0);
     }
 
     #[test]
@@ -5806,6 +6283,7 @@ mod interaction_tests {
     #[test]
     fn survival_dig_starts_on_press_and_finishes_after_holding() {
         let mut gs = looking_along_x();
+        gs.player.on_ground = true; // standing: no vanilla in-air dig penalty
         gs.world.set_block(3, 0, 0, BlockState::STONE);
         // Vanilla press tick: clickMouse swings + sends START, then
         // sendClickBlockToController advances the dig and swings again (two C0A).
@@ -6637,7 +7115,7 @@ mod interaction_tests {
 
     #[test]
     fn projectile_kinds_map_to_item_sprites() {
-        assert_eq!(projectile_item_id(60), Some(262)); // arrow
+        assert_eq!(projectile_item_id(60), None); // arrow is a 3D model, not a sprite
         assert_eq!(projectile_item_id(61), Some(332)); // snowball
         assert_eq!(projectile_item_id(65), Some(368)); // ender pearl
         // Falling block, item and armor stand are rendered elsewhere, not here.

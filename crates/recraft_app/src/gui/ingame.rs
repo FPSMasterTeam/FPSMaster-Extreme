@@ -97,7 +97,6 @@ const SLOT_PITCH: i32 = 20;
 /// Chat panel width in GUI pixels (vanilla chat is 320 wide when open).
 const CHAT_WIDTH_GUI: i32 = 320;
 
-const WHITE_DIM: UiColor = UiColor::rgba(235, 241, 232, 95);
 const MUTED: UiColor = UiColor::rgba(176, 190, 181, 255);
 const BLACK_120: UiColor = UiColor::rgba(0, 0, 0, 120);
 const BLACK_170: UiColor = UiColor::rgba(0, 0, 0, 170);
@@ -153,18 +152,17 @@ impl GuiIngame {
             None => {}
         }
 
-        // Crosshair: 10 GUI px arms, 2 GUI px thick. Hidden while a screen is open.
+        // Crosshair (vanilla `GuiIngame`): the 16×16 `gui/icons.png` sprite at
+        // (0,0), drawn at center − 7 GUI px, on a dedicated inversion-blend pass
+        // (set up by the renderer) so it reads as the inverse of the scene
+        // behind it. Hidden while a screen is open.
         if !screen_open {
-            let center_x = width / 2;
-            let center_y = height / 2;
-            ui.rect(
-                UiRect::new(center_x - 5 * scale, center_y - scale, 10 * scale, 2 * scale),
-                WHITE_DIM,
-            );
-            ui.rect(
-                UiRect::new(center_x - scale, center_y - 5 * scale, 2 * scale, 10 * scale),
-                WHITE_DIM,
-            );
+            ui.crosshair(UiRect::new(
+                width / 2 - 7 * scale,
+                height / 2 - 7 * scale,
+                16 * scale,
+                16 * scale,
+            ));
         }
 
         // Chat is the bottom-most HUD layer: the status bars (health / hunger / XP)

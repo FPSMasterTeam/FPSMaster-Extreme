@@ -1,5 +1,5 @@
 use bytemuck::{Pod, Zeroable};
-use glam::Vec3;
+use glam::{Mat4, Vec3};
 use recraft_core::EntityKind;
 
 use crate::texture::{
@@ -37,6 +37,11 @@ impl ModelVertex {
 pub struct ModelMesh {
     pub vertices: Vec<ModelVertex>,
     pub indices: Vec<u32>,
+    /// Transient: the death fall-over tilt (radians) applied by `push_parts`
+    /// about the model's forward axis through the feet. Set by `push_entity` /
+    /// `push_armor` from `EntityAnim::death_roll` for the current entity and
+    /// reset to 0 afterwards, so non-living parts (chests, books) are unaffected.
+    pub death_roll: f32,
 }
 
 /// Unit-cube corner table shared by every box. Indices match the `FACES` quads.
@@ -98,6 +103,9 @@ pub struct EntityAnim {
     /// eases the arm with a quartic `f⁴`; 1.7 used a cubic `f³`, which snaps the
     /// arm forward faster. Only affects the attack swing, not the walk cycle.
     pub old_animations: bool,
+    /// Death fall-over tilt in radians (vanilla `RendererLivingEntity`
+    /// applyRotations death roll). 0 for a living entity.
+    pub death_roll: f32,
 }
 
 /// Articulation for one model part: a primary rotation about `pivot`, plus an
@@ -159,6 +167,7 @@ impl ModelMesh {
     pub fn clear(&mut self) {
         self.vertices.clear();
         self.indices.clear();
+        self.death_roll = 0.0;
     }
 
     pub fn is_empty(&self) -> bool {
@@ -228,6 +237,9 @@ impl ModelMesh {
         anim: &EntityAnim,
         skin_row: Option<u32>,
     ) {
+        // Apply this entity's death tilt to every part it pushes, then clear it so
+        // following non-entity geometry (chests/books) draws upright.
+        self.death_roll = anim.death_roll;
         match kind {
             EntityKind::LocalPlayer | EntityKind::RemotePlayer => {
                 // A downloaded skin row when one is allocated, else the shared
@@ -256,11 +268,15 @@ impl ModelMesh {
                     yaw_degrees,
                 );
             }
+            // Arrow: the flight pitch rides in `anim.head_pitch` (the entity's
+            // interpolated render pitch); yaw is the body yaw.
+            EntityKind::Object(60) => self.push_arrow(feet, yaw_degrees, anim.head_pitch),
             EntityKind::Object(_) => {}
             // Experience orbs are drawn as colour-cycling billboards in their
             // own pass, never as an articulated model.
             EntityKind::ExperienceOrb => {}
         }
+        self.death_roll = 0.0;
     }
 
     /// Build one known mob from its archetype: pick the part list, pose list and
@@ -359,17 +375,25 @@ impl ModelMesh {
         let scale = MODEL_SCALE;
         let yaw = yaw_degrees.to_radians();
         let (sin, cos) = (yaw.sin(), yaw.cos());
+        // Death fall-over tilt: a roll about the model's forward (Z) axis through
+        // the feet, applied BEFORE the body yaw (vanilla applies it after the yaw
+        // in GL post-multiply order, i.e. first to the vertex). Copied out of
+        // `self` so the per-box closure doesn't borrow `self` alongside the
+        // `&mut self` `push_textured_box` call.
+        let (droll_sin, droll_cos) = self.death_roll.sin_cos();
         let (ox, oy) = slot_grid_origin(slot_index);
         let origin = [ox as f32, oy as f32];
         // Box bounds stay in model px; the per-part closure articulates each
-        // box about its pivot, scales px→world, then rotates by the body yaw.
+        // box about its pivot, scales px→world, then rolls (death) and rotates by
+        // the body yaw.
         for (i, (min_px, max_px, region)) in parts.iter().enumerate() {
             let pose = poses.get(i).copied().unwrap_or_else(PartPose::still);
             let min = Vec3::from(*min_px);
             let max = Vec3::from(*max_px);
             self.push_textured_box(min, max, region, origin, 1.0, &|local_px| {
                 let articulated = apply_part_rotation(local_px, &pose) * scale;
-                rotate_y(articulated, sin, cos) + feet
+                let rolled = rotate_z(articulated, droll_sin, droll_cos);
+                rotate_y(rolled, sin, cos) + feet
             });
         }
     }
@@ -405,6 +429,89 @@ impl ModelMesh {
             }
             self.indices
                 .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        }
+    }
+
+    /// Push one transformed quad: four `(local_position, uv)` corners mapped to
+    /// world by `m`, two triangles, flat `color`.
+    fn push_model_quad(&mut self, m: Mat4, corners: [([f32; 3], [f32; 2]); 4], color: [f32; 4]) {
+        let base = self.vertices.len() as u32;
+        for (p, uv) in corners {
+            self.vertices.push(ModelVertex {
+                position: m.transform_point3(Vec3::from(p)).to_array(),
+                color,
+                uv,
+            });
+        }
+        self.indices
+            .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
+
+    /// Vanilla `RenderArrow`: a 3D arrow built from four cross blades along the
+    /// shaft plus the fletched tail caps, oriented to `yaw`/`pitch` (its flight
+    /// direction). Sampled from the 32×32 `entity/arrow.png` in its atlas slot.
+    /// Arrows carry no living-entity model flip, so the geometry is placed in
+    /// world axes through the verbatim vanilla GL chain (`rotate(yaw-90, Y)`,
+    /// `rotate(pitch, Z)`, the 45° roll, `scale(0.05625)`, `translate(-4)`); the
+    /// model pass doesn't cull, so winding is irrelevant. Lit afterwards by the
+    /// caller's per-entity lightmap scale (the white vertex colour is the base).
+    fn push_arrow(&mut self, feet: Vec3, yaw_degrees: f32, pitch_degrees: f32) {
+        // The arrow texture occupies the top-left 32px of its 128px atlas slot.
+        let (ox, oy) = entity_slot_origin(EntitySlot::Arrow);
+        let uv = |u: f32, v: f32| {
+            [
+                (ox as f32 + u * 32.0) / ENTITY_ATLAS_WIDTH as f32,
+                (oy as f32 + v * 32.0) / ENTITY_ATLAS_HEIGHT as f32,
+            ]
+        };
+
+        let base = Mat4::from_translation(feet)
+            * Mat4::from_rotation_y((yaw_degrees - 90.0).to_radians())
+            * Mat4::from_rotation_z(pitch_degrees.to_radians())
+            * Mat4::from_rotation_x(45.0_f32.to_radians())
+            * Mat4::from_scale(Vec3::splat(0.05625))
+            * Mat4::from_translation(Vec3::new(-4.0, 0.0, 0.0));
+
+        let color = [1.0, 1.0, 1.0, 1.0];
+
+        // Tail fletch caps at x=-7 (front + back). UV: u 0..5/32, v 5/32..10/32.
+        let (v0, v1, uc) = (5.0 / 32.0, 10.0 / 32.0, 5.0 / 32.0);
+        self.push_model_quad(
+            base,
+            [
+                ([-7.0, -2.0, -2.0], uv(0.0, v0)),
+                ([-7.0, -2.0, 2.0], uv(uc, v0)),
+                ([-7.0, 2.0, 2.0], uv(uc, v1)),
+                ([-7.0, 2.0, -2.0], uv(0.0, v1)),
+            ],
+            color,
+        );
+        self.push_model_quad(
+            base,
+            [
+                ([-7.0, 2.0, -2.0], uv(0.0, v0)),
+                ([-7.0, 2.0, 2.0], uv(uc, v0)),
+                ([-7.0, -2.0, 2.0], uv(uc, v1)),
+                ([-7.0, -2.0, -2.0], uv(0.0, v1)),
+            ],
+            color,
+        );
+
+        // Four shaft blades, each a further 90° about the shaft (X) axis. UV:
+        // u 0..0.5 (the shaft strip), v 0..5/32.
+        let sv = 5.0 / 32.0;
+        for j in 1..=4 {
+            let m = base * Mat4::from_rotation_x((90.0 * j as f32).to_radians());
+            self.push_model_quad(
+                m,
+                [
+                    ([-8.0, -2.0, 0.0], uv(0.0, 0.0)),
+                    ([8.0, -2.0, 0.0], uv(0.5, 0.0)),
+                    ([8.0, 2.0, 0.0], uv(0.5, sv)),
+                    ([-8.0, 2.0, 0.0], uv(0.0, sv)),
+                ],
+                color,
+            );
         }
     }
 }
@@ -709,7 +816,7 @@ fn swing(limb_swing: f32, amount: f32, phase: f32, scale: f32) -> f32 {
 /// Order matches [`humanoid_parts`]: right leg, left leg, body, right arm, left
 /// arm, head, hat (the hat tracks the head).
 fn humanoid_poses(anim: &EntityAnim) -> [PartPose; 7] {
-    use std::f32::consts::PI;
+    use std::f32::consts::{FRAC_PI_6, PI};
     let (s, a) = (anim.limb_swing, anim.limb_swing_amount);
     let head_y = anim.net_head_yaw.to_radians();
     let head_x = anim.head_pitch.to_radians();
@@ -728,7 +835,7 @@ fn humanoid_poses(anim: &EntityAnim) -> [PartPose; 7] {
         1 => arm_r_x = arm_r_x * 0.5 - PI / 10.0,
         3 => {
             arm_r_x = arm_r_x * 0.5 - PI / 10.0 * 3.0;
-            arm_r_y = -0.523_598_8;
+            arm_r_y = -FRAC_PI_6; // vanilla -0.5235988 (-30°)
         }
         _ => {}
     }
@@ -1575,6 +1682,8 @@ impl ModelMesh {
         feet: Vec3,
         yaw_degrees: f32,
     ) {
+        // Worn armor tips with the body during the death animation.
+        self.death_roll = anim.death_roll;
         let poses = humanoid_poses(anim);
 
         // Helmet (slot 4)
@@ -1604,6 +1713,7 @@ impl ModelMesh {
             let boot_poses = [poses[0], poses[1]]; // right leg, left leg
             self.push_parts(&parts, &boot_poses, mat.layer1 as u32, feet, yaw_degrees);
         }
+        self.death_roll = 0.0;
     }
 
     /// Append the enchantment-glint geometry for worn armor into `self` (a
@@ -1620,6 +1730,7 @@ impl ModelMesh {
         feet: Vec3,
         yaw_degrees: f32,
     ) {
+        self.death_roll = anim.death_roll;
         let poses = humanoid_poses(anim);
 
         if enchanted[4] {
@@ -1650,6 +1761,7 @@ impl ModelMesh {
                 self.push_parts(&parts, &boot_poses, mat.layer1 as u32, feet, yaw_degrees);
             }
         }
+        self.death_roll = 0.0;
     }
 }
 

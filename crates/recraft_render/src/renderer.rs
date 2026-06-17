@@ -632,12 +632,17 @@ pub struct Renderer {
     /// server sends a time update.
     world_time: f64,
     ui_pipeline: wgpu::RenderPipeline,
+    /// Same shader/layout as `ui_pipeline` but with the vanilla crosshair
+    /// inversion blend (`ONE_MINUS_DST_COLOR`/`ONE_MINUS_SRC_COLOR`).
+    crosshair_pipeline: wgpu::RenderPipeline,
     ui_bind_group_layout: wgpu::BindGroupLayout,
     ui_sampler: wgpu::Sampler,
     ui_cache: Option<UiCache>,
     /// Foreground UI layer (counts, hover, carried stack) drawn over the 3D
     /// block-icon cube pass.
     ui_overlay_cache: Option<UiCache>,
+    /// Crosshair layer, drawn with `crosshair_pipeline` over the 3D scene.
+    crosshair_cache: Option<UiCache>,
     /// Identity view-projection so the GUI cube pass can take pre-baked clip
     /// coordinates straight through the shared shader.
     gui_camera_bind_group: wgpu::BindGroup,
@@ -1683,9 +1688,15 @@ impl Renderer {
                 unclipped_depth: false,
                 conservative: false,
             },
+            // `Always` draws the hand over the whole world, and we WRITE its (near)
+            // depth so anything drawn in a later pass respects it — specifically the
+            // SSR water pass (shaders + Fancy), which runs after this in a separate
+            // pass and would otherwise depth-test against the world behind the hand
+            // and paint water over the held item. The enchant glint that follows
+            // uses `LessEqual`, so it still draws at the hand's own depth.
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: DEPTH_FORMAT,
-                depth_write_enabled: Some(false),
+                depth_write_enabled: Some(true),
                 depth_compare: Some(wgpu::CompareFunction::Always),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
@@ -2372,6 +2383,63 @@ impl Renderer {
         multiview_mask: None,
         });
 
+        // Crosshair pipeline: identical to the UI pipeline except for the blend,
+        // which is vanilla `tryBlendFuncSeparate(GL_ONE_MINUS_DST_COLOR,
+        // GL_ONE_MINUS_SRC_COLOR, GL_ONE, GL_ZERO)` — the crosshair shows as the
+        // inverse of whatever's already in the swapchain (the 3D scene), so it
+        // stays visible on any background. Transparent sprite pixels (rgb 0)
+        // leave the scene unchanged; the white cross (rgb 1) inverts it.
+        let crosshair_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("crosshair-pipeline"),
+            layout: Some(&ui_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &ui_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &ui_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_format,
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::OneMinusDst,
+                            dst_factor: wgpu::BlendFactor::OneMinusSrc,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                        alpha: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::Zero,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                    }),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Always),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+        cache: None,
+        multiview_mask: None,
+        });
+
         // Nametag text atlas: a small RGBA texture, rebuilt when names change.
         // It shares the model pass's texture+sampler layout so nametag billboards
         // draw through the model pipeline.
@@ -2983,10 +3051,12 @@ impl Renderer {
             star_quads,
             world_time: 6000.0,
             ui_pipeline,
+            crosshair_pipeline,
             ui_bind_group_layout,
             ui_sampler,
             ui_cache: None,
             ui_overlay_cache: None,
+            crosshair_cache: None,
             gui_camera_bind_group,
             gui_item_mesh: None,
             gui_glint_mesh: None,
@@ -3738,6 +3808,19 @@ impl Renderer {
         self.chunk_transparent.remove(pos);
         self.chunk_water.remove(pos);
         self.chunk_sections.remove(&pos);
+    }
+
+    /// Free the GPU meshes of the given sections without touching their block
+    /// data. Drives the client-side render-distance safety net
+    /// ([`GameState::enforce_render_distance`]): sections beyond the view are
+    /// dropped here and re-meshed through the normal queue if the player returns.
+    pub fn drop_chunk_sections(&mut self, sections: &[SectionPos]) {
+        for &pos in sections {
+            // Drop the generation so any in-flight mesh job for this section is
+            // discarded on arrival (its generation no longer matches).
+            self.chunk_mesh_generations.remove(&pos);
+            self.remove_section(pos);
+        }
     }
 
     /// Replace the per-frame entity/hand geometry drawn in the model pass. The
@@ -5690,6 +5773,16 @@ impl Renderer {
                 up.draw(0..3, 0..1);
                 draw_calls += 1;
             }
+            // Crosshair: drawn over the scene (and the vignette/HUD background)
+            // with the inversion blend, like vanilla `GuiIngame`. The layer is a
+            // no-op where transparent, so an empty crosshair (screen open) costs
+            // nothing visible.
+            if let Some(cache) = &self.crosshair_cache {
+                up.set_pipeline(&self.crosshair_pipeline);
+                up.set_bind_group(0, &cache.bind_group, &[]);
+                up.draw(0..3, 0..1);
+                draw_calls += 1;
+            }
             // 3D block icons: convex cubes (cull-free) baked into clip space via
             // the identity camera. The pass cleared depth to the far plane, so
             // they depth-test correctly among themselves.
@@ -5823,6 +5916,19 @@ impl Renderer {
             height,
             divisor,
             "ui-front",
+        );
+        prepare_ui_layer(
+            &self.device,
+            &self.queue,
+            &mut self.crosshair_cache,
+            &self.ui_bind_group_layout,
+            &self.ui_sampler,
+            &self.gui_atlas,
+            ui.crosshair_commands(),
+            width,
+            height,
+            divisor,
+            "ui-crosshair",
         );
 
         // 3D block icons, baked into clip space for the GPU cube pass.

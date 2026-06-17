@@ -265,6 +265,10 @@ pub struct UiFrame {
     /// Enchanted item icons to overlay with the scrolling glint (drawn over the
     /// icons in the UI pass, additively, like the held/world item glint).
     glint_items: Vec<GuiGlintItem>,
+    /// Crosshair layer: a single sprite drawn on its own GPU pass with the
+    /// vanilla inversion blend (`GL_ONE_MINUS_DST_COLOR`/`GL_ONE_MINUS_SRC_COLOR`)
+    /// so it shows as the inverse of the 3D scene behind it.
+    crosshair: Vec<UiCommand>,
 }
 
 impl UiFrame {
@@ -277,6 +281,7 @@ impl UiFrame {
             && self.overlay.is_empty()
             && self.block_items.is_empty()
             && self.glint_items.is_empty()
+            && self.crosshair.is_empty()
     }
 
     /// Background (under-cube) and foreground (over-cube) command layers.
@@ -294,6 +299,25 @@ impl UiFrame {
 
     pub fn glint_items(&self) -> &[GuiGlintItem] {
         &self.glint_items
+    }
+
+    pub fn crosshair_commands(&self) -> &[UiCommand] {
+        &self.crosshair
+    }
+
+    /// Queue the vanilla crosshair: the 16×16 sprite at (0,0) of `gui/icons.png`,
+    /// drawn at `dst`. It goes on its own inversion-blend GPU layer, matching
+    /// vanilla `GuiIngame` (`drawTexturedModalRect(.., 0, 0, 16, 16)` under the
+    /// `ONE_MINUS_DST_COLOR`/`ONE_MINUS_SRC_COLOR` blend).
+    pub fn crosshair(&mut self, dst: UiRect) {
+        self.crosshair.push(UiCommand::Image {
+            dst,
+            texture: GuiTexture::Icons,
+            sx: 0,
+            sy: 0,
+            sw: 16,
+            sh: 16,
+        });
     }
 
     /// Queue an enchanted item icon's glint overlay. `block` carries the cube's

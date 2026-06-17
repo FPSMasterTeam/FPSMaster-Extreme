@@ -1489,6 +1489,15 @@ fn render_frame(
     // number is actually shown: the F3 overlay, or a scripted benchmark run.
     renderer.set_gpu_timing(f3_debug || smoke_active || app.settings.adaptive_resolution);
 
+    // Render-distance safety net: free the GPU meshes of columns that drifted
+    // out of view (keeping their block data) so resident VRAM stays bounded even
+    // on servers that never send ChunkUnload. Runs only on a chunk-boundary
+    // crossing; any re-mesh it needs is queued through the dirty budget below.
+    let evicted = app.game.enforce_render_distance(app.settings.render_distance);
+    if !evicted.is_empty() {
+        renderer.drop_chunk_sections(&evicted);
+    }
+
     // Local block prediction gets submitted to the background mesher first, but
     // never rebuilt on the render thread; placing/breaking must not stall a
     // frame.

@@ -88,6 +88,13 @@ pub struct EntityState {
     /// Vanilla `hurtTime`: counts down from 10 to 0 after a damage animation,
     /// driving the red overlay flash in the renderer.
     pub hurt_time: u8,
+    /// Vanilla death state: set when the entity dies (EntityStatus 3 or health
+    /// ≤ 0). While set, `death_time` increments each tick (capped at 20),
+    /// driving the fall-over rotation and keeping the red overlay on.
+    pub dead: bool,
+    /// Vanilla `deathTime`: 0 until death, then counts UP to 20 over the death
+    /// animation (the body tips onto its side, the corpse stays red).
+    pub death_time: u8,
     /// Entity metadata index 0 bit 0x01: the entity is on fire.
     pub on_fire: bool,
     /// Entity metadata index 0 bit 0x20: the entity is invisible. The renderer
@@ -169,6 +176,8 @@ impl EntityState {
             using_item: false,
             age: 0,
             hurt_time: 0,
+            dead: false,
+            death_time: 0,
             on_fire: false,
             invisible: false,
             custom_name: None,
@@ -244,6 +253,14 @@ impl EntityState {
         self.hurt_time = 10;
     }
 
+    /// Begin the death animation (EntityStatus 3, or health reaching 0). From
+    /// here `tick_interpolation` runs `death_time` up to 20; idempotent so a
+    /// second death signal doesn't restart it. The fall-over tilt is derived
+    /// from `death_time` in the renderer (`death_roll_radians`).
+    pub fn start_death(&mut self) {
+        self.dead = true;
+    }
+
     /// Trigger the arm-swing animation (S0B Animation 0 from the server), the
     /// same restart gate vanilla uses so held swings flow into each other.
     pub fn start_swing(&mut self) {
@@ -291,6 +308,11 @@ impl EntityState {
         self.tick_swing();
         if self.hurt_time > 0 {
             self.hurt_time -= 1;
+        }
+        // Vanilla `onDeathUpdate`: once dead, deathTime counts up to 20 (after
+        // which the server removes the entity), driving the fall-over tilt.
+        if self.dead && self.death_time < 20 {
+            self.death_time += 1;
         }
     }
 
@@ -455,6 +477,28 @@ mod tests {
 
     fn mob_at(position: DVec3) -> EntityState {
         EntityState::new_remote(EntityId(1), EntityKind::Mob(54), position, 0.0, 0.0)
+    }
+
+    #[test]
+    fn death_starts_and_counts_death_time_up_to_twenty() {
+        let mut e = mob_at(DVec3::ZERO);
+        assert!(!e.dead && e.death_time == 0, "alive mob isn't dying");
+        // Ticking while alive never advances death_time.
+        e.tick_interpolation();
+        assert_eq!(e.death_time, 0);
+
+        e.start_death();
+        assert!(e.dead);
+        for expected in 1..=20 {
+            e.tick_interpolation();
+            assert_eq!(e.death_time, expected, "deathTime increments each tick");
+        }
+        // Caps at 20 (the server removes the corpse around here).
+        e.tick_interpolation();
+        assert_eq!(e.death_time, 20, "deathTime saturates at 20");
+        // A second death signal doesn't restart the animation.
+        e.start_death();
+        assert_eq!(e.death_time, 20);
     }
 
     #[test]
