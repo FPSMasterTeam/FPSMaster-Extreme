@@ -189,7 +189,7 @@ pub fn append_flat_item_glint(
 
 /// Vanilla element UV mapping within a tile (v grows downward), matching the
 /// world mesher so partial boxes (slabs/stairs) sample the correct sub-region.
-fn face_uv(normal: [i32; 3], px: f32, py: f32, pz: f32) -> (f32, f32) {
+pub(crate) fn face_uv(normal: [i32; 3], px: f32, py: f32, pz: f32) -> (f32, f32) {
     match normal {
         [0, 1, 0] => (px, pz),
         [0, -1, 0] => (px, 1.0 - pz),

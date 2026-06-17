@@ -576,6 +576,119 @@ fn append_block<S: BlockSource>(
         RenderShape::Torch => append_torch(mesh, ctx, x, y, z, block),
         RenderShape::Fluid => append_fluid(mesh, ctx, x, y, z, block),
         RenderShape::Fire => append_fire(mesh, ctx, x, y, z, block),
+        RenderShape::Bed => append_bed(mesh, ctx, x, y, z, block),
+    }
+}
+
+/// Bed (id 26): a 9/16-tall directed block with two halves (foot / head).
+///
+/// Meta bits 0–1 encode facing (0=south, 1=west, 2=north, 3=east — the
+/// direction the HEAD faces). Bit 3 (0x8) selects the head half.
+///
+/// Geometry (from vanilla `bed_foot.json` / `bed_head.json`):
+/// - Main element: y 0..9/16, all four vertical sides rendered except the seam
+///   joining the two halves. The top face uses a facing-dependent 90° UV
+///   rotation (vanilla `"uv": [0,16,16,0], "rotation": 90`).
+/// - Planks underside: flat DOWN face at y=3/16 (oak planks texture).
+fn append_bed<S: BlockSource>(
+    mesh: &mut ChunkMesh,
+    ctx: &BlockCtx<S>,
+    x: i32,
+    y: i32,
+    z: i32,
+    block: BlockState,
+) {
+    let is_head = block.meta & 8 != 0;
+    let facing = block.meta & 3; // 0=south, 1=west, 2=north, 3=east
+
+    let top_tex: Option<&str> = Some(if is_head { "bed_head_top" } else { "bed_feet_top" });
+    let end_tex: Option<&str> = Some(if is_head { "bed_head_end" } else { "bed_feet_end" });
+    let side_tex: Option<&str> = Some(if is_head { "bed_head_side" } else { "bed_feet_side" });
+
+    // Facing direction vector (foot → head).
+    let facing_dir: [i32; 3] = match facing {
+        0 => [0, 0, 1],   // south
+        1 => [-1, 0, 0],  // west
+        2 => [0, 0, -1],  // north
+        _ => [1, 0, 0],   // east
+    };
+
+    // Foot block: end face is opposite to facing; head block: end = facing.
+    let end_normal: [i32; 3] = if is_head {
+        facing_dir
+    } else {
+        [-facing_dir[0], 0, -facing_dir[2]]
+    };
+    // The open seam side (faces the other bed half) is not rendered.
+    let open_normal: [i32; 3] = [-end_normal[0], 0, -end_normal[2]];
+
+    const TOP: f32 = 9.0 / 16.0; // vanilla setBedBounds height (0.5625)
+    let mn = [0.0f32, 0.0, 0.0];
+    let mx = [1.0f32, TOP, 1.0];
+    let alpha = 1.0;
+    let buffer = buffer_for(mesh, block);
+
+    // Vertical faces: the end face and the two sides perpendicular to facing.
+    for face in &FACES {
+        let n = face.normal;
+        if n[1] != 0 { continue; }       // top/bottom handled separately
+        if n == open_normal { continue; } // open seam side — not rendered
+        let texture = if n == end_normal { end_tex } else { side_tex };
+        let (nx, ny, nz) = (x + n[0], y + n[1], z + n[2]);
+        emit_face(buffer, ctx, face, x, y, z, mn, mx, texture, block, alpha, nx, ny, nz);
+    }
+
+    // Top face with facing-dependent 90° UV rotation.
+    {
+        let face = &FACES[2]; // UP face ([0,1,0])
+        warn_if_missing(ctx.atlas, block, "its top face", top_tex);
+        let rect = ctx.atlas.tile_rect(top_tex);
+        let front = [x, y + 1, z];
+        let mut corners = [[0.0f32; 3]; 4];
+        let mut uvs = [[0.0f32; 2]; 4];
+        let mut colors = [[0.0f32; 4]; 4];
+        let mut lights = [[0.0f32; 2]; 4];
+        let mut local = [[0.0f32; 2]; 4];
+        for (i, corner) in face.corners.iter().enumerate() {
+            let px = corner[0];
+            let pz = corner[2];
+            corners[i] = [x as f32 + px, y as f32 + TOP, z as f32 + pz];
+            let (u, v) = bed_top_uv(facing, px, pz);
+            local[i] = [u, v];
+            uvs[i] = rect_uv(rect, u, v);
+            if ctx.flat { continue; }
+            let (sky, blk, ao) = vertex_light(ctx, face.normal, front, *corner);
+            colors[i] = [face.light * ao, face.light * ao, face.light * ao, alpha];
+            lights[i] = [sky, blk];
+        }
+        if ctx.flat {
+            let (blk_l, sky_l) = ctx.source.light_at(front[0], front[1], front[2]);
+            let light = [sky_l as f32 / 15.0, blk_l as f32 / 15.0];
+            let color = [face.light, face.light, face.light, alpha];
+            push_greedy_quad(buffer, corners, local, [rect[0], rect[1]], color, light);
+        } else {
+            buffer.push_quad_smooth(corners, uvs, colors, lights);
+        }
+    }
+
+    // Planks underside (vanilla element 2): flat DOWN face at y=3/16.
+    {
+        let face = &FACES[3]; // DOWN face ([0,-1,0])
+        let pmn = [0.0f32, 3.0 / 16.0, 0.0];
+        let pmx = [1.0f32, 3.0 / 16.0, 1.0];
+        emit_face(buffer, ctx, face, x, y, z, pmn, pmx, Some("planks_oak"), block, alpha, x, y - 1, z);
+    }
+}
+
+/// UV mapping for the bed's top face. The vanilla model uses `"uv": [0,16,16,0],
+/// "rotation": 90`, then the blockstate applies a Y-rotation per facing direction.
+/// Composed, this maps (px, pz) ∈ {0,1}² to the following (u, v) in tile space:
+fn bed_top_uv(facing: u8, px: f32, pz: f32) -> (f32, f32) {
+    match facing {
+        0 => (1.0 - pz, px),        // south (model y=0)
+        1 => (1.0 - px, 1.0 - pz),  // west  (model y=90)
+        2 => (pz, 1.0 - px),        // north (model y=180)
+        _ => (px, pz),              // east  (model y=270)
     }
 }
 

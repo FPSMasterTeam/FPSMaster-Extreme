@@ -118,6 +118,13 @@ struct App {
     /// Audio backend: resolves `sounds.json` events and plays positioned/UI
     /// sounds queued by the game. Silent if no output device is available.
     sound: sound::SoundManager,
+    /// GUI/container interaction packets (ClickWindow, CloseWindow, …) produced
+    /// at frame time by screen input. Vanilla emits them inside `runTick` BEFORE
+    /// that tick's flying packet; we buffer them and flush right before
+    /// `send_movement` so Grim's Post check sees `click_window → flying →
+    /// transaction`, not the reverse (sending at frame time let a transaction
+    /// land between the last flying and the click → Post "click window v1.8").
+    pending_window_packets: Vec<ServerboundPacket>,
     quit: bool,
 }
 
@@ -373,6 +380,7 @@ impl ApplicationHandler for WinitApp {
             entity_glint: recraft_render::ModelMesh::new(),
             last_entity_key: None,
             sound: sound::SoundManager::new(),
+            pending_window_packets: Vec::new(),
             quit: false,
         };
         renderer.upload_world(&app.game.world);
@@ -698,6 +706,13 @@ impl ApplicationHandler for WinitApp {
                     let abilities = app.game.take_abilities_packet();
                     if let Some(network) = &app.network {
                         if app.game.can_send_movement_packets() {
+                            // Frame-time GUI packets (ClickWindow, …) first, then
+                            // this tick's interactions, then abilities, then the
+                            // flying packet — all BEFORE movement, matching vanilla
+                            // runTick so Grim's Post check sees the right order.
+                            for packet in app.pending_window_packets.drain(..) {
+                                network.send_packet(packet);
+                            }
                             for packet in actions {
                                 network.send_packet(packet);
                             }
@@ -1074,9 +1089,10 @@ fn handle_actions(
             GuiAction::SetVolumetricLight(on) => renderer.set_volumetric_light_enabled(on),
             GuiAction::SaveSettings => app.settings.save(),
             GuiAction::SendPacket(packet) => {
-                if let Some(network) = &app.network {
-                    network.send_packet(packet);
-                }
+                // Buffered, not sent now: flushed just before the next tick's
+                // flying packet (see the tick loop) so the order matches vanilla
+                // runTick and Grim's Post check stays happy.
+                app.pending_window_packets.push(packet);
             }
             GuiAction::OpenUrl(url) => open_url(&url),
             GuiAction::ReloadResourcePack(path) => {
@@ -1182,6 +1198,10 @@ fn pump_network(app: &mut App, window: &winit::window::Window, cursor_captured: 
         // World data has arrived: enter gameplay.
         app.connecting = false;
         app.in_world = true;
+        // Drop any GUI packets buffered by a previous session that never flushed
+        // (e.g. a container click right before disconnect) so they can't leak out
+        // on this session's first tick.
+        app.pending_window_packets.clear();
         app.screen = None;
     }
     sync_cursor(window, cursor_captured, app);
@@ -1604,7 +1624,8 @@ fn render_frame(
         dropped.extend(app.game.projectiles(tick_alpha));
         let mut world_items =
             ItemRenderer::build_world_items(&app.game.camera, &dropped, atlas_uv);
-        let falling = app.game.falling_block_cubes(tick_alpha);
+        let mut falling = app.game.falling_block_cubes(tick_alpha);
+        falling.extend(app.game.primed_tnt_cubes(tick_alpha));
         append_mesh(
             &mut world_items.vertices,
             &mut world_items.indices,

@@ -592,7 +592,7 @@ pub struct Renderer {
     entity_glint: Option<DynamicMesh>,
     /// Crack overlay over the block being mined (vanilla destroy_stage_N).
     break_overlay: Option<DynamicMesh>,
-    last_break_overlay: Option<(i32, i32, i32, u8)>,
+    last_break_overlay: Option<(i32, i32, i32, u8, recraft_core::BlockState)>,
     /// Camera-facing particle billboards (vanilla EntityFX), rebuilt each frame.
     particles: Option<DynamicMesh>,
     /// Camera-facing block-break debris (vanilla EntityDiggingFX) sampling the
@@ -4224,7 +4224,7 @@ impl Renderer {
     /// Set (or clear) the mining crack overlay: the block cell being mined and
     /// its 0..9 destroy stage. Rebuilds the small overlay mesh only when the
     /// target or stage actually changes.
-    pub fn set_break_overlay(&mut self, overlay: Option<(i32, i32, i32, u8)>) {
+    pub fn set_break_overlay(&mut self, overlay: Option<(i32, i32, i32, u8, recraft_core::BlockState)>) {
         if overlay == self.last_break_overlay {
             return;
         }
@@ -4235,8 +4235,8 @@ impl Renderer {
                     mesh.index_count = 0;
                 }
             }
-            Some((x, y, z, stage)) => {
-                let (vertices, indices) = break_overlay_geometry(x, y, z, stage, &self.atlas_uv);
+            Some((x, y, z, stage, block)) => {
+                let (vertices, indices) = break_overlay_geometry(x, y, z, stage, block, &self.atlas_uv);
                 fill_dynamic_mesh(
                     &self.device,
                     &self.queue,
@@ -6037,88 +6037,78 @@ fn fill_dynamic_mesh(
     mesh.index_count = index_count;
 }
 
-/// Geometry for the mining crack overlay: a cube slightly inflated around the
-/// mined block cell, every face textured with the `destroy_stage_<stage>`
-/// atlas tile at full brightness. Drawn with the translucent pipeline, so the
-/// crack texels alpha-blend over the block beneath (vanilla look).
+/// Geometry for the mining crack overlay: the `destroy_stage_<stage>` atlas tile
+/// applied to every face of the mined block's render boxes, each slightly
+/// inflated so the overlay never z-fights the block. A partial block cracks only
+/// over its shape (a slab over its half, stairs over their steps) — the texture
+/// crops to each box exactly like the world mesher, so the crack lines up with
+/// the visible faces instead of floating on a full cube. Drawn with the
+/// translucent pipeline, so the crack texels alpha-blend over the block beneath
+/// (vanilla look). Blocks with no render boxes (cross/torch/…) fall back to a
+/// full cube so the crack stays visible.
 fn break_overlay_geometry(
     x: i32,
     y: i32,
     z: i32,
     stage: u8,
+    block: recraft_core::BlockState,
     atlas: &AtlasUv,
 ) -> (Vec<Vertex>, Vec<u32>) {
-    let uv = atlas.uv(Some(&format!("destroy_stage_{}", stage.min(9))));
+    let rect = atlas.tile_rect(Some(&format!("destroy_stage_{}", stage.min(9))));
+    let computed = block.render_boxes();
+    let fallback = [recraft_core::BlockBox { min: [0.0; 3], max: [1.0; 3] }];
+    let boxes: &[recraft_core::BlockBox] = if computed.as_slice().is_empty() {
+        &fallback
+    } else {
+        computed.as_slice()
+    };
+
     // Inflate past the block faces so the overlay never z-fights them.
     const PAD: f32 = 0.004;
-    let lo = [x as f32 - PAD, y as f32 - PAD, z as f32 - PAD];
-    let hi = [
-        x as f32 + 1.0 + PAD,
-        y as f32 + 1.0 + PAD,
-        z as f32 + 1.0 + PAD,
+
+    // Each face: outward normal (for the UV convention) plus four corners, where
+    // a corner component selects the box min (0) or max (1) along that axis. The
+    // translucent pipeline doesn't cull, so the winding only needs to be
+    // consistent.
+    const FACES: [([i32; 3], [[u8; 3]; 4]); 6] = [
+        ([1, 0, 0], [[1, 0, 0], [1, 1, 0], [1, 1, 1], [1, 0, 1]]),
+        ([-1, 0, 0], [[0, 0, 1], [0, 1, 1], [0, 1, 0], [0, 0, 0]]),
+        ([0, 1, 0], [[0, 1, 1], [1, 1, 1], [1, 1, 0], [0, 1, 0]]),
+        ([0, -1, 0], [[0, 0, 0], [1, 0, 0], [1, 0, 1], [0, 0, 1]]),
+        ([0, 0, 1], [[1, 0, 1], [1, 1, 1], [0, 1, 1], [0, 0, 1]]),
+        ([0, 0, -1], [[0, 0, 0], [0, 1, 0], [1, 1, 0], [1, 0, 0]]),
     ];
 
-    // Corner order per face matches the atlas UV order (bottom-left, top-left,
-    // top-right, bottom-right); the translucent pipeline doesn't cull, so the
-    // winding only needs to be consistent.
-    let faces: [[[f32; 3]; 4]; 6] = [
-        // -X
-        [
-            [lo[0], lo[1], hi[2]],
-            [lo[0], hi[1], hi[2]],
-            [lo[0], hi[1], lo[2]],
-            [lo[0], lo[1], lo[2]],
-        ],
-        // +X
-        [
-            [hi[0], lo[1], lo[2]],
-            [hi[0], hi[1], lo[2]],
-            [hi[0], hi[1], hi[2]],
-            [hi[0], lo[1], hi[2]],
-        ],
-        // -Y
-        [
-            [lo[0], lo[1], lo[2]],
-            [lo[0], lo[1], hi[2]],
-            [hi[0], lo[1], hi[2]],
-            [hi[0], lo[1], lo[2]],
-        ],
-        // +Y
-        [
-            [lo[0], hi[1], hi[2]],
-            [lo[0], hi[1], lo[2]],
-            [hi[0], hi[1], lo[2]],
-            [hi[0], hi[1], hi[2]],
-        ],
-        // -Z
-        [
-            [lo[0], lo[1], lo[2]],
-            [lo[0], hi[1], lo[2]],
-            [hi[0], hi[1], lo[2]],
-            [hi[0], lo[1], lo[2]],
-        ],
-        // +Z
-        [
-            [hi[0], lo[1], hi[2]],
-            [hi[0], hi[1], hi[2]],
-            [lo[0], hi[1], hi[2]],
-            [lo[0], lo[1], hi[2]],
-        ],
-    ];
-
-    let mut vertices = Vec::with_capacity(24);
-    let mut indices = Vec::with_capacity(36);
-    for corners in faces {
-        let base = vertices.len() as u32;
-        for (corner, corner_uv) in corners.iter().zip(uv.iter()) {
-            vertices.push(Vertex {
-                position: *corner,
-                color: [1.0, 1.0, 1.0, 1.0],
-                uv: *corner_uv,
-                light: crate::FULLBRIGHT,
-            });
+    let mut vertices = Vec::with_capacity(24 * boxes.len());
+    let mut indices = Vec::with_capacity(36 * boxes.len());
+    for b in boxes {
+        let bmin = [b.min[0] as f32, b.min[1] as f32, b.min[2] as f32];
+        let bmax = [b.max[0] as f32, b.max[1] as f32, b.max[2] as f32];
+        for (normal, corners) in FACES {
+            let base = vertices.len() as u32;
+            for c in corners {
+                // Box-local coord (0..1 within the cell) drives the UV so the
+                // crack crops to the box; PAD inflates only the world position.
+                let lc = [
+                    if c[0] == 0 { bmin[0] } else { bmax[0] },
+                    if c[1] == 0 { bmin[1] } else { bmax[1] },
+                    if c[2] == 0 { bmin[2] } else { bmax[2] },
+                ];
+                let pos = [
+                    x as f32 + lc[0] + if c[0] == 0 { -PAD } else { PAD },
+                    y as f32 + lc[1] + if c[1] == 0 { -PAD } else { PAD },
+                    z as f32 + lc[2] + if c[2] == 0 { -PAD } else { PAD },
+                ];
+                let (fu, fv) = crate::gui_item::face_uv(normal, lc[0], lc[1], lc[2]);
+                vertices.push(Vertex {
+                    position: pos,
+                    color: [1.0, 1.0, 1.0, 1.0],
+                    uv: [rect[0] + fu * rect[2], rect[1] + fv * rect[3]],
+                    light: crate::FULLBRIGHT,
+                });
+            }
+            indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
         }
-        indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     }
     (vertices, indices)
 }

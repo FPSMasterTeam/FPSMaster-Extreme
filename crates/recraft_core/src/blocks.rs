@@ -59,6 +59,8 @@ pub enum Shape {
     /// Torch / redstone torch: a thin post, standing on the floor or leaning
     /// against a wall depending on meta (`BlockTorch` FACING).
     Torch,
+    /// Bed (id 26): a 9/16-tall directional block with head and foot halves.
+    Bed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -389,6 +391,7 @@ fn parse_shape(value: &str) -> Shape {
         "piston" => Shape::Piston,
         "piston_head" => Shape::PistonHead,
         "torch" => Shape::Torch,
+        "bed" => Shape::Bed,
         _ => Shape::Cube,
     }
 }
@@ -460,8 +463,9 @@ mod tests {
             );
             let block = BlockState::new(id, 0);
             // Entity-rendered blocks (signs/banners/skulls, shape None) carry no
-            // terrain texture by design; every other block must map one.
-            if block.render_shape() != RenderShape::None {
+            // terrain texture by design; Bed uses hardcoded texture names in the
+            // mesher instead of the block-def lookup; every other block must map one.
+            if !matches!(block.render_shape(), RenderShape::None | RenderShape::Bed) {
                 let textured = [BlockFace::Top, BlockFace::Bottom, BlockFace::Side]
                     .into_iter()
                     .any(|face| block.texture_name(face).is_some());

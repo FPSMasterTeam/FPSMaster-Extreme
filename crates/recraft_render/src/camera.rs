@@ -9,6 +9,10 @@ pub struct Camera {
     pub fovy_degrees: f32,
     pub z_near: f32,
     pub z_far: f32,
+    /// Screen-space roll in radians from the hurt-camera effect (vanilla
+    /// `EntityRenderer.hurtCameraEffect`): the whole view tilts about the
+    /// forward axis when the player takes damage, then eases back to 0.
+    pub roll: f32,
 }
 
 impl Camera {
@@ -21,6 +25,7 @@ impl Camera {
             fovy_degrees: 70.0,
             z_near: 0.05,
             z_far: 1000.0,
+            roll: 0.0,
         }
     }
 
@@ -47,7 +52,16 @@ impl Camera {
             self.z_near,
             self.z_far,
         );
-        projection * view
+        if self.roll != 0.0 {
+            // Roll about the view-space forward axis (camera looks down −Z), so
+            // the entire rendered image tilts like vanilla's outermost modelview
+            // rotation — world, entities, world items and the first-person hand
+            // all roll together, while the separate HUD pass stays upright.
+            let roll = Mat4::from_axis_angle(Vec3::Z, self.roll);
+            projection * roll * view
+        } else {
+            projection * view
+        }
     }
 
     pub fn frustum(&self) -> Frustum {

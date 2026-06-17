@@ -100,6 +100,7 @@ impl BlockState {
             Shape::Piston => RenderShape::Piston,
             Shape::PistonHead => RenderShape::PistonHead,
             Shape::Torch => RenderShape::Torch,
+            Shape::Bed => RenderShape::Bed,
             _ => RenderShape::Boxes,
         }
     }
@@ -310,6 +311,8 @@ impl BlockState {
             Shape::Piston | Shape::PistonHead => CollisionBoxes::one(FULL_CUBE),
             // Torches have no collision; the mesher builds the leaning post.
             Shape::Torch => CollisionBoxes::none(),
+            // Bed: vanilla setBedBounds gives a 9/16-tall flat box.
+            Shape::Bed => CollisionBoxes::one(box3(0.0, 0.0, 0.0, 1.0, 0.5625, 1.0)),
         }
     }
 }
@@ -370,6 +373,8 @@ pub enum RenderShape {
     Fluid,
     /// Fire: tall crossed planes (floor) plus planes against adjacent walls.
     Fire,
+    /// Bed: 9/16-tall directional block with head/foot halves and a rotated top.
+    Bed,
 }
 
 /// An axis-aligned box in unit (0..1) block space.

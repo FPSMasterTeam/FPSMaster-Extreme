@@ -526,6 +526,13 @@ impl TextureAtlasImage {
         // The recessed front face of an extended piston body (the mesher draws it
         // directly; it is not a per-face entry in any block def).
         names.push("piston_inner".to_owned());
+        // Bed textures: the mesher selects head/feet×top/end/side directly by
+        // name (the block def has no per-face tex entries), so register them here.
+        for part in ["feet", "head"] {
+            for face in ["top", "end", "side"] {
+                names.push(format!("bed_{part}_{face}"));
+            }
+        }
         // Item sprites (under textures/items/) join the atlas so the
         // first-person item renderer can draw real held items; their atlas
         // names keep the "items/" prefix.

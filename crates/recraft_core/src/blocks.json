@@ -29,7 +29,7 @@
     { "id": 27, "shape": "rail", "collision": "none", "opaque": false, "layer": "cutout", "mask": 15, "by_meta": ["rail_golden", "rail_golden", "rail_golden", "rail_golden", "rail_golden", "rail_golden", "rail_golden", "rail_golden", "rail_golden_powered", "rail_golden_powered", "rail_golden_powered", "rail_golden_powered", "rail_golden_powered", "rail_golden_powered", "rail_golden_powered", "rail_golden_powered"] },
     { "id": 28, "shape": "rail", "collision": "none", "opaque": false, "layer": "cutout", "mask": 15, "by_meta": ["rail_detector", "rail_detector", "rail_detector", "rail_detector", "rail_detector", "rail_detector", "rail_detector", "rail_detector", "rail_detector_powered", "rail_detector_powered", "rail_detector_powered", "rail_detector_powered", "rail_detector_powered", "rail_detector_powered", "rail_detector_powered", "rail_detector_powered"] },
     {"id": 29, "shape": "piston", "opaque": true, "tex": {"top": "piston_top_sticky", "bottom": "piston_bottom", "side": "piston_side"}},
-    { "id": 30, "tex": "web", "shape": "cube", "collision": "none", "layer": "cutout", "opaque": false },
+    { "id": 30, "tex": "web", "shape": "cross", "collision": "none", "layer": "cutout", "opaque": false },
     { "id": 31, "shape": "cross", "collision": "none", "opaque": false, "layer": "cutout", "tint": "grass", "mask": 3, "by_meta": ["deadbush", "tallgrass", "fern"] },
     { "id": 32, "shape": "cross", "collision": "none", "opaque": false, "layer": "cutout", "tex": "deadbush" },
     {"id": 33, "shape": "piston", "opaque": true, "tex": {"top": "piston_top_normal", "bottom": "piston_bottom", "side": "piston_side"}},
@@ -172,7 +172,7 @@
     {"id": 196, "shape": "door", "opaque": false, "layer": "cutout", "tex": {"top": "door_acacia_upper", "bottom": "door_acacia_lower"}},
     {"id": 197, "shape": "door", "opaque": false, "layer": "cutout", "tex": {"top": "door_dark_oak_upper", "bottom": "door_dark_oak_lower"}},
 
-    {"id": 26, "shape": "cube", "collision": "auto", "opaque": false, "tex": {"top": "bed_feet_top", "bottom": "planks_oak", "side": "bed_feet_end"}},
+    {"id": 26, "shape": "bed", "collision": "auto", "opaque": false, "layer": "cutout"},
     {"id": 55, "shape": "lily", "collision": "none", "opaque": false, "layer": "cutout", "tex": "redstone_dust_cross"},
     {"id": 69, "shape": "cross", "collision": "none", "opaque": false, "layer": "cutout", "tex": "lever"},
     {"id": 75, "shape": "torch", "collision": "none", "opaque": false, "layer": "cutout", "tex": "redstone_torch_off"},

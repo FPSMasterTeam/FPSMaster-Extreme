@@ -79,6 +79,10 @@ pub struct EntityState {
     pub is_swinging: bool,
     /// Entity metadata flag (index 0 bit 0x02): drives the crouch pose.
     pub sneaking: bool,
+    /// Entity metadata index 0 bit 0x10: the entity is using/holding its item
+    /// (eating, drinking, drawing a bow, or blocking with a sword). Combined
+    /// with the held item's use action it drives the third-person blocking pose.
+    pub using_item: bool,
     /// Ticks since the entity was first tracked, for the dropped-item bob/spin.
     pub age: u32,
     /// Vanilla `hurtTime`: counts down from 10 to 0 after a damage animation,
@@ -162,6 +166,7 @@ impl EntityState {
             swing_progress_int: 0,
             is_swinging: false,
             sneaking: false,
+            using_item: false,
             age: 0,
             hurt_time: 0,
             on_fire: false,

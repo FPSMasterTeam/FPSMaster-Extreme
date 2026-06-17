@@ -90,6 +90,10 @@ pub struct EntityAnim {
     pub swing_progress: f32,
     /// Whether the entity is crouching (drives the sneak pose).
     pub sneaking: bool,
+    /// Vanilla `ModelBiped.heldItemRight`: 0 = empty hand, 1 = holding an item
+    /// (the right arm lowers ~PI/10), 3 = blocking (the arm lowers ~3·PI/10 and
+    /// rotates -30° so the sword cants across the body). Only set for players.
+    pub held_item_right: u8,
     /// Use the 1.7-style attack-swing curve (the "OldAnimations" setting). 1.8
     /// eases the arm with a quartic `f⁴`; 1.7 used a cubic `f³`, which snaps the
     /// arm forward faster. Only affects the attack swing, not the walk cycle.
@@ -713,8 +717,22 @@ fn humanoid_poses(anim: &EntityAnim) -> [PartPose; 7] {
     // Right arm and right leg are a half-cycle apart (natural opposite swing).
     let mut arm_r_x = swing(s, a, PI, 1.0);
     let arm_l_x = swing(s, a, 0.0, 1.0);
+    let mut arm_r_y = 0.0;
     let mut arm_r_z = 0.0;
     let mut body_y = 0.0;
+
+    // Vanilla `ModelBiped.setRotationAngles` heldItemRight branch (applied before
+    // the attack swing): holding an item lowers the arm, blocking lowers it more
+    // and cants it inward so the sword crosses the body.
+    match anim.held_item_right {
+        1 => arm_r_x = arm_r_x * 0.5 - PI / 10.0,
+        3 => {
+            arm_r_x = arm_r_x * 0.5 - PI / 10.0 * 3.0;
+            arm_r_y = -0.523_598_8;
+        }
+        _ => {}
+    }
+
     if anim.swing_progress > 0.0 {
         let sp = anim.swing_progress;
         // Vanilla `ModelBiped`: ease the attack swing, then take the sine.
@@ -755,7 +773,7 @@ fn humanoid_poses(anim: &EntityAnim) -> [PartPose; 7] {
         still(waist, Vec3::new(body_tilt, body_y, 0.0)),
         grouped(
             Vec3::new(-6.0, 24.0, 0.0),
-            Vec3::new(arm_r_x + arm_extra, 0.0, arm_r_z),
+            Vec3::new(arm_r_x + arm_extra, arm_r_y, arm_r_z),
         ),
         grouped(
             Vec3::new(6.0, 24.0, 0.0),
@@ -1635,50 +1653,46 @@ impl ModelMesh {
     }
 }
 
-// ─── Held item hand frame ───────────────────────────────────────────────────
+// ─── Held item arm attachment ───────────────────────────────────────────────
 
-/// World-space reference frame for a held item in the right hand: the hand
-/// position plus three orthogonal axes that orient the item with the arm.
+/// Rigid attachment for an item held in the right hand. It captures the exact
+/// articulation [`ModelMesh::push_entity`] applies to the right-arm box, so item
+/// geometry expressed in the arm's rest model-pixel frame (shoulder pivot at
+/// `SHOULDER_PX`, +y up, feet at y=0 — recraft's convention) rides the arm into
+/// world space identically to the rendered arm, picking up the held-item lower /
+/// blocking pose and the sneak tilt for free (they live in the arm `PartPose`).
 #[derive(Debug, Clone, Copy)]
-pub struct HeldItemFrame {
-    /// World position of the hand (bottom of the right arm).
-    pub hand: Vec3,
-    /// Unit vector along the arm, from shoulder to hand (item extends here).
-    pub arm_dir: Vec3,
-    /// Unit vector the body faces (entity's +z in model space, rotated by yaw).
-    pub forward: Vec3,
-    /// Right-hand cross: arm_dir × forward, for the item's lateral axis.
-    pub right: Vec3,
+pub struct ArmAttach {
+    pose: PartPose,
+    feet: Vec3,
+    sin: f32,
+    cos: f32,
 }
 
-/// Compute the world-space reference frame for an item held in the right hand.
-/// `feet` is the entity's world feet position, `yaw_degrees` the body yaw.
-pub fn held_item_frame(feet: Vec3, yaw_degrees: f32, anim: &EntityAnim) -> HeldItemFrame {
-    let poses = humanoid_poses(anim);
-    let arm_pose = &poses[3]; // right arm
+impl ArmAttach {
+    /// Right-arm shoulder pivot in model pixels (vanilla `bipedRightArm`
+    /// rotationPoint, recraft's feet-up convention). The vanilla
+    /// `LayerHeldItem.postRenderArm` anchor.
+    pub const SHOULDER_PX: Vec3 = Vec3::new(-6.0, 24.0, 0.0);
 
-    // Two reference points on the arm in model px:
-    //  - shoulder = pivot = (-6, 24, 0)
-    //  - hand     = bottom of the arm box = (-6, 12, 0)
-    let shoulder_px = Vec3::new(-6.0, 24.0, 0.0);
-    let hand_px = Vec3::new(-6.0, 12.0, 0.0);
+    /// Bottom-centre of the right-arm box in model pixels — the hand, for
+    /// sampling the lightmap where the held item sits.
+    pub const HAND_PX: Vec3 = Vec3::new(-6.0, 12.0, 0.0);
 
-    // Articulate both through the arm's rotation and the optional sneak tilt,
-    // then scale px → world and rotate by the body yaw.
+    /// Map a point in the arm's rest model-pixel frame to world space.
+    pub fn to_world(&self, arm_px: Vec3) -> Vec3 {
+        rotate_y(apply_part_rotation(arm_px, &self.pose) * MODEL_SCALE, self.sin, self.cos) + self.feet
+    }
+}
+
+/// Build the right-arm attachment for an entity standing at `feet` with body
+/// `yaw_degrees`, posed by `anim` (which carries the held-item / blocking arm
+/// state via [`EntityAnim::held_item_right`]).
+pub fn arm_attach(feet: Vec3, yaw_degrees: f32, anim: &EntityAnim) -> ArmAttach {
+    let pose = humanoid_poses(anim)[3]; // right arm
     let yaw = yaw_degrees.to_radians();
     let (sin, cos) = (yaw.sin(), yaw.cos());
-    let to_world = |px: Vec3| rotate_y(apply_part_rotation(px, arm_pose) * MODEL_SCALE, sin, cos) + feet;
-
-    let shoulder = to_world(shoulder_px);
-    let hand = to_world(hand_px);
-
-    let arm_dir = (hand - shoulder).normalize_or_zero();
-    let forward = rotate_y(Vec3::Z, sin, cos); // body +z rotated by yaw
-    // Orthogonalize: right = arm_dir × forward, then re-derive forward
-    let right = arm_dir.cross(forward).normalize_or_zero();
-    let forward = right.cross(arm_dir).normalize_or_zero();
-
-    HeldItemFrame { hand, arm_dir, forward, right }
+    ArmAttach { pose, feet, sin, cos }
 }
 
 // ─── Chest block-entity ───────────────────────────────────────────────────────

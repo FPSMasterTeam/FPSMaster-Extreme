@@ -30,7 +30,7 @@ use recraft_protocol::v1_8_9::{
     },
 };
 use recraft_render::{
-    held_item_frame, Camera, ChestKind, EntityAnim, ModelMesh, SignKind, SignTextDraw,
+    arm_attach, Camera, ChestKind, EntityAnim, ModelMesh, SignKind, SignTextDraw,
 };
 use winit::{
     event::{ElementState, KeyEvent},
@@ -576,10 +576,6 @@ pub struct GameState {
     sprinting: bool,
     /// Vanilla `sprintToggleTimer`: the 7-tick double-tap-W window.
     sprint_toggle_timer: i32,
-    /// Set on the tick an attack cancels sprint (the "w-tap reset"); blocks
-    /// the sprint-key-held re-enable for THIS tick so the server sees the
-    /// StopSprinting before the next StartSprinting.
-    sprint_reset_by_attack: bool,
     /// `movementInput.sneak` / `moveForward` from the previous tick (vanilla's
     /// `flag1` / `flag2`, read before `updatePlayerMoveState`).
     prev_sneak: bool,
@@ -650,6 +646,33 @@ fn item_use_action(id: i16, damage: i16) -> ItemUseAction {
             ItemUseAction::Eat
         }
         _ => ItemUseAction::None,
+    }
+}
+
+/// Vanilla `EntityRenderer.hurtCameraEffect` roll, in radians, for the given
+/// hurt timer and partial-tick alpha. `hurt_time` counts down from `MAX_HURT`
+/// (10) to 0; the tilt follows `sin((f)⁴·π)·14°` and eases back to nothing.
+/// `attackedAtYaw` is always 0 here (the local EntityStatus hurt carries no
+/// direction), so it reduces to a pure screen roll.
+fn hurt_camera_roll(hurt_time: u8, alpha: f32) -> f32 {
+    const MAX_HURT: f32 = 10.0;
+    let f = hurt_time as f32 - alpha;
+    if f <= 0.0 {
+        return 0.0;
+    }
+    let f = f / MAX_HURT;
+    let f = (f * f * f * f * std::f32::consts::PI).sin();
+    -(f * 14.0).to_radians()
+}
+
+/// Vanilla `RenderPlayer.setModelVisibilities` arm state for a remote player:
+/// 0 = empty hand, 1 = holding an item, 3 = blocking (using a sword). Drives the
+/// third-person held-arm / blocking pose (`ModelBiped.heldItemRight`).
+fn held_item_right_state(item: Option<&SlotItem>, using_item: bool) -> u8 {
+    match item {
+        None => 0,
+        Some(it) if using_item && item_use_action(it.id, it.damage) == ItemUseAction::Block => 3,
+        Some(_) => 1,
     }
 }
 
@@ -800,7 +823,6 @@ impl GameState {
             pending_actions: TickActions::default(),
             sprinting: false,
             sprint_toggle_timer: 0,
-            sprint_reset_by_attack: false,
             prev_sneak: false,
             prev_move_forward: 0.0,
             capabilities: PlayerCapabilities::default(),
@@ -1319,18 +1341,20 @@ impl GameState {
         }
 
         // `if (isUsingItem()) { ... } else { ... }` — while an item is in use
-        // (sword block), attack/use presses are swallowed; otherwise they drive
-        // clickMouse / rightClickMouse. With old_animations on, 1.7 let a
-        // left-click attack still fire while right-click-blocking, so the attack
-        // press is honoured here (use/pick stay drained — the block keeps them).
+        // (sword block), vanilla 1.8 swallows ALL clicks: no attack/dig/use
+        // packet goes out (block-hitting was removed in 1.8), only the right-key
+        // release stops the block. old_animations restores the 1.7 *visual* and
+        // NOTHING else: a left-click starts the local arm swing (rendered layered
+        // onto the block pose for the "swing + block" look) but sends no packet,
+        // so the network stays vanilla-1.8 and Grim sees a plain block.
         if self.is_using_item() {
             if !a.right_held {
                 self.on_stopped_using_item(&mut out);
             }
             if a.old_animations && a.attack_pressed {
-                self.click_mouse(&mut out);
+                self.swing_arm();
             }
-            // remaining use/pick presses are drained (ignored) this tick.
+            // all click presses are drained (no packets) this tick.
         } else {
             if a.attack_pressed {
                 self.click_mouse(&mut out);
@@ -1369,6 +1393,9 @@ impl GameState {
         // Advance particle effects once per tick (before any early return), so
         // smoke/flame age and move at the vanilla 20 Hz.
         self.particles.tick();
+        // Count down the local player's hurt timer (vanilla EntityLivingBase
+        // .onUpdate), fading the hurt-camera tilt over 10 ticks.
+        self.player.hurt_time = self.player.hurt_time.saturating_sub(1);
         self.previous_player_position = self.player.position;
         let turn_speed = 110.0 * dt;
         if self.input.turn_left {
@@ -1513,10 +1540,7 @@ impl GameState {
         }
         let flag3 = self.food > 6 || self.capabilities.allow_flying;
         // Double-tap-W start (on the ground, on a fresh forward press).
-        // Suppress on the tick an attack just cancelled sprint so the server
-        // sees StopSprinting before the re-enable (the "w-tap" gap).
-        if !self.sprint_reset_by_attack
-            && self.player.on_ground
+        if self.player.on_ground
             && !flag1
             && !flag2
             && move_forward >= 0.8
@@ -1531,8 +1555,11 @@ impl GameState {
             }
         }
         // Sprint-key-held start (no onGround requirement, exactly like vanilla).
-        if !self.sprint_reset_by_attack
-            && !self.sprinting
+        // Runs the same tick an attack cancelled sprint, so a sprint-attack while
+        // W + sprint are held re-enables sprint immediately — vanilla never sends
+        // a StopSprinting in that case (final isSprinting() stays true, so
+        // onUpdateWalkingPlayer emits no C0B); only the ×0.6 momentum hit lands.
+        if !self.sprinting
             && move_forward >= 0.8
             && flag3
             && !self.is_using_item()
@@ -1546,7 +1573,6 @@ impl GameState {
         {
             self.sprinting = false;
         }
-        self.sprint_reset_by_attack = false;
         self.prev_sneak = self.input.sneak;
         self.prev_move_forward = move_forward;
         if self.world.is_block_column_loaded(bx, bz) {
@@ -1605,6 +1631,7 @@ impl GameState {
         self.camera.fovy_degrees = (BASE_FOV + SPRINT_FOV_BOOST * sprint) * fly_factor;
         self.camera.yaw = self.player.yaw;
         self.camera.pitch = self.player.pitch;
+        self.camera.roll = hurt_camera_roll(self.player.hurt_time, alpha);
     }
 
     /// Start the hand-swing animation (vanilla `swingItem`): a new swing only
@@ -1717,6 +1744,14 @@ impl GameState {
             // head past a natural turn (vanilla mobs clamp head rotation too).
             let net_head_yaw =
                 wrap_degrees(entity.render_head_yaw(tick_alpha) - body_yaw).clamp(-75.0, 75.0);
+            // Players lower the right arm to hold an item / raise it to block;
+            // mobs keep their archetype arm pose (held_item_right = 0).
+            let held_item_right = if matches!(entity.kind, EntityKind::RemotePlayer) {
+                let held = self.entity_equipment.get(&entity.id).and_then(|s| s[0].as_ref());
+                held_item_right_state(held, entity.using_item)
+            } else {
+                0
+            };
             let anim = EntityAnim {
                 limb_swing,
                 limb_swing_amount,
@@ -1724,6 +1759,7 @@ impl GameState {
                 head_pitch: entity.render_pitch(tick_alpha),
                 swing_progress: entity.render_swing(tick_alpha),
                 sneaking: entity.sneaking,
+                held_item_right,
                 old_animations,
             };
             let start = mesh.vertices.len();
@@ -2077,6 +2113,51 @@ impl GameState {
                 block: *block,
                 pos,
                 light: [sky_l as f32 / 15.0, block_l as f32 / 15.0],
+                scale: 1.0,
+                flash: 0.0,
+            });
+        }
+        cubes
+    }
+
+    /// This frame's primed-TNT cubes (SpawnObject kind 50): a TNT block that
+    /// swells and flashes white as its fuse counts down, a port of vanilla
+    /// `RenderTNTPrimed`. The fuse is client-local (1.8 never syncs it): it
+    /// starts at 80 and counts down with the entity's tracked age, so
+    /// `fuse = 80 - age`.
+    pub fn primed_tnt_cubes(&self, tick_alpha: f32) -> Vec<FallingBlock> {
+        let mut cubes = Vec::new();
+        for entity in self.world.entities() {
+            if entity.kind != EntityKind::Object(50) {
+                continue;
+            }
+            let fuse = (80i64 - entity.age as i64).max(0) as f32;
+            // Vanilla `f = fuse - partialTicks + 1`.
+            let f = fuse - tick_alpha + 1.0;
+            // Last 10 fuse ticks: swell to ×1.3 with a quartic ease-in.
+            let scale = if f < 10.0 {
+                let t = (1.0 - f / 10.0).clamp(0.0, 1.0);
+                1.0 + t * t * t * t * 0.3
+            } else {
+                1.0
+            };
+            // White flash on every other 5-tick fuse window; the overlay
+            // strength grows as the fuse shortens (vanilla `(1 - f/100) * 0.8`).
+            let flash = if (fuse as i64 / 5) % 2 == 0 {
+                (1.0 - f / 100.0) * 0.8
+            } else {
+                0.0
+            };
+            let pos = to_render_vec3(entity.render_position(tick_alpha as f64));
+            let (block_l, sky_l) =
+                self.world
+                    .light_at(pos.x.floor() as i32, pos.y.floor() as i32, pos.z.floor() as i32);
+            cubes.push(FallingBlock {
+                block: BlockState::new(46, 0),
+                pos,
+                light: [sky_l as f32 / 15.0, block_l as f32 / 15.0],
+                scale,
+                flash,
             });
         }
         cubes
@@ -2175,16 +2256,24 @@ impl GameState {
                 head_pitch: entity.render_pitch(tick_alpha),
                 swing_progress: entity.render_swing(tick_alpha),
                 sneaking: entity.sneaking,
+                held_item_right: held_item_right_state(Some(item), entity.using_item),
                 old_animations,
             };
-            let frame = held_item_frame(feet, body_yaw, &anim);
+            let attach = arm_attach(feet, body_yaw, &anim);
+            // Sample the lightmap at the rendered hand (bottom-centre of the arm).
+            let hand = attach.to_world(recraft_render::ArmAttach::HAND_PX);
             let (block_l, sky_l) = self.world.light_at(
-                frame.hand.x.floor() as i32,
-                frame.hand.y.floor() as i32,
-                frame.hand.z.floor() as i32,
+                hand.x.floor() as i32,
+                hand.y.floor() as i32,
+                hand.z.floor() as i32,
             );
             let light = [sky_l as f32 / 15.0, block_l as f32 / 15.0];
-            items.push(PlayerHeldItem { item: item.clone(), frame, light });
+            items.push(PlayerHeldItem {
+                item: item.clone(),
+                attach,
+                sneaking: entity.sneaking,
+                light,
+            });
         }
         items
     }
@@ -2271,7 +2360,7 @@ impl GameState {
             mix(qa(lsa));
             mix(qa(e.render_swing(tick_alpha)));
             mix(e.hurt_time as u64);
-            mix((e.sneaking as u64) << 2 | (e.invisible as u64) << 1 | e.custom_name_visible as u64);
+            mix((e.using_item as u64) << 3 | (e.sneaking as u64) << 2 | (e.invisible as u64) << 1 | e.custom_name_visible as u64);
             if let Some(name) = &e.custom_name {
                 for b in name.as_bytes() {
                     mix(*b as u64);
@@ -2580,20 +2669,36 @@ impl GameState {
     }
 
     /// Vanilla `PlayerControllerMP.attackEntity` + `attackTargetEntityWithCurrentItem`:
-    /// sync held item, send C02 ATTACK, and apply the sprint hit (halve
-    /// horizontal motion + cancel sprint — the w-tap reset; no knockback enchant
-    /// here so it fires exactly when sprinting).
+    /// sync held item, send C02 ATTACK (always, regardless of target), and apply
+    /// the sprint hit (halve horizontal motion + cancel sprint; no knockback
+    /// enchant here so it fires exactly when sprinting). The cancel runs before
+    /// this tick's `onLivingUpdate` sprint recompute, which re-enables sprint the
+    /// same tick if W + sprint are still held (vanilla held-key behaviour) — so
+    /// the ×0.6 momentum is the only server-visible effect and no StopSprinting
+    /// packet is sent.
+    ///
+    /// The sprint hit only lands when the target's CLIENT-side `attackEntityFrom`
+    /// returns true. On a remote world a living mob (`EntityLivingBase`) short-
+    /// circuits to `false` via `worldObj.isRemote`, so hitting a normal mob does
+    /// NOT slow the attacker — only other players (`EntityOtherPlayerMP` → true)
+    /// and non-living objects (minecart/boat/…) do. Grim gates attack-slow the
+    /// same way (`PacketPlayerAttack`: `!isLivingEntity || PLAYER`), so slowing on
+    /// a mob hit desyncs its prediction → Simulation. XP orbs (and dropped items)
+    /// aren't attackable in vanilla (`canAttackWithItem` false), so never slow.
     fn attack_entity(&mut self, id: i32, out: &mut Vec<ServerboundPacket>) {
         self.sync_current_play_item(out);
         out.push(ServerboundPacket::UseEntity {
             target: id,
             kind: UseEntityKind::Attack,
         });
-        if self.sprinting {
+        let target_slows = matches!(
+            self.world.entity(EntityId(id)).map(|e| e.kind),
+            Some(EntityKind::RemotePlayer | EntityKind::Object(_))
+        );
+        if target_slows && self.sprinting {
             self.player.velocity.x *= 0.6;
             self.player.velocity.z *= 0.6;
             self.sprinting = false;
-            self.sprint_reset_by_attack = true;
         }
     }
 
@@ -2909,10 +3014,10 @@ impl GameState {
 
     /// The block currently being mined and its 0..9 crack stage, for the HUD /
     /// breaking overlay.
-    pub fn breaking_overlay(&self) -> Option<(i32, i32, i32, u8)> {
+    pub fn breaking_overlay(&self) -> Option<(i32, i32, i32, u8, BlockState)> {
         self.breaking.as_ref().map(|b| {
             let stage = (b.progress.clamp(0.0, 0.999) * 10.0) as u8;
-            (b.x, b.y, b.z, stage)
+            (b.x, b.y, b.z, stage, self.world.block_at(b.x, b.y, b.z))
         })
     }
 
@@ -3749,6 +3854,10 @@ impl GameState {
                     // UpdateHealth covers damage that changes health, but EntityStatus
                     // fires on every hit (incl. absorbed/blocked), so play it here too.
                     if EntityId(entity_id) == self.player.id {
+                        // Drive the hurt-camera tilt off the authoritative local
+                        // player (its world copy isn't tick-interpolated, so its
+                        // hurt timer would never decrement).
+                        self.player.start_hurt();
                         let pos = self.camera.position;
                         self.queue_sound("game.player.hurt", pos, 1.0, 1.0);
                     }
@@ -3911,12 +4020,14 @@ impl GameState {
                 (0, MetadataValue::Byte(flags)) => {
                     let on_fire = flags & 0x01 != 0;
                     let sneaking = flags & 0x02 != 0;
+                    let using_item = flags & 0x10 != 0;
                     let invisible = flags & 0x20 != 0;
                     if entity_id == self.player.id.0 {
                         self.player.on_fire = on_fire;
                     }
                     if let Some(entity) = self.remote_entity_mut(entity_id) {
                         entity.sneaking = sneaking;
+                        entity.using_item = using_item;
                         entity.on_fire = on_fire;
                         entity.invisible = invisible;
                     }
@@ -4448,10 +4559,12 @@ struct EntityHit {
     origin: DVec3,
 }
 
-/// Targetable = a non-air block that has a selection/collision box (excludes
-/// air and fluids; includes leaves and glass).
+/// Targetable = any non-air, non-fluid block. Vanilla ray-picks every block with
+/// a selection box, which is all of them except air; torches, plants, rails and
+/// the other no-collision blocks have selection boxes too, so they break like the
+/// rest. Fluids stay non-pickable (a normal trace doesn't stop on liquid).
 fn is_pickable(block: BlockState) -> bool {
-    !block.is_air() && (block.is_solid_collision() || block.is_opaque_cube())
+    !block.is_air() && !block.is_liquid()
 }
 
 /// The neighbour cell a placement lands in, for a clicked face (vanilla
@@ -5045,6 +5158,22 @@ mod interaction_tests {
     use recraft_core::{BlockState, EntityId, EntityKind};
 
     #[test]
+    fn hurt_camera_roll_matches_the_vanilla_curve() {
+        // No hurt → no roll; an expired/zero timer → no roll.
+        assert_eq!(hurt_camera_roll(0, 0.0), 0.0);
+        assert_eq!(hurt_camera_roll(0, 0.5), 0.0);
+        // At the instant of the hit (timer just set to 10, no partial) f/maxHurt
+        // is 1.0 → sin(π) = 0, so the tilt starts at ~0 then grows.
+        assert!(hurt_camera_roll(10, 0.0).abs() < 1.0e-4);
+        // Mid-fade the view is tilted; the magnitude never exceeds 14°.
+        let mid = hurt_camera_roll(8, 0.0);
+        assert!(mid < 0.0, "tilt rolls one way (negative, like vanilla)");
+        for t in 0..=10u8 {
+            assert!(hurt_camera_roll(t, 0.0).abs() <= 14.0_f32.to_radians() + 1.0e-6);
+        }
+    }
+
+    #[test]
     fn block_hardness_matches_vanilla_across_the_tiers() {
         // Spot-check the full 1.8.9 hardness table (copied from minecraft-data)
         // against known vanilla values, one per tier, to guard the big match.
@@ -5453,8 +5582,10 @@ mod interaction_tests {
         assert!(!gs.is_swinging);
         assert_eq!(gs.use_action, ItemUseAction::Block, "still blocking");
 
-        // 1.7 (old_animations): the same left-click fires the attack swing while
-        // the block is held — SwingArm goes out and the local swing starts.
+        // 1.7 (old_animations) is ANIMATION-ONLY: the same left-click starts the
+        // local arm swing (for the "swing + block" visual) but sends NO packet —
+        // the network stays vanilla 1.8 (block-hitting removed), so Grim still
+        // sees a plain block. No SwingArm/UseEntity/PlayerDigging goes out.
         let p = act(
             &mut gs,
             TickActions {
@@ -5466,10 +5597,10 @@ mod interaction_tests {
             },
         );
         assert!(
-            p.iter().any(|x| matches!(x, ServerboundPacket::SwingArm)),
-            "1.7 must swing while blocking, got {p:?}"
+            p.is_empty(),
+            "old_animations must not send any packet while blocking, got {p:?}"
         );
-        assert!(gs.is_swinging);
+        assert!(gs.is_swinging, "but the local swing animation starts");
         assert_eq!(gs.use_action, ItemUseAction::Block, "block is not released");
     }
 
@@ -5555,7 +5686,31 @@ mod interaction_tests {
     }
 
     #[test]
-    fn sprint_attack_resets_sprint_and_halves_horizontal_motion() {
+    fn sprint_attack_on_a_player_resets_sprint_and_halves_horizontal_motion() {
+        // Hitting another PLAYER slows: EntityOtherPlayerMP.attackEntityFrom
+        // returns true on the client, so the sprint hit lands.
+        let mut gs = looking_along_x();
+        gs.world.upsert_entity(EntityState::new_remote(
+            EntityId(1),
+            EntityKind::RemotePlayer,
+            DVec3::new(2.0, 0.0, 0.5),
+            0.0,
+            0.0,
+        ));
+        gs.sprinting = true;
+        gs.player.velocity = DVec3::new(1.0, 0.0, 2.0);
+        let _ = attack(&mut gs);
+        assert!(!gs.sprinting, "a sprint hit on a player cancels the sprint");
+        assert!((gs.player.velocity.x - 0.6).abs() < 1e-9);
+        assert!((gs.player.velocity.z - 1.2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn sprint_attack_on_a_mob_does_not_slow_or_cancel_sprint() {
+        // Hitting a living mob does NOT slow on the client: EntityLivingBase's
+        // attackEntityFrom short-circuits to false under `worldObj.isRemote`, so
+        // motion and the sprint flag are untouched (Grim expects no attack-slow
+        // here — applying one trips Simulation).
         let mut gs = looking_along_x();
         gs.world.upsert_entity(EntityState::new_remote(
             EntityId(1),
@@ -5567,9 +5722,58 @@ mod interaction_tests {
         gs.sprinting = true;
         gs.player.velocity = DVec3::new(1.0, 0.0, 2.0);
         let _ = attack(&mut gs);
-        assert!(!gs.sprinting, "a sprint hit cancels the sprint");
-        assert!((gs.player.velocity.x - 0.6).abs() < 1e-9);
-        assert!((gs.player.velocity.z - 1.2).abs() < 1e-9);
+        assert!(gs.sprinting, "a mob hit must NOT cancel the sprint");
+        assert_eq!(
+            gs.player.velocity,
+            DVec3::new(1.0, 0.0, 2.0),
+            "a mob hit must NOT halve horizontal motion"
+        );
+    }
+
+    #[test]
+    fn sprint_attack_reenables_sprint_same_tick_when_holding_forward() {
+        // Vanilla: a sprint-hit cancels sprint inside clickMouse, but the SAME
+        // tick's onLivingUpdate re-enables it while W + the sprint key are held,
+        // so isSprinting() is still true at onUpdateWalkingPlayer — no
+        // StopSprinting is sent (the ×0.6 momentum is the only server-visible
+        // effect). Suppressing the re-enable for a tick (the old
+        // `sprint_reset_by_attack` path) emitted a StopSprinting → StartSprinting
+        // pair vanilla never sends, which Grim flags as Simulation.
+        let mut gs = looking_along_x();
+        gs.player.yaw = -90.0; // the full tick recomputes the camera from this
+        gs.player.on_ground = true;
+        gs.sprinting = true;
+        gs.input.sprint = true; // toggle stands in for keyBindSprint.isKeyDown()
+        gs.input.forward = true;
+        // A PLAYER target at eye level (camera ends up at ~y=81.6 after update);
+        // attacking a player actually cancels sprint, so the re-enable is tested.
+        gs.world.upsert_entity(EntityState::new_remote(
+            EntityId(1),
+            EntityKind::RemotePlayer,
+            DVec3::new(2.0, 81.0, 0.5),
+            0.0,
+            0.0,
+        ));
+        gs.set_pending_actions(TickActions {
+            attack_pressed: true,
+            left_held: true,
+            ..Default::default()
+        });
+        let (packets, movement) = gs.tick(0.05).expect("not a freeze tick");
+        assert!(
+            packets.iter().any(|p| matches!(
+                p,
+                ServerboundPacket::UseEntity {
+                    target: 1,
+                    kind: UseEntityKind::Attack
+                }
+            )),
+            "the attack must land for this test to be meaningful: {packets:?}"
+        );
+        assert!(
+            movement.sprinting,
+            "sprint must re-enable the same tick so no StopSprinting is sent"
+        );
     }
 
     #[test]
@@ -6387,6 +6591,48 @@ mod interaction_tests {
         let cubes = g.falling_block_cubes(1.0);
         assert_eq!(cubes.len(), 1);
         assert_eq!(cubes[0].block, BlockState::new(98, 3));
+    }
+
+    #[test]
+    fn primed_tnt_swells_and_flashes_with_its_fuse() {
+        let mut g = GameState::empty_for_server(1.0);
+        g.apply_play_packet(ClientboundPlayPacket::SpawnObject {
+            entity_id: 7,
+            kind: 50, // primed TNT
+            x: 0.5,
+            y: 80.0,
+            z: 0.5,
+            yaw: 0.0,
+            pitch: 0.0,
+            data: 0,
+            velocity: None,
+        });
+        // Fresh fuse (age 0 → fuse 80): a TNT block, no swell, flash window on
+        // (80 / 5 = 16, even).
+        let cubes = g.primed_tnt_cubes(0.0);
+        assert_eq!(cubes.len(), 1);
+        assert_eq!(cubes[0].block, BlockState::new(46, 0));
+        assert!((cubes[0].scale - 1.0).abs() < 1e-6, "no swell early in the fuse");
+        assert!(cubes[0].flash > 0.0, "fuse 80 is in a flash window");
+
+        // age 5 → fuse 75 (75 / 5 = 15, odd): between flash windows, still no swell.
+        let mut e = g.world.entity(EntityId(7)).unwrap().clone();
+        e.age = 5;
+        g.world.upsert_entity(e);
+        let cubes = g.primed_tnt_cubes(0.0);
+        assert_eq!(cubes[0].flash, 0.0, "fuse 75 is between flash windows");
+        assert!((cubes[0].scale - 1.0).abs() < 1e-6);
+
+        // age 78 → fuse 2 (< 10): swelling toward ×1.3.
+        let mut e = g.world.entity(EntityId(7)).unwrap().clone();
+        e.age = 78;
+        g.world.upsert_entity(e);
+        let cubes = g.primed_tnt_cubes(0.0);
+        assert!(
+            cubes[0].scale > 1.0 && cubes[0].scale <= 1.3,
+            "swells in the last 10 fuse ticks: {}",
+            cubes[0].scale
+        );
     }
 
     #[test]

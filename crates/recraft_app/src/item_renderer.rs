@@ -19,7 +19,7 @@ use glam::{Mat4, Vec3};
 use recraft_core::{BlockFace, BlockState, RenderShape, Tint};
 use recraft_protocol::v1_8_9::packets::SlotItem;
 use recraft_render::texture::item_texture_name;
-use recraft_render::{AtlasUv, BiomeColors, Camera, HeldItemFrame, ModelMesh, Vertex};
+use recraft_render::{ArmAttach, AtlasUv, BiomeColors, Camera, ModelMesh, Vertex};
 
 use crate::game::{FirstPersonView, ItemUseAction};
 
@@ -33,21 +33,32 @@ pub struct DroppedItem {
     pub light: [f32; 2],
 }
 
-/// A falling-block entity (SpawnObject kind 70) to render as a full terrain-
-/// textured cube at its interpolated world position.
+/// A world block-cube entity to render as a full terrain-textured cube at its
+/// interpolated position: a falling block (SpawnObject kind 70) or a primed TNT
+/// (kind 50). Primed TNT additionally swells and flashes white via `scale` /
+/// `flash`; a falling block leaves those at `1.0` / `0.0`.
 pub struct FallingBlock {
     pub block: BlockState,
     /// Entity feet position in world coordinates.
     pub pos: Vec3,
     /// `[sky_light, block_light]` in 0..1, sampled at the entity position.
     pub light: [f32; 2],
+    /// Uniform scale about the block centre (1.0 = unscaled). Primed TNT swells
+    /// up to 1.3 over its last 10 fuse ticks (vanilla `RenderTNTPrimed`).
+    pub scale: f32,
+    /// White-overlay strength 0..1 for the primed-TNT flash (0 = none). When
+    /// positive the cube's colour and light are lerped toward full-bright white,
+    /// approximating vanilla's additive white pass on `fuse / 5 % 2 == 0`.
+    pub flash: f32,
 }
 
-/// A held item on another player, with the arm's world-space reference frame
-/// so the item model can be oriented correctly.
+/// A held item on another player: the stack, the right-arm attachment (which
+/// already carries the articulated/holding/blocking arm pose), whether the
+/// player is sneaking (an extra `LayerHeldItem` offset), and the hand lightmap.
 pub struct PlayerHeldItem {
     pub item: SlotItem,
-    pub frame: HeldItemFrame,
+    pub attach: ArmAttach,
+    pub sneaking: bool,
     pub light: [f32; 2],
 }
 
@@ -196,7 +207,7 @@ impl ItemRenderer {
                     gl_scale(&mut m, 2.0, 2.0, 2.0);
                     finish_item_model(&mut m);
                     let to_world = |c: Vec3| view_to_world(camera, m.transform_point3(c));
-                    push_block_cube(&mut vertices, &mut indices, &to_world, block, atlas, recraft_render::FULLBRIGHT);
+                    push_block_cube(&mut vertices, &mut indices, &to_world, block, atlas, recraft_render::FULLBRIGHT, 0.0);
                 }
             }
         } else if let Some(name) = item_texture_name(item.id) {
@@ -280,7 +291,7 @@ impl ItemRenderer {
                             let p = (corner - Vec3::splat(0.5)) * size;
                             base + Vec3::new(p.x * c - p.z * s, p.y, p.x * s + p.z * c)
                         };
-                        push_block_cube(&mut v, &mut i, &spin_to_world, block, atlas, d.light);
+                        push_block_cube(&mut v, &mut i, &spin_to_world, block, atlas, d.light, 0.0);
                     }
                 }
             } else if let Some(name) = item_texture_name(item.id) {
@@ -315,10 +326,12 @@ impl ItemRenderer {
                 continue;
             }
             // Unit-cube model space (0..1) → world: centred horizontally on the
-            // entity, base at its feet.
+            // entity, base at its feet. Primed TNT scales about the block centre
+            // (0.5, 0.5, 0.5) so the swell grows symmetrically.
             let base = f.pos - Vec3::new(0.5, 0.0, 0.5);
-            let to_world = |c: Vec3| base + c;
-            push_block_cube(&mut vertices, &mut indices, &to_world, f.block, atlas, f.light);
+            let center = Vec3::splat(0.5);
+            let to_world = |c: Vec3| base + center + (c - center) * f.scale;
+            push_block_cube(&mut vertices, &mut indices, &to_world, f.block, atlas, f.light, f.flash);
         }
         (vertices, indices)
     }
@@ -383,9 +396,14 @@ impl ItemRenderer {
         (vertices, indices)
     }
 
-    /// Build geometry for items held by other players. Each item is positioned
-    /// at the player's right hand and oriented along the arm, replicating
-    /// vanilla's `LayerHeldItem` third-person appearance.
+    /// Build geometry for items held by other players, porting vanilla's
+    /// `LayerHeldItem` + `RenderItem` THIRD_PERSON path: `postRenderArm`'s anchor
+    /// (provided by [`ArmAttach`]), the post-arm offset, the per-item-type
+    /// third-person display transform (block / generated sprite / handheld tool),
+    /// and `RenderItem.renderItem`'s base centring. The whole chain is built in
+    /// vanilla's authored (y-down, front -z) model space, then mapped to
+    /// recraft's feet-up, front +z arm frame by a 180-degree rotation about X
+    /// (negate Y and Z), which preserves winding.
     pub fn build_player_held_items(
         held: &[PlayerHeldItem],
         atlas: &AtlasUv,
@@ -393,75 +411,124 @@ impl ItemRenderer {
         let mut out = ItemGeometry::default();
 
         for h in held {
-            let f = &h.frame;
             let item = &h.item;
             let mut vertices = Vec::new();
             let mut indices = Vec::new();
-            // The item extends along the arm direction, centered at the hand.
-            // `arm_dir` points shoulder→hand (roughly downward at rest),
-            // `forward` is the body's front, `right` is the lateral axis.
-            let size = 0.35;
-            let half = size * 0.5;
 
-            // Build a local→world transform using the arm frame:
-            //  - item X → frame.right
-            //  - item Y → -frame.arm_dir  (up = opposite to arm direction)
-            //  - item Z → frame.forward
-            // Origin: hand, shifted slightly along arm_dir so the item hangs
-            // below the hand rather than centering on it.
-            let origin = f.hand + f.arm_dir * half;
-
-            let to_world = |c: Vec3| {
-                let local = (c - Vec3::splat(0.5)) * size;
-                origin + f.right * local.x - f.arm_dir * local.y + f.forward * local.z
-            };
-
-            if (0..256).contains(&item.id) {
-                let block =
-                    BlockState::new(item.id as u16, (item.damage.max(0) & 15) as u8);
+            // Pick the item-model kind (its third-person display transform) and
+            // draw the geometry. Block cubes render as a textured cube; flat
+            // blocks and every flat item render as an extruded sprite.
+            let drew = if (0..256).contains(&item.id) {
+                let block = BlockState::new(item.id as u16, (item.damage.max(0) & 15) as u8);
                 if block.is_air() || block.render_shape() == RenderShape::None {
-                    continue;
-                }
-                match block.render_shape() {
-                    RenderShape::Cross | RenderShape::Rail | RenderShape::Ladder => {
-                        let name = block.texture_name(BlockFace::Side).map(str::to_owned);
-                        let tint = tint3(block.tint(BlockFace::Side));
-                        push_held_sprite(
-                            &mut vertices,
-                            &mut indices,
-                            &to_world,
-                            name.as_deref(),
-                            atlas,
-                            tint,
-                            h.light,
-                        );
-                    }
-                    _ => {
-                        push_block_cube(
-                            &mut vertices,
-                            &mut indices,
-                            &to_world,
-                            block,
-                            atlas,
-                            h.light,
-                        );
-                    }
+                    false
+                } else if matches!(
+                    block.render_shape(),
+                    RenderShape::Cross | RenderShape::Rail | RenderShape::Ladder
+                ) {
+                    let to_world = held_item_to_world(h, HeldItemKind::Generated);
+                    let name = block.texture_name(BlockFace::Side).map(str::to_owned);
+                    let tint = tint3(block.tint(BlockFace::Side));
+                    push_sprite(&mut vertices, &mut indices, &to_world, name.as_deref(), atlas, tint, h.light);
+                    true
+                } else {
+                    let to_world = held_item_to_world(h, HeldItemKind::Block);
+                    push_block_cube(&mut vertices, &mut indices, &to_world, block, atlas, h.light, 0.0);
+                    true
                 }
             } else if let Some(name) = item_texture_name(item.id) {
+                let kind = if is_handheld_item(name) {
+                    HeldItemKind::Handheld
+                } else {
+                    HeldItemKind::Generated
+                };
+                let to_world = held_item_to_world(h, kind);
                 let name = format!("items/{name}");
-                push_held_sprite(
-                    &mut vertices,
-                    &mut indices,
-                    &to_world,
-                    Some(&name),
-                    atlas,
-                    [1.0, 1.0, 1.0],
-                    h.light,
-                );
+                push_sprite(&mut vertices, &mut indices, &to_world, Some(&name), atlas, [1.0, 1.0, 1.0], h.light);
+                true
+            } else {
+                false
+            };
+
+            if drew {
+                // `held_item_to_world` maps with a 180° rotation about X (negate
+                // Y and Z), which preserves triangle winding — no re-wind needed
+                // (the old Y-only reflection mirrored the geometry and flipped
+                // every triangle, which is why it had to swap them back).
+                out.push(vertices, indices, is_enchanted(item));
             }
-            out.push(vertices, indices, is_enchanted(item));
         }
         out
+    }
+}
+
+/// The three 1.8.9 item-model display families, by their THIRD_PERSON transform.
+#[derive(Clone, Copy)]
+enum HeldItemKind {
+    /// `item/stone`-style block items: cube, rotation [10,-45,170], scale 0.375.
+    Block,
+    /// `builtin/generated` flat items (food, ingredients, flat blocks): rotation
+    /// [-90,0,0], scale 0.55.
+    Generated,
+    /// Tools/stick/bone/blaze rod: rotation [0,90,-35], scale 0.85.
+    Handheld,
+}
+
+/// Vanilla 1.8.9 item ids that override the third-person display with the
+/// "handheld" pose: every tool (sword/shovel/pickaxe/axe/hoe) plus stick, bone
+/// and blaze rod. Matched by texture base-name so it tracks the item registry.
+fn is_handheld_item(name: &str) -> bool {
+    matches!(name, "stick" | "bone" | "blaze_rod")
+        || name.ends_with("_sword")
+        || name.ends_with("_pickaxe")
+        || name.ends_with("_axe")
+        || name.ends_with("_shovel")
+        || name.ends_with("_hoe")
+}
+
+/// Build the item-model (0..1) → world closure for a player-held item: the
+/// vanilla `LayerHeldItem`/`RenderItem` THIRD_PERSON transform chain in authored
+/// (y-down) space, then a Y reflection into recraft's feet-up arm-pixel frame and
+/// the rigid arm attachment. See [`ItemRenderer::build_player_held_items`].
+fn held_item_to_world(h: &PlayerHeldItem, kind: HeldItemKind) -> impl Fn(Vec3) -> Vec3 + '_ {
+    // THIRD_PERSON display: translation (already block units), rotation degrees
+    // (x, y, z), uniform scale — straight from the 1.8.9 item model JSON.
+    let (trans, rot, scale) = match kind {
+        HeldItemKind::Block => ([0.0, 1.5 / 16.0, -2.75 / 16.0], [10.0, -45.0, 170.0], 0.375),
+        HeldItemKind::Generated => ([0.0, 1.0 / 16.0, -3.0 / 16.0], [-90.0, 0.0, 0.0], 0.55),
+        HeldItemKind::Handheld => ([0.0, 1.25 / 16.0, -3.5 / 16.0], [0.0, 90.0, -35.0], 0.85),
+    };
+
+    let mut m = Mat4::IDENTITY;
+    // LayerHeldItem: postRenderArm anchor is supplied by ArmAttach; this is the
+    // fixed post-arm offset, then the sneak nudge.
+    gl_translate(&mut m, -0.0625, 0.4375, 0.0625);
+    if h.sneaking {
+        gl_translate(&mut m, 0.0, 0.203125, 0.0);
+    }
+    // ItemRenderer.renderItem: the single 2× (gui3d via renderItem, sprites via
+    // preTransform) — RenderItem.renderItem's 0.5 in finish_item_model cancels it.
+    gl_scale(&mut m, 2.0, 2.0, 2.0);
+    // ItemCameraTransforms.applyTransform(THIRD_PERSON): translate, rotY, rotX,
+    // rotZ, scale.
+    gl_translate(&mut m, trans[0], trans[1], trans[2]);
+    gl_rotate(&mut m, rot[1], 0.0, 1.0, 0.0);
+    gl_rotate(&mut m, rot[0], 1.0, 0.0, 0.0);
+    gl_rotate(&mut m, rot[2], 0.0, 0.0, 1.0);
+    gl_scale(&mut m, scale, scale, scale);
+    // RenderItem.renderItem: scale(0.5), translate(-0.5) to centre the 0..1 model.
+    finish_item_model(&mut m);
+
+    move |c: Vec3| {
+        // Vanilla authored item space (blocks, y-down, front −z) → recraft
+        // arm-pixel frame (16 px/block, y-up, front +z), anchored at the
+        // shoulder. This is a 180° rotation about X — negate Y AND Z — matching
+        // `push_arm_box`'s `y → 1.5−y, z → −z` convention. Negating Y alone left
+        // the item facing backwards (it looked "worn on the back").
+        let v = m.transform_point3(c);
+        let arm_px =
+            ArmAttach::SHOULDER_PX + Vec3::new(v.x * 16.0, -v.y * 16.0, -v.z * 16.0);
+        h.attach.to_world(arm_px)
     }
 }
 
@@ -658,6 +725,7 @@ fn push_block_cube(
     block: BlockState,
     atlas: &AtlasUv,
     light: [f32; 2],
+    flash: f32,
 ) {
     // Per face: vanilla FaceBakery vertex order (outward CCW), the texture
     // face, and the diffuse shade. Outward winding matters because first-person
@@ -704,48 +772,20 @@ fn push_block_cube(
             [rect[0] + rect[2], rect[1]],
         ];
         let tint = tint3(block.tint(face));
-        let color = [tint[0] * shade, tint[1] * shade, tint[2] * shade, 1.0];
+        let mut color = [tint[0] * shade, tint[1] * shade, tint[2] * shade, 1.0];
+        let mut light = light;
+        // Primed-TNT white flash: lerp colour + lightmap toward full-bright white
+        // (vanilla overlays an additive all-white, full-bright TNT here).
+        if flash > 0.0 {
+            for c in color.iter_mut().take(3) {
+                *c += (1.0 - *c) * flash;
+            }
+            light[0] += (1.0 - light[0]) * flash;
+            light[1] += (1.0 - light[1]) * flash;
+        }
         let world = corners.map(to_world);
         push_quad(vertices, indices, world, uvs, color, light);
     }
-}
-
-/// Simplified held sprite: front and back quads through the caller's transform
-/// (oriented by the arm frame, not billboarded). No per-pixel extrusion —
-/// just the two flat faces, which is enough at third-person distance.
-fn push_held_sprite(
-    vertices: &mut Vec<Vertex>,
-    indices: &mut Vec<u32>,
-    to_world: &dyn Fn(Vec3) -> Vec3,
-    name: Option<&str>,
-    atlas: &AtlasUv,
-    tint: [f32; 3],
-    light: [f32; 2],
-) {
-    let rect = atlas.tile_rect(name);
-    let uv = |u: f32, v: f32| [rect[0] + u * rect[2], rect[1] + v * rect[3]];
-    let color = [tint[0], tint[1], tint[2], 1.0];
-    let w = |x: f32, y: f32, z: f32| to_world(Vec3::new(x, y, z));
-
-    const ZF: f32 = 0.53;
-    const ZB: f32 = 0.47;
-
-    push_quad(
-        vertices,
-        indices,
-        [w(0.0, 1.0, ZF), w(0.0, 0.0, ZF), w(1.0, 0.0, ZF), w(1.0, 1.0, ZF)],
-        [uv(0.0, 0.0), uv(0.0, 1.0), uv(1.0, 1.0), uv(1.0, 0.0)],
-        color,
-        light,
-    );
-    push_quad(
-        vertices,
-        indices,
-        [w(1.0, 1.0, ZB), w(1.0, 0.0, ZB), w(0.0, 0.0, ZB), w(0.0, 1.0, ZB)],
-        [uv(1.0, 0.0), uv(1.0, 1.0), uv(0.0, 1.0), uv(0.0, 0.0)],
-        color,
-        light,
-    );
 }
 
 /// A held sprite item: vanilla `ItemModelGenerator` geometry — the 16×16
@@ -921,6 +961,64 @@ mod tests {
         // transforms collapse to identity at swing=0).
         let on_rest = ItemRenderer::build_held_item(&cam, &blocking_view(0.0), &uv, true);
         assert!((centroid(&rest) - centroid(&on_rest)).length() < 1.0e-6);
+    }
+
+    #[test]
+    fn player_held_block_anchors_near_the_hand() {
+        use recraft_render::{arm_attach, ArmAttach, EntityAnim};
+        // A player at an offset position/holding pose: the item must sit at the
+        // rendered hand, not at the origin or metres away (gross-anchor guard).
+        let anim = EntityAnim { held_item_right: 1, ..Default::default() };
+        let attach = arm_attach(Vec3::new(10.0, 64.0, -3.0), 0.0, &anim);
+        let hand = attach.to_world(ArmAttach::HAND_PX);
+        let held = vec![PlayerHeldItem {
+            item: SlotItem::new(1, 1, 0), // stone block
+            attach,
+            sneaking: false,
+            light: [1.0, 1.0],
+        }];
+        let g = ItemRenderer::build_player_held_items(&held, &atlas());
+        assert_eq!(g.vertices.len(), 24, "a held block is one cube");
+        assert!(
+            (centroid(&g) - hand).length() < 0.6,
+            "held block centroid {:?} should sit at the hand {hand:?}",
+            centroid(&g)
+        );
+    }
+
+    #[test]
+    fn player_held_item_extends_in_front_not_behind_the_hand() {
+        use recraft_render::{arm_attach, ArmAttach, EntityAnim};
+        // Rest arm pose, body facing +z (yaw 0): the item must extend toward the
+        // front (+z), not the back. Mapping with a Y-only flip (missing the Z
+        // negation) put it behind the player — it looked "worn on the back".
+        let attach = arm_attach(Vec3::ZERO, 0.0, &EntityAnim::default());
+        let hand = attach.to_world(ArmAttach::HAND_PX);
+        let held = vec![PlayerHeldItem {
+            item: SlotItem::new(276, 1, 0), // diamond sword (handheld pose)
+            attach,
+            sneaking: false,
+            light: [1.0, 1.0],
+        }];
+        let g = ItemRenderer::build_player_held_items(&held, &atlas());
+        assert!(
+            centroid(&g).z > hand.z,
+            "held item must extend in front of the hand (+z): centroid {:?} vs hand {hand:?}",
+            centroid(&g)
+        );
+    }
+
+    #[test]
+    fn handheld_items_are_classified_by_name() {
+        assert!(is_handheld_item("diamond_sword"));
+        assert!(is_handheld_item("iron_pickaxe"));
+        assert!(is_handheld_item("golden_hoe"));
+        assert!(is_handheld_item("stick"));
+        assert!(is_handheld_item("blaze_rod"));
+        // Bow / fishing rod / shears use the generated third-person pose in 1.8.9.
+        assert!(!is_handheld_item("bow"));
+        assert!(!is_handheld_item("fishing_rod"));
+        assert!(!is_handheld_item("apple"));
     }
 
     #[test]
