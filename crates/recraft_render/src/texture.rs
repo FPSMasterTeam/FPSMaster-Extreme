@@ -43,6 +43,69 @@ pub struct PbrAtlases {
     pub specular: Option<(Vec<u8>, u32, u32)>,
 }
 
+/// One animated atlas tile: a texture loaded from an N-frame vertical strip.
+/// The renderer cycles the 16×16 `frames` through the tile's atlas cell each
+/// frame so water/lava/fire animate without any mesh/UV/shader change.
+#[derive(Debug, Clone)]
+pub struct AnimatedTile {
+    /// Top-left pixel of the tile's cell in the block atlas (mip 0).
+    pub atlas_x: u32,
+    pub atlas_y: u32,
+    /// All animation frames as 16×16 RGBA images (downscaled from the strip's
+    /// native frame size, like the static `copy_tile` path).
+    pub frames: Vec<RgbaImage>,
+    /// Ticks each displayed frame stays on screen (`animation.frametime`, ≥1).
+    pub frametime: u32,
+    /// Display order as indices into `frames` (`animation.frames`, or 0..N).
+    pub order: Vec<usize>,
+}
+
+/// Parse an `<name>.png.mcmeta` animation block into `(frametime, order)`.
+/// `frametime` defaults to 1; `order` is `None` when no explicit `frames`
+/// array is present (caller then cycles 0..N in order). Invalid JSON yields the
+/// defaults so a malformed mcmeta never breaks atlas loading.
+fn parse_animation_meta(json: &str) -> (u32, Option<Vec<usize>>) {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
+        return (1, None);
+    };
+    let animation = value.get("animation");
+    let frametime = animation
+        .and_then(|a| a.get("frametime"))
+        .and_then(|f| f.as_u64())
+        .map(|f| f.max(1) as u32)
+        .unwrap_or(1);
+    let order = animation
+        .and_then(|a| a.get("frames"))
+        .and_then(|f| f.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_u64().map(|n| n as usize))
+                .collect::<Vec<_>>()
+        })
+        .filter(|order: &Vec<usize>| !order.is_empty());
+    (frametime, order)
+}
+
+/// Split a vertical animation strip into its frames, each downscaled to
+/// `TILE_SIZE`×`TILE_SIZE` (matching the static atlas tile size). Returns
+/// `None` when the image is not a strip (height ≤ width, or not a whole
+/// multiple of the frame width).
+fn split_animation_frames_16(image: &DynamicImage) -> Option<Vec<RgbaImage>> {
+    let (w, h) = (image.width(), image.height());
+    if w == 0 || h <= w || h % w != 0 {
+        return None;
+    }
+    let frames = (0..h / w)
+        .map(|i| {
+            image
+                .crop_imm(0, i * w, w, w)
+                .resize_exact(TILE_SIZE, TILE_SIZE, FilterType::Nearest)
+                .to_rgba8()
+        })
+        .collect();
+    Some(frames)
+}
+
 /// Map a 1.8.9 block texture name to its 1.13+ (flattened) equivalent.
 /// Returns `None` when the name is unchanged across versions.
 fn name_1_8_to_1_13(name: &str) -> Option<&'static str> {
@@ -275,6 +338,33 @@ fn read_block_texture(
     }
 }
 
+/// Read a block texture's `.png.mcmeta` sidecar, following the same 1.8 →
+/// 1.13+ path fallback as [`read_block_texture`] so the animation metadata is
+/// found next to whichever PNG actually loaded.
+fn read_block_texture_meta(
+    name: &str,
+    read: &mut dyn FnMut(&str) -> Option<Vec<u8>>,
+) -> Option<Vec<u8>> {
+    if name.contains('/') {
+        return read(&format!("assets/minecraft/textures/{name}.png.mcmeta"));
+    }
+    let candidates = [
+        format!("assets/minecraft/textures/blocks/{name}.png.mcmeta"),
+        format!("assets/minecraft/textures/block/{name}.png.mcmeta"),
+    ];
+    for asset in &candidates {
+        if let Some(bytes) = read(asset) {
+            return Some(bytes);
+        }
+    }
+    if let Some(mapped) = name_1_8_to_1_13(name) {
+        return read(&format!(
+            "assets/minecraft/textures/block/{mapped}.png.mcmeta"
+        ));
+    }
+    None
+}
+
 /// Maps texture base-names to atlas tile indices and yields UVs. Index 0 is the
 /// magenta "missing" tile, so unknown/missing textures are visually obvious.
 #[derive(Debug, Clone, Default)]
@@ -388,6 +478,8 @@ pub struct TextureAtlasImage {
     missing_indices: Vec<u32>,
     /// PBR normal + specular atlases (only present when a resource pack provides them).
     pub pbr: PbrAtlases,
+    /// Tiles loaded from multi-frame strips, for per-frame CPU atlas animation.
+    pub animated: Vec<AnimatedTile>,
 }
 
 #[derive(Debug, Clone)]
@@ -469,7 +561,8 @@ impl TextureAtlasImage {
 
     fn from_asset_directory(path: PathBuf, names: &[String]) -> Result<Self, String> {
         let mut read = |asset: &str| read_directory_image(&path, asset);
-        let (built, loaded) = build_atlas(names, &mut read);
+        let mut read_meta = |asset: &str| read_directory_bytes(&path, asset);
+        let (built, loaded) = build_atlas(names, &mut read, &mut read_meta);
         if loaded == 0 && !names.is_empty() {
             return Err("directory has no block textures".to_owned());
         }
@@ -478,9 +571,16 @@ impl TextureAtlasImage {
 
     fn from_asset_zip(path: PathBuf, names: &[String]) -> Result<Self, String> {
         let file = File::open(&path).map_err(|err| err.to_string())?;
-        let mut zip = ZipArchive::new(file).map_err(|err| err.to_string())?;
-        let mut read = |asset: &str| read_zip_image(&mut zip, asset);
-        let (built, loaded) = build_atlas(names, &mut read);
+        let zip = Arc::new(Mutex::new(
+            ZipArchive::new(file).map_err(|err| err.to_string())?,
+        ));
+        let mut read = |asset: &str| {
+            zip.lock().ok().and_then(|mut z| read_zip_image(&mut z, asset))
+        };
+        let mut read_meta = |asset: &str| {
+            zip.lock().ok().and_then(|mut z| read_zip_bytes(&mut z, asset))
+        };
+        let (built, loaded) = build_atlas(names, &mut read, &mut read_meta);
         if loaded == 0 && !names.is_empty() {
             return Err("archive has no block textures".to_owned());
         }
@@ -489,7 +589,8 @@ impl TextureAtlasImage {
 
     fn fallback(names: &[String]) -> Self {
         let mut read = |_: &str| None;
-        let (built, _) = build_atlas(names, &mut read);
+        let mut read_meta = |_: &str| None;
+        let (built, _) = build_atlas(names, &mut read, &mut read_meta);
         Self::from_built(built, TextureAtlasSource::Fallback, PbrAtlases::default())
     }
 
@@ -559,7 +660,26 @@ impl TextureAtlasImage {
             }
             None
         };
-        let (built, loaded) = build_atlas(names, &mut read);
+        let mut read_meta = |asset: &str| {
+            if let Some(bytes) = read_directory_bytes(&pack_path, asset) {
+                return Some(bytes);
+            }
+            for base in &base_paths {
+                let bytes = if base.is_dir() {
+                    read_directory_bytes(base, asset)
+                } else {
+                    File::open(base)
+                        .ok()
+                        .and_then(|file| ZipArchive::new(file).ok())
+                        .and_then(|mut zip| read_zip_bytes(&mut zip, asset))
+                };
+                if let Some(bytes) = bytes {
+                    return Some(bytes);
+                }
+            }
+            None
+        };
+        let (built, loaded) = build_atlas(names, &mut read, &mut read_meta);
         if loaded == 0 && !names.is_empty() {
             return Err("resource pack has no block textures".to_owned());
         }
@@ -596,7 +716,30 @@ impl TextureAtlasImage {
             }
             None
         };
-        let (built, loaded) = build_atlas(names, &mut read);
+        let mut read_meta = |asset: &str| {
+            if let Some(bytes) = pack_zip
+                .lock()
+                .ok()
+                .and_then(|mut z| read_zip_bytes(&mut z, asset))
+            {
+                return Some(bytes);
+            }
+            for base in &base_paths {
+                let bytes = if base.is_dir() {
+                    read_directory_bytes(base, asset)
+                } else {
+                    File::open(base)
+                        .ok()
+                        .and_then(|file| ZipArchive::new(file).ok())
+                        .and_then(|mut zip| read_zip_bytes(&mut zip, asset))
+                };
+                if let Some(bytes) = bytes {
+                    return Some(bytes);
+                }
+            }
+            None
+        };
+        let (built, loaded) = build_atlas(names, &mut read, &mut read_meta);
         if loaded == 0 && !names.is_empty() {
             return Err("resource pack has no block textures".to_owned());
         }
@@ -616,6 +759,7 @@ impl TextureAtlasImage {
             rows: built.rows,
             missing_indices: built.missing_indices,
             pbr,
+            animated: built.animated,
         }
     }
 }
@@ -627,6 +771,7 @@ struct BuiltAtlas {
     grass_color: [f32; 3],
     foliage_color: [f32; 3],
     missing_indices: Vec<u32>,
+    animated: Vec<AnimatedTile>,
 }
 
 /// Place the missing-tile at index 0 then every named texture at index 1.., one
@@ -635,6 +780,7 @@ struct BuiltAtlas {
 fn build_atlas(
     names: &[String],
     read: &mut dyn FnMut(&str) -> Option<DynamicImage>,
+    read_meta: &mut dyn FnMut(&str) -> Option<Vec<u8>>,
 ) -> (BuiltAtlas, usize) {
     let tile_count = names.len() as u32 + 1; // +1 for the missing tile at 0
     let rows = tile_count.div_ceil(ATLAS_COLUMNS).max(1);
@@ -645,10 +791,35 @@ fn build_atlas(
     let mut loaded = 0;
     let mut missing = Vec::new();
     let mut missing_indices = Vec::new();
+    let mut animated = Vec::new();
     for (offset, name) in names.iter().enumerate() {
         let index = offset as u32 + 1;
         name_to_index.insert(name.clone(), index);
         if let Some(source) = read_block_texture(name, read) {
+            // Multi-frame strips animate: keep every 16×16 frame and the tile's
+            // atlas cell so the renderer can cycle them. copy_tile still seeds
+            // the cell with frame 0 (the static fallback when not animated).
+            if let Some(frames) = split_animation_frames_16(&source) {
+                let (frametime, explicit) = read_block_texture_meta(name, read_meta)
+                    .map(|bytes| {
+                        parse_animation_meta(&String::from_utf8_lossy(&bytes))
+                    })
+                    .unwrap_or((1, None));
+                // Drop any explicit frame index that is out of range; fall back
+                // to the natural 0..N order if nothing valid remains.
+                let order: Vec<usize> = explicit
+                    .map(|o| o.into_iter().filter(|&i| i < frames.len()).collect())
+                    .filter(|o: &Vec<usize>| !o.is_empty())
+                    .unwrap_or_else(|| (0..frames.len()).collect());
+                let (atlas_x, atlas_y) = tile_origin(index);
+                animated.push(AnimatedTile {
+                    atlas_x,
+                    atlas_y,
+                    frames,
+                    frametime,
+                    order,
+                });
+            }
             copy_tile(&mut image, index, source);
             loaded += 1;
         } else {
@@ -688,6 +859,7 @@ fn build_atlas(
             grass_color: u8_to_unit(grass),
             foliage_color: u8_to_unit(foliage),
             missing_indices,
+            animated,
         },
         loaded,
     )
@@ -1894,6 +2066,22 @@ fn read_zip_image<R: Read + std::io::Seek>(
     image::load_from_memory(&bytes).ok()
 }
 
+/// Read a raw asset file (e.g. a `.mcmeta` sidecar) from an asset directory.
+fn read_directory_bytes(root: &Path, asset_path: &str) -> Option<Vec<u8>> {
+    fs::read(directory_texture_path(root, asset_path)).ok()
+}
+
+/// Read a raw asset file (e.g. a `.mcmeta` sidecar) from a zip archive.
+fn read_zip_bytes<R: Read + std::io::Seek>(
+    zip: &mut ZipArchive<R>,
+    asset_path: &str,
+) -> Option<Vec<u8>> {
+    let mut file = zip.by_name(asset_path).ok()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    Some(bytes)
+}
+
 /// Build PBR normal and specular atlases with the same tile layout as the
 /// colour atlas.  For each texture name, looks for `_n.png` (normal) and
 /// `_s.png` (specular) in both 1.8 and 1.13+ paths.
@@ -2145,6 +2333,49 @@ mod tests {
         // A single square (or non-strip) image yields exactly one frame.
         let single = RgbaImage::new(TILE_SIZE, TILE_SIZE);
         assert_eq!(split_animation_frames(&single).len(), 1);
+    }
+
+    #[test]
+    fn animated_atlas_frames_split_to_tile_size() {
+        // A tall strip (N>1) yields N frames, each downscaled to TILE_SIZE.
+        // water_still is 16×512 → 32 frames; lava_flow is 32×512 → 16 frames
+        // whose 32px source frames are resized to 16px.
+        let still = DynamicImage::ImageRgba8(RgbaImage::new(TILE_SIZE, TILE_SIZE * 8));
+        let frames = split_animation_frames_16(&still).expect("tall strip is animated");
+        assert_eq!(frames.len(), 8);
+        for f in &frames {
+            assert_eq!((f.width(), f.height()), (TILE_SIZE, TILE_SIZE));
+        }
+        // A 32px-wide flow strip downscales each frame to TILE_SIZE.
+        let flow = DynamicImage::ImageRgba8(RgbaImage::new(32, 32 * 4));
+        let flow_frames = split_animation_frames_16(&flow).expect("flow strip is animated");
+        assert_eq!(flow_frames.len(), 4);
+        assert_eq!((flow_frames[0].width(), flow_frames[0].height()), (TILE_SIZE, TILE_SIZE));
+
+        // A single 16×16 source is not a strip → no animation.
+        let single = DynamicImage::ImageRgba8(RgbaImage::new(TILE_SIZE, TILE_SIZE));
+        assert!(split_animation_frames_16(&single).is_none());
+    }
+
+    #[test]
+    fn animation_mcmeta_parses_frametime_and_order() {
+        // frametime present, no explicit frame order.
+        let (frametime, order) =
+            parse_animation_meta(r#"{"animation":{"frametime":2}}"#);
+        assert_eq!(frametime, 2);
+        assert_eq!(order, None);
+
+        // Explicit frame order is parsed; frametime defaults to 1.
+        let (frametime, order) =
+            parse_animation_meta(r#"{"animation":{"frames":[0,1,2,1]}}"#);
+        assert_eq!(frametime, 1);
+        assert_eq!(order, Some(vec![0, 1, 2, 1]));
+
+        // Empty / malformed metadata falls back to the safe defaults.
+        assert_eq!(parse_animation_meta("{}"), (1, None));
+        assert_eq!(parse_animation_meta("not json"), (1, None));
+        // frametime of 0 is clamped up to 1 (avoids a div-by-zero downstream).
+        assert_eq!(parse_animation_meta(r#"{"animation":{"frametime":0}}"#).0, 1);
     }
 
     #[test]

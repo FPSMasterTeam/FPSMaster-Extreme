@@ -666,6 +666,13 @@ pub struct Renderer {
     texture_bind_groups: Vec<wgpu::BindGroup>,
     /// Retained group(1) layout for rebuilding texture_bind_groups on atlas reload.
     texture_layout: wgpu::BindGroupLayout,
+    /// The block-atlas GPU texture itself, retained so animated tiles can be
+    /// re-uploaded into their atlas cells (mip 0) each frame.
+    block_atlas_texture: wgpu::Texture,
+    /// Animated tiles (water/lava/fire/…) and the last displayed frame index per
+    /// tile, so a cell is only re-uploaded when its frame actually advances.
+    animated_tiles: Vec<crate::texture::AnimatedTile>,
+    animated_last_frame: Vec<usize>,
     /// Retained group(2) layout for rebuilding lighting_bind_group on atlas reload.
     lighting_layout: wgpu::BindGroupLayout,
     /// PBR normal/specular atlas views + sampler, for rebuilding lighting bind group.
@@ -943,8 +950,17 @@ impl Renderer {
                 resource: gui_camera_buffer.as_entire_binding(),
             }],
         });
-        let (texture_layout, texture_bind_groups, biome_colors, atlas_uv, block_image) =
-            create_texture_bind_group(&device, &queue);
+        let (
+            texture_layout,
+            texture_bind_groups,
+            biome_colors,
+            atlas_uv,
+            block_image,
+            block_atlas_texture,
+            animated_tiles,
+        ) = create_texture_bind_group(&device, &queue);
+        // Force the first per-frame upload of every animated tile (sentinel index).
+        let animated_last_frame = vec![usize::MAX; animated_tiles.len()];
         let (entity_texture_layout, entity_bind_group, entity_texture) =
             create_entity_texture_bind_group(&device, &queue);
         // The UI reuses the block atlas (and its name→tile map) for item icons.
@@ -2849,6 +2865,9 @@ impl Renderer {
             window_depth_view,
             texture_bind_groups,
             texture_layout,
+            block_atlas_texture,
+            animated_tiles,
+            animated_last_frame,
             lighting_layout,
             pbr_normal_view,
             pbr_specular_view,
@@ -3665,7 +3684,8 @@ impl Renderer {
     /// uploading new GPU textures and recreating the mesh worker pool.
     /// Returns the new `AtlasUv` so the caller can update its own copy.
     pub fn reload_atlas(&mut self, pack_path: Option<std::path::PathBuf>) -> AtlasUv {
-        let atlas = TextureAtlasImage::load_with_pack(pack_path);
+        let mut atlas = TextureAtlasImage::load_with_pack(pack_path);
+        let animated = std::mem::take(&mut atlas.animated);
         let biome_colors = BiomeColors {
             grass: atlas.grass_color,
             foliage: atlas.foliage_color,
@@ -3742,6 +3762,11 @@ impl Renderer {
             .collect();
 
         self.texture_bind_groups = bind_groups;
+        // Retain the new atlas texture + animated tiles; force a re-upload of
+        // every animated cell on the next frame (sentinel last-frame index).
+        self.block_atlas_texture = texture;
+        self.animated_last_frame = vec![usize::MAX; animated.len()];
+        self.animated_tiles = animated;
 
         // Upload PBR atlases if the pack provides them
         let has_pbr = atlas.pbr.normal.is_some() || atlas.pbr.specular.is_some();
@@ -4352,6 +4377,46 @@ impl Renderer {
         });
     }
 
+    /// Cycle animated terrain tiles by writing the current frame into each
+    /// tile's 16×16 atlas cell (mip 0) when its frame index advances. Vanilla
+    /// runs the atlas animation at 20 ticks/sec, so a frame is held `frametime`
+    /// ticks; `frame = order[(tick / frametime) % order.len()]`. Only mip 0 is
+    /// updated — the lower mips keep frame 0, a minor staleness that is only
+    /// visible at distance where the chunk LOD already blurs the surface.
+    fn update_animated_tiles(&mut self, time: f32) {
+        if self.animated_tiles.is_empty() {
+            return;
+        }
+        let tick = (time * 20.0) as u64;
+        for (i, tile) in self.animated_tiles.iter().enumerate() {
+            let slot = (tick / tile.frametime as u64) as usize % tile.order.len();
+            let frame = tile.order[slot];
+            if self.animated_last_frame[i] == frame {
+                continue;
+            }
+            self.animated_last_frame[i] = frame;
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.block_atlas_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x: tile.atlas_x, y: tile.atlas_y, z: 0 },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &tile.frames[frame],
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4 * crate::texture::TILE_SIZE),
+                    rows_per_image: Some(crate::texture::TILE_SIZE),
+                },
+                wgpu::Extent3d {
+                    width: crate::texture::TILE_SIZE,
+                    height: crate::texture::TILE_SIZE,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+    }
+
     fn render_inner(
         &mut self,
         camera: &Camera,
@@ -4364,6 +4429,9 @@ impl Renderer {
         let sky = crate::sky::sky_colors(self.world_time);
         let view_proj = camera.view_projection();
         let time = self.start_time.elapsed().as_secs_f32();
+        // Advance animated terrain tiles (water/lava/fire/…) by re-uploading the
+        // current 16×16 frame into each tile's atlas cell when it changes.
+        self.update_animated_tiles(time);
         self.queue.write_buffer(
             &self.camera_buffer,
             0,
@@ -6464,8 +6532,11 @@ fn create_texture_bind_group(
     BiomeColors,
     AtlasUv,
     Option<image::RgbaImage>,
+    wgpu::Texture,
+    Vec<crate::texture::AnimatedTile>,
 ) {
-    let atlas = TextureAtlasImage::load_default();
+    let mut atlas = TextureAtlasImage::load_default();
+    let animated = std::mem::take(&mut atlas.animated);
     let biome_colors = BiomeColors {
         grass: atlas.grass_color,
         foliage: atlas.foliage_color,
@@ -6595,7 +6666,7 @@ fn create_texture_bind_group(
     // Hand the CPU atlas image to the UI for block item thumbnails (reuses this
     // build instead of loading the atlas a second time).
     let block_image = image::RgbaImage::from_raw(atlas.width, atlas.height, atlas.pixels);
-    (layout, bind_groups, biome_colors, atlas_uv, block_image)
+    (layout, bind_groups, biome_colors, atlas_uv, block_image, texture, animated)
 }
 
 fn create_default_pbr_textures(
