@@ -4390,7 +4390,14 @@ impl Renderer {
             }
             return;
         }
-        const SCALE: i32 = 1;
+        // SCALE 2 rasterizes the text at twice the resolution. This is required
+        // for CJK/unicode: those glyphs live in 16px pages, and at SCALE 1 the
+        // font downsamples them 16→8 (nearest), dropping ~half the thin strokes
+        // so Chinese reads as blank fragments. At SCALE 2 unicode is 16→16 (1:1,
+        // full detail) and ASCII upscales cleanly. Layout below derives from
+        // line_h, so the on-board text size is unchanged — only the texture is
+        // sharper.
+        const SCALE: i32 = 2;
         let line_h = (8 * SCALE) as u32;
         let font = crate::font::font();
         // Each sign gets one texture row block of 4 lines; the texture is as wide
