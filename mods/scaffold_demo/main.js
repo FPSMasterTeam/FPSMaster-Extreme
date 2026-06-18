@@ -20,7 +20,8 @@
 //  - The host snaps the silent look to your own mouse-rotation quantum (the
 //    sensitivity factor), so the server-visible rotation deltas stay multiples
 //    of it — Grim's AimModulo360 (rotation-GCD) check sees mouse-like rotation.
-//  - Respects the vanilla right-click cooldown (4 ticks) and needs a block in
+//  - Respects the vanilla right-click rate in REAL time (~210 ms, via mc.now())
+//    so catch-up tick bursts can't bunch placements up, and needs a block in
 //    hand. The host's onPlayerRightClick gate still refuses any placement that
 //    would clip you or target a non-replaceable block.
 //
@@ -28,12 +29,16 @@
 // injected rotation at all — the camera visibly moves, like manual play).
 
 const KEY = "KeyG";
-const PLACE_DELAY = 4; // vanilla rightClickDelayTimer, in ticks
+// Vanilla's right-click hold places every 4 ticks (200 ms). Gate in REAL time,
+// not ticks: when the host runs several catch-up ticks in one frame their ticks
+// are ~0 ms apart, so a tick-based cooldown lets two placements go out back to
+// back — which AAC's fastplace (it measures real time) flags as 0.000.
+const PLACE_DELAY_MS = 210;
 const cfg = mc.config.load({ silent: true });
 
 let enabled = false;
 let tick = 0;
-let lastPlace = -100;
+let lastPlaceMs = -1e9;
 let aimedKey = null; // the target we've been aiming at
 let aimedTick = -100; // when we started aiming at it
 let status = "off";
@@ -179,13 +184,15 @@ mc.on("tick", () => {
     status = "aiming";
     return;
   }
-  if (tick - lastPlace < PLACE_DELAY) {
+  // Real-time cooldown (not ticks) so a frame that runs several catch-up ticks
+  // still places at most once — keeping the real-time rate AAC measures sane.
+  if (mc.now() - lastPlaceMs < PLACE_DELAY_MS) {
     status = "cooldown";
     return;
   }
 
   p.placeBlock(place.nx, place.ny, place.nz, place.face, FACE_CURSOR[place.face]);
-  lastPlace = tick;
+  lastPlaceMs = mc.now();
   status = "placed " + tx + "," + ty + "," + tz;
 });
 

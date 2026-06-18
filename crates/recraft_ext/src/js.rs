@@ -11,7 +11,19 @@ use std::path::Path;
 
 use rquickjs::{CatchResultExt, Context, Function, Runtime};
 
+use std::sync::OnceLock;
+use std::time::Instant;
+
 use crate::bridge::{self, cur};
+
+/// Monotonic milliseconds since the first call, for `mc.now()`. Mods rate-limit
+/// actions in REAL time with this — a tick counter is wrong when the host runs
+/// several catch-up ticks in one frame (their real-time gap is ~0), which an
+/// anti-cheat measuring real time (e.g. AAC fastplace) would flag.
+fn process_millis() -> f64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_secs_f64() * 1000.0
+}
 use crate::event::Verdict;
 use crate::host::{HookCtx, HostHooks};
 use crate::hud::{HudCtx, HudDraw};
@@ -114,6 +126,9 @@ const PRELUDE: &str = r#"
     world: world,
     connection: connection,
     log: log, warn: warn, error: error,
+    // Monotonic real-time milliseconds — rate-limit actions with this, not a tick
+    // count, so catch-up ticks in one frame don't bunch them up in real time.
+    now: () => __rcf_now(),
     on:(name,cb)=>{ const k=EVENTS[name];
       if(!k){ error('mc.on: unknown event "'+name+'"'); return; } RT.h[k].push(cb); },
     onPacket:(type,cb)=>{ const k=String(type); (RT.h.packet[k]||(RT.h.packet[k]=[])).push(cb); },
@@ -216,6 +231,11 @@ impl JsRuntime {
                 "__rcf_hud",
                 Function::new(ctx.clone(), |json: String| bridge::handle_hud(&json))
                     .map_err(JsError::from_rquickjs)?,
+            )
+            .map_err(JsError::from_rquickjs)?;
+            g.set(
+                "__rcf_now",
+                Function::new(ctx.clone(), process_millis).map_err(JsError::from_rquickjs)?,
             )
             .map_err(JsError::from_rquickjs)?;
             g.set("__rcf_dir", dir_str)
