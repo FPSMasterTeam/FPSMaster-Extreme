@@ -128,6 +128,10 @@ struct App {
     /// transaction`, not the reverse (sending at frame time let a transaction
     /// land between the last flying and the click → Post "click window v1.8").
     pending_window_packets: Vec<ServerboundPacket>,
+    /// Extension-injected serverbound packets, flushed in the next tick's
+    /// pre-flying window (like vanilla interactions) so the order the server sees
+    /// matches a real client — see the drain in `about_to_wait`.
+    pending_ext_packets: Vec<ServerboundPacket>,
     /// Extension host: owns loaded mods, the event bus and the command queue.
     /// A sibling field of `game`, so `app.ext.method(&GameViews(&app.game))` is a
     /// disjoint two-field borrow.
@@ -409,6 +413,7 @@ impl ApplicationHandler for WinitApp {
             last_entity_key: None,
             sound: sound::SoundManager::new(),
             pending_window_packets: Vec::new(),
+            pending_ext_packets: Vec::new(),
             ext: recraft_ext::ExtManager::new(),
             block_tints: recraft_render::TintTable::new(),
             tints_dirty: false,
@@ -791,6 +796,13 @@ impl ApplicationHandler for WinitApp {
                                 network.send_packet(packet);
                             }
                             for packet in actions {
+                                network.send_packet(packet);
+                            }
+                            // Extension-injected interactions (placement, digging,
+                            // …) ride the same pre-flying window as vanilla
+                            // interactions so Grim's Post/RotationPlace ordering
+                            // holds — they were queued in the previous tick's hooks.
+                            for packet in app.pending_ext_packets.drain(..) {
                                 network.send_packet(packet);
                             }
                             if let Some(abilities) = abilities {
@@ -1276,14 +1288,12 @@ fn apply_ext_commands(app: &mut App) {
     for cmd in app.ext.take_commands() {
         match cmd {
             recraft_ext::ExtCommand::Chat(s) => {
-                if let Some(net) = &app.network {
-                    net.send_packet(ServerboundPacket::ChatMessage { message: s });
-                }
+                app.pending_ext_packets
+                    .push(ServerboundPacket::ChatMessage { message: s });
             }
             recraft_ext::ExtCommand::SendServerbound(b) => {
-                if let Some(net) = &app.network {
-                    net.send_packet(ext_bridge::build_to_serverbound(b));
-                }
+                app.pending_ext_packets
+                    .push(ext_bridge::build_to_serverbound(b));
             }
             recraft_ext::ExtCommand::Log(level, msg) => {
                 let level = match level {
@@ -1369,7 +1379,7 @@ fn apply_ext_commands(app: &mut App) {
                 cursor,
             } => {
                 let packets = app.game.ext_place_block(x, y, z, face, cursor);
-                send_all(app, packets);
+                app.pending_ext_packets.extend(packets);
             }
             recraft_ext::ExtCommand::Digging {
                 status,
@@ -1378,49 +1388,45 @@ fn apply_ext_commands(app: &mut App) {
                 z,
                 face,
             } => {
-                if let Some(net) = &app.network {
-                    net.send_packet(ext_bridge::build_to_serverbound(
-                        recraft_ext::PacketBuild::PlayerDigging {
-                            status,
-                            x,
-                            y,
-                            z,
-                            face,
-                        },
-                    ));
-                }
+                app.pending_ext_packets.push(ext_bridge::build_to_serverbound(
+                    recraft_ext::PacketBuild::PlayerDigging {
+                        status,
+                        x,
+                        y,
+                        z,
+                        face,
+                    },
+                ));
             }
             recraft_ext::ExtCommand::AttackEntity { id } => {
                 let packets = app.game.ext_attack_entity(id);
-                send_all(app, packets);
+                app.pending_ext_packets.extend(packets);
             }
             recraft_ext::ExtCommand::InteractEntity { id, at } => {
                 let packets = app.game.ext_interact_entity(id, at);
-                send_all(app, packets);
+                app.pending_ext_packets.extend(packets);
             }
             recraft_ext::ExtCommand::ContainerClick { slot, button, mode } => {
                 let packets = app.game.container_click(slot, button, mode);
-                send_all(app, packets);
+                app.pending_ext_packets.extend(packets);
             }
             recraft_ext::ExtCommand::ContainerClose => {
                 if let Some(packet) = app.game.container_close() {
-                    if let Some(net) = &app.network {
-                        net.send_packet(packet);
-                    }
+                    app.pending_ext_packets.push(packet);
                 }
             }
             recraft_ext::ExtCommand::OpenInventory => app.game.open_player_inventory(),
             recraft_ext::ExtCommand::SelectSlot { slot } => {
                 let packets = app.game.ext_select_slot(slot);
-                send_all(app, packets);
+                app.pending_ext_packets.extend(packets);
             }
             recraft_ext::ExtCommand::SwingArm => {
                 let packets = app.game.ext_swing();
-                send_all(app, packets);
+                app.pending_ext_packets.extend(packets);
             }
             recraft_ext::ExtCommand::UseItem => {
                 let packets = app.game.ext_use_item();
-                send_all(app, packets);
+                app.pending_ext_packets.extend(packets);
             }
             recraft_ext::ExtCommand::SetRotation { yaw, pitch, silent } => {
                 app.game.ext_set_rotation(yaw, pitch, silent);
@@ -1434,15 +1440,6 @@ fn apply_ext_commands(app: &mut App) {
                     log::warn!("[ext] config save failed ({}): {e}", path.display());
                 }
             }
-        }
-    }
-}
-
-/// Send a batch of mod-built serverbound packets, if connected.
-fn send_all(app: &App, packets: Vec<ServerboundPacket>) {
-    if let Some(net) = &app.network {
-        for packet in packets {
-            net.send_packet(packet);
         }
     }
 }
@@ -1773,6 +1770,7 @@ fn pump_network(app: &mut App, window: &winit::window::Window, cursor_captured: 
         // (e.g. a container click right before disconnect) so they can't leak out
         // on this session's first tick.
         app.pending_window_packets.clear();
+        app.pending_ext_packets.clear();
         app.screen = None;
     }
     sync_cursor(window, cursor_captured, app);

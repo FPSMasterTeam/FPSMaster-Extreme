@@ -172,6 +172,12 @@ pub struct PlayerInput {
     /// (base 0.1, scaled by potion/server modifiers via S20), excluding the
     /// sprint boost which physics applies itself.
     pub walk_speed: f32,
+    /// Yaw to drive horizontal movement with, overriding `player.yaw`. Set by a
+    /// silent-look override so the move direction matches the yaw the *server*
+    /// sees (the flying packet), keeping its movement prediction in sync. `None`
+    /// uses the real look. `forward`/`strafe` must already be remapped to the
+    /// legal input that points the intended way under this yaw.
+    pub move_yaw: Option<f32>,
 }
 
 impl Default for PlayerInput {
@@ -185,6 +191,7 @@ impl Default for PlayerInput {
             flying: false,
             fly_speed: 0.05,
             walk_speed: 0.1,
+            move_yaw: None,
         }
     }
 }
@@ -229,6 +236,9 @@ pub struct PlayerPhysics {
 impl PlayerPhysics {
     pub fn tick(&self, world: &World, player: &mut EntityState, input: PlayerInput) {
         let mut velocity = player.velocity;
+        // Drive horizontal movement with the silent-look yaw when set, so the
+        // move matches the rotation the server sees in the flying packet.
+        let move_yaw = input.move_yaw.unwrap_or(player.yaw);
 
         // Vanilla EntityLivingBase.onLivingUpdate zeroes sub-0.005 motion before
         // anything else this tick.
@@ -271,7 +281,7 @@ impl PlayerPhysics {
             if input.sprint {
                 // Vanilla sprint-jump boost: 0.2 in the facing direction, using
                 // MathHelper trig (not libm) so the direction matches the server.
-                let yaw = player.yaw * DEG_TO_RAD;
+                let yaw = move_yaw * DEG_TO_RAD;
                 velocity.x -= (mc_sin(yaw) * 0.2) as f64;
                 velocity.z += (mc_cos(yaw) * 0.2) as f64;
             }
@@ -304,7 +314,7 @@ impl PlayerPhysics {
         // normal branch's vertical motion.
         let (feet, on_ground, collided, out_velocity) = if input.flying {
             let acceleration = input.fly_speed * if input.sprint { 2.0 } else { 1.0 };
-            velocity += movement_vector(forward, strafe, player.yaw, acceleration);
+            velocity += movement_vector(forward, strafe, move_yaw, acceleration);
             let pre_move_y = velocity.y;
             let result = web_aware_move(
                 world,
@@ -329,7 +339,7 @@ impl PlayerPhysics {
         } else if in_water {
             // Vanilla water branch: 0.02 accel, 0.8 horizontal drag, 0.8 vertical
             // drag, a flat 0.02 sink, and a swim-up bump against ledges.
-            velocity += movement_vector(forward, strafe, player.yaw, 0.02);
+            velocity += movement_vector(forward, strafe, move_yaw, 0.02);
             let pre_pos_y = player.position.y;
             let result = web_aware_move(
                 world,
@@ -359,7 +369,7 @@ impl PlayerPhysics {
             )
         } else if in_lava {
             // Vanilla lava branch: 0.02 accel, 0.5 drag on every axis, 0.02 sink.
-            velocity += movement_vector(forward, strafe, player.yaw, 0.02);
+            velocity += movement_vector(forward, strafe, move_yaw, 0.02);
             let pre_pos_y = player.position.y;
             let result = web_aware_move(
                 world,
@@ -407,7 +417,7 @@ impl PlayerPhysics {
                         1.0
                     }
             };
-            velocity += movement_vector(forward, strafe, player.yaw, acceleration);
+            velocity += movement_vector(forward, strafe, move_yaw, acceleration);
 
             // Vanilla 1.8 sneak edge protection: while sneaking on the ground, the
             // intended horizontal movement is shrunk in 0.05 steps until the
@@ -492,6 +502,13 @@ impl PlayerPhysics {
         // tick's airborne accel reflects this tick's sprint.
         player.air_sprinting = input.sprint;
     }
+}
+
+/// The unit-ish world direction a given movement input produces at `yaw`
+/// (vanilla `moveFlying` with friction 1). Used to remap a player's input to the
+/// nearest legal direction under a silent-look yaw.
+pub fn movement_direction(forward: f32, strafe: f32, yaw_degrees: f32) -> DVec3 {
+    movement_vector(forward, strafe, yaw_degrees, 1.0)
 }
 
 fn movement_vector(forward: f32, strafe: f32, yaw_degrees: f32, friction: f32) -> DVec3 {

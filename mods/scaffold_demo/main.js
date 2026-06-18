@@ -4,19 +4,26 @@
 // your feet is air, it aims at a REAL adjacent block face and places a block
 // there, bridging as you walk.
 //
-// Vanilla-legitimacy — nothing here is something a manual player couldn't do:
-//  - Only places against an EXISTING full-cube face (never mid-air). If there
-//    is no support block, it does nothing — exactly like vanilla.
-//  - Sends the look to the server BEFORE the placement: it aims one tick, and
-//    only places on a later tick once that rotation has actually ridden a
-//    movement packet. So at placement time the server sees you looking at the
-//    block — like a real player, not a teleporting crosshair.
-//  - The turn is "silent" by default (the server sees it, your camera stays
-//    free). Set `silent: false` in this mod's config.json for a fully
-//    hand-reproducible camera turn instead.
+// Vanilla-legitimacy (Grim-oriented) — what the mod and the host guarantee:
+//  - Only places against an EXISTING full-cube face (never mid-air). No support
+//    block → does nothing, exactly like vanilla.
+//  - Aims one tick, places the next. The host sends ext interactions in the
+//    pre-flying window (like vanilla), so by placement time the look has ridden
+//    a flying packet → the server sees you looking at the block (RotationPlace /
+//    Post order pass).
+//  - Silent look keeps your camera free; the host drives MOVEMENT with the
+//    silent yaw and snaps your input to the legal 8 directions, so the server's
+//    movement prediction stays in sync (Simulation / GroundSpoof). When aiming
+//    straight down (block below you) yaw is left alone, so walking is unaffected.
 //  - Respects the vanilla right-click cooldown (4 ticks) and needs a block in
-//    hand. The host additionally refuses any placement that would clip you or
-//    target a non-replaceable block (the vanilla onPlayerRightClick gate).
+//    hand. The host's onPlayerRightClick gate still refuses any placement that
+//    would clip you or target a non-replaceable block.
+//
+// KNOWN GAP: the silent rotation values are still snapped to exact angles, so
+// Grim's AimModulo360 (rotation-GCD) check will flag them. Beating that needs
+// mouse-sensitivity-quantized rotation (a host change, tracked separately). Set
+// `silent: false` in config.json to turn the real camera instead (no injected
+// rotation → passes the GCD check, but the camera visibly moves).
 
 const KEY = "KeyG";
 const PLACE_DELAY = 4; // vanilla rightClickDelayTimer, in ticks
@@ -101,8 +108,13 @@ mc.on("tick", () => {
   const az = pick.nz + 0.5 + 0.5 * fd[2];
   const eyeY = p.y + (p.sneaking ? 1.54 : 1.62);
   const dx = ax - p.x, dy = ay - eyeY, dz = az - p.z;
-  const yaw = (Math.atan2(-dx, dz) * 180) / Math.PI;
-  const pitch = (-Math.atan2(dy, Math.hypot(dx, dz)) * 180) / Math.PI;
+  const horiz = Math.hypot(dx, dz);
+  // When the block is (almost) straight down, yaw is irrelevant to the aim — keep
+  // the real camera yaw so the host's strafe-remap leaves movement untouched.
+  // Only a side-face (horizontal bridging) genuinely needs a yaw turn, and then
+  // movement is snapped to the nearest legal 8-direction by the host.
+  const yaw = horiz < 0.25 ? p.yaw : (Math.atan2(-dx, dz) * 180) / Math.PI;
+  const pitch = (-Math.atan2(dy, horiz) * 180) / Math.PI;
   p.setRotation(yaw, pitch, { silent: cfg.silent });
 
   // Only place once this look has actually been SENT — i.e. we've been aiming
