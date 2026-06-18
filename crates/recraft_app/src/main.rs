@@ -776,20 +776,21 @@ impl ApplicationHandler for WinitApp {
                     right_held: self.right_held,
                     old_animations: app.settings.old_animations,
                 });
+                // The extension tick runs BEFORE physics so a mod's silent look is
+                // the yaw physics MOVES with AND the yaw the flying packet carries
+                // (they must match or Grim's Simulation desyncs). A mod that aims
+                // at a position-dependent target predicts this tick's move (it sees
+                // the pre-move position + velocity). The movement snapshot is then
+                // rebuilt AFTER tick so the flying packet still carries this tick's
+                // post-physics position together with that look.
+                app.ext.dispatch_tick(&GameViews(&app.game));
+                apply_ext_commands(app);
                 if let Some(actions) = app.game.tick(0.05) {
                     self.slot_select = None;
                     self.slot_scroll = 0;
                     self.attack_pressed = false;
                     self.use_pressed = false;
                     let abilities = app.game.take_abilities_packet();
-                    // The extension tick runs AFTER physics (vanilla `runTick`
-                    // processes interactions against the post-move state): a mod
-                    // sees this tick's position, sets its silent look and queues
-                    // interactions, THEN the movement snapshot is (re)built so the
-                    // flying packet carries that look AND this tick's position —
-                    // a placement's rotation matches the position Grim ray-traces.
-                    app.ext.dispatch_tick(&GameViews(&app.game));
-                    apply_ext_commands(app);
                     let movement = app.game.movement_snapshot();
                     // Extension pre-send hook (on_serverbound): a mod may observe
                     // or drop each natural client packet this tick. Movement is
