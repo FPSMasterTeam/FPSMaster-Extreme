@@ -3703,6 +3703,15 @@ impl Renderer {
         self.upload_dirty_sections(world, sections);
     }
 
+    /// Install extension block-tint overrides (the `setBlockTint` preset) and
+    /// re-mesh all loaded chunks so the change takes effect. A synchronous
+    /// re-mesh like an atlas reload — fine because tint changes are rare (mostly
+    /// at mod load).
+    pub fn set_block_tints(&mut self, table: crate::TintTable, world: &World) {
+        crate::set_block_tints(table);
+        self.upload_world(world);
+    }
+
     pub fn upload_dirty_sections<I>(&mut self, world: &World, sections: I)
     where
         I: IntoIterator<Item = SectionPos>,

@@ -555,6 +555,14 @@ struct BlockCtx<'a, S: BlockSource> {
     flat: bool,
 }
 
+impl<S: BlockSource> BlockCtx<'_, S> {
+    /// Resolve a face tint: a `setBlockTint` override wins, else the block's
+    /// vanilla biome/constant tint.
+    fn tint(&self, block: BlockState, face: BlockFace) -> [f32; 3] {
+        block_tint(block).unwrap_or_else(|| tint_color(block.tint(face), self.biome))
+    }
+}
+
 fn append_block<S: BlockSource>(
     mesh: &mut ChunkMesh,
     ctx: &BlockCtx<S>,
@@ -1058,7 +1066,7 @@ fn emit_face<S: BlockSource>(
     ny: i32,
     nz: i32,
 ) {
-    let tint = tint_color(block.tint(face.face), ctx.biome);
+    let tint = ctx.tint(block, face.face);
     warn_if_missing(ctx.atlas, block, face_context(face.face), texture);
     let rect = ctx.atlas.tile_rect(texture);
     let front = [nx, ny, nz];
@@ -1180,7 +1188,7 @@ fn append_cross<S: BlockSource>(
     block: BlockState,
 ) {
     let light = face_light(ctx, x, y, z);
-    let tint = tint_color(block.tint(BlockFace::Side), ctx.biome);
+    let tint = ctx.tint(block, BlockFace::Side);
     let color = [tint[0], tint[1], tint[2], block.render_alpha()];
     let texture = block.texture_name(BlockFace::Side);
     warn_if_missing(ctx.atlas, block, "its cross texture", texture);
@@ -1270,7 +1278,7 @@ fn append_rail<S: BlockSource>(
         block.meta & 0x7
     };
     let light = face_light(ctx, x, y + 1, z);
-    let tint = tint_color(block.tint(BlockFace::Top), ctx.biome);
+    let tint = ctx.tint(block, BlockFace::Top);
     let color = [tint[0], tint[1], tint[2], block.render_alpha()];
 
     let (fx, fy, fz) = (x as f32, y as f32, z as f32);
@@ -1410,7 +1418,7 @@ fn append_ladder<S: BlockSource>(
 ) {
     let (corners, sample) = ladder_quad(x, y, z, block.meta);
     let light = face_light(ctx, x + sample[0], y + sample[1], z + sample[2]);
-    let tint = tint_color(block.tint(BlockFace::Side), ctx.biome);
+    let tint = ctx.tint(block, BlockFace::Side);
     let color = [tint[0], tint[1], tint[2], block.render_alpha()];
     let texture = block.texture_name(BlockFace::Side);
     warn_if_missing(ctx.atlas, block, "its ladder texture", texture);
@@ -1650,6 +1658,66 @@ fn tint_color(tint: Tint, biome: BiomeColors) -> [f32; 3] {
         Tint::Water => WATER_COLOR,
         Tint::Rgb(rgb) => rgb,
     }
+}
+
+/// Static per-block tint overrides populated by the extension preset
+/// `setBlockTint`. Keyed by block id, optionally narrowed to one meta.
+#[derive(Debug, Clone, Default)]
+pub struct TintTable {
+    by_id: std::collections::HashMap<u16, [f32; 3]>,
+    by_id_meta: std::collections::HashMap<(u16, u8), [f32; 3]>,
+}
+
+impl TintTable {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// `meta = None` tints every meta of `id`; `Some(m)` narrows to one meta and
+    /// takes precedence over an all-meta entry.
+    pub fn set(&mut self, id: u16, meta: Option<u8>, color: [f32; 3]) {
+        match meta {
+            Some(m) => {
+                self.by_id_meta.insert((id, m), color);
+            }
+            None => {
+                self.by_id.insert(id, color);
+            }
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_id.is_empty() && self.by_id_meta.is_empty()
+    }
+
+    fn lookup(&self, block: BlockState) -> Option<[f32; 3]> {
+        self.by_id_meta
+            .get(&(block.id, block.meta))
+            .or_else(|| self.by_id.get(&block.id))
+            .copied()
+    }
+}
+
+static TINTS: std::sync::LazyLock<std::sync::RwLock<TintTable>> =
+    std::sync::LazyLock::new(|| std::sync::RwLock::new(TintTable::new()));
+static HAS_TINTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Install the process-wide block tint overrides (from `setBlockTint`). Meshing
+/// reads them via [`block_tint`] with an atomic fast-path, so the common
+/// no-override case costs one relaxed load per face.
+pub fn set_block_tints(table: TintTable) {
+    let empty = table.is_empty();
+    *TINTS.write().unwrap() = table;
+    HAS_TINTS.store(!empty, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The tint override for `block`, if any (read by the mesher + worker threads).
+#[inline]
+pub fn block_tint(block: BlockState) -> Option<[f32; 3]> {
+    if !HAS_TINTS.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    TINTS.read().unwrap().lookup(block)
 }
 
 /// Read a neighbouring block, using the owning chunk directly when inside it
@@ -2007,8 +2075,8 @@ fn emit_greedy_quad(
         0 => (w as f32, h as f32),
         _ => (h as f32, w as f32),
     };
-    let bf = key.block.tint(face.face);
-    let tint = tint_color(bf, biome);
+    let tint =
+        block_tint(key.block).unwrap_or_else(|| tint_color(key.block.tint(face.face), biome));
     let shade = face.light;
     let color = [
         tint[0] * shade,
@@ -2041,6 +2109,30 @@ mod tests {
 
     fn atlas() -> AtlasUv {
         crate::TextureAtlasImage::load_default().uv_table()
+    }
+
+    #[test]
+    fn tint_table_meta_overrides_id() {
+        let mut t = TintTable::new();
+        t.set(1, None, [0.1, 0.2, 0.3]);
+        t.set(1, Some(5), [0.9, 0.8, 0.7]);
+        assert_eq!(t.lookup(BlockState { id: 1, meta: 0 }), Some([0.1, 0.2, 0.3]));
+        assert_eq!(t.lookup(BlockState { id: 1, meta: 5 }), Some([0.9, 0.8, 0.7]));
+        assert_eq!(t.lookup(BlockState { id: 2, meta: 0 }), None);
+    }
+
+    #[test]
+    fn global_block_tint_set_and_fast_path() {
+        // id 200 is above MAX_BLOCK_ID, so no meshing test will ever look it up —
+        // keeps this global-state test from racing concurrent meshing tests.
+        assert_eq!(block_tint(BlockState { id: 200, meta: 0 }), None);
+        let mut t = TintTable::new();
+        t.set(200, None, [1.0, 0.0, 0.0]);
+        set_block_tints(t);
+        assert_eq!(block_tint(BlockState { id: 200, meta: 0 }), Some([1.0, 0.0, 0.0]));
+        assert_eq!(block_tint(BlockState { id: 201, meta: 0 }), None);
+        set_block_tints(TintTable::new()); // reset the global fast-path
+        assert_eq!(block_tint(BlockState { id: 200, meta: 0 }), None);
     }
 
     fn vpos(v: &ChunkVertex) -> [f32; 3] {
