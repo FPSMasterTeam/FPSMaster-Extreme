@@ -1,0 +1,8 @@
+id = "preset_demo"
+version = "1.0.0"
+tier = "js"
+api = "^0.1"
+entry = "main.js"
+capabilities = ["render", "input", "hud"]
+name = "Preset Render Demo"
+description = "Toggle every preset render modification with the F7-F9 / bracket keys."
