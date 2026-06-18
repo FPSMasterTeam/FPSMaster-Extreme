@@ -15,14 +15,6 @@ use recraft_protocol::{
 
 use crate::game::MovementSnapshot;
 
-/// TEMP DIAGNOSTIC: monotonic seconds since first call, to time-stamp placements.
-fn diag_secs() -> f64 {
-    use std::sync::OnceLock;
-    use std::time::Instant;
-    static START: OnceLock<Instant> = OnceLock::new();
-    START.get_or_init(Instant::now).elapsed().as_secs_f64()
-}
-
 #[derive(Debug)]
 pub enum NetworkEvent {
     Connected {
@@ -270,16 +262,6 @@ fn network_thread(
             match commands.try_recv() {
                 Ok(NetworkCommand::Send(packet)) => {
                     log::debug!("sending {}", packet_debug_name(&packet));
-                    // TEMP DIAGNOSTIC: trace EVERY outgoing packet (name + real-time
-                    // stamp) so we can see the exact per-tick sequence the server /
-                    // anti-cheat receives around a placement.
-                    let extra = match &packet {
-                        ServerboundPacket::PlayerBlockPlacement { x, y, z, face, .. } => {
-                            format!(" ({x},{y},{z}) face={face}")
-                        }
-                        _ => String::new(),
-                    };
-                    log::info!("[net] {}{extra} t={:.3}s", packet_debug_name(&packet), diag_secs());
                     if let Err(err) = client.write_packet(packet.into_frame()) {
                         let _ =
                             events.send(NetworkEvent::Disconnected(format!("write failed: {err}")));
