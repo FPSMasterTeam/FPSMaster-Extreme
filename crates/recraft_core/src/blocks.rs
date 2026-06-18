@@ -3,7 +3,12 @@
 //! of the engine queries. Only the *assignments* are data — the geometry math
 //! for each shape lives in `block.rs`.
 
-use std::{collections::HashMap, fs, path::PathBuf, sync::OnceLock};
+use std::{
+    collections::HashMap,
+    fs,
+    path::PathBuf,
+    sync::{LazyLock, OnceLock, RwLock},
+};
 
 use serde::Deserialize;
 
@@ -161,6 +166,34 @@ impl BlockDef {
     pub fn tint(&self, face: BlockFace) -> Tint {
         self.tint.get(face)
     }
+
+    /// Build a simple full-cube block definition for a content mod. `texture` is
+    /// a base texture name applied to every face — reuse a vanilla name (e.g.
+    /// `"stone"`) until per-mod texture/atlas registration exists. `alpha < 1.0`
+    /// makes it translucent.
+    pub fn mod_cube(texture: impl Into<String>, opaque: bool, alpha: f32, tint: Tint) -> Self {
+        BlockDef {
+            shape: Shape::Cube,
+            collision: CollisionKind::Full,
+            layer: if alpha < 1.0 {
+                RenderLayer::Translucent
+            } else {
+                RenderLayer::Solid
+            },
+            opaque,
+            alpha,
+            tint: TintFaces {
+                all: tint,
+                ..Default::default()
+            },
+            tex: Faces {
+                all: Some(texture.into()),
+                ..Default::default()
+            },
+            mask: 0,
+            by_meta: Vec::new(),
+        }
+    }
 }
 
 pub struct BlockRegistry {
@@ -210,6 +243,43 @@ static REGISTRY: OnceLock<BlockRegistry> = OnceLock::new();
 
 pub fn registry() -> &'static BlockRegistry {
     REGISTRY.get_or_init(BlockRegistry::load)
+}
+
+/// Content-mod block definitions registered at runtime (ids beyond the vanilla
+/// `0..=MAX_BLOCK_ID` range). Definitions are leaked into `'static` so lookups
+/// return `&'static BlockDef` with no lock held — mod blocks are registered at
+/// load and never removed.
+static OVERLAY: LazyLock<RwLock<HashMap<u16, &'static BlockDef>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+static OVERLAY_LUMINANCE: LazyLock<RwLock<HashMap<u16, u8>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// Resolve a block definition: the embedded/vanilla registry first, then any
+/// content-mod overlay. `BlockState`'s property accessors go through here, so a
+/// registered mod block (id > 197) renders like any other.
+pub fn def(id: u16) -> Option<&'static BlockDef> {
+    if let Some(def) = registry().def(id) {
+        return Some(def);
+    }
+    OVERLAY.read().unwrap().get(&id).copied()
+}
+
+/// Register a content-mod block at `id` (typically > `MAX_BLOCK_ID`) with the
+/// light level it emits. Only meaningful in a recraft-authoritative world — a
+/// connected vanilla 1.8 server never sends mod block ids.
+pub fn register_block(id: u16, def: BlockDef, luminance: u8) {
+    let leaked: &'static BlockDef = Box::leak(Box::new(def));
+    OVERLAY.write().unwrap().insert(id, leaked);
+    if luminance > 0 {
+        OVERLAY_LUMINANCE.write().unwrap().insert(id, luminance.min(15));
+    }
+    log::info!("[content] registered mod block id {id}");
+}
+
+/// Light emitted by a registered mod block, if any (vanilla ids use the table in
+/// `BlockState::luminance`).
+pub fn overlay_luminance(id: u16) -> Option<u8> {
+    OVERLAY_LUMINANCE.read().unwrap().get(&id).copied()
 }
 
 fn candidate_paths() -> Vec<PathBuf> {
@@ -415,6 +485,25 @@ fn parse_collision(value: &str) -> CollisionKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{BlockState, RenderShape};
+
+    #[test]
+    fn content_mod_block_registers_above_vanilla_range() {
+        let id = 300; // beyond MAX_BLOCK_ID
+        assert!(BlockState { id, meta: 0 }.is_air(), "unregistered id is air");
+        register_block(
+            id,
+            BlockDef::mod_cube("stone", true, 1.0, Tint::Rgb([1.0, 0.0, 0.0])),
+            7,
+        );
+        let b = BlockState { id, meta: 0 };
+        assert!(!b.is_air(), "registered mod block is not air");
+        assert_eq!(b.render_shape(), RenderShape::Cube);
+        assert!(b.is_opaque_cube());
+        assert_eq!(b.texture_name(BlockFace::Side), Some("stone"));
+        assert_eq!(b.tint(BlockFace::Side), Tint::Rgb([1.0, 0.0, 0.0]));
+        assert_eq!(b.luminance(), 7);
+    }
 
     #[test]
     fn embedded_data_parses() {

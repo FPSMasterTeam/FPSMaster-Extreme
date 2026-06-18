@@ -28,13 +28,21 @@ impl BlockState {
     /// collision, non-occluding. (An *in-range* id that's merely absent from
     /// `blocks.json` is a client config gap, not air — it still renders the
     /// magenta missing tile so the gap is visible.)
-    pub const fn is_air(self) -> bool {
-        self.id == 0 || self.id > Self::MAX_BLOCK_ID
+    pub fn is_air(self) -> bool {
+        if self.id == 0 {
+            return true;
+        }
+        // Out-of-vanilla-range ids are air UNLESS a content mod registered a
+        // block there (recraft-authoritative worlds only).
+        self.id > Self::MAX_BLOCK_ID && blocks::def(self.id).is_none()
     }
 
     /// Block-light this block emits (0..=15), matching vanilla 1.8 light values.
     /// Used by the offline/demo light engine (servers send their own lightmap).
-    pub const fn luminance(self) -> u8 {
+    pub fn luminance(self) -> u8 {
+        if self.id > Self::MAX_BLOCK_ID {
+            return blocks::overlay_luminance(self.id).unwrap_or(0);
+        }
         match self.id {
             10 | 11 => 15,  // lava (flowing/still)
             39 => 0,        // brown mushroom (vanilla 1, negligible)
@@ -56,8 +64,7 @@ impl BlockState {
     }
 
     fn shape(self) -> Shape {
-        blocks::registry()
-            .def(self.id)
+        blocks::def(self.id)
             .map_or(Shape::Cube, |def| def.shape)
     }
 
@@ -68,7 +75,7 @@ impl BlockState {
         if self.is_air() || self.id == 166 {
             return false;
         }
-        blocks::registry().def(self.id).is_none_or(|def| def.opaque)
+        blocks::def(self.id).is_none_or(|def| def.opaque)
     }
 
     /// Render geometry: full cube, crossed plant, or partial boxes.
@@ -106,26 +113,23 @@ impl BlockState {
     }
 
     pub fn render_layer(self) -> RenderLayer {
-        blocks::registry()
-            .def(self.id)
+        blocks::def(self.id)
             .map_or(RenderLayer::Solid, |def| def.layer)
     }
 
     pub fn render_alpha(self) -> f32 {
-        blocks::registry().def(self.id).map_or(1.0, |def| def.alpha)
+        blocks::def(self.id).map_or(1.0, |def| def.alpha)
     }
 
     /// Texture base-name for the given face, or None to fall back to a missing
     /// placeholder.
     pub fn texture_name(self, face: BlockFace) -> Option<&'static str> {
-        blocks::registry()
-            .def(self.id)
+        blocks::def(self.id)
             .and_then(|def| def.texture_name(self.meta, face))
     }
 
     pub fn tint(self, face: BlockFace) -> Tint {
-        blocks::registry()
-            .def(self.id)
+        blocks::def(self.id)
             .map_or(Tint::None, |def| def.tint(face))
     }
 
@@ -197,7 +201,7 @@ impl BlockState {
         if self.is_air() {
             return CollisionBoxes::none();
         }
-        let Some(def) = blocks::registry().def(self.id) else {
+        let Some(def) = blocks::def(self.id) else {
             return CollisionBoxes::one(FULL_CUBE);
         };
         match def.collision {

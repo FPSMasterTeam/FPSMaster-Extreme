@@ -141,6 +141,12 @@ interface Recraft {
   // ---- preset render modifications (closed, host-implemented set) ----
   /** Statically tint a block id (read by the mesher). `meta` narrows to one meta. */
   setBlockTint(id: number, color: Color, meta?: number): void;
+  /** Register a content-mod full-cube block (id > 197). Takes effect only in a
+   *  recraft-authoritative world. `tint` is `[r,g,b]` in 0..1. */
+  registerBlock(id: number, opts?: {
+    texture?: string; opaque?: boolean; alpha?: number;
+    luminance?: number; tint?: [number, number, number];
+  }): void;
   fullbright(on: boolean): void;
   blockOutline(on: boolean): void;
   chunkBorders(on: boolean): void;

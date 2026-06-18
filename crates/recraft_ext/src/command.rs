@@ -82,4 +82,15 @@ pub enum ExtCommand {
         vertices: Vec<[f32; 9]>,
         indices: Vec<u32>,
     },
+    /// Register a content-mod block (full cube). Only takes effect in a
+    /// recraft-authoritative world; `texture` reuses a vanilla base name until
+    /// per-mod texture registration exists.
+    RegisterBlock {
+        id: u16,
+        texture: String,
+        opaque: bool,
+        alpha: f32,
+        luminance: u8,
+        tint: Option<[f32; 3]>,
+    },
 }

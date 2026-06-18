@@ -290,6 +290,22 @@ mod tests {
     }
 
     #[test]
+    fn js_register_block_enqueues_command() {
+        let mut mgr = js_mod(
+            "recraft.onLoad(() => recraft.registerBlock(300, { texture: 'stone', luminance: 7, tint: [1,0,0] }));",
+        );
+        mgr.dispatch_tick(&MockViews); // runs the pending on_load
+        let cmds = mgr.take_commands();
+        assert!(
+            cmds.iter().any(|c| matches!(
+                c,
+                ExtCommand::RegisterBlock { id: 300, luminance: 7, texture, .. } if texture == "stone"
+            )),
+            "registerBlock should enqueue a RegisterBlock command: {cmds:?}"
+        );
+    }
+
+    #[test]
     fn js_syntax_error_rejected_at_load() {
         let rt = js::JsRuntime::new().unwrap();
         assert!(rt.load("bad", "this is ) not valid javascript (").is_err());

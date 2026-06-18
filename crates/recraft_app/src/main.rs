@@ -1289,6 +1289,24 @@ fn apply_ext_commands(app: &mut App) {
                 app.ext_indices = indices;
                 app.geometry_dirty = true;
             }
+            recraft_ext::ExtCommand::RegisterBlock {
+                id,
+                texture,
+                opaque,
+                alpha,
+                luminance,
+                tint,
+            } => {
+                let tint = match tint {
+                    Some(rgb) => recraft_core::Tint::Rgb(rgb),
+                    None => recraft_core::Tint::None,
+                };
+                recraft_core::blocks::register_block(
+                    id,
+                    recraft_core::blocks::BlockDef::mod_cube(texture, opaque, alpha, tint),
+                    luminance,
+                );
+            }
         }
     }
 }

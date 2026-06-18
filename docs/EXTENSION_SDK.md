@@ -141,6 +141,30 @@ recraft.particleDensity(0.5);
 
 > `setBlockTint` is fully wired (the chunk mesher applies it). The other presets are accepted and queued; their renderer wiring lands with the render-hook milestone.
 
+### Content (experimental)
+
+`recraft.registerBlock` (and `HostApi::register_block` for native mods) registers
+a new full-cube block beyond the vanilla `0..=197` id range. The block gets full
+render/collision/light properties from a runtime registry overlay (vanilla ids
+keep their fast path, so there is no cost to existing blocks):
+
+```js
+recraft.onLoad(() => recraft.registerBlock(300, {
+  texture: "stone",          // reuse a vanilla atlas texture for now
+  opaque: true, alpha: 1.0,
+  luminance: 7,              // 0..15 light emitted
+  tint: [0.4, 0.8, 1.0],     // optional [r,g,b] 0..1
+}));
+```
+
+**Caveat:** this only manifests in a *recraft-authoritative* world. recraft is a
+client to a vanilla/Paper 1.8 server, which never sends mod block ids, so there
+is currently no world where a registered mod block can be placed. Per-mod
+*texture* registration (its own atlas entry, vs. reusing a vanilla name) is also
+not implemented yet. The id-space + property registry — the core of this
+milestone — is in place; placement/rendering of a new block awaits a
+recraft-authoritative world.
+
 ### Error isolation & hot reload
 
 Each mod runs in its own QuickJS context. A handler that throws is caught and logged (other handlers keep running); a mod that fails to load is skipped. **F10** drops all directory mods and reloads them from disk.

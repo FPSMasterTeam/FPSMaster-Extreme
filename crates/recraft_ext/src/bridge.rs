@@ -135,11 +135,39 @@ pub(crate) fn handle_cmd(json: &str) {
             pitch: f64_field(&v, "pitch") as f32,
         }),
         "render" => parse_render_preset(&v).map(ExtCommand::Render),
+        "block" => Some(ExtCommand::RegisterBlock {
+            id: int_field(&v, "id") as u16,
+            texture: {
+                let t = str_field(&v, "texture");
+                if t.is_empty() {
+                    "stone".to_string()
+                } else {
+                    t
+                }
+            },
+            opaque: v.get("opaque").and_then(Value::as_bool).unwrap_or(true),
+            alpha: v.get("alpha").and_then(Value::as_f64).unwrap_or(1.0) as f32,
+            luminance: int_field(&v, "lum").clamp(0, 15) as u8,
+            tint: rgb_field(&v, "tint"),
+        }),
         _ => None,
     };
     if let Some(cmd) = cmd {
         cur::push_command(cmd);
     }
+}
+
+/// Parse an optional `[r, g, b]` (0..1) color array field.
+fn rgb_field(v: &Value, k: &str) -> Option<[f32; 3]> {
+    let arr = v.get(k)?.as_array()?;
+    if arr.len() < 3 {
+        return None;
+    }
+    Some([
+        arr[0].as_f64().unwrap_or(0.0) as f32,
+        arr[1].as_f64().unwrap_or(0.0) as f32,
+        arr[2].as_f64().unwrap_or(0.0) as f32,
+    ])
 }
 
 /// Answer a read-view query from a `{"k":..}` JSON payload, returning JSON.

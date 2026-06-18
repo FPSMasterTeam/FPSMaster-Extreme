@@ -136,6 +136,15 @@ impl HostApi {
         ));
     }
 
+    /// Register a content-mod full-cube block at `id` (recraft-authoritative
+    /// worlds only). `texture` reuses a vanilla base name; `luminance` is 0..=15.
+    pub fn register_block(&self, id: u16, texture: &str, opaque: bool, alpha: f32, luminance: u8) {
+        self.cmd(format!(
+            r#"{{"t":"block","id":{id},"texture":"{}","opaque":{opaque},"alpha":{alpha},"lum":{luminance}}}"#,
+            esc(texture)
+        ));
+    }
+
     /// Submit native render-hook geometry (world-space, drawn after entities).
     /// Replaces the previous submission; pass empties to clear. Native-only.
     pub fn submit_geometry(&self, vertices: &[ExtVertex], indices: &[u32]) {
