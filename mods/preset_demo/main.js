@@ -6,7 +6,7 @@
 //
 // (The targeted-block outline is built into recraft now, like vanilla.)
 
-/// <reference path="../recraft.d.ts" />
+/// <reference path="../mc.d.ts" />
 
 const s = { fullbright: false, chunks: false, ebox: false };
 const nametags = [1.0, 2.0, 0.5];
@@ -14,36 +14,38 @@ const densities = [1.0, 0.2, 3.0];
 let ni = 0;
 let di = 0;
 
-recraft.onLoad(() => recraft.log("preset_demo: F7 fullbright, F9 chunks, [ hitboxes, ] nametag, \\ density"));
+mc.on("load", () =>
+  mc.log("preset_demo: F7 fullbright, F9 chunks, [ hitboxes, ] nametag, \\ density")
+);
 
-recraft.onKey((e) => {
+mc.on("key", (e) => {
   if (!e.pressed) return;
   switch (e.key) {
     case "F7":
       s.fullbright = !s.fullbright;
-      recraft.fullbright(s.fullbright);
+      mc.world.fullbright(s.fullbright);
       return true;
     case "F9":
       s.chunks = !s.chunks;
-      recraft.chunkBorders(s.chunks);
+      mc.world.chunkBorders(s.chunks);
       return true;
     case "BracketLeft":
       s.ebox = !s.ebox;
       // Colors are 0-255 (or 0xRRGGBBAA / "#fff"); [255,255,255] = white.
-      recraft.entityBox("", [255, 255, 255], s.ebox);
+      mc.world.entityBox("", [255, 255, 255], s.ebox);
       return true;
     case "BracketRight":
       ni = (ni + 1) % nametags.length;
-      recraft.nametagScale(nametags[ni]);
+      mc.world.nametagScale(nametags[ni]);
       return true;
     case "Backslash":
       di = (di + 1) % densities.length;
-      recraft.particleDensity(densities[di]);
+      mc.world.particleDensity(densities[di]);
       return true;
   }
 });
 
-recraft.drawHud((ctx) => {
+mc.drawHud((ctx) => {
   const yes = 0xffff_55ff;
   const no = 0xaaaaaaff;
   const rows = [

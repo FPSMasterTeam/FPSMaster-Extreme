@@ -4,7 +4,8 @@
 //! Rust<->JS interchange is the shared all-JSON [`crate::bridge`] protocol: three
 //! native globals `__rcf_cmd` / `__rcf_query` / `__rcf_hud`, and the host calls
 //! global `__rcf_dispatch_*` functions to fan out to registered handlers. The
-//! ergonomic `recraft.*` / `hud.*` API is built on top in the JS [`PRELUDE`].
+//! ergonomic `mc.*` / `hud.*` API (modelled on vanilla `mc.player` / `mc.world`)
+//! is built on top in the JS [`PRELUDE`].
 
 use std::path::Path;
 
@@ -19,13 +20,15 @@ use crate::packet::PacketView;
 use crate::view::ReadViews;
 
 /// JS bootstrap eval'd into every mod context before the mod source. Builds the
-/// `recraft`, `hud`, `console` API and the `__rcf_dispatch_*` fan-out on top of
-/// the three native globals, wrapping each handler in try/catch.
+/// ergonomic `mc.*` / `hud.*` / `console` API (modelled on vanilla `mc.player`,
+/// `mc.world`, `mc.connection`) and the `__rcf_dispatch_*` fan-out on top of the
+/// three native globals, wrapping each handler in try/catch.
 const PRELUDE: &str = r#"
 (() => {
-  const RT = (globalThis.__rcf = { h: { tick:[], frame:[], load:[], key:[], packet:{},
-    blockChange:[], chunkLoad:[], chunkUnload:[], chat:[], entitySpawn:[], entityRemove:[],
-    playerHealth:[], hud:[] } });
+  const RT = (globalThis.__rcf = { h: { tick:[], frame:[], load:[], key:[],
+    sb:{}, packet:{}, blockChange:[], chunkLoad:[], chunkUnload:[], chat:[],
+    entitySpawn:[], entityRemove:[], playerHealth:[], hud:[] },
+    keys:[], sched:[], schedId:0 });
   const color = (c) => {
     if (c == null) return 0xffffffff;
     if (typeof c === 'number') return c >>> 0;
@@ -36,34 +39,45 @@ const PRELUDE: &str = r#"
     return 0xffffffff;
   };
   const cmd = (o) => __rcf_cmd(JSON.stringify(o));
-  const recraft = globalThis.recraft = {
-    onTick:(cb)=>RT.h.tick.push(cb),
-    onFrame:(cb)=>RT.h.frame.push(cb),
-    onLoad:(cb)=>RT.h.load.push(cb),
-    onKey:(cb)=>RT.h.key.push(cb),
-    onChat:(cb)=>RT.h.chat.push(cb),
-    onBlockChange:(cb)=>RT.h.blockChange.push(cb),
-    onChunkLoad:(cb)=>RT.h.chunkLoad.push(cb),
-    onChunkUnload:(cb)=>RT.h.chunkUnload.push(cb),
-    onEntitySpawn:(cb)=>RT.h.entitySpawn.push(cb),
-    onEntityRemove:(cb)=>RT.h.entityRemove.push(cb),
-    onPlayerHealth:(cb)=>RT.h.playerHealth.push(cb),
-    onPacket:(type,cb)=>{ const k=String(type); (RT.h.packet[k]||(RT.h.packet[k]=[])).push(cb); },
-    drawHud:(cb)=>RT.h.hud.push(cb),
-    sendChat:(s)=>cmd({t:'chat',s:String(s)}),
-    sendPacket:(p)=>cmd({t:'packet',p:p}),
-    log:(...a)=>cmd({t:'log',l:2,m:a.map(String).join(' ')}),
-    warn:(...a)=>cmd({t:'log',l:1,m:a.map(String).join(' ')}),
-    error:(...a)=>cmd({t:'log',l:0,m:a.map(String).join(' ')}),
-    spawnParticle:(kind,x,y,z,o)=>{o=o||{};cmd({t:'particle',kind:kind|0,x:+x,y:+y,z:+z,
-      ox:+(o.ox||0),oy:+(o.oy||0),oz:+(o.oz||0),speed:+(o.speed||0),count:(o.count|0)||1});},
-    playSound:(event,x,y,z,o)=>{o=o||{};cmd({t:'sound',event:String(event),x:+x,y:+y,z:+z,
-      volume:+(o.volume==null?1:o.volume),pitch:+(o.pitch==null?1:o.pitch)});},
-    player:()=>JSON.parse(__rcf_query('{"k":"player"}')),
-    blockAt:(x,y,z)=>JSON.parse(__rcf_query(JSON.stringify({k:'block',x:x|0,y:y|0,z:z|0}))),
-    entities:()=>JSON.parse(__rcf_query('{"k":"entities"}')),
-    worldTime:()=>+__rcf_query('{"k":"time"}'),
-    dimension:()=>+__rcf_query('{"k":"dim"}'),
+  const q = (k,o) => JSON.parse(__rcf_query(JSON.stringify(Object.assign({k:k}, o||{}))));
+  const q1 = (k) => __rcf_query('{"k":"'+k+'"}');
+  const eid = (e) => (e && e.id != null ? e.id : e) | 0;
+
+  // ---- mc.player: a fresh snapshot each access, with action methods ----
+  const buildPlayer = () => {
+    const p = q('player');
+    p.heldItem    = () => q('held');
+    p.inventory   = () => q('inventory');
+    p.selectedSlot= () => +q1('selectedSlot');
+    p.capabilities= () => q('capabilities');
+    p.effects     = () => q('effects');
+    p.xp          = () => q('xp');
+    p.container   = () => q('container');
+    p.setRotation = (yaw,pitch,opts)=>{opts=opts||{};
+      cmd({t:'rotate',yaw:+yaw,pitch:+pitch,silent:!!opts.silent});};
+    p.clearRotation = ()=>cmd({t:'clearRotate'});
+    p.selectSlot  = (s)=>cmd({t:'selectSlot',slot:s|0});
+    p.swing       = ()=>cmd({t:'swing'});
+    p.useItem     = ()=>cmd({t:'useItem'});
+    p.attack      = (e)=>cmd({t:'attack',id:eid(e)});
+    p.interact    = (e,at)=>{const o={t:'interact',id:eid(e)};
+      if(at){o.ax=+at[0];o.ay=+at[1];o.az=+at[2];} cmd(o);};
+    p.placeBlock  = (x,y,z,face,cursor)=>{cursor=cursor||[8,8,8];
+      cmd({t:'place',x:x|0,y:y|0,z:z|0,face:face|0,cx:cursor[0]|0,cy:cursor[1]|0,cz:cursor[2]|0});};
+    p.dig         = (status,x,y,z,face)=>cmd({t:'dig',status:status|0,x:x|0,y:y|0,z:z|0,face:face|0});
+    p.openInventory = ()=>cmd({t:'openInv'});
+    p.closeContainer= ()=>cmd({t:'close'});
+    p.clickSlot   = (slot,button,mode)=>cmd({t:'click',slot:slot|0,button:button|0,mode:mode|0});
+    return p;
+  };
+
+  const world = {
+    getBlock:(x,y,z)=>q('block',{x:x|0,y:y|0,z:z|0}),
+    get time(){ return +q1('time'); },
+    get dimension(){ return +q1('dim'); },
+    get loadedChunks(){ return +q1('chunks'); },
+    entities:()=>q('entities'),
+    entity:(id)=>q('entity',{id:id|0}),
     setBlockTint:(id,c,meta)=>cmd({t:'render',r:'blockTint',id:id|0,
       meta:(meta==null?-1:meta|0),color:color(c)}),
     registerBlock:(id,o)=>{o=o||{};cmd({t:'block',id:id|0,texture:String(o.texture||'stone'),
@@ -75,8 +89,57 @@ const PRELUDE: &str = r#"
       color:color(c),on:on!==false}),
     nametagScale:(s)=>cmd({t:'render',r:'nametagScale',v:+s}),
     particleDensity:(s)=>cmd({t:'render',r:'particleDensity',v:+s}),
+    spawnParticle:(kind,x,y,z,o)=>{o=o||{};cmd({t:'particle',kind:kind|0,x:+x,y:+y,z:+z,
+      ox:+(o.ox||0),oy:+(o.oy||0),oz:+(o.oz||0),speed:+(o.speed||0),count:(o.count|0)||1});},
+    playSound:(event,x,y,z,o)=>{o=o||{};cmd({t:'sound',event:String(event),x:+x,y:+y,z:+z,
+      volume:+(o.volume==null?1:o.volume),pitch:+(o.pitch==null?1:o.pitch)});},
   };
-  globalThis.console = { log:recraft.log, info:recraft.log, warn:recraft.warn, error:recraft.error };
+
+  const connection = {
+    get connected(){ return q1('connected') === 'true'; },
+    sendChat:(s)=>cmd({t:'chat',s:String(s)}),
+    sendPacket:(p)=>cmd({t:'packet',p:p}),
+  };
+
+  // ---- event registration (vanilla-ish mc.on) ----
+  const EVENTS = { tick:'tick', frame:'frame', load:'load', key:'key', chat:'chat',
+    blockChange:'blockChange', chunkLoad:'chunkLoad', chunkUnload:'chunkUnload',
+    entitySpawn:'entitySpawn', entityRemove:'entityRemove', playerHealth:'playerHealth' };
+  const log = (...a)=>cmd({t:'log',l:2,m:a.map(String).join(' ')});
+  const warn= (...a)=>cmd({t:'log',l:1,m:a.map(String).join(' ')});
+  const error=(...a)=>cmd({t:'log',l:0,m:a.map(String).join(' ')});
+
+  const mc = globalThis.mc = {
+    get player(){ return buildPlayer(); },
+    world: world,
+    connection: connection,
+    log: log, warn: warn, error: error,
+    on:(name,cb)=>{ const k=EVENTS[name];
+      if(!k){ error('mc.on: unknown event "'+name+'"'); return; } RT.h[k].push(cb); },
+    onPacket:(type,cb)=>{ const k=String(type); (RT.h.packet[k]||(RT.h.packet[k]=[])).push(cb); },
+    onServerbound:(type,cb)=>{ const k=String(type); (RT.h.sb[k]||(RT.h.sb[k]=[])).push(cb); },
+    drawHud:(cb)=>RT.h.hud.push(cb),
+    // Forge-style key binding driven by the raw key stream.
+    keyBinding:(name,defaultKey)=>{ const kb={ name:String(name||''), key:String(defaultKey||''),
+      pressed:false, _p:[], _r:[], onPress:(cb)=>{kb._p.push(cb);return kb;},
+      onRelease:(cb)=>{kb._r.push(cb);return kb;}, isPressed:()=>kb.pressed };
+      RT.keys.push(kb); return kb; },
+    // Tick-based scheduler (QuickJS has no timers).
+    scheduler:{
+      after:(ticks,cb)=>{ const t={n:ticks|0,every:false,cb:cb,id:++RT.schedId}; RT.sched.push(t); return t.id; },
+      every:(ticks,cb)=>{ const p=Math.max(1,ticks|0); const t={n:p,p:p,every:true,cb:cb,id:++RT.schedId}; RT.sched.push(t); return t.id; },
+      clear:(id)=>{ RT.sched=RT.sched.filter(t=>t.id!==id); },
+    },
+    config: (()=>{ let data={}; try{ data=JSON.parse(globalThis.__rcf_config||'{}')||{}; }catch(e){}
+      const api={ get data(){return data;},
+        load:(defaults)=>{ data=Object.assign({}, defaults||{}, data); return data; },
+        get:(k,def)=>(k in data?data[k]:def),
+        set:(k,v)=>{ data[k]=v; return api; },
+        save:()=>cmd({t:'saveConfig',dir:(globalThis.__rcf_dir||'.'),json:JSON.stringify(data)}) };
+      return api; })(),
+  };
+
+  globalThis.console = { log:log, info:log, warn:warn, error:error };
   globalThis.hud = {
     rect:(x,y,w,h,c)=>__rcf_hud(JSON.stringify({o:'rect',x:x|0,y:y|0,w:w|0,h:h|0,c:color(c)})),
     text:(x,y,text,o)=>{o=o||{};__rcf_hud(JSON.stringify({o:'text',x:x|0,y:y|0,
@@ -86,14 +149,25 @@ const PRELUDE: &str = r#"
     blockItem:(x,y,id,meta,o)=>{o=o||{};__rcf_hud(JSON.stringify({o:'block',x:x|0,y:y|0,
       sz:(o.size|0)||16,id:id|0,meta:meta|0}));},
   };
-  const safe=(cb,arg,who)=>{ try{ return cb(arg); }catch(e){ recraft.error('['+who+'] '+((e&&e.stack)||e)); } };
-  globalThis.__rcf_dispatch_tick=()=>{ for(const cb of RT.h.tick) safe(cb,undefined,'onTick'); };
-  globalThis.__rcf_dispatch_frame=()=>{ for(const cb of RT.h.frame) safe(cb,undefined,'onFrame'); };
-  globalThis.__rcf_dispatch_load=()=>{ for(const cb of RT.h.load) safe(cb,undefined,'onLoad'); };
+
+  const safe=(cb,arg,who)=>{ try{ return cb(arg); }catch(e){ error('['+who+'] '+((e&&e.stack)||e)); } };
+  globalThis.__rcf_dispatch_tick=()=>{
+    for(const cb of RT.h.tick) safe(cb,undefined,'tick');
+    if(RT.sched.length){ const due=[]; const keep=[];
+      for(const t of RT.sched){ t.n--; if(t.n<=0){ due.push(t); if(t.every){ t.n=t.p; keep.push(t);} } else keep.push(t); }
+      RT.sched=keep; for(const t of due) safe(t.cb,undefined,'scheduler'); }
+  };
+  globalThis.__rcf_dispatch_frame=()=>{ for(const cb of RT.h.frame) safe(cb,undefined,'frame'); };
+  globalThis.__rcf_dispatch_load=()=>{ for(const cb of RT.h.load) safe(cb,undefined,'load'); };
   globalThis.__rcf_dispatch_key=(json)=>{ const e=JSON.parse(json); let consumed=false;
-    for(const cb of RT.h.key){ if(safe(cb,e,'onKey')===true) consumed=true; } return consumed; };
+    for(const kb of RT.keys){ if(kb.key===e.key){ if(e.pressed!==kb.pressed){ kb.pressed=e.pressed;
+      const list=e.pressed?kb._p:kb._r; for(const cb of list) safe(cb,kb,'keyBinding'); } } }
+    for(const cb of RT.h.key){ if(safe(cb,e,'key')===true) consumed=true; } return consumed; };
   globalThis.__rcf_dispatch_packet=(json)=>{ const e=JSON.parse(json); let drop=false;
     const list=RT.h.packet[e.type]; if(list) for(const cb of list){ if(safe(cb,e,'onPacket')===false) drop=true; }
+    return drop; };
+  globalThis.__rcf_dispatch_serverbound=(json)=>{ const e=JSON.parse(json); let drop=false;
+    const list=RT.h.sb[e.type]; if(list) for(const cb of list){ if(safe(cb,e,'onServerbound')===false) drop=true; }
     return drop; };
   globalThis.__rcf_dispatch_event=(json)=>{ const e=JSON.parse(json);
     const map={BlockChange:'blockChange',ChunkLoad:'chunkLoad',ChunkUnload:'chunkUnload',
@@ -115,10 +189,14 @@ impl JsRuntime {
         Ok(Self { rt })
     }
 
-    /// Build a [`JsPlugin`] from a mod id and its source. Registers the native
-    /// globals, evals the prelude, then evals the mod source (a syntax/runtime
-    /// error at load is reported and the mod rejected).
-    pub fn load(&self, id: &str, source: &str) -> Result<JsPlugin, JsError> {
+    /// Build a [`JsPlugin`] from a mod id, its source and its directory.
+    /// Registers the native globals, injects the mod's config dir + persisted
+    /// `config.json` (for `mc.config`), evals the prelude, then evals the mod
+    /// source (a syntax/runtime error at load is reported and the mod rejected).
+    pub fn load(&self, id: &str, source: &str, dir: &Path) -> Result<JsPlugin, JsError> {
+        let config_json =
+            std::fs::read_to_string(dir.join("config.json")).unwrap_or_else(|_| "{}".to_string());
+        let dir_str = dir.to_string_lossy().to_string();
         let ctx = Context::full(&self.rt).map_err(JsError::from_rquickjs)?;
         ctx.with(|ctx| -> Result<(), JsError> {
             let g = ctx.globals();
@@ -140,6 +218,10 @@ impl JsRuntime {
                     .map_err(JsError::from_rquickjs)?,
             )
             .map_err(JsError::from_rquickjs)?;
+            g.set("__rcf_dir", dir_str)
+                .map_err(JsError::from_rquickjs)?;
+            g.set("__rcf_config", config_json)
+                .map_err(JsError::from_rquickjs)?;
             ctx.eval::<(), _>(PRELUDE)
                 .catch(&ctx)
                 .map_err(|e| JsError::Eval(e.to_string()))?;
@@ -213,6 +295,18 @@ impl HostHooks for JsPlugin {
         let _v = cur::ViewsGuard::enter(views);
         let _c = cur::CommandsGuard::enter(commands);
         if self.call_bool("__rcf_dispatch_packet", &json) {
+            Verdict::Drop
+        } else {
+            Verdict::Pass
+        }
+    }
+
+    fn on_serverbound_packet(&mut self, packet: &PacketView, ctx: &mut HookCtx) -> Verdict {
+        let json = bridge::packet_view_json(packet);
+        let (views, commands) = ctx.raw_parts();
+        let _v = cur::ViewsGuard::enter(views);
+        let _c = cur::CommandsGuard::enter(commands);
+        if self.call_bool("__rcf_dispatch_serverbound", &json) {
             Verdict::Drop
         } else {
             Verdict::Pass

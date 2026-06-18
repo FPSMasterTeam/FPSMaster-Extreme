@@ -248,7 +248,9 @@ mod tests {
     fn js_mod(source: &str) -> ExtManager {
         let mut mgr = ExtManager::new();
         let rt = js::JsRuntime::new().expect("js runtime");
-        let plugin = rt.load("test.mod", source).expect("load js mod");
+        let plugin = rt
+            .load("test.mod", source, std::path::Path::new("."))
+            .expect("load js mod");
         mgr.register(Box::new(plugin));
         // The plugin's context keeps the runtime alive, so dropping `rt` is fine.
         mgr
@@ -256,7 +258,8 @@ mod tests {
 
     #[test]
     fn js_tick_reads_views_and_enqueues_chat() {
-        let mut mgr = js_mod("recraft.onTick(() => recraft.sendChat('x=' + recraft.player().x));");
+        let mut mgr =
+            js_mod("mc.on('tick', () => mc.connection.sendChat('x=' + mc.player.x));");
         mgr.dispatch_tick(&MockViews);
         let cmds = mgr.take_commands();
         assert!(
@@ -269,7 +272,7 @@ mod tests {
     #[test]
     fn js_block_query_reaches_views() {
         let mut mgr = js_mod(
-            "recraft.onTick(() => { const b = recraft.blockAt(1,2,3); recraft.log('id', b.id); });",
+            "mc.on('tick', () => { const b = mc.world.getBlock(1,2,3); mc.log('id', b.id); });",
         );
         mgr.dispatch_tick(&MockViews);
         let cmds = mgr.take_commands();
@@ -280,7 +283,7 @@ mod tests {
 
     #[test]
     fn js_packet_handler_can_drop() {
-        let mut mgr = js_mod("recraft.onPacket('ChatMessage', (p) => false);");
+        let mut mgr = js_mod("mc.onPacket('ChatMessage', (p) => false);");
         let verdict = mgr.dispatch_clientbound_packet(
             &PacketView::Chat {
                 text: "hi".into(),
@@ -294,14 +297,14 @@ mod tests {
 
     #[test]
     fn js_input_handler_consumes() {
-        let mut mgr = js_mod("recraft.onKey((e) => e.key === 'F6' && e.pressed);");
+        let mut mgr = js_mod("mc.on('key', (e) => e.key === 'F6' && e.pressed);");
         assert!(mgr.dispatch_input(&InputEvent::new("F6", true), &MockViews));
         assert!(!mgr.dispatch_input(&InputEvent::new("KeyW", true), &MockViews));
     }
 
     #[test]
     fn js_draw_hud_records_commands() {
-        let mut mgr = js_mod("recraft.drawHud((ctx) => hud.text(2, 2, 'p=' + recraft.player().z));");
+        let mut mgr = js_mod("mc.drawHud((ctx) => hud.text(2, 2, 'p=' + mc.player.z));");
         let mut hud = HudDraw::new();
         let ctx = HudCtx {
             width: 320,
@@ -320,8 +323,8 @@ mod tests {
     fn js_handler_exception_is_isolated() {
         // First handler throws; second still runs and enqueues its command.
         let mut mgr = js_mod(
-            "recraft.onTick(() => { throw new Error('boom'); });\
-             recraft.onTick(() => recraft.sendChat('survived'));",
+            "mc.on('tick', () => { throw new Error('boom'); });\
+             mc.on('tick', () => mc.connection.sendChat('survived'));",
         );
         mgr.dispatch_tick(&MockViews);
         let cmds = mgr.take_commands();
@@ -333,7 +336,7 @@ mod tests {
     #[test]
     fn js_register_block_enqueues_command() {
         let mut mgr = js_mod(
-            "recraft.onLoad(() => recraft.registerBlock(300, { texture: 'stone', luminance: 7, tint: [1,0,0] }));",
+            "mc.on('load', () => mc.world.registerBlock(300, { texture: 'stone', luminance: 7, tint: [1,0,0] }));",
         );
         mgr.dispatch_tick(&MockViews); // runs the pending on_load
         let cmds = mgr.take_commands();
@@ -349,7 +352,13 @@ mod tests {
     #[test]
     fn js_syntax_error_rejected_at_load() {
         let rt = js::JsRuntime::new().unwrap();
-        assert!(rt.load("bad", "this is ) not valid javascript (").is_err());
+        assert!(rt
+            .load(
+                "bad",
+                "this is ) not valid javascript (",
+                std::path::Path::new(".")
+            )
+            .is_err());
     }
 
     #[test]
@@ -453,11 +462,15 @@ mod tests {
             .unwrap();
             std::fs::write(md.join("main.js"), body).unwrap();
         };
-        mk("alpha", "", "recraft.onTick(() => recraft.sendChat('alpha'));");
+        mk(
+            "alpha",
+            "",
+            "mc.on('tick', () => mc.connection.sendChat('alpha'));",
+        );
         mk(
             "beta",
             "\"alpha\"",
-            "recraft.onTick(() => recraft.sendChat('beta'));",
+            "mc.on('tick', () => mc.connection.sendChat('beta'));",
         );
 
         let mut mgr = ExtManager::new();

@@ -115,7 +115,7 @@ impl ExtManager {
                         Some(rt) => rt,
                         None => continue,
                     };
-                    match rt.load(&manifest.id, &source) {
+                    match rt.load(&manifest.id, &source, path) {
                         Ok(plugin) => {
                             self.push_plugin(Box::new(plugin), true);
                             loaded.push(manifest.id.clone());

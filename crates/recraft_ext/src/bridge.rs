@@ -266,6 +266,18 @@ pub(crate) fn handle_query(json: &str) -> String {
                 .collect();
             Value::Array(list).to_string()
         }
+        "entity" => match views.entity(int_field(&v, "id") as i32) {
+            Some(e) => {
+                let (kind, type_id) = entity_kind_js(e.kind);
+                json!({
+                    "id": e.id, "kind": kind, "typeId": type_id,
+                    "x": e.x, "y": e.y, "z": e.z, "yaw": e.yaw, "pitch": e.pitch,
+                    "onGround": e.on_ground, "name": e.name, "health": e.health
+                })
+                .to_string()
+            }
+            None => "null".to_string(),
+        },
         "time" => views.world_time().to_string(),
         "dim" => views.dimension().to_string(),
         "chunks" => views.loaded_chunk_count().to_string(),
