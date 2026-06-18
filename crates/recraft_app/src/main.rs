@@ -41,8 +41,11 @@ use gui::progress::{
 use singleplayer::LocalServer;
 use gui::{AccountEntry, DrawCtx, GuiAction, GuiScreen, ScreenCtx};
 use item_renderer::ItemRenderer;
-use network::{NetworkEvent, NetworkHandle};
-use recraft_protocol::{net::PremiumSession, v1_8_9::packets::ServerboundPacket};
+use network::{NetworkEvent, NetworkHandle, WalkingPacketState};
+use recraft_protocol::{
+    net::PremiumSession,
+    v1_8_9::packets::{ClientboundPlayPacket, ServerboundPacket},
+};
 use recraft_render::{RenderStats, Renderer};
 use settings::{FpsCounter, GameAction, Keybinds, Settings};
 
@@ -128,6 +131,10 @@ struct App {
     /// transaction`, not the reverse (sending at frame time let a transaction
     /// land between the last flying and the click → Post "click window v1.8").
     pending_window_packets: Vec<ServerboundPacket>,
+    /// Outgoing movement delta-encoding state (vanilla onUpdateWalkingPlayer).
+    /// Owned here so the flying packet and the teleport confirm that resets its
+    /// baseline are built on the main thread, in tick order with the acks.
+    walking_packets: WalkingPacketState,
     /// Extension-injected serverbound packets, flushed in the next tick's
     /// pre-flying window (like vanilla interactions) so the order the server sees
     /// matches a real client — see the drain in `about_to_wait`.
@@ -413,6 +420,7 @@ impl ApplicationHandler for WinitApp {
             last_entity_key: None,
             sound: sound::SoundManager::new(),
             pending_window_packets: Vec::new(),
+            walking_packets: WalkingPacketState::default(),
             pending_ext_packets: Vec::new(),
             ext: recraft_ext::ExtManager::new(),
             block_tints: recraft_render::TintTable::new(),
@@ -819,7 +827,12 @@ impl ApplicationHandler for WinitApp {
                             if let Some(abilities) = abilities {
                                 network.send_packet(abilities);
                             }
-                            network.send_movement(movement);
+                            // The flying packet last, built on the main thread from
+                            // the delta-encoding state (vanilla onUpdateWalkingPlayer)
+                            // so it's ordered after this tick's acks + interactions.
+                            for packet in app.walking_packets.next_packets(movement) {
+                                network.send_packet(packet);
+                            }
                         }
                     }
                 }
@@ -1709,6 +1722,72 @@ fn replay_hud(ui: &mut recraft_render::UiFrame, draw: &recraft_ext::HudDraw, sca
 /// DestroyEntities) must be processed before the next tick — otherwise the
 /// server (Grim) considers entities removed while the client still sees them,
 /// causing BadPacketsW ("interacted with non-existent entity").
+/// Respond to a control packet the way vanilla's `NetHandlerPlayClient` does —
+/// on the game thread, in receipt order, queued ahead of this tick's flying
+/// packet: pong KeepAlive/ConfirmTransaction, send the join handshake, and ack a
+/// teleport (resolving relative axes, echoing a full position+look with
+/// on_ground=false, resetting the movement baseline). Returns `true` if the
+/// packet is fully handled here and should NOT also be applied to game state.
+fn respond_to_control_packet(
+    network: &NetworkHandle,
+    walking: &mut WalkingPacketState,
+    packet: &ClientboundPlayPacket,
+) -> bool {
+    match packet {
+        ClientboundPlayPacket::KeepAlive { id } => {
+            network.send_packet(ServerboundPacket::KeepAlive { id: *id });
+            true
+        }
+        ClientboundPlayPacket::ConfirmTransaction {
+            window_id,
+            action_number,
+            accepted,
+        } => {
+            if !accepted {
+                network.send_packet(ServerboundPacket::ConfirmTransaction {
+                    window_id: *window_id,
+                    action_number: *action_number,
+                    accepted: true,
+                });
+            }
+            true
+        }
+        ClientboundPlayPacket::JoinGame { .. } => {
+            for p in network::initial_play_packets() {
+                network.send_packet(p);
+            }
+            false
+        }
+        ClientboundPlayPacket::PlayerPositionLook {
+            x,
+            y,
+            z,
+            yaw,
+            pitch,
+            flags,
+        } => {
+            // The teleport confirm must precede any LATER transaction pong (the
+            // receipt-order constraint Grim's setback logic needs) — receipt
+            // order is preserved because this runs as packets are drained in
+            // order. The game state + freeze are applied separately.
+            let snap = game::MovementSnapshot {
+                x: if flags & 0x01 != 0 { walking.last_reported_x + x } else { *x },
+                y: if flags & 0x02 != 0 { walking.last_reported_y + y } else { *y },
+                z: if flags & 0x04 != 0 { walking.last_reported_z + z } else { *z },
+                yaw: if flags & 0x08 != 0 { walking.last_reported_yaw + yaw } else { *yaw },
+                pitch: if flags & 0x10 != 0 { walking.last_reported_pitch + pitch } else { *pitch },
+                on_ground: false,
+                entity_id: 0,
+                sneaking: false,
+                sprinting: false,
+            };
+            network.send_packet(walking.confirm_packet(snap));
+            false
+        }
+        _ => false,
+    }
+}
+
 fn pump_network(app: &mut App, window: &winit::window::Window, cursor_captured: &mut bool) {
     let Some(network) = &app.network else { return };
     let mut disconnect: Option<String> = None;
@@ -1718,6 +1797,15 @@ fn pump_network(app: &mut App, window: &winit::window::Window, cursor_captured: 
                 log::info!("logged in as {username} ({uuid})");
             }
             Ok(NetworkEvent::PlayPacket(packet)) => {
+                // Vanilla `NetHandlerPlayClient` runs on the game thread: respond
+                // to the control packets HERE, in receipt order, queued ahead of
+                // this tick's flying packet (pump_network runs before the tick
+                // loop). That gives the vanilla per-tick order — acks/pongs →
+                // interactions → flying — that transaction-based anti-cheats key
+                // off, instead of the old network-thread immediate pong.
+                if respond_to_control_packet(network, &mut app.walking_packets, &packet) {
+                    continue;
+                }
                 // ext seam: project a stable view + derive events BEFORE the
                 // packet is moved into apply_play_packet. A mod may `Drop` it.
                 // Commands queued here are drained after pump_network returns
@@ -1783,6 +1871,7 @@ fn pump_network(app: &mut App, window: &winit::window::Window, cursor_captured: 
         // on this session's first tick.
         app.pending_window_packets.clear();
         app.pending_ext_packets.clear();
+        app.walking_packets = WalkingPacketState::default();
         app.screen = None;
     }
     sync_cursor(window, cursor_captured, app);
@@ -2510,6 +2599,7 @@ fn run_headless_interact(config: &LaunchConfig, seconds: f32) -> anyhow::Result<
     );
     let network = NetworkHandle::connect_offline_1_8_9(host, port, config.username.clone());
     let mut game = GameState::empty_for_server(1.0);
+    let mut walking_packets = WalkingPacketState::default();
 
     let start = Instant::now();
     let tick = Duration::from_millis(50);
@@ -2531,8 +2621,11 @@ fn run_headless_interact(config: &LaunchConfig, seconds: f32) -> anyhow::Result<
                     log::info!("logged in as {username} ({uuid})")
                 }
                 Ok(NetworkEvent::PlayPacket(packet)) => {
-                    game.apply_play_packet(packet);
                     budget -= 1;
+                    if respond_to_control_packet(&network, &mut walking_packets, &packet) {
+                        continue;
+                    }
+                    game.apply_play_packet(packet);
                 }
                 Ok(NetworkEvent::ChunkColumn { x, z, column }) => {
                     game.apply_chunk_column(x, z, &column);
@@ -2598,7 +2691,9 @@ fn run_headless_interact(config: &LaunchConfig, seconds: f32) -> anyhow::Result<
                     for packet in actions {
                         network.send_packet(packet);
                     }
-                    network.send_movement(game.movement_snapshot());
+                    for packet in walking_packets.next_packets(game.movement_snapshot()) {
+                        network.send_packet(packet);
+                    }
                 }
             }
             tick_count += 1;
@@ -2625,6 +2720,7 @@ fn run_headless_smoke(config: &LaunchConfig, seconds: f32) -> anyhow::Result<()>
     );
     let network = NetworkHandle::connect_offline_1_8_9(host, port, config.username.clone());
     let mut game = GameState::empty_for_server(1.0);
+    let mut walking_packets = WalkingPacketState::default();
 
     let start = Instant::now();
     let tick = Duration::from_millis(50);
@@ -2647,8 +2743,11 @@ fn run_headless_smoke(config: &LaunchConfig, seconds: f32) -> anyhow::Result<()>
                     log::info!("logged in as {username} ({uuid})")
                 }
                 Ok(NetworkEvent::PlayPacket(packet)) => {
-                    game.apply_play_packet(packet);
                     budget -= 1;
+                    if respond_to_control_packet(&network, &mut walking_packets, &packet) {
+                        continue;
+                    }
+                    game.apply_play_packet(packet);
                 }
                 Ok(NetworkEvent::ChunkColumn { x, z, column }) => {
                     game.apply_chunk_column(x, z, &column);
@@ -2681,7 +2780,9 @@ fn run_headless_smoke(config: &LaunchConfig, seconds: f32) -> anyhow::Result<()>
         if in_game {
             if game.tick(0.05).is_some() {
                 if game.can_send_movement_packets() {
-                    network.send_movement(game.movement_snapshot());
+                    for packet in walking_packets.next_packets(game.movement_snapshot()) {
+                        network.send_packet(packet);
+                    }
                 }
             }
         }

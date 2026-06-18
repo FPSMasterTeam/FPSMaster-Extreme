@@ -39,24 +39,28 @@ pub enum NetworkEvent {
 
 #[derive(Debug)]
 pub enum NetworkCommand {
-    Move(MovementSnapshot),
     Send(ServerboundPacket),
 }
 
+/// Delta-encoding state for the client's outgoing movement packets (vanilla
+/// `EntityPlayerSP.onUpdateWalkingPlayer`). Owned by the MAIN thread so the
+/// flying packet — and the teleport confirm that resets its baseline — are sent
+/// in tick order, right after this tick's incoming packets are processed
+/// (replicating `NetHandlerPlayClient` running on the game thread).
 #[derive(Debug, Default)]
-struct WalkingPacketState {
-    last_reported_x: f64,
-    last_reported_y: f64,
-    last_reported_z: f64,
-    last_reported_yaw: f32,
-    last_reported_pitch: f32,
+pub struct WalkingPacketState {
+    pub last_reported_x: f64,
+    pub last_reported_y: f64,
+    pub last_reported_z: f64,
+    pub last_reported_yaw: f32,
+    pub last_reported_pitch: f32,
     position_update_ticks: i32,
     server_sneak_state: bool,
     server_sprint_state: bool,
 }
 
 impl WalkingPacketState {
-    fn next_packets(&mut self, movement: MovementSnapshot) -> Vec<ServerboundPacket> {
+    pub fn next_packets(&mut self, movement: MovementSnapshot) -> Vec<ServerboundPacket> {
         let mut packets = Vec::new();
         if movement.sprinting != self.server_sprint_state {
             packets.push(ServerboundPacket::EntityAction {
@@ -93,7 +97,7 @@ impl WalkingPacketState {
     /// resends the correction every tick. So always emit a full position+look,
     /// regardless of how small the delta is, and reset our reporting baseline so
     /// the following movement delta is measured from the confirmed position.
-    fn confirm_packet(&mut self, movement: MovementSnapshot) -> ServerboundPacket {
+    pub fn confirm_packet(&mut self, movement: MovementSnapshot) -> ServerboundPacket {
         self.last_reported_x = movement.x;
         self.last_reported_y = movement.y;
         self.last_reported_z = movement.z;
@@ -193,11 +197,9 @@ impl NetworkHandle {
         }
     }
 
-    pub fn send_movement(&self, movement: MovementSnapshot) {
-        let _ = self.commands.send(NetworkCommand::Move(movement));
-    }
-
-    /// Queue an arbitrary serverbound packet (interaction, held-item change…).
+    /// Queue an arbitrary serverbound packet (interaction, held-item change,
+    /// flying packet…). The main thread builds the flying packets via
+    /// [`WalkingPacketState::next_packets`] and queues them here, in tick order.
     pub fn send_packet(&self, packet: ServerboundPacket) {
         let _ = self.commands.send(NetworkCommand::Send(packet));
     }
@@ -245,29 +247,19 @@ fn network_thread(
     });
     let _ = client.set_read_timeout(Some(Duration::from_millis(10)));
 
-    let mut walking_packets = WalkingPacketState::default();
-    // The brand / client-settings handshake must be sent only once the server
-    // is in the play state — i.e. after it sends JoinGame. Sending earlier (e.g.
-    // through a proxy still in login) yields "Bad packet id".
-    let mut sent_join_handshake = false;
     // Sky light presence is dimension-derived (overworld only); tracked here so
     // chunks can be decoded on this thread without the game state.
     let mut has_sky_light = true;
 
+    // This thread is a pure reader/writer: it writes whatever serverbound packets
+    // the main thread queues (in order) and forwards every incoming packet to the
+    // main thread (in receipt order). Acks/pongs (KeepAlive, ConfirmTransaction,
+    // teleport confirm) and the flying packet are produced on the MAIN thread, at
+    // tick time, so their order matches vanilla's `NetHandlerPlayClient` (which
+    // runs on the game thread) — what transaction-based anti-cheats key off.
     loop {
         loop {
             match commands.try_recv() {
-                Ok(NetworkCommand::Move(movement)) => {
-                    for packet in walking_packets.next_packets(movement) {
-                        log::debug!("sending {}", packet_debug_name(&packet));
-                        let frame = packet.into_frame();
-                        if let Err(err) = client.write_packet(frame) {
-                            let _ = events
-                                .send(NetworkEvent::Disconnected(format!("write failed: {err}")));
-                            return;
-                        }
-                    }
-                }
                 Ok(NetworkCommand::Send(packet)) => {
                     log::debug!("sending {}", packet_debug_name(&packet));
                     if let Err(err) = client.write_packet(packet.into_frame()) {
@@ -282,123 +274,16 @@ fn network_thread(
         }
 
         match client.read_play_packet_1_8_9() {
-            Ok(ClientboundPlayPacket::KeepAlive { id }) => {
-                if let Err(err) =
-                    client.write_packet(ServerboundPacket::KeepAlive { id }.into_frame())
-                {
-                    let _ = events.send(NetworkEvent::Disconnected(format!(
-                        "keepalive write failed: {err}"
-                    )));
-                    return;
-                }
-            }
-            Ok(ClientboundPlayPacket::ConfirmTransaction {
-                window_id,
-                action_number,
-                accepted,
-            }) => {
-                // Vanilla echoes an unaccepted server transaction straight back
-                // on the network thread. Anti-cheats (e.g. Grim) inject these as
-                // a timing/ack ping and gate their movement setbacks on the
-                // reply, so a faithful 1.8 client must pong them promptly.
-                if !accepted {
-                    if let Err(err) = client.write_packet(
-                        ServerboundPacket::ConfirmTransaction {
-                            window_id,
-                            action_number,
-                            accepted: true,
-                        }
-                        .into_frame(),
-                    ) {
-                        let _ = events.send(NetworkEvent::Disconnected(format!(
-                            "transaction write failed: {err}"
-                        )));
-                        return;
-                    }
-                }
-            }
             Ok(packet) => {
-                // Track dimension-derived sky light and send the vanilla join
-                // handshake (brand + client settings) once we reach the play
-                // state (JoinGame).
+                // Track dimension-derived sky light (needed to decode chunks on
+                // this thread). The join handshake + every ack now happen on the
+                // main thread; this thread only forwards.
                 match &packet {
                     ClientboundPlayPacket::JoinGame { dimension, .. } => {
                         has_sky_light = *dimension == 0;
-                        if !sent_join_handshake {
-                            sent_join_handshake = true;
-                            for handshake in initial_play_packets() {
-                                if let Err(err) = client.write_packet(handshake.into_frame()) {
-                                    let _ = events.send(NetworkEvent::Disconnected(format!(
-                                        "handshake write failed: {err}"
-                                    )));
-                                    return;
-                                }
-                            }
-                        }
                     }
                     ClientboundPlayPacket::Respawn { dimension, .. } => {
                         has_sky_light = *dimension == 0;
-                    }
-                    ClientboundPlayPacket::PlayerPositionLook {
-                        x,
-                        y,
-                        z,
-                        yaw,
-                        pitch,
-                        flags,
-                    } => {
-                        // Ack the teleport synchronously here, in packet order —
-                        // BEFORE ponging any later transaction. Vanilla does this on
-                        // the netty thread; deferring it to the game tick lets a
-                        // newer transaction pong go out first, so a strict anti-cheat
-                        // (Grim) sees the player "skip past" the setback and
-                        // setback-loops forever. Relative axes resolve against the
-                        // last reported position the network thread already tracks.
-                        let rx = if flags & 0x01 != 0 {
-                            walking_packets.last_reported_x + x
-                        } else {
-                            *x
-                        };
-                        let ry = if flags & 0x02 != 0 {
-                            walking_packets.last_reported_y + y
-                        } else {
-                            *y
-                        };
-                        let rz = if flags & 0x04 != 0 {
-                            walking_packets.last_reported_z + z
-                        } else {
-                            *z
-                        };
-                        let ryaw = if flags & 0x08 != 0 {
-                            walking_packets.last_reported_yaw + yaw
-                        } else {
-                            *yaw
-                        };
-                        let rpitch = if flags & 0x10 != 0 {
-                            walking_packets.last_reported_pitch + pitch
-                        } else {
-                            *pitch
-                        };
-                        let confirm = walking_packets.confirm_packet(MovementSnapshot {
-                            x: rx,
-                            y: ry,
-                            z: rz,
-                            yaw: ryaw,
-                            pitch: rpitch,
-                            // Vanilla teleport-ack reports on_ground=false; with the
-                            // transaction now in order Grim recognises the ack and
-                            // exempts it from the ground check.
-                            on_ground: false,
-                            entity_id: 0,
-                            sneaking: false,
-                            sprinting: false,
-                        });
-                        if let Err(err) = client.write_packet(confirm.into_frame()) {
-                            let _ = events.send(NetworkEvent::Disconnected(format!(
-                                "teleport confirm write failed: {err}"
-                            )));
-                            return;
-                        }
                     }
                     _ => {}
                 }
@@ -473,8 +358,9 @@ fn network_thread(
 }
 
 /// The packets a vanilla 1.8 client sends right after entering the play state:
-/// the client brand on `MC|Brand`, then client settings.
-fn initial_play_packets() -> Vec<ServerboundPacket> {
+/// the client brand on `MC|Brand`, then client settings. Sent by the main thread
+/// when it processes JoinGame (vanilla sends these from the game thread).
+pub fn initial_play_packets() -> Vec<ServerboundPacket> {
     let mut brand = recraft_protocol::io::PacketWriter::new();
     brand.write_string("recraft");
     vec![
