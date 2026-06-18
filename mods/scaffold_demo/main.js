@@ -15,15 +15,15 @@
 //    silent yaw and snaps your input to the legal 8 directions, so the server's
 //    movement prediction stays in sync (Simulation / GroundSpoof). When aiming
 //    straight down (block below you) yaw is left alone, so walking is unaffected.
+//  - The host snaps the silent look to your own mouse-rotation quantum (the
+//    sensitivity factor), so the server-visible rotation deltas stay multiples
+//    of it — Grim's AimModulo360 (rotation-GCD) check sees mouse-like rotation.
 //  - Respects the vanilla right-click cooldown (4 ticks) and needs a block in
 //    hand. The host's onPlayerRightClick gate still refuses any placement that
 //    would clip you or target a non-replaceable block.
 //
-// KNOWN GAP: the silent rotation values are still snapped to exact angles, so
-// Grim's AimModulo360 (rotation-GCD) check will flag them. Beating that needs
-// mouse-sensitivity-quantized rotation (a host change, tracked separately). Set
-// `silent: false` in config.json to turn the real camera instead (no injected
-// rotation → passes the GCD check, but the camera visibly moves).
+// Set `silent: false` in config.json to turn the real camera instead (no
+// injected rotation at all — the camera visibly moves, like manual play).
 
 const KEY = "KeyG";
 const PLACE_DELAY = 4; // vanilla rightClickDelayTimer, in ticks

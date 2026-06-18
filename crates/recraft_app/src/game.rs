@@ -715,6 +715,18 @@ fn yaw_differs(a: f32, b: f32) -> bool {
     d > 0.01
 }
 
+/// Snap `target` onto the lattice `base + n*step` via the shortest angular turn.
+/// `base` is a real (mouse-produced) rotation, so the result stays on the same
+/// `origin + n*step` lattice the server already sees — keeping rotation deltas
+/// integer multiples of `step`. `step <= 0` leaves the target unsnapped.
+fn quantize_rotation(target: f32, base: f32, step: f32) -> f32 {
+    if step <= 0.0 {
+        return target;
+    }
+    let delta = wrap_degrees(target - base);
+    base + (delta / step).round() * step
+}
+
 /// Sign of a movement input axis as -1/0/1 (vanilla `moveForward`/`moveStrafing`
 /// are always one of these before scaling).
 fn sign3(v: f32) -> i32 {
@@ -1323,10 +1335,21 @@ impl GameState {
     /// Set the player's look (extension SetRotation). `silent` keeps the camera
     /// where it is and only overrides the server-visible rotation on the next
     /// movement packet (vanilla-style "pre" rotation); otherwise it turns the
-    /// camera too and clears any silent override.
-    pub fn ext_set_rotation(&mut self, yaw: f32, pitch: f32, silent: bool) {
+    /// camera too and clears any silent override. `step` is the mouse-rotation
+    /// quantum (the sensitivity factor) the silent look is snapped to.
+    pub fn ext_set_rotation(&mut self, yaw: f32, pitch: f32, silent: bool, step: f32) {
         if silent {
-            self.server_look = Some((yaw, pitch.clamp(-90.0, 90.0)));
+            // Snap the look to the player's mouse-rotation lattice (multiples of
+            // `step`, measured from the real camera). Real rotations are
+            // `origin + n*step` (mouseDelta * sensitivity), so keeping the silent
+            // look on the same lattice keeps every server-visible rotation delta
+            // an integer multiple of `step` — what Grim's rotation-GCD
+            // (AimModulo360) check verifies. The residual aim error is ≤ step/2,
+            // far inside the block-face tolerance.
+            let qyaw = quantize_rotation(yaw, self.player.yaw, step);
+            let qpitch = quantize_rotation(pitch.clamp(-89.0, 89.0), self.player.pitch, step)
+                .clamp(-90.0, 90.0);
+            self.server_look = Some((qyaw, qpitch));
         } else {
             self.server_look = None;
             self.debug_set_look(yaw, pitch);
@@ -7744,6 +7767,23 @@ mod interaction_tests {
         // direction (sign pattern) is remapped.
         let (f, s) = remap_input_to_yaw(0.2, 0.0, 0.0, 90.0);
         assert!((f.abs().max(s.abs()) - 0.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn quantize_rotation_stays_on_step_lattice() {
+        let step = 0.15_f32; // default-sensitivity mouse factor
+        let base = 12.3_f32;
+        for &target in &[12.34_f32, 45.7, -30.2, 357.0, 12.3] {
+            let q = quantize_rotation(target, base, step);
+            // On the base + n*step lattice (so deltas stay multiples of step).
+            let n = (q - base) / step;
+            assert!((n - n.round()).abs() < 1e-2, "off lattice: target={target} n={n}");
+            // And within step/2 of the requested aim (shortest turn).
+            let err = wrap_degrees(q - target).abs();
+            assert!(err <= step / 2.0 + 1e-3, "aim error {err} exceeds step/2");
+        }
+        // A non-positive step is a no-op (no quantisation data).
+        assert_eq!(quantize_rotation(40.0, 0.0, 0.0), 40.0);
     }
 
     #[test]
