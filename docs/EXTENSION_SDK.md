@@ -132,19 +132,18 @@ A **closed, host-implemented** set (the JS layer's "controlled rendering" — ad
 ```js
 recraft.setBlockTint(1, [120, 200, 255]);   // statically tint a block id (read by the mesher)
 recraft.fullbright(true);
-recraft.blockOutline(true);
 recraft.chunkBorders(true);
-recraft.entityBox("mobs", "#ff5050", true);
+recraft.entityBox("mobs", "#ffffff", true);   // thick hitbox wireframe
 recraft.nametagScale(1.5);
 recraft.particleDensity(0.5);
 ```
 
 All presets are wired to the renderer: `setBlockTint` (chunk mesher),
-`fullbright` (brightness boost, restoring your setting when off), `nametagScale`
-(nametag world size), `particleDensity` (spawn-count multiplier), and
-`blockOutline` / `chunkBorders` / `entityBox` (a debug line overlay drawn in the
-world pass — target-block wireframe, the player chunk's grid, and per-entity
-boxes).
+`fullbright` (forces the world lightmap to full — caves/night fully visible,
+no washout), `nametagScale` (nametag world size), `particleDensity` (spawn-count
+multiplier), `chunkBorders` (the player chunk's grid), and `entityBox` (a thick
+white hitbox wireframe around entities). The targeted-block outline is built into
+recraft (always drawn, like vanilla), not a preset.
 
 ### Content (experimental)
 

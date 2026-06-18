@@ -148,8 +148,8 @@ interface Recraft {
     luminance?: number; tint?: [number, number, number];
   }): void;
   fullbright(on: boolean): void;
-  blockOutline(on: boolean): void;
   chunkBorders(on: boolean): void;
+  /** ESP-style hitbox wireframe (thick boxes) around entities. */
   entityBox(filter: "players" | "mobs" | "items" | "", color: Color, on?: boolean): void;
   nametagScale(scale: number): void;
   particleDensity(scale: number): void;

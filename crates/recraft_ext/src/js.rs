@@ -70,7 +70,6 @@ const PRELUDE: &str = r#"
       opaque:o.opaque!==false,alpha:+(o.alpha==null?1:o.alpha),lum:(o.luminance|0)||0,
       tint:(o.tint||null)});},
     fullbright:(on)=>cmd({t:'render',r:'fullbright',on:!!on}),
-    blockOutline:(on)=>cmd({t:'render',r:'blockOutline',on:!!on}),
     chunkBorders:(on)=>cmd({t:'render',r:'chunkBorders',on:!!on}),
     entityBox:(filter,c,on)=>cmd({t:'render',r:'entityBox',filter:String(filter||''),
       color:color(c),on:on!==false}),

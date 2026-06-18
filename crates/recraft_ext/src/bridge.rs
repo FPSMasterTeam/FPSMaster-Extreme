@@ -382,7 +382,6 @@ fn parse_render_preset(v: &Value) -> Option<RenderPreset> {
             })
         }
         "fullbright" => Some(RenderPreset::Fullbright(on("on"))),
-        "blockOutline" => Some(RenderPreset::BlockOutline(on("on"))),
         "chunkBorders" => Some(RenderPreset::ChunkBorders(on("on"))),
         "entityBox" => Some(RenderPreset::EntityBox {
             kind: match v.get("filter").and_then(Value::as_str).unwrap_or("") {

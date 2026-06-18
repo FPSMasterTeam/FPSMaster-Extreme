@@ -23,7 +23,6 @@ pub enum RenderPreset {
         color: [f32; 3],
     },
     Fullbright(bool),
-    BlockOutline(bool),
     ChunkBorders(bool),
     /// ESP-style entity box for entities matching `kind` (`None` = all).
     EntityBox {

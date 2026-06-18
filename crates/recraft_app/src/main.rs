@@ -146,7 +146,6 @@ struct App {
     /// boxes). The overlays regenerate their line geometry each frame while on.
     ext_fullbright: bool,
     ext_nametag_scale: f32,
-    ext_block_outline: bool,
     ext_chunk_borders: bool,
     ext_entity_box: Option<[f32; 3]>,
     ext_lines_on: bool,
@@ -414,7 +413,6 @@ impl ApplicationHandler for WinitApp {
             geometry_dirty: false,
             ext_fullbright: false,
             ext_nametag_scale: 1.0,
-            ext_block_outline: false,
             ext_chunk_borders: false,
             ext_entity_box: None,
             ext_lines_on: false,
@@ -849,15 +847,19 @@ impl ApplicationHandler for WinitApp {
         // nametag scale, and the ESP line overlays.
         renderer.set_fullbright(app.ext_fullbright);
         renderer.set_nametag_scale(app.ext_nametag_scale);
-        let overlays_on =
-            app.ext_block_outline || app.ext_chunk_borders || app.ext_entity_box.is_some();
-        if overlays_on {
-            let lines = build_debug_lines(app);
-            renderer.set_debug_lines(&lines);
+        // Debug overlays: the built-in targeted-block outline + chunkBorders preset
+        // (thin lines), and the entityBox hitbox (thick boxes). Rebuilt each frame
+        // during gameplay (the outline follows where you look).
+        let show_overlays = app.in_world && app.screen.is_none();
+        if show_overlays {
+            renderer.set_debug_lines(&build_debug_lines(app));
+            renderer.set_debug_tris(&build_debug_tris(app));
+            app.ext_lines_on = true;
         } else if app.ext_lines_on {
             renderer.set_debug_lines(&[]);
+            renderer.set_debug_tris(&[]);
+            app.ext_lines_on = false;
         }
-        app.ext_lines_on = overlays_on;
         render_frame(
             renderer,
             app,
@@ -1357,7 +1359,6 @@ fn apply_render_preset(app: &mut App, preset: recraft_ext::RenderPreset) {
         P::Fullbright(on) => app.ext_fullbright = on,
         P::NametagScale(scale) => app.ext_nametag_scale = scale,
         P::ParticleDensity(density) => app.game.set_particle_density(density),
-        P::BlockOutline(on) => app.ext_block_outline = on,
         P::ChunkBorders(on) => app.ext_chunk_borders = on,
         P::EntityBox { color, enabled, .. } => {
             app.ext_entity_box = enabled.then_some(color);
@@ -1370,15 +1371,15 @@ fn apply_render_preset(app: &mut App, preset: recraft_ext::RenderPreset) {
 fn build_debug_lines(app: &App) -> Vec<recraft_render::LineVertex> {
     let mut out = Vec::new();
     let game = &app.game;
-    if app.ext_block_outline {
-        if let Some(game::InteractionTarget::Block { x, y, z, .. }) = game.pick_target() {
-            push_box(
-                &mut out,
-                [x as f32, y as f32, z as f32],
-                [x as f32 + 1.0, y as f32 + 1.0, z as f32 + 1.0],
-                [0.0, 0.0, 0.0, 0.6],
-            );
-        }
+    // Built-in vanilla-style black outline on the targeted block (always on).
+    if let Some(game::InteractionTarget::Block { x, y, z, .. }) = game.pick_target() {
+        let e = 0.002;
+        push_box(
+            &mut out,
+            [x as f32 - e, y as f32 - e, z as f32 - e],
+            [x as f32 + 1.0 + e, y as f32 + 1.0 + e, z as f32 + 1.0 + e],
+            [0.0, 0.0, 0.0, 0.6],
+        );
     }
     if app.ext_chunk_borders {
         let p = game.player_position();
@@ -1399,19 +1400,27 @@ fn build_debug_lines(app: &App) -> Vec<recraft_render::LineVertex> {
             out.push(v(cx as f32, 256.0, fz));
         }
     }
+    out
+}
+
+/// Build this frame's thick `entityBox` hitbox geometry: each entity's AABB
+/// wireframe rendered as thin solid boxes (tubes) so the lines look thick.
+fn build_debug_tris(app: &App) -> Vec<recraft_render::LineVertex> {
+    let mut out = Vec::new();
     if let Some(rgb) = app.ext_entity_box {
-        let color = [rgb[0], rgb[1], rgb[2], 0.8];
-        for e in GameViews(game).entities() {
+        let color = [rgb[0], rgb[1], rgb[2], 1.0];
+        for e in GameViews(&app.game).entities() {
             let (hw, h) = match e.kind {
                 recraft_ext::EntityKindView::Player | recraft_ext::EntityKindView::Mob(_) => {
                     (0.3, 1.8)
                 }
                 _ => (0.15, 0.3),
             };
-            push_box(
+            push_tube_box(
                 &mut out,
                 [e.x as f32 - hw, e.y as f32, e.z as f32 - hw],
                 [e.x as f32 + hw, e.y as f32 + h, e.z as f32 + hw],
+                0.04,
                 color,
             );
         }
@@ -1439,6 +1448,52 @@ fn push_box(out: &mut Vec<recraft_render::LineVertex>, min: [f32; 3], max: [f32;
     for (a, b) in EDGES {
         out.push(v(corners[a][0], corners[a][1], corners[a][2]));
         out.push(v(corners[b][0], corners[b][1], corners[b][2]));
+    }
+}
+
+/// Push an axis-aligned box as solid triangles (36 vertices, no culling).
+fn push_solid_box(out: &mut Vec<recraft_render::LineVertex>, min: [f32; 3], max: [f32; 3], color: [f32; 4]) {
+    let p = [
+        [min[0], min[1], min[2]], [max[0], min[1], min[2]],
+        [max[0], max[1], min[2]], [min[0], max[1], min[2]],
+        [min[0], min[1], max[2]], [max[0], min[1], max[2]],
+        [max[0], max[1], max[2]], [min[0], max[1], max[2]],
+    ];
+    // 6 faces (as quads of corner indices); winding ignored (cull_mode None).
+    const FACES: [[usize; 4]; 6] = [
+        [0, 1, 2, 3], [5, 4, 7, 6], [4, 0, 3, 7],
+        [1, 5, 6, 2], [3, 2, 6, 7], [4, 5, 1, 0],
+    ];
+    for [a, b, c, d] in FACES {
+        for i in [a, b, c, a, c, d] {
+            out.push(recraft_render::LineVertex {
+                position: p[i],
+                color,
+            });
+        }
+    }
+}
+
+/// Push the 12 edges of an axis-aligned box as thin solid boxes of width `t` —
+/// a "thick wireframe" (the entityBox hitbox).
+fn push_tube_box(out: &mut Vec<recraft_render::LineVertex>, min: [f32; 3], max: [f32; 3], t: f32, color: [f32; 4]) {
+    let h = t * 0.5;
+    let [x0, y0, z0] = min;
+    let [x1, y1, z1] = max;
+    for y in [y0, y1] {
+        for z in [z0, z1] {
+            push_solid_box(out, [x0 - h, y - h, z - h], [x1 + h, y + h, z + h], color);
+        }
+    }
+    for x in [x0, x1] {
+        for z in [z0, z1] {
+            push_solid_box(out, [x - h, y0 - h, z - h], [x + h, y1 + h, z + h], color);
+        }
+    }
+    for x in [x0, x1] {
+        for y in [y0, y1] {
+            push_solid_box(out, [x - h, y - h, z0 - h], [x + h, y + h, z1 + h], color);
+        }
     }
 }
 

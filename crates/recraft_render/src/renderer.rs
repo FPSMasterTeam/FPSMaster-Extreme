@@ -593,10 +593,14 @@ pub struct Renderer {
     extension_mesh: Option<DynamicMesh>,
     /// Extension `nametagScale` preset: world-size multiplier for player nametags.
     nametag_scale: f32,
-    /// Debug-overlay line pipeline + geometry (extension blockOutline /
-    /// chunkBorders / entityBox presets), drawn in the world pass.
+    /// Debug-overlay line pipeline + geometry: the built-in targeted-block
+    /// outline and the chunkBorders preset, drawn in the world pass.
     line_pipeline: wgpu::RenderPipeline,
     debug_lines: Option<DynamicMesh>,
+    /// Solid-triangle variant of the debug overlay (same shader) for thick lines
+    /// drawn as thin boxes — the entityBox hitbox preset.
+    debug_tri_pipeline: wgpu::RenderPipeline,
+    debug_tris: Option<DynamicMesh>,
     /// Inventory player-preview (vanilla `GuiInventory.drawEntityOnScreen`): the
     /// local-player biped baked into clip space and drawn in the UI pass,
     /// scissored to the panel's model box. Same shader as `model_pipeline` but a
@@ -2072,6 +2076,47 @@ impl Renderer {
             cache: None,
             multiview_mask: None,
         });
+        // Same shader/layout as the lines, but TriangleList — used to draw thick
+        // "lines" as thin solid boxes (the entityBox hitbox overlay).
+        let debug_tri_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("debug-tri-pipeline"),
+            layout: Some(&line_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &line_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[LineVertex::layout()],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &line_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            cache: None,
+            multiview_mask: None,
+        });
         // Inventory player preview: same model shader/layout, but its colour
         // target is the swapchain (`surface_format`) since it draws in the UI
         // pass. Depth-tested+written against the UI pass's window depth so the
@@ -3106,6 +3151,8 @@ impl Renderer {
             nametag_scale: 1.0,
             line_pipeline,
             debug_lines: None,
+            debug_tri_pipeline,
+            debug_tris: None,
             inventory_preview_pipeline,
             inventory_preview_mesh: None,
             inventory_preview_scissor: None,
@@ -3983,6 +4030,21 @@ impl Renderer {
             bytemuck::cast_slice(&indices),
             indices.len() as u32,
             "debug-lines",
+        );
+    }
+
+    /// Replace the solid-triangle debug geometry (thick "lines" drawn as thin
+    /// boxes — the entityBox hitbox overlay). Pass an empty slice to clear.
+    pub fn set_debug_tris(&mut self, vertices: &[LineVertex]) {
+        let indices: Vec<u32> = (0..vertices.len() as u32).collect();
+        fill_dynamic_mesh(
+            &self.device,
+            &self.queue,
+            &mut self.debug_tris,
+            bytemuck::cast_slice(vertices),
+            bytemuck::cast_slice(&indices),
+            indices.len() as u32,
+            "debug-tris",
         );
     }
 
@@ -5483,13 +5545,22 @@ impl Renderer {
                 draw_calls += 1;
             }
 
-            // Debug-overlay lines (extension blockOutline/chunkBorders/entityBox).
+            // Debug-overlay lines: built-in block outline + chunkBorders preset.
             if let Some(lines) = self.debug_lines.as_ref().filter(|m| m.index_count > 0) {
                 pass.set_pipeline(&self.line_pipeline);
                 pass.set_bind_group(0, &self.camera_bind_group, &[]);
                 pass.set_vertex_buffer(0, lines.vertex_buffer.slice(..));
                 pass.set_index_buffer(lines.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..lines.index_count, 0, 0..1);
+                draw_calls += 1;
+            }
+            // Thick debug geometry (entityBox hitbox), drawn as thin solid boxes.
+            if let Some(tris) = self.debug_tris.as_ref().filter(|m| m.index_count > 0) {
+                pass.set_pipeline(&self.debug_tri_pipeline);
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                pass.set_vertex_buffer(0, tris.vertex_buffer.slice(..));
+                pass.set_index_buffer(tris.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..tris.index_count, 0, 0..1);
                 draw_calls += 1;
             }
 
