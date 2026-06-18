@@ -5,8 +5,9 @@
 // there, bridging as you walk.
 //
 // Vanilla-legitimacy (Grim-oriented) — what the mod and the host guarantee:
-//  - Only places against an EXISTING full-cube face (never mid-air). No support
-//    block → does nothing, exactly like vanilla.
+//  - Only places against an EXISTING full-cube face you could actually point at:
+//    the face must front the eye AND have clear line of sight (no placing
+//    through, behind, or under blocks). No reachable support → does nothing.
 //  - Aims one tick, places the next. The host sends ext interactions in the
 //    pre-flying window (like vanilla), so by placement time the look has ridden
 //    a flying packet → the server sees you looking at the block (RotationPlace /
@@ -39,13 +40,14 @@ let status = "off";
 // 1.8 face ids: 0 -Y, 1 +Y, 2 -Z, 3 +Z, 4 -X, 5 +X. For each neighbour of the
 // target T, `face` is the face of that neighbour pointing back at T (the face a
 // player would click to place into T).
+// Candidate supports (no "above": you can't click the bottom of a block over
+// your head). The `face` is the face of that neighbour pointing back at T.
 const NEIGHBORS = [
   { d: [0, -1, 0], face: 1 }, // support below  -> click its top (+Y)
   { d: [-1, 0, 0], face: 5 }, // support west   -> click its +X
   { d: [1, 0, 0], face: 4 }, //  support east   -> click its -X
   { d: [0, 0, -1], face: 3 }, // support north  -> click its +Z
   { d: [0, 0, 1], face: 2 }, //  support south  -> click its -Z
-  { d: [0, 1, 0], face: 0 }, //  support above  -> click its bottom (-Y)
 ];
 // outward unit vector of each face (for the aim point)
 const FACE_DIR = [
@@ -58,6 +60,26 @@ const FACE_CURSOR = [
 
 const isBlockItem = (it) => it && it.id >= 1 && it.id <= 255;
 const solidFace = (b) => b && !b.isAir && b.opaque;
+
+// Does the eye actually have line of sight to face-centre (ax,ay,az) of block
+// (nx,ny,nz)? Step along the ray: the first solid block it enters must be that
+// block — otherwise something is in the way (you couldn't point at it). Also
+// enforces vanilla reach.
+function hasLineOfSight(ex, ey, ez, ax, ay, az, nx, ny, nz) {
+  const dx = ax - ex, dy = ay - ey, dz = az - ez;
+  const dist = Math.hypot(dx, dy, dz);
+  if (dist > 4.5) return false;
+  const steps = Math.ceil(dist / 0.0625);
+  for (let i = 1; i < steps; i++) {
+    const t = i / steps;
+    const bx = Math.floor(ex + dx * t);
+    const by = Math.floor(ey + dy * t);
+    const bz = Math.floor(ez + dz * t);
+    if (bx === nx && by === ny && bz === nz) return true; // reached the support
+    if (!mc.world.getBlock(bx, by, bz).isAir) return false; // blocked first
+  }
+  return true;
+}
 
 mc.keyBinding("Scaffold toggle", KEY).onPress(() => {
   enabled = !enabled;
@@ -84,36 +106,39 @@ mc.on("tick", () => {
 
   if (!isBlockItem(p.heldItem())) return reset("no block in hand");
 
-  // The mod runs BEFORE physics, so p.{x,y,z} is the pre-move position but the
-  // flying packet will carry the POST-move position. Aim from the predicted
-  // post-move position (current + this tick's velocity) so the rotation matches
-  // where Grim ray-traces the placement from.
-  const fx = p.x + p.vx, fy = p.y + p.vy, fz = p.z + p.vz;
-
-  // Target = the block position directly under the (predicted) feet.
-  const tx = Math.floor(fx);
-  const ty = Math.floor(fy) - 1;
-  const tz = Math.floor(fz);
+  // Target = the block directly under your CURRENT feet (where you actually are).
+  const tx = Math.floor(p.x);
+  const ty = Math.floor(p.y) - 1;
+  const tz = Math.floor(p.z);
   if (!mc.world.getBlock(tx, ty, tz).isAir) return reset("supported"); // already standing on something
 
-  // Find a real full-cube face to place against (no mid-air placement).
+  // The mod runs BEFORE physics, so aim from the predicted post-move EYE (where
+  // the flying packet will report you): current eye + this tick's velocity. The
+  // look + the reachability check then match where Grim ray-traces the place.
+  const ex = p.x + p.vx;
+  const ey = p.y + p.vy + (p.sneaking ? 1.54 : 1.62);
+  const ez = p.z + p.vz;
+
+  // Pick a solid neighbour whose clicked face you can actually point at: the
+  // face must point toward the eye AND have clear line of sight (no placing
+  // through or behind blocks).
   let pick = null;
   for (const n of NEIGHBORS) {
     const nx = tx + n.d[0], ny = ty + n.d[1], nz = tz + n.d[2];
-    if (solidFace(mc.world.getBlock(nx, ny, nz))) {
-      pick = { nx, ny, nz, face: n.face };
-      break;
-    }
+    if (!solidFace(mc.world.getBlock(nx, ny, nz))) continue;
+    const fd = FACE_DIR[n.face];
+    const ax = nx + 0.5 + 0.5 * fd[0];
+    const ay = ny + 0.5 + 0.5 * fd[1];
+    const az = nz + 0.5 + 0.5 * fd[2];
+    if (fd[0] * (ex - ax) + fd[1] * (ey - ay) + fd[2] * (ez - az) <= 0) continue; // face away from eye
+    if (!hasLineOfSight(ex, ey, ez, ax, ay, az, nx, ny, nz)) continue; // blocked
+    pick = { nx, ny, nz, face: n.face, ax, ay, az };
+    break;
   }
-  if (!pick) return reset("no support"); // can't place — would be mid-air
+  if (!pick) return reset("no reachable support"); // nothing you could actually point at
 
-  // Aim at the centre of the clicked face so the look hits a real face.
-  const fd = FACE_DIR[pick.face];
-  const ax = pick.nx + 0.5 + 0.5 * fd[0];
-  const ay = pick.ny + 0.5 + 0.5 * fd[1];
-  const az = pick.nz + 0.5 + 0.5 * fd[2];
-  const eyeY = fy + (p.sneaking ? 1.54 : 1.62);
-  const dx = ax - fx, dy = ay - eyeY, dz = az - fz;
+  // Aim at the centre of the clicked face.
+  const dx = pick.ax - ex, dy = pick.ay - ey, dz = pick.az - ez;
   const horiz = Math.hypot(dx, dz);
   // When the block is (almost) straight down, yaw is irrelevant to the aim — keep
   // the real camera yaw so the host's strafe-remap leaves movement untouched.
