@@ -193,7 +193,9 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-recraft_ext_api = "0.1"
+# Bundled with this SDK — no crates.io needed. (Or a git dep:
+#   recraft_ext_api = { git = "https://github.com/gaoyu06/MiniCraft" }  )
+recraft_ext_api = { path = "../recraft_ext_api" }
 # abi_stable's macros expand to `::abi_stable` paths, so depend on it directly
 # at the SAME version recraft_ext_api uses:
 abi_stable = "0.11"

@@ -1,0 +1,13 @@
+# Standalone copy of the recraft native plugin ABI, bundled so the SDK builds
+# without crates.io. It is a snapshot of the repo's `crates/recraft_ext_api`;
+# the template/example depend on it via a relative path.
+[package]
+name = "recraft_ext_api"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Stable plugin ABI for recraft native (cdylib) extensions."
+readme = "README.md"
+
+[dependencies]
+abi_stable = "0.11"

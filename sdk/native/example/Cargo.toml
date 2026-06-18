@@ -9,7 +9,8 @@ description = "Example recraft native (cdylib) extension."
 crate-type = ["cdylib"]
 
 [dependencies]
-recraft_ext_api = "0.1"
+# Bundled with this SDK (no crates.io needed) — see ../recraft_ext_api/.
+recraft_ext_api = { path = "../recraft_ext_api" }
 # abi_stable's macros expand to `::abi_stable` paths, so depend on it directly at
 # the same version recraft_ext_api uses.
 abi_stable = "0.11"

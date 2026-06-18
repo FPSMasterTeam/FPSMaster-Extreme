@@ -24,6 +24,7 @@ sdk/
     examples/          ← coords_hud, chat_alert, block_tint, preset_demo
   native/
     README.md          ← building a native cdylib mod
+    recraft_ext_api/   ← the plugin ABI crate, bundled (no crates.io needed)
     example/           ← a complete, building native mod
     template/          ← a minimal starter native mod
 ```
@@ -59,7 +60,8 @@ Then read **[REFERENCE.md](REFERENCE.md)** for the full API, and crib from
 ## Native mods
 
 See **[native/README.md](native/README.md)**. Native mods compile against the
-`recraft_ext_api` crate (published to crates.io) and `abi_stable`.
+`recraft_ext_api` crate (bundled here in `native/recraft_ext_api/` — no crates.io
+needed) and `abi_stable`.
 
 ## Capabilities
 

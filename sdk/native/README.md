@@ -6,9 +6,18 @@ unrestricted native code — own threads/state, heavy CPU work, and a render-geo
 hook. The host loads it after an `abi_stable` layout + version check (a mismatch is
 rejected, not crashed).
 
+The `recraft_ext_api` crate is **bundled in this SDK** (`recraft_ext_api/`), so no
+crates.io is needed — the template/example depend on it via a relative path
+(`{ path = "../recraft_ext_api" }`). Alternatives, if you'd rather not carry the
+folder around: a git dependency
+(`recraft_ext_api = { git = "https://github.com/gaoyu06/MiniCraft" }`), or
+crates.io if it ever gets published. (`abi_stable` itself does come from crates.io
+— that's a normal third-party dependency.)
+
 ## Build
 
-`template/` is a minimal starter, `example/` is a complete working mod.
+`template/` is a minimal starter, `example/` is a complete working mod. Both
+path-depend on the bundled `recraft_ext_api/`, so build from inside the SDK.
 
 ```sh
 cd template          # or example
