@@ -710,10 +710,17 @@ impl ApplicationHandler for WinitApp {
         };
 
         poll_auth_events(app);
-        pump_network(app, window, &mut self.cursor_captured);
-        // Drain commands queued by the clientbound/chunk ext hooks (done here, not
-        // inside pump_network, because that loop holds a borrow of app.network).
-        apply_ext_commands(app);
+        // Before we're in a world there's no tick loop, so process incoming
+        // packets per FRAME (login / chunk-load burst, KeepAlive). Once in-world,
+        // packets are drained per TICK inside the loop below — vanilla's
+        // `processReceivedPackets` cadence — so each tick's ack/pong is interleaved
+        // with that tick's flying packet (an anti-cheat bounds the placements it
+        // counts per tick by those acks; draining per frame batched several ticks'
+        // placements under one ack → false fastplace).
+        if !app.in_world {
+            pump_network(app, window, &mut self.cursor_captured);
+            apply_ext_commands(app);
+        }
 
         if app.game.take_window_open() {
             app.suspend_gameplay_input(&mut self.left_held, &mut self.right_held);
@@ -775,6 +782,12 @@ impl ApplicationHandler for WinitApp {
         if app.in_world {
             self.tick_accumulator += sim_dt;
             while self.tick_accumulator >= 0.05 {
+                // Vanilla `processReceivedPackets`, run at the top of each tick:
+                // drain incoming, pong KeepAlive/transaction + ack teleports (queued
+                // ahead of this tick's flying), and apply world state — so every
+                // tick has exactly one ack window bounding its single placement.
+                pump_network(app, window, &mut self.cursor_captured);
+                apply_ext_commands(app);
                 app.game.set_pending_actions(game::TickActions {
                     slot_select: self.slot_select,
                     slot_scroll: self.slot_scroll,
