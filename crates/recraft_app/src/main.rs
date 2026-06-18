@@ -27,6 +27,7 @@ use anyhow::Context;
 use auth::{AuthEvent, Session};
 use ext_bridge::GameViews;
 use game::GameState;
+use recraft_ext::ReadViews;
 use gui::accounts::GuiAccounts;
 use gui::chat_screen::GuiChat;
 use gui::game_over::GuiGameOver;
@@ -140,6 +141,16 @@ struct App {
     ext_geometry: Vec<recraft_render::ModelVertex>,
     ext_indices: Vec<u32>,
     geometry_dirty: bool,
+    /// Extension preset render state: fullbright (brightness), nametag scale, and
+    /// the ESP-style line overlays (target block outline / chunk borders / entity
+    /// boxes). The overlays regenerate their line geometry each frame while on.
+    ext_fullbright: bool,
+    ext_fullbright_dirty: bool,
+    ext_nametag_scale: f32,
+    ext_block_outline: bool,
+    ext_chunk_borders: bool,
+    ext_entity_box: Option<[f32; 3]>,
+    ext_lines_on: bool,
     quit: bool,
 }
 
@@ -402,6 +413,13 @@ impl ApplicationHandler for WinitApp {
             ext_geometry: Vec::new(),
             ext_indices: Vec::new(),
             geometry_dirty: false,
+            ext_fullbright: false,
+            ext_fullbright_dirty: false,
+            ext_nametag_scale: 1.0,
+            ext_block_outline: false,
+            ext_chunk_borders: false,
+            ext_entity_box: None,
+            ext_lines_on: false,
             quit: false,
         };
         renderer.upload_world(&app.game.world);
@@ -829,6 +847,26 @@ impl ApplicationHandler for WinitApp {
             renderer.set_extension_geometry(&app.ext_geometry, &app.ext_indices);
             app.geometry_dirty = false;
         }
+        // Extension preset render toggles: fullbright (via brightness, restoring
+        // the user's setting when off), nametag scale, and the ESP line overlays.
+        if app.ext_fullbright_dirty {
+            renderer.set_brightness(if app.ext_fullbright {
+                8.0
+            } else {
+                app.settings.brightness
+            });
+            app.ext_fullbright_dirty = false;
+        }
+        renderer.set_nametag_scale(app.ext_nametag_scale);
+        let overlays_on =
+            app.ext_block_outline || app.ext_chunk_borders || app.ext_entity_box.is_some();
+        if overlays_on {
+            let lines = build_debug_lines(app);
+            renderer.set_debug_lines(&lines);
+        } else if app.ext_lines_on {
+            renderer.set_debug_lines(&[]);
+        }
+        app.ext_lines_on = overlays_on;
         render_frame(
             renderer,
             app,
@@ -1325,7 +1363,94 @@ fn apply_render_preset(app: &mut App, preset: recraft_ext::RenderPreset) {
             app.block_tints.set(block_id, meta, color);
             app.tints_dirty = true;
         }
-        other => log::debug!("[ext] render preset not yet applied: {other:?}"),
+        P::Fullbright(on) => {
+            app.ext_fullbright = on;
+            app.ext_fullbright_dirty = true;
+        }
+        P::NametagScale(scale) => app.ext_nametag_scale = scale,
+        P::ParticleDensity(density) => app.game.set_particle_density(density),
+        P::BlockOutline(on) => app.ext_block_outline = on,
+        P::ChunkBorders(on) => app.ext_chunk_borders = on,
+        P::EntityBox { color, enabled, .. } => {
+            app.ext_entity_box = enabled.then_some(color);
+        }
+    }
+}
+
+/// Build this frame's debug-overlay line geometry from the active ESP-style
+/// presets (target block outline / chunk borders / entity boxes).
+fn build_debug_lines(app: &App) -> Vec<recraft_render::LineVertex> {
+    let mut out = Vec::new();
+    let game = &app.game;
+    if app.ext_block_outline {
+        if let Some(game::InteractionTarget::Block { x, y, z, .. }) = game.pick_target() {
+            push_box(
+                &mut out,
+                [x as f32, y as f32, z as f32],
+                [x as f32 + 1.0, y as f32 + 1.0, z as f32 + 1.0],
+                [0.0, 0.0, 0.0, 0.6],
+            );
+        }
+    }
+    if app.ext_chunk_borders {
+        let p = game.player_position();
+        let cx = (p.x.floor() as i32).div_euclid(16) * 16;
+        let cz = (p.z.floor() as i32).div_euclid(16) * 16;
+        let color = [0.2, 0.8, 1.0, 0.5];
+        let v = |x: f32, y: f32, z: f32| recraft_render::LineVertex {
+            position: [x, y, z],
+            color,
+        };
+        // Vertical lines along the player's chunk's two near borders (16-grid).
+        for i in 0..=16 {
+            let fx = (cx + i) as f32;
+            out.push(v(fx, 0.0, cz as f32));
+            out.push(v(fx, 256.0, cz as f32));
+            let fz = (cz + i) as f32;
+            out.push(v(cx as f32, 0.0, fz));
+            out.push(v(cx as f32, 256.0, fz));
+        }
+    }
+    if let Some(rgb) = app.ext_entity_box {
+        let color = [rgb[0], rgb[1], rgb[2], 0.8];
+        for e in GameViews(game).entities() {
+            let (hw, h) = match e.kind {
+                recraft_ext::EntityKindView::Player | recraft_ext::EntityKindView::Mob(_) => {
+                    (0.3, 1.8)
+                }
+                _ => (0.15, 0.3),
+            };
+            push_box(
+                &mut out,
+                [e.x as f32 - hw, e.y as f32, e.z as f32 - hw],
+                [e.x as f32 + hw, e.y as f32 + h, e.z as f32 + hw],
+                color,
+            );
+        }
+    }
+    out
+}
+
+/// Push the 12 edges of an axis-aligned box as line segments (vertex pairs).
+fn push_box(out: &mut Vec<recraft_render::LineVertex>, min: [f32; 3], max: [f32; 3], color: [f32; 4]) {
+    let v = |x: f32, y: f32, z: f32| recraft_render::LineVertex {
+        position: [x, y, z],
+        color,
+    };
+    let [x0, y0, z0] = min;
+    let [x1, y1, z1] = max;
+    let corners = [
+        [x0, y0, z0], [x1, y0, z0], [x1, y0, z1], [x0, y0, z1],
+        [x0, y1, z0], [x1, y1, z0], [x1, y1, z1], [x0, y1, z1],
+    ];
+    const EDGES: [(usize, usize); 12] = [
+        (0, 1), (1, 2), (2, 3), (3, 0),
+        (4, 5), (5, 6), (6, 7), (7, 4),
+        (0, 4), (1, 5), (2, 6), (3, 7),
+    ];
+    for (a, b) in EDGES {
+        out.push(v(corners[a][0], corners[a][1], corners[a][2]));
+        out.push(v(corners[b][0], corners[b][1], corners[b][2]));
     }
 }
 

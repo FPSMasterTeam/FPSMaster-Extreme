@@ -139,7 +139,12 @@ recraft.nametagScale(1.5);
 recraft.particleDensity(0.5);
 ```
 
-> `setBlockTint` is fully wired (the chunk mesher applies it). The other presets are accepted and queued; their renderer wiring lands with the render-hook milestone.
+All presets are wired to the renderer: `setBlockTint` (chunk mesher),
+`fullbright` (brightness boost, restoring your setting when off), `nametagScale`
+(nametag world size), `particleDensity` (spawn-count multiplier), and
+`blockOutline` / `chunkBorders` / `entityBox` (a debug line overlay drawn in the
+world pass — target-block wireframe, the player chunk's grid, and per-entity
+boxes).
 
 ### Content (experimental)
 

@@ -22,7 +22,9 @@ pub use model::{
     arm_attach, ArmAttach, ChestKind, EntityAnim, ModelMesh, ModelVertex, SignKind,
 };
 pub use particle::{build_particle_mesh, ParticleBillboard};
-pub use renderer::{InventoryPreview, RenderStats, Renderer, RendererError, SignTextDraw};
+pub use renderer::{
+    InventoryPreview, LineVertex, RenderStats, Renderer, RendererError, SignTextDraw,
+};
 pub use texture::{AtlasUv, OverlayTextures, PackMeta, PbrAtlases, TextureAtlasImage, discover_resource_packs};
 pub use ui::{
     gui_pixel_scale, text_height, text_width, GuiAtlas, GuiTexture, UiColor, UiFrame, UiRect,

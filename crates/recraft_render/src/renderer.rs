@@ -157,6 +157,28 @@ struct DynamicMesh {
     index_count: u32,
 }
 
+/// A world-space colored line vertex for the debug-overlay pipeline (extension
+/// `blockOutline` / `chunkBorders` / `entityBox` presets).
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct LineVertex {
+    pub position: [f32; 3],
+    pub color: [f32; 4],
+}
+
+impl LineVertex {
+    const ATTRS: [wgpu::VertexAttribute; 2] =
+        wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4];
+
+    fn layout<'a>() -> wgpu::VertexBufferLayout<'a> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Self>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &Self::ATTRS,
+        }
+    }
+}
+
 /// Per-frame timing and draw-scale counters, used to attribute the frame budget
 /// to CPU work vs. GPU/swapchain waits while profiling. All times are the wall
 /// clock the CPU spent in each region; under an uncapped present mode a large
@@ -566,6 +588,12 @@ pub struct Renderer {
     /// Native render-hook custom geometry (model-pass format), drawn in the world
     /// pass right after entities. `None`/empty when no native mod submits any.
     extension_mesh: Option<DynamicMesh>,
+    /// Extension `nametagScale` preset: world-size multiplier for player nametags.
+    nametag_scale: f32,
+    /// Debug-overlay line pipeline + geometry (extension blockOutline /
+    /// chunkBorders / entityBox presets), drawn in the world pass.
+    line_pipeline: wgpu::RenderPipeline,
+    debug_lines: Option<DynamicMesh>,
     /// Inventory player-preview (vanilla `GuiInventory.drawEntityOnScreen`): the
     /// local-player biped baked into clip space and drawn in the UI pass,
     /// scissored to the panel's model box. Same shader as `model_pipeline` but a
@@ -1988,6 +2016,57 @@ impl Renderer {
         cache: None,
         multiview_mask: None,
         });
+        // Debug-overlay lines (extension blockOutline/chunkBorders/entityBox):
+        // camera-only, LineList topology, depth-tested against the world (so
+        // terrain in front occludes the lines) but not depth-writing.
+        let line_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("line-shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shader/line.wgsl").into()),
+        });
+        let line_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("line-pipeline-layout"),
+            bind_group_layouts: &[Some(&camera_layout)],
+            immediate_size: 0,
+        });
+        let line_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("line-pipeline"),
+            layout: Some(&line_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &line_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[LineVertex::layout()],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &line_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::LineList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            cache: None,
+            multiview_mask: None,
+        });
         // Inventory player preview: same model shader/layout, but its colour
         // target is the swapchain (`surface_format`) since it draws in the UI
         // pass. Depth-tested+written against the UI pass's window depth so the
@@ -3019,6 +3098,9 @@ impl Renderer {
             model_pipeline,
             model_mesh: None,
             extension_mesh: None,
+            nametag_scale: 1.0,
+            line_pipeline,
+            debug_lines: None,
             inventory_preview_pipeline,
             inventory_preview_mesh: None,
             inventory_preview_scissor: None,
@@ -3256,6 +3338,11 @@ impl Renderer {
     /// Overall lighting brightness multiplier (vanilla "Brightness" gamma).
     pub fn set_brightness(&mut self, value: f32) {
         self.brightness = value;
+    }
+
+    /// Player-nametag world-size multiplier (extension `nametagScale` preset).
+    pub fn set_nametag_scale(&mut self, scale: f32) {
+        self.nametag_scale = scale.clamp(0.1, 5.0);
     }
 
     pub fn set_vignette_enabled(&mut self, on: bool) {
@@ -3869,6 +3956,22 @@ impl Renderer {
         );
     }
 
+    /// Replace the debug-overlay line geometry (extension blockOutline /
+    /// chunkBorders / entityBox presets). Consecutive vertex pairs form line
+    /// segments; pass an empty slice to clear.
+    pub fn set_debug_lines(&mut self, vertices: &[LineVertex]) {
+        let indices: Vec<u32> = (0..vertices.len() as u32).collect();
+        fill_dynamic_mesh(
+            &self.device,
+            &self.queue,
+            &mut self.debug_lines,
+            bytemuck::cast_slice(vertices),
+            bytemuck::cast_slice(&indices),
+            indices.len() as u32,
+            "debug-lines",
+        );
+    }
+
     /// Replace this frame's entity-armor glint geometry: the enchanted worn
     /// armor in model-pass vertex format, drawn additively with the scrolling
     /// glint texture right after the entity model pass. Pass an empty mesh when
@@ -4441,7 +4544,7 @@ impl Renderer {
         let right = forward.cross(Vec3::Y).normalize_or_zero();
         let up = right.cross(forward).normalize_or_zero();
         // Vanilla nameplate scale: 1.6 * 0.016666668 world units per font px.
-        let ws = 0.016_666_668 * 1.6 / SCALE as f32;
+        let ws = 0.016_666_668 * 1.6 / SCALE as f32 * self.nametag_scale;
         let white_uv = [0.5 / tex_w as f32, 0.5 / tex_h as f32];
 
         let mut vertices: Vec<ModelVertex> = Vec::new();
@@ -5362,6 +5465,16 @@ impl Renderer {
                 pass.set_vertex_buffer(0, ext.vertex_buffer.slice(..));
                 pass.set_index_buffer(ext.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..ext.index_count, 0, 0..1);
+                draw_calls += 1;
+            }
+
+            // Debug-overlay lines (extension blockOutline/chunkBorders/entityBox).
+            if let Some(lines) = self.debug_lines.as_ref().filter(|m| m.index_count > 0) {
+                pass.set_pipeline(&self.line_pipeline);
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                pass.set_vertex_buffer(0, lines.vertex_buffer.slice(..));
+                pass.set_index_buffer(lines.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..lines.index_count, 0, 0..1);
                 draw_calls += 1;
             }
 

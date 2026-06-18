@@ -108,6 +108,9 @@ pub struct ParticleSystem {
     particles: Vec<Particle>,
     block_particles: Vec<BlockParticle>,
     rng: Rng,
+    /// Extension `particleDensity` preset: scales every spawn's particle count
+    /// (1.0 = vanilla). Clamped at the setter.
+    density: f32,
 }
 
 impl ParticleSystem {
@@ -118,7 +121,13 @@ impl ParticleSystem {
             // A fixed seed keeps spawns deterministic across runs; particle
             // jitter is cosmetic so the exact stream doesn't matter.
             rng: Rng::new(0x9E37_79B9_7F4A_7C15),
+            density: 1.0,
         }
+    }
+
+    /// Set the spawn-count multiplier (extension `particleDensity` preset).
+    pub fn set_density(&mut self, density: f32) {
+        self.density = density.clamp(0.0, 4.0);
     }
 
     /// Advance every particle one tick (vanilla 20 Hz) and drop the dead ones.
@@ -173,7 +182,8 @@ impl ParticleSystem {
         // NOTE/REDSTONE/SPELL reuse the offset/speed fields as colour inputs,
         // handled inside `make_particle` (one particle, no positional jitter).
         let colour_carrying = matches!(type_id, 23 | 30 | 15 | 16 | 17);
-        let n = if colour_carrying { 1 } else { count.max(1) };
+        let base = if colour_carrying { 1 } else { count.max(1) };
+        let n = ((base as f32) * self.density).round() as usize;
         for _ in 0..n {
             let p_pos = if colour_carrying {
                 pos

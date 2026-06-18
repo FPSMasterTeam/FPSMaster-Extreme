@@ -1167,6 +1167,11 @@ impl GameState {
         self.particles.spawn(type_id, pos, offset, speed, count, &[]);
     }
 
+    /// Set the particle spawn-count multiplier (extension `particleDensity`).
+    pub fn set_particle_density(&mut self, density: f32) {
+        self.particles.set_density(density);
+    }
+
     /// Queue a positional sound for an extension `PlaySound` command (drained by
     /// the host into the audio backend like every other queued sound).
     pub fn ext_play_sound(&mut self, event: String, pos: Vec3, volume: f32, pitch: f32) {
