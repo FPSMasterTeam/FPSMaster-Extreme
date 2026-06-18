@@ -17,6 +17,7 @@ pub mod ingame;
 pub mod ingame_menu;
 pub mod inventory;
 pub mod main_menu;
+pub mod mods;
 pub mod multiplayer;
 pub mod options;
 pub mod progress;
@@ -187,6 +188,12 @@ pub enum GuiAction {
     SendPacket(ServerboundPacket),
     /// Open a URL from a chat component's `open_url` clickEvent in the OS browser.
     OpenUrl(String),
+    /// Hot-reload all mods from the `mods/` directory (mod-management screen).
+    ReloadMods,
+    /// Enable or disable a loaded mod by id, persisting the choice.
+    SetModEnabled(String, bool),
+    /// Open the `mods/` directory in the OS file manager.
+    OpenModsFolder,
 }
 
 /// Immutable per-frame data screens draw from.
@@ -208,6 +215,8 @@ pub struct DrawCtx<'a> {
     pub accounts: &'a [AccountEntry],
     /// HUD data when a world session is active (inventory screen, HUD).
     pub hud: Option<&'a HudState<'a>>,
+    /// Snapshot of loaded mods for the mod-management screen.
+    pub mods: &'a [recraft_ext::ModInfo],
 }
 
 /// Mutable application state screens may edit directly during input handling

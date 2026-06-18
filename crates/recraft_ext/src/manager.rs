@@ -17,7 +17,7 @@ use crate::host::{HookCtx, HostHooks};
 use crate::hud::{HudCtx, HudDraw};
 use crate::input::InputEvent;
 use crate::js;
-use crate::manifest::{self, ModManifest, Tier};
+use crate::manifest::{self, Capability, ModManifest, Tier};
 use crate::packet::PacketView;
 use crate::view::ReadViews;
 
@@ -28,7 +28,34 @@ struct LoadedPlugin {
     /// Loaded from the `mods/` directory (vs registered in-process). Only these
     /// are dropped/recreated on a hot reload.
     from_dir: bool,
+    /// Display metadata captured at load (from the manifest for directory mods).
+    meta: PluginMeta,
     hooks: Box<dyn HostHooks>,
+}
+
+/// A mod's manifest-derived display metadata. In-process registrations have no
+/// manifest, so their fields are placeholders.
+#[derive(Clone)]
+struct PluginMeta {
+    name: Option<String>,
+    description: Option<String>,
+    version: String,
+    tier: Option<Tier>,
+    capabilities: Vec<Capability>,
+}
+
+/// A snapshot of one mod's metadata and state, for the management UI.
+#[derive(Debug, Clone)]
+pub struct ModInfo {
+    pub id: String,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub version: String,
+    pub tier: Option<Tier>,
+    pub capabilities: Vec<Capability>,
+    pub enabled: bool,
+    /// Loaded from the `mods/` directory (vs an in-process registration).
+    pub from_dir: bool,
 }
 
 #[derive(Default)]
@@ -46,10 +73,17 @@ impl ExtManager {
     /// Register an in-process plugin (e.g. the demo mod). Its `on_load` runs on
     /// the next dispatch that carries read-views. These survive a hot reload.
     pub fn register(&mut self, hooks: Box<dyn HostHooks>) {
-        self.push_plugin(hooks, false);
+        let meta = PluginMeta {
+            name: None,
+            description: None,
+            version: "in-process".to_string(),
+            tier: None,
+            capabilities: Vec::new(),
+        };
+        self.push_plugin(hooks, false, meta);
     }
 
-    fn push_plugin(&mut self, hooks: Box<dyn HostHooks>, from_dir: bool) {
+    fn push_plugin(&mut self, hooks: Box<dyn HostHooks>, from_dir: bool, meta: PluginMeta) {
         let id = hooks.id().to_string();
         log::info!("[ext] registered mod '{id}'");
         self.plugins.push(LoadedPlugin {
@@ -57,6 +91,7 @@ impl ExtManager {
             enabled: true,
             loaded: false,
             from_dir,
+            meta,
             hooks,
         });
     }
@@ -117,7 +152,7 @@ impl ExtManager {
                     };
                     match rt.load(&manifest.id, &source, path) {
                         Ok(plugin) => {
-                            self.push_plugin(Box::new(plugin), true);
+                            self.push_plugin(Box::new(plugin), true, plugin_meta(manifest));
                             loaded.push(manifest.id.clone());
                         }
                         Err(e) => log::error!("[ext] loading mod '{}' failed: {e}", manifest.id),
@@ -127,7 +162,7 @@ impl ExtManager {
                     let entry = path.join(&manifest.entry);
                     match crate::native::NativeAdapter::load(&entry) {
                         Ok(adapter) => {
-                            self.push_plugin(Box::new(adapter), true);
+                            self.push_plugin(Box::new(adapter), true, plugin_meta(manifest));
                             loaded.push(manifest.id.clone());
                         }
                         Err(e) => {
@@ -159,6 +194,36 @@ impl ExtManager {
 
     pub fn is_empty(&self) -> bool {
         self.plugins.is_empty()
+    }
+
+    /// A snapshot of every loaded mod (enabled or not) for the management UI.
+    pub fn mods(&self) -> Vec<ModInfo> {
+        self.plugins
+            .iter()
+            .map(|p| ModInfo {
+                id: p.id.clone(),
+                name: p.meta.name.clone(),
+                description: p.meta.description.clone(),
+                version: p.meta.version.clone(),
+                tier: p.meta.tier,
+                capabilities: p.meta.capabilities.clone(),
+                enabled: p.enabled,
+                from_dir: p.from_dir,
+            })
+            .collect()
+    }
+
+    /// Enable or disable a loaded mod by id. Disabling pauses all hook dispatch
+    /// for it; enabling resumes (and runs a pending `on_load` if it never ran).
+    /// Returns `false` if no mod has that id.
+    pub fn set_enabled(&mut self, id: &str, enabled: bool) -> bool {
+        for p in self.plugins.iter_mut() {
+            if p.id == id {
+                p.enabled = enabled;
+                return true;
+            }
+        }
+        false
     }
 
     pub fn enabled_ids(&self) -> Vec<&str> {
@@ -304,6 +369,16 @@ impl ExtManager {
                 disable(&mut p.enabled, &p.id, "draw_hud");
             }
         }
+    }
+}
+
+fn plugin_meta(manifest: &ModManifest) -> PluginMeta {
+    PluginMeta {
+        name: manifest.name.clone(),
+        description: manifest.description.clone(),
+        version: manifest.version.clone(),
+        tier: Some(manifest.tier),
+        capabilities: manifest.capabilities.clone(),
     }
 }
 

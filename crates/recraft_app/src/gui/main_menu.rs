@@ -5,6 +5,7 @@ use recraft_render::{GuiTexture, UiColor, UiFrame, UiRect};
 
 use super::accounts::GuiAccounts;
 use super::demo_select::GuiDemoSelect;
+use super::mods::GuiModList;
 use super::multiplayer::GuiMultiplayer;
 use super::options::GuiOptions;
 use super::widgets::GuiButton;
@@ -37,11 +38,13 @@ impl GuiMainMenu {
             GuiButton::at_px(cx - 100 * s, j + 48 * s, 200 * s, s, "Accounts"),
             // [3] Demo World: (cx-100, j+72), 200×20
             GuiButton::at_px(cx - 100 * s, j + 72 * s, 200 * s, s, "Demo World"),
+            // [4] Mods: (cx-100, j+96), 200×20 (recraft addition)
+            GuiButton::at_px(cx - 100 * s, j + 96 * s, 200 * s, s, "Mods..."),
             // Bottom split row, vanilla-style: Options + Quit side by side.
-            // [4] Options: (cx-100, j+96), 98×20
-            GuiButton::at_px(cx - 100 * s, j + 96 * s, 98 * s, s, "Options..."),
-            // [5] Quit: (cx+2, j+96), 98×20
-            GuiButton::at_px(cx + 2 * s, j + 96 * s, 98 * s, s, "Quit Game"),
+            // [5] Options: (cx-100, j+120), 98×20
+            GuiButton::at_px(cx - 100 * s, j + 120 * s, 98 * s, s, "Options..."),
+            // [6] Quit: (cx+2, j+120), 98×20
+            GuiButton::at_px(cx + 2 * s, j + 120 * s, 98 * s, s, "Quit Game"),
         ];
     }
 }
@@ -116,7 +119,7 @@ impl GuiScreen for GuiMainMenu {
     }
 
     fn mouse_clicked(&mut self, x: f64, y: f64, _ctx: &mut ScreenCtx) -> Vec<GuiAction> {
-        if self.buttons.len() < 6 {
+        if self.buttons.len() < 7 {
             return Vec::new();
         }
         if self.buttons[0].clicked(x, y) {
@@ -132,9 +135,12 @@ impl GuiScreen for GuiMainMenu {
             return vec![GuiAction::SetScreen(Box::new(GuiDemoSelect::new()))];
         }
         if self.buttons[4].clicked(x, y) {
-            return vec![GuiAction::SetScreen(Box::new(GuiOptions::from_main_menu()))];
+            return vec![GuiAction::SetScreen(Box::new(GuiModList::new(true)))];
         }
         if self.buttons[5].clicked(x, y) {
+            return vec![GuiAction::SetScreen(Box::new(GuiOptions::from_main_menu()))];
+        }
+        if self.buttons[6].clicked(x, y) {
             return vec![GuiAction::Quit];
         }
         Vec::new()
