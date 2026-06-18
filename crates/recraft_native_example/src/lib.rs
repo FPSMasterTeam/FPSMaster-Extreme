@@ -40,6 +40,12 @@ impl NativePlugin for ExampleMod {
         false // Pass
     }
 
+    fn on_serverbound_packet(&mut self, _host: HostApi, _packet: RStr<'_>) -> bool {
+        // Pre-send hook (0.2): observe or `return true` to drop the outgoing
+        // packet. `_packet` is JSON (e.g. {"type":"OutChat","message":".."}).
+        false
+    }
+
     fn on_event(&mut self, _host: HostApi, _event: RStr<'_>) {}
 
     fn on_tick(&mut self, host: HostApi) {
@@ -57,9 +63,10 @@ impl NativePlugin for ExampleMod {
     }
 
     fn draw_hud(&mut self, host: HostApi, _ctx: RStr<'_>) {
-        // Reads the live player view, then draws a label (white, gui-pixel coords).
+        // Reads live player state (0.2 helpers), then draws a label.
         let _player = host.player_json();
-        host.hud_text(2, 48, "native mod hud", 0xffff_ffff);
+        let slot = host.selected_slot();
+        host.hud_text(2, 48, &format!("native mod hud (slot {slot})"), 0xffff_ffff);
     }
 }
 

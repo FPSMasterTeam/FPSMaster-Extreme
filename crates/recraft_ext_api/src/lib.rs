@@ -46,7 +46,7 @@ pub struct ExtVertex {
 
 /// The native API semver, mirrored from the manifest `api` requirement. The
 /// `abi_stable` layout check is the second, stronger safety net.
-pub const API_VERSION: (u32, u32, u32) = (0, 1, 0);
+pub const API_VERSION: (u32, u32, u32) = (0, 2, 0);
 
 /// Everything a native mod needs in scope to declare its plugin and root module.
 /// `use recraft_ext_api::prelude::*;` and implement [`NativePlugin`].
@@ -153,6 +153,139 @@ impl HostApi {
             RVec::from(indices.to_vec()),
         );
     }
+
+    // ---- read-views (JSON in, JSON/primitive out; added in 0.2) ----
+
+    /// All remote entities as a JSON array.
+    pub fn entities_json(&self) -> RString {
+        self.query(r#"{"k":"entities"}"#)
+    }
+    /// One entity by id as JSON (`null` if unknown).
+    pub fn entity_json(&self, id: i32) -> RString {
+        self.query(format!(r#"{{"k":"entity","id":{id}}}"#))
+    }
+    /// The held item as JSON (`null` if empty).
+    pub fn held_item_json(&self) -> RString {
+        self.query(r#"{"k":"held"}"#)
+    }
+    /// The 45-slot inventory as a JSON array (`null` per empty slot).
+    pub fn inventory_json(&self) -> RString {
+        self.query(r#"{"k":"inventory"}"#)
+    }
+    /// The player's abilities as JSON.
+    pub fn capabilities_json(&self) -> RString {
+        self.query(r#"{"k":"capabilities"}"#)
+    }
+    /// Active potion effects as a JSON array.
+    pub fn effects_json(&self) -> RString {
+        self.query(r#"{"k":"effects"}"#)
+    }
+    /// XP `{"bar":..,"level":..}` as JSON.
+    pub fn xp_json(&self) -> RString {
+        self.query(r#"{"k":"xp"}"#)
+    }
+    /// The open container `{windowId,kind,size}` as JSON (`null` if none).
+    pub fn container_json(&self) -> RString {
+        self.query(r#"{"k":"container"}"#)
+    }
+    /// The selected hotbar slot (0..8).
+    pub fn selected_slot(&self) -> i32 {
+        self.query(r#"{"k":"selectedSlot"}"#)
+            .as_str()
+            .trim()
+            .parse()
+            .unwrap_or(0)
+    }
+    /// World time in ticks.
+    pub fn world_time(&self) -> i64 {
+        self.query(r#"{"k":"time"}"#)
+            .as_str()
+            .trim()
+            .parse()
+            .unwrap_or(0)
+    }
+    /// Current dimension id.
+    pub fn dimension(&self) -> i32 {
+        self.query(r#"{"k":"dim"}"#)
+            .as_str()
+            .trim()
+            .parse()
+            .unwrap_or(0)
+    }
+    /// Whether a server connection is active.
+    pub fn connected(&self) -> bool {
+        self.query(r#"{"k":"connected"}"#).as_str().trim() == "true"
+    }
+
+    // ---- world / player actions (added in 0.2) ----
+
+    /// Place the held item against a block face; `cursor` is the in-block hit
+    /// point (0..15 each), e.g. `[8, 8, 8]` for the face centre.
+    pub fn place_block(&self, x: i32, y: i32, z: i32, face: u8, cursor: [u8; 3]) {
+        self.cmd(format!(
+            r#"{{"t":"place","x":{x},"y":{y},"z":{z},"face":{face},"cx":{},"cy":{},"cz":{}}}"#,
+            cursor[0], cursor[1], cursor[2]
+        ));
+    }
+    /// Raw digging: `status` 0 start, 1 cancel, 2 finish, 3 drop-stack, 4 drop,
+    /// 5 release-use.
+    pub fn dig(&self, status: u8, x: i32, y: i32, z: i32, face: u8) {
+        self.cmd(format!(
+            r#"{{"t":"dig","status":{status},"x":{x},"y":{y},"z":{z},"face":{face}}}"#
+        ));
+    }
+    /// Attack an entity by id.
+    pub fn attack_entity(&self, id: i32) {
+        self.cmd(format!(r#"{{"t":"attack","id":{id}}}"#));
+    }
+    /// Right-click / interact with an entity (no hit point).
+    pub fn interact_entity(&self, id: i32) {
+        self.cmd(format!(r#"{{"t":"interact","id":{id}}}"#));
+    }
+    /// Interact with an entity at a specific hit point (InteractAt).
+    pub fn interact_entity_at(&self, id: i32, at: [f32; 3]) {
+        self.cmd(format!(
+            r#"{{"t":"interact","id":{id},"ax":{},"ay":{},"az":{}}}"#,
+            at[0], at[1], at[2]
+        ));
+    }
+    /// Click a slot in the open window (vanilla ClickWindow codes).
+    pub fn container_click(&self, slot: i16, button: i8, mode: i8) {
+        self.cmd(format!(
+            r#"{{"t":"click","slot":{slot},"button":{button},"mode":{mode}}}"#
+        ));
+    }
+    /// Close the open window.
+    pub fn container_close(&self) {
+        self.cmd(r#"{"t":"close"}"#);
+    }
+    /// Open the player inventory window.
+    pub fn open_inventory(&self) {
+        self.cmd(r#"{"t":"openInv"}"#);
+    }
+    /// Select a hotbar slot (0..8).
+    pub fn select_slot(&self, slot: i32) {
+        self.cmd(format!(r#"{{"t":"selectSlot","slot":{slot}}}"#));
+    }
+    /// Swing the arm.
+    pub fn swing(&self) {
+        self.cmd(r#"{"t":"swing"}"#);
+    }
+    /// Use the held item with no target.
+    pub fn use_item(&self) {
+        self.cmd(r#"{"t":"useItem"}"#);
+    }
+    /// Set the look. `silent` keeps the camera put and only overrides the
+    /// server-visible rotation on the next movement packet (pre-event style).
+    pub fn set_rotation(&self, yaw: f32, pitch: f32, silent: bool) {
+        self.cmd(format!(
+            r#"{{"t":"rotate","yaw":{yaw},"pitch":{pitch},"silent":{silent}}}"#
+        ));
+    }
+    /// Clear a silent-look override.
+    pub fn clear_rotation(&self) {
+        self.cmd(r#"{"t":"clearRotate"}"#);
+    }
 }
 
 /// Minimal JSON string escaper (no serde dependency in this crate).
@@ -186,6 +319,13 @@ pub trait NativePlugin {
     fn on_frame(&mut self, host: HostApi);
     fn on_input(&mut self, host: HostApi, input: RStr<'_>) -> bool;
     fn draw_hud(&mut self, host: HostApi, ctx: RStr<'_>);
+    /// An outbound packet is about to be sent (pre-send hook); return `true` to
+    /// drop it. Added in 0.2 with a default body, so older mods are unaffected
+    /// and a mod overrides it only if it cares.
+    fn on_serverbound_packet(&mut self, host: HostApi, packet: RStr<'_>) -> bool {
+        let _ = (host, packet);
+        false
+    }
 }
 
 /// The owned, type-erased plugin object passed across the ABI.

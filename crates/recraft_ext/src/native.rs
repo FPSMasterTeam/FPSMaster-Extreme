@@ -102,6 +102,21 @@ impl HostHooks for NativeAdapter {
         }
     }
 
+    fn on_serverbound_packet(&mut self, packet: &PacketView, ctx: &mut HookCtx) -> Verdict {
+        let json = bridge::packet_view_json(packet);
+        let (views, commands) = ctx.raw_parts();
+        let _v = cur::ViewsGuard::enter(views);
+        let _c = cur::CommandsGuard::enter(commands);
+        if self
+            .plugin
+            .on_serverbound_packet(host_api(), RStr::from(json.as_str()))
+        {
+            Verdict::Drop
+        } else {
+            Verdict::Pass
+        }
+    }
+
     fn on_event(&mut self, event: &crate::event::ExtEvent, ctx: &mut HookCtx) {
         let json = bridge::event_json(event);
         let (views, commands) = ctx.raw_parts();
