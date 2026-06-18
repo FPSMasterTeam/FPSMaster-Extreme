@@ -1665,7 +1665,11 @@ impl GameState {
     /// `None` on the tick right after a teleport, where vanilla emits only the
     /// teleport ack (already sent via [`take_position_confirm`]) and resumes
     /// movement next tick. The caller must not send a movement packet on `None`.
-    pub fn tick(&mut self, dt: f32) -> Option<(Vec<ServerboundPacket>, MovementSnapshot)> {
+    /// Run one 20 Hz tick (input → physics → state). Returns the serverbound
+    /// interaction packets to send before the flying packet; the caller builds
+    /// the movement snapshot itself via [`Self::movement_snapshot`] *after* the
+    /// extension tick, so a mod's silent look rides this tick's flying packet.
+    pub fn tick(&mut self, dt: f32) -> Option<Vec<ServerboundPacket>> {
         // Vanilla GuiIngame.updateTick: a free-running tick counter that drives the
         // heart-shake RNG and the heart/hunger blink timing.
         self.hud_update_counter = self.hud_update_counter.wrapping_add(1);
@@ -1817,7 +1821,7 @@ impl GameState {
                 self.world.upsert_entity(self.player.clone());
                 self.advance_view_state();
                 self.update_camera(1.0);
-                return Some((actions, self.movement_snapshot()));
+                return Some(actions);
             }
         }
 
@@ -1922,7 +1926,7 @@ impl GameState {
         self.world.upsert_entity(self.player.clone());
         self.advance_view_state();
         self.update_camera(1.0);
-        Some((actions, self.movement_snapshot()))
+        Some(actions)
     }
 
     /// Ease the sneak/sprint view amounts toward their targets, once per tick so
@@ -4377,7 +4381,11 @@ impl GameState {
         sections
     }
 
-    fn movement_snapshot(&self) -> MovementSnapshot {
+    /// Build the movement packet snapshot. Public so the host can rebuild it
+    /// AFTER the extension tick runs (post-physics), capturing a mod's silent
+    /// look + this tick's position together, so a placement's rotation matches
+    /// the position the flying packet carries (Grim RotationPlace ray-traces both).
+    pub fn movement_snapshot(&self) -> MovementSnapshot {
         // A silent-look override (extension `setRotation` with silent) rides the
         // movement packet so the server sees that rotation while the camera stays.
         let (yaw, pitch) = self
@@ -6570,7 +6578,8 @@ mod interaction_tests {
             right_held: true,
             ..Default::default()
         });
-        let (_packets, movement) = gs.tick(0.05).expect("not a freeze tick");
+        gs.tick(0.05).expect("not a freeze tick");
+        let movement = gs.movement_snapshot();
         assert_eq!(gs.use_action, ItemUseAction::Block);
         assert!(!movement.sprinting, "blocking drops sprint within the tick");
     }
@@ -6581,11 +6590,13 @@ mod interaction_tests {
         gs.player.on_ground = true;
         gs.input.forward = true;
         gs.input.sprint = true; // toggle = keyBindSprint.isKeyDown()
-        let (_p, m) = gs.tick(0.05).expect("tick");
+        gs.tick(0.05).expect("tick");
+        let m = gs.movement_snapshot();
         assert!(m.sprinting, "sprint key + forward starts sprinting");
         // Release forward: moveForward drops below 0.8 → stop.
         gs.input.forward = false;
-        let (_p, m) = gs.tick(0.05).expect("tick");
+        gs.tick(0.05).expect("tick");
+        let m = gs.movement_snapshot();
         assert!(!m.sprinting, "releasing forward stops the sprint");
     }
 
@@ -6598,7 +6609,8 @@ mod interaction_tests {
         gs.input.sprint = true;
         // Vanilla starts (no collision check) then stops (collidedHorizontally)
         // in the same onLivingUpdate, so it never flickers on in the report.
-        let (_p, m) = gs.tick(0.05).expect("tick");
+        gs.tick(0.05).expect("tick");
+        let m = gs.movement_snapshot();
         assert!(!m.sprinting, "pressing into a wall reports not-sprinting");
     }
 
@@ -6609,13 +6621,15 @@ mod interaction_tests {
         gs.input.sprint = false; // no sprint key — only the double-tap can start
         // First fresh forward press: arms the 7-tick window, no sprint yet.
         gs.input.forward = true;
-        let (_p, m1) = gs.tick(0.05).expect("tick");
+        gs.tick(0.05).expect("tick");
+        let m1 = gs.movement_snapshot();
         assert!(!m1.sprinting, "first tap only arms sprintToggleTimer");
         // Release, then re-press within the window → sprint starts.
         gs.input.forward = false;
         let _ = gs.tick(0.05).expect("tick");
         gs.input.forward = true;
-        let (_p, m3) = gs.tick(0.05).expect("tick");
+        gs.tick(0.05).expect("tick");
+        let m3 = gs.movement_snapshot();
         assert!(m3.sprinting, "a second tap within 7 ticks starts the sprint");
     }
 
@@ -6693,7 +6707,8 @@ mod interaction_tests {
             left_held: true,
             ..Default::default()
         });
-        let (packets, movement) = gs.tick(0.05).expect("not a freeze tick");
+        let packets = gs.tick(0.05).expect("not a freeze tick");
+        let movement = gs.movement_snapshot();
         assert!(
             packets.iter().any(|p| matches!(
                 p,
