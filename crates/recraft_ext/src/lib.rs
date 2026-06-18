@@ -426,7 +426,7 @@ mod tests {
         }
         let mut mgr = ExtManager::new();
         let loaded = mgr.load_mods(&root);
-        for id in ["coords_hud", "chat_alert", "block_tint", "preset_demo"] {
+        for id in ["coords_hud", "chat_alert", "block_tint", "preset_demo", "scaffold_demo"] {
             assert!(loaded.contains(&id.to_string()), "example mod '{id}' failed to load");
         }
         // Exercise their hooks once to ensure the dispatchers run without error.
