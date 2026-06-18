@@ -1435,7 +1435,10 @@ fn apply_ext_commands(app: &mut App) {
                 app.pending_ext_packets.extend(packets);
             }
             recraft_ext::ExtCommand::SetRotation { yaw, pitch, silent } => {
-                app.game.ext_set_rotation(yaw, pitch, silent);
+                // The silent look is snapped to the player's own mouse-rotation
+                // quantum (sensitivity factor) so its deltas pass Grim's GCD check.
+                let step = app.settings.clone().mouse_factor();
+                app.game.ext_set_rotation(yaw, pitch, silent, step);
             }
             recraft_ext::ExtCommand::ClearSilentRotation => {
                 app.game.ext_clear_silent_rotation();
