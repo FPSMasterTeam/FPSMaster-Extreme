@@ -27,6 +27,7 @@ struct Lighting {
     flags: vec4<f32>,
     fog_color: vec4<f32>,
     fog_params: vec4<f32>, // x start, y end, z enabled, w brightness gamma
+    extra: vec4<f32>,      // x fullbright (1 = force lightmap to full)
 };
 @group(2) @binding(0) var<uniform> lighting: Lighting;
 
@@ -108,7 +109,8 @@ fn sample_tile(repeat_uv: vec2<f32>, tile_origin: vec2<f32>) -> vec4<f32> {
 fn shade(in: VsOut, texel: vec4<f32>) -> vec3<f32> {
     let gamma = 1.0 + (1.0 - lighting.fog_params.w) * 1.5;
     let albedo = texel.rgb * in.color.rgb;
-    let lit = albedo * light_curve(vanilla_lightmap(in.light), gamma);
+    // Fullbright preset: skip the lightmap darkening (keep baked AO/face shade).
+    let lit = select(albedo * light_curve(vanilla_lightmap(in.light), gamma), albedo, lighting.extra.x > 0.5);
     return apply_fog(lit, in.world_pos);
 }
 

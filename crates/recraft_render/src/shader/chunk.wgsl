@@ -26,6 +26,7 @@ struct Lighting {
     flags: vec4<f32>,
     fog_color: vec4<f32>,  // rgb: fog (horizon) colour
     fog_params: vec4<f32>, // x: start dist, y: end dist, z: enabled, w: brightness
+    extra: vec4<f32>,      // x: fullbright (1 = force lightmap to full)
 };
 
 @group(2) @binding(0)
@@ -178,6 +179,10 @@ fn sample_pbr_normal(uv: vec2<f32>, geo_n: vec3<f32>) -> vec3<f32> {
 // Apply the shader-pack lighting model to an albedo colour. Falls back to the
 // vanilla flat day/night brightness when shaders are disabled.
 fn apply_lighting(albedo: vec3<f32>, in: VertexOutput) -> vec3<f32> {
+    // Fullbright preset: skip all lightmap/shader darkening (keep baked shading).
+    if (lighting.extra.x > 0.5) {
+        return albedo;
+    }
     // Brightness option (fog_params.w in 0..1) → gamma: 1.0 neutral, lower darker.
     let gamma = 1.0 + (1.0 - lighting.fog_params.w) * 1.5;
     if (lighting.flags.x < 0.5) {

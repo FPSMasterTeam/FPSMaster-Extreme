@@ -145,7 +145,6 @@ struct App {
     /// the ESP-style line overlays (target block outline / chunk borders / entity
     /// boxes). The overlays regenerate their line geometry each frame while on.
     ext_fullbright: bool,
-    ext_fullbright_dirty: bool,
     ext_nametag_scale: f32,
     ext_block_outline: bool,
     ext_chunk_borders: bool,
@@ -414,7 +413,6 @@ impl ApplicationHandler for WinitApp {
             ext_indices: Vec::new(),
             geometry_dirty: false,
             ext_fullbright: false,
-            ext_fullbright_dirty: false,
             ext_nametag_scale: 1.0,
             ext_block_outline: false,
             ext_chunk_borders: false,
@@ -847,16 +845,9 @@ impl ApplicationHandler for WinitApp {
             renderer.set_extension_geometry(&app.ext_geometry, &app.ext_indices);
             app.geometry_dirty = false;
         }
-        // Extension preset render toggles: fullbright (via brightness, restoring
-        // the user's setting when off), nametag scale, and the ESP line overlays.
-        if app.ext_fullbright_dirty {
-            renderer.set_brightness(if app.ext_fullbright {
-                8.0
-            } else {
-                app.settings.brightness
-            });
-            app.ext_fullbright_dirty = false;
-        }
+        // Extension preset render toggles: fullbright (force lightmap to full),
+        // nametag scale, and the ESP line overlays.
+        renderer.set_fullbright(app.ext_fullbright);
         renderer.set_nametag_scale(app.ext_nametag_scale);
         let overlays_on =
             app.ext_block_outline || app.ext_chunk_borders || app.ext_entity_box.is_some();
@@ -1363,10 +1354,7 @@ fn apply_render_preset(app: &mut App, preset: recraft_ext::RenderPreset) {
             app.block_tints.set(block_id, meta, color);
             app.tints_dirty = true;
         }
-        P::Fullbright(on) => {
-            app.ext_fullbright = on;
-            app.ext_fullbright_dirty = true;
-        }
+        P::Fullbright(on) => app.ext_fullbright = on,
         P::NametagScale(scale) => app.ext_nametag_scale = scale,
         P::ParticleDensity(density) => app.game.set_particle_density(density),
         P::BlockOutline(on) => app.ext_block_outline = on,

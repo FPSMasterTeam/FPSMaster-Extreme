@@ -68,8 +68,11 @@ struct LightingUniform {
     flags: [f32; 4],
     /// rgb = fog colour (sky horizon), w unused.
     fog_color: [f32; 4],
-    /// x = fog start dist, y = fog end dist, z = fog enabled, w unused.
+    /// x = fog start dist, y = fog end dist, z = fog enabled, w = brightness gamma.
     fog_params: [f32; 4],
+    /// x = fullbright (extension preset; 1 = force the world lightmap to full),
+    /// y/z/w reserved.
+    extra: [f32; 4],
 }
 
 /// Uniform for the post pass's depth-aware effects (DoF / motion blur):
@@ -766,6 +769,8 @@ pub struct Renderer {
     fog_enabled: bool,
     /// Overall lighting brightness multiplier (user "Brightness" option).
     brightness: f32,
+    /// Extension `fullbright` preset: force the world lightmap to full.
+    fullbright: bool,
     /// Post-process effect toggles (consumed by the post pass).
     vignette_enabled: bool,
     chromatic_enabled: bool,
@@ -3190,6 +3195,7 @@ impl Renderer {
             specular_enabled: false,
             fog_enabled: false,
             brightness: 1.0,
+            fullbright: false,
             vignette_enabled: false,
             chromatic_enabled: false,
             dof_enabled: false,
@@ -3343,6 +3349,14 @@ impl Renderer {
     /// Player-nametag world-size multiplier (extension `nametagScale` preset).
     pub fn set_nametag_scale(&mut self, scale: f32) {
         self.nametag_scale = scale.clamp(0.1, 5.0);
+    }
+
+    /// Force the world lightmap to full brightness (extension `fullbright`
+    /// preset). Unlike the brightness gamma, this flatly removes the lightmap
+    /// darkening (terrain keeps its baked AO/face shading), so caves/night are
+    /// fully visible without washing the image out.
+    pub fn set_fullbright(&mut self, on: bool) {
+        self.fullbright = on;
     }
 
     pub fn set_vignette_enabled(&mut self, on: bool) {
@@ -4962,6 +4976,7 @@ impl Renderer {
                     on(self.fog_enabled),
                     self.brightness,
                 ],
+                extra: [on(self.fullbright), 0.0, 0.0, 0.0],
             }),
         );
 
