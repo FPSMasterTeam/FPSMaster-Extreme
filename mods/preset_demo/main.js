@@ -29,7 +29,8 @@ recraft.onKey((e) => {
       return true;
     case "BracketLeft":
       s.ebox = !s.ebox;
-      recraft.entityBox("", [1.0, 1.0, 1.0], s.ebox);
+      // Colors are 0-255 (or 0xRRGGBBAA / "#fff"); [255,255,255] = white.
+      recraft.entityBox("", [255, 255, 255], s.ebox);
       return true;
     case "BracketRight":
       ni = (ni + 1) % nametags.length;
