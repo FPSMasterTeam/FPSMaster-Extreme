@@ -2,10 +2,24 @@
 members = [
     "crates/recraft_app",
     "crates/recraft_core",
+    "crates/recraft_ext",
+    "crates/recraft_ext_api",
+    "crates/recraft_native_example",
     "crates/recraft_protocol",
     "crates/recraft_render",
 ]
 resolver = "2"
+
+# Release "obfuscation" baseline. Rust has no true obfuscator; stripping the
+# symbol table is the closest primitive and is enough here because native mods
+# never reference host symbols — they depend only on `recraft_ext_api`'s checked
+# layout. `strip = "symbols"` drops internal names from the host binary while a
+# mod cdylib keeps its `recraft_ext_mod` root-module export in the *dynamic*
+# symbol table (the loader resolves it there), so stripped release builds still
+# load native mods. That dynamic export is the de-facto symbol whitelist.
+[profile.release]
+strip = "symbols"
+lto = "thin"
 
 [workspace.package]
 edition = "2021"
