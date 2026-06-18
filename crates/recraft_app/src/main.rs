@@ -776,20 +776,21 @@ impl ApplicationHandler for WinitApp {
                     right_held: self.right_held,
                     old_animations: app.settings.old_animations,
                 });
-                // The extension tick runs BEFORE physics — the vanilla position
-                // for input/interactions in `runTick`. A mod sets its silent look
-                // and queues interactions now, so the look lands in THIS tick's
-                // flying packet and a placement is flushed in the pre-flying
-                // window: the place-then-flying order (with a matching rotation)
-                // that Grim's RotationPlace expects.
-                app.ext.dispatch_tick(&GameViews(&app.game));
-                apply_ext_commands(app);
-                if let Some((actions, movement)) = app.game.tick(0.05) {
+                if let Some(actions) = app.game.tick(0.05) {
                     self.slot_select = None;
                     self.slot_scroll = 0;
                     self.attack_pressed = false;
                     self.use_pressed = false;
                     let abilities = app.game.take_abilities_packet();
+                    // The extension tick runs AFTER physics (vanilla `runTick`
+                    // processes interactions against the post-move state): a mod
+                    // sees this tick's position, sets its silent look and queues
+                    // interactions, THEN the movement snapshot is (re)built so the
+                    // flying packet carries that look AND this tick's position —
+                    // a placement's rotation matches the position Grim ray-traces.
+                    app.ext.dispatch_tick(&GameViews(&app.game));
+                    apply_ext_commands(app);
+                    let movement = app.game.movement_snapshot();
                     // Extension pre-send hook (on_serverbound): a mod may observe
                     // or drop each natural client packet this tick. Movement is
                     // not routed through it (a dropped move would desync physics).
@@ -808,8 +809,9 @@ impl ApplicationHandler for WinitApp {
                             }
                             // Extension-injected interactions (placement, digging,
                             // …) ride the same pre-flying window as vanilla
-                            // interactions so Grim's Post/RotationPlace ordering
-                            // holds — they were queued in the previous tick's hooks.
+                            // interactions, with the look already in this tick's
+                            // flying — the place-then-flying order + matching
+                            // rotation Grim's Post / RotationPlace checks expect.
                             for packet in app.pending_ext_packets.drain(..) {
                                 network.send_packet(packet);
                             }
@@ -2590,12 +2592,12 @@ fn run_headless_interact(config: &LaunchConfig, seconds: f32) -> anyhow::Result<
                 right_held: false,
                 old_animations: false,
             });
-            if let Some((actions, movement)) = game.tick(0.05) {
+            if let Some(actions) = game.tick(0.05) {
                 if game.can_send_movement_packets() {
                     for packet in actions {
                         network.send_packet(packet);
                     }
-                    network.send_movement(movement);
+                    network.send_movement(game.movement_snapshot());
                 }
             }
             tick_count += 1;
@@ -2676,9 +2678,9 @@ fn run_headless_smoke(config: &LaunchConfig, seconds: f32) -> anyhow::Result<()>
         let _ = game.take_position_confirm();
         game.apply_scripted_smoke_input(elapsed, seconds);
         if in_game {
-            if let Some((_actions, movement)) = game.tick(0.05) {
+            if game.tick(0.05).is_some() {
                 if game.can_send_movement_packets() {
-                    network.send_movement(movement);
+                    network.send_movement(game.movement_snapshot());
                 }
             }
         }
