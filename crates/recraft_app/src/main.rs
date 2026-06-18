@@ -444,6 +444,7 @@ impl ApplicationHandler for WinitApp {
         // Load `.js` (and, later, native) mods from `mods/` next to the working
         // directory. F10 reloads them at runtime.
         let loaded = app.ext.load_mods(std::path::Path::new("mods"));
+        apply_disabled_mods(&mut app);
         if !loaded.is_empty() {
             log::info!("[ext] loaded {} mod(s): {:?}", loaded.len(), loaded);
         }
@@ -491,6 +492,7 @@ impl ApplicationHandler for WinitApp {
                     && matches!(event.physical_key, PhysicalKey::Code(KeyCode::F10))
                 {
                     let loaded = app.ext.reload_mods(std::path::Path::new("mods"));
+                    apply_disabled_mods(app);
                     log::info!("[ext] reloaded {} mod(s): {:?}", loaded.len(), loaded);
                 }
                 if event.state == ElementState::Pressed
@@ -1262,7 +1264,30 @@ fn handle_actions(
                 log::info!("resource pack reload requested: {:?}", path);
                 *atlas_uv = renderer.reload_atlas(path);
             }
+            GuiAction::ReloadMods => {
+                let loaded = app.ext.reload_mods(std::path::Path::new("mods"));
+                apply_disabled_mods(app);
+                log::info!("[ext] reloaded {} mod(s): {:?}", loaded.len(), loaded);
+            }
+            GuiAction::SetModEnabled(id, enabled) => {
+                app.ext.set_enabled(&id, enabled);
+                if enabled {
+                    app.settings.disabled_mods.retain(|m| m != &id);
+                } else if !app.settings.disabled_mods.contains(&id) {
+                    app.settings.disabled_mods.push(id);
+                }
+                app.settings.save();
+            }
+            GuiAction::OpenModsFolder => open_path(std::path::Path::new("mods")),
         }
+    }
+}
+
+/// Re-apply the persisted disabled set after a (re)load: every mod loads, then
+/// the ones the user turned off are paused. Centralizes the startup/F10/UI path.
+fn apply_disabled_mods(app: &mut App) {
+    for id in &app.settings.disabled_mods {
+        app.ext.set_enabled(id, false);
     }
 }
 
@@ -2453,6 +2478,7 @@ fn render_frame(
         replay_hud(&mut ui, &hud_draw, scale);
     }
     if let Some(screen) = screen.as_mut() {
+        let mod_list = ext.mods();
         let ctx = DrawCtx {
             width,
             height,
@@ -2466,6 +2492,7 @@ fn render_frame(
             session_username: ms_session.as_ref().map(|s| s.username.as_str()),
             accounts: &account_entries,
             hud: Some(&hud),
+            mods: &mod_list,
         };
         screen.draw(&mut ui, &ctx);
     }
@@ -2864,6 +2891,25 @@ fn open_url(url: &str) {
         .spawn();
     if let Err(err) = result {
         log::warn!("failed to open url {url}: {err}");
+    }
+}
+
+/// Open a local directory in the OS file manager (mod-management "Open Folder").
+/// Creates the directory first so the shortcut works on a fresh install.
+fn open_path(path: &std::path::Path) {
+    if let Err(err) = std::fs::create_dir_all(path) {
+        log::warn!("failed to create {}: {err}", path.display());
+    }
+    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    #[cfg(target_os = "macos")]
+    let program = "open";
+    #[cfg(target_os = "windows")]
+    let program = "explorer";
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let program = "xdg-open";
+
+    if let Err(err) = std::process::Command::new(program).arg(&canonical).spawn() {
+        log::warn!("failed to open folder {}: {err}", canonical.display());
     }
 }
 

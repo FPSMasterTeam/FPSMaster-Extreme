@@ -4,6 +4,7 @@ use recraft_render::UiFrame;
 use winit::event::{ElementState, KeyEvent};
 use winit::keyboard::{KeyCode, PhysicalKey};
 
+use super::mods::GuiModList;
 use super::options::GuiOptions;
 use super::widgets::GuiButton;
 use super::{draw_centered_text, draw_default_background, DrawCtx, GuiAction, GuiScreen, ScreenCtx};
@@ -31,8 +32,9 @@ impl GuiScreen for GuiIngameMenu {
         self.buttons = vec![
             GuiButton::at_px(x, top, 200 * s, s, "Back to Game"),
             GuiButton::at_px(x, top + 24 * s, 200 * s, s, "Options..."),
+            GuiButton::at_px(x, top + 48 * s, 200 * s, s, "Mods..."),
             // Vanilla separates the leave button from the rest with a gap.
-            GuiButton::at_px(x, top + 72 * s, 200 * s, s, "Quit to Title"),
+            GuiButton::at_px(x, top + 96 * s, 200 * s, s, "Quit to Title"),
         ];
         draw_default_background(ui, ctx);
         draw_centered_text(ui, ctx.width, ctx.height / 4, s, super::TEXT_WHITE, "Game Menu");
@@ -42,7 +44,7 @@ impl GuiScreen for GuiIngameMenu {
     }
 
     fn mouse_clicked(&mut self, x: f64, y: f64, _ctx: &mut ScreenCtx) -> Vec<GuiAction> {
-        if self.buttons.len() < 3 {
+        if self.buttons.len() < 4 {
             return Vec::new();
         }
         if self.buttons[0].clicked(x, y) {
@@ -52,6 +54,9 @@ impl GuiScreen for GuiIngameMenu {
             return vec![GuiAction::SetScreen(Box::new(GuiOptions::new()))];
         }
         if self.buttons[2].clicked(x, y) {
+            return vec![GuiAction::SetScreen(Box::new(GuiModList::new(false)))];
+        }
+        if self.buttons[3].clicked(x, y) {
             return vec![GuiAction::QuitToTitle];
         }
         Vec::new()

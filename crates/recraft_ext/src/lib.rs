@@ -30,7 +30,7 @@ pub use event::{ExtEvent, Verdict};
 pub use host::{HookCtx, HostHooks};
 pub use hud::{HudCmd, HudCtx, HudDraw, TexHandle};
 pub use input::InputEvent;
-pub use manager::ExtManager;
+pub use manager::{ExtManager, ModInfo};
 pub use manifest::{
     load_order, Capability, ManifestError, ModManifest, Tier, JS_API_VERSION, NATIVE_API_VERSION,
 };

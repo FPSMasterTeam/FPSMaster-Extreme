@@ -86,6 +86,9 @@ pub struct Settings {
     /// Customizable key bindings (vanilla "Controls"). Maps each rebindable
     /// [`GameAction`] to a physical [`KeyCode`].
     pub keybinds: Keybinds,
+    /// Ids of mods the user has disabled from the mod-management screen. Disabled
+    /// mods load but their hooks are not dispatched. Persisted comma-separated.
+    pub disabled_mods: Vec<String>,
 }
 
 /// Selectable resolutions (None = native). Common 16:9 modes most panels scale.
@@ -145,6 +148,7 @@ impl Default for Settings {
             old_animations: false,
             resource_pack: None,
             keybinds: Keybinds::default(),
+            disabled_mods: Vec::new(),
         }
     }
 }
@@ -309,6 +313,14 @@ impl Settings {
                         s.resource_pack = Some(val.to_owned());
                     }
                 }
+                "disabled_mods" => {
+                    s.disabled_mods = val
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|m| !m.is_empty())
+                        .map(str::to_owned)
+                        .collect();
+                }
                 k => {
                     // Key bindings: `key.<action>=<KeyCode name>`.
                     if let Some(action_name) = k.strip_prefix("key.") {
@@ -374,6 +386,7 @@ impl Settings {
             self.old_animations,
             self.resource_pack.as_deref().unwrap_or(""),
         );
+        text.push_str(&format!("disabled_mods={}\n", self.disabled_mods.join(",")));
         for &(action, code) in self.keybinds.iter() {
             text.push_str(&format!(
                 "key.{}={}\n",
