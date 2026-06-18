@@ -270,13 +270,16 @@ fn network_thread(
             match commands.try_recv() {
                 Ok(NetworkCommand::Send(packet)) => {
                     log::debug!("sending {}", packet_debug_name(&packet));
-                    // TEMP DIAGNOSTIC: show every outgoing C08 with its target so we
-                    // can tell a real placement (real x,y,z) from a use-item / "can't
-                    // place" fallback (x=y=z=-1, face=255), and time them.
-                    if let ServerboundPacket::PlayerBlockPlacement { x, y, z, face, .. } = &packet {
-                        let kind = if *face == 255 { "USE/air" } else { "PLACE" };
-                        log::info!("[C08 {kind}] ({x},{y},{z}) face={face} t={:.3}s", diag_secs());
-                    }
+                    // TEMP DIAGNOSTIC: trace EVERY outgoing packet (name + real-time
+                    // stamp) so we can see the exact per-tick sequence the server /
+                    // anti-cheat receives around a placement.
+                    let extra = match &packet {
+                        ServerboundPacket::PlayerBlockPlacement { x, y, z, face, .. } => {
+                            format!(" ({x},{y},{z}) face={face}")
+                        }
+                        _ => String::new(),
+                    };
+                    log::info!("[net] {}{extra} t={:.3}s", packet_debug_name(&packet), diag_secs());
                     if let Err(err) = client.write_packet(packet.into_frame()) {
                         let _ =
                             events.send(NetworkEvent::Disconnected(format!("write failed: {err}")));
