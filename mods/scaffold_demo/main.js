@@ -5,9 +5,10 @@
 // there, bridging as you walk.
 //
 // Vanilla-legitimacy (Grim-oriented) — what the mod and the host guarantee:
-//  - Only places against an EXISTING full-cube face you could actually point at:
-//    the face must front the eye AND have clear line of sight (no placing
-//    through, behind, or under blocks). No reachable support → does nothing.
+//  - The clicked block + face come from a real voxel ray cast along the look it
+//    will send (same as vanilla/Grim getLook), so the placement is always the
+//    face the crosshair actually hits — never through, behind, or under a block.
+//    No face whose ray-hit lands the block at the target → does nothing.
 //  - Aims one tick, places the next. The host sends ext interactions in the
 //    pre-flying window (like vanilla), so by placement time the look has ridden
 //    a flying packet → the server sees you looking at the block (RotationPlace /
@@ -61,24 +62,41 @@ const FACE_CURSOR = [
 const isBlockItem = (it) => it && it.id >= 1 && it.id <= 255;
 const solidFace = (b) => b && !b.isAir && b.opaque;
 
-// Does the eye actually have line of sight to face-centre (ax,ay,az) of block
-// (nx,ny,nz)? Step along the ray: the first solid block it enters must be that
-// block — otherwise something is in the way (you couldn't point at it). Also
-// enforces vanilla reach.
-function hasLineOfSight(ex, ey, ez, ax, ay, az, nx, ny, nz) {
-  const dx = ax - ex, dy = ay - ey, dz = az - ez;
-  const dist = Math.hypot(dx, dy, dz);
-  if (dist > 4.5) return false;
-  const steps = Math.ceil(dist / 0.0625);
-  for (let i = 1; i < steps; i++) {
-    const t = i / steps;
-    const bx = Math.floor(ex + dx * t);
-    const by = Math.floor(ey + dy * t);
-    const bz = Math.floor(ez + dz * t);
-    if (bx === nx && by === ny && bz === nz) return true; // reached the support
-    if (!mc.world.getBlock(bx, by, bz).isAir) return false; // blocked first
+// Unit look vector from yaw/pitch (vanilla convention: yaw 0 → +Z, pitch + → down).
+function lookVec(yaw, pitch) {
+  const yr = (yaw * Math.PI) / 180, pr = (pitch * Math.PI) / 180;
+  const cp = Math.cos(pr);
+  return [-Math.sin(yr) * cp, -Math.sin(pr), Math.cos(yr) * cp];
+}
+
+// Voxel DDA ray cast from (ox,oy,oz) along unit dir; returns the first solid
+// block hit and the face it ENTERED through (the face you'd be clicking), or
+// null within `maxDist`. This is the real "what does my crosshair hit" — the
+// placement is derived from it so the look and the clicked face always agree.
+function raycast(ox, oy, oz, dir, maxDist) {
+  const [dx, dy, dz] = dir;
+  let x = Math.floor(ox), y = Math.floor(oy), z = Math.floor(oz);
+  const sx = Math.sign(dx), sy = Math.sign(dy), sz = Math.sign(dz);
+  const tdx = dx !== 0 ? 1 / Math.abs(dx) : Infinity;
+  const tdy = dy !== 0 ? 1 / Math.abs(dy) : Infinity;
+  const tdz = dz !== 0 ? 1 / Math.abs(dz) : Infinity;
+  const init = (o, d) =>
+    d > 0 ? (Math.floor(o) + 1 - o) / d : d < 0 ? (o - Math.floor(o)) / -d : Infinity;
+  let tmx = init(ox, dx), tmy = init(oy, dy), tmz = init(oz, dz);
+  let t = 0, face = -1;
+  while (t <= maxDist) {
+    if (tmx <= tmy && tmx <= tmz) {
+      x += sx; t = tmx; tmx += tdx; face = sx > 0 ? 4 : 5; // entered -X / +X face
+    } else if (tmy <= tmz) {
+      y += sy; t = tmy; tmy += tdy; face = sy > 0 ? 0 : 1; // entered -Y / +Y face
+    } else {
+      z += sz; t = tmz; tmz += tdz; face = sz > 0 ? 2 : 3; // entered -Z / +Z face
+    }
+    if (t > maxDist) break;
+    const b = mc.world.getBlock(x, y, z);
+    if (b && !b.isAir && b.opaque) return { x, y, z, face };
   }
-  return true;
+  return null;
 }
 
 mc.keyBinding("Scaffold toggle", KEY).onPress(() => {
@@ -119,39 +137,38 @@ mc.on("tick", () => {
   const ey = p.y + p.vy + (p.sneaking ? 1.54 : 1.62);
   const ez = p.z + p.vz;
 
-  // Pick a solid neighbour whose clicked face you can actually point at: the
-  // face must point toward the eye AND have clear line of sight (no placing
-  // through or behind blocks).
-  let pick = null;
+  // For each candidate support, aim at its face centre and RAY CAST with that
+  // exact look. Keep it only if the ray's first hit is a face whose placement
+  // lands the new block at T — then the look provably hits the clicked face, so
+  // Grim's own ray cast agrees. This also rejects occluded / behind-block spots.
+  let place = null;
   for (const n of NEIGHBORS) {
     const nx = tx + n.d[0], ny = ty + n.d[1], nz = tz + n.d[2];
     if (!solidFace(mc.world.getBlock(nx, ny, nz))) continue;
     const fd = FACE_DIR[n.face];
-    const ax = nx + 0.5 + 0.5 * fd[0];
-    const ay = ny + 0.5 + 0.5 * fd[1];
-    const az = nz + 0.5 + 0.5 * fd[2];
-    if (fd[0] * (ex - ax) + fd[1] * (ey - ay) + fd[2] * (ez - az) <= 0) continue; // face away from eye
-    if (!hasLineOfSight(ex, ey, ez, ax, ay, az, nx, ny, nz)) continue; // blocked
-    pick = { nx, ny, nz, face: n.face, ax, ay, az };
-    break;
+    const ax = nx + 0.5 + 0.5 * fd[0], ay = ny + 0.5 + 0.5 * fd[1], az = nz + 0.5 + 0.5 * fd[2];
+    const dx = ax - ex, dy = ay - ey, dz = az - ez;
+    const horiz = Math.hypot(dx, dz);
+    // Straight-down aim keeps the real yaw (so the strafe-remap leaves walking
+    // alone); a side face needs a real yaw turn.
+    const yaw = horiz < 0.25 ? p.yaw : (Math.atan2(-dx, dz) * 180) / Math.PI;
+    const pitch = (-Math.atan2(dy, horiz) * 180) / Math.PI;
+    const hit = raycast(ex, ey, ez, lookVec(yaw, pitch), 4.5);
+    if (!hit) continue;
+    const hd = FACE_DIR[hit.face];
+    if (hit.x + hd[0] === tx && hit.y + hd[1] === ty && hit.z + hd[2] === tz) {
+      place = { nx: hit.x, ny: hit.y, nz: hit.z, face: hit.face, yaw, pitch };
+      break;
+    }
   }
-  if (!pick) return reset("no reachable support"); // nothing you could actually point at
+  if (!place) return reset("no reachable support"); // nothing you could actually point at
 
-  // Aim at the centre of the clicked face.
-  const dx = pick.ax - ex, dy = pick.ay - ey, dz = pick.az - ez;
-  const horiz = Math.hypot(dx, dz);
-  // When the block is (almost) straight down, yaw is irrelevant to the aim — keep
-  // the real camera yaw so the host's strafe-remap leaves movement untouched.
-  // Only a side-face (horizontal bridging) genuinely needs a yaw turn, and then
-  // movement is snapped to the nearest legal 8-direction by the host.
-  const yaw = horiz < 0.25 ? p.yaw : (Math.atan2(-dx, dz) * 180) / Math.PI;
-  const pitch = (-Math.atan2(dy, horiz) * 180) / Math.PI;
-  p.setRotation(yaw, pitch, { silent: cfg.silent });
+  p.setRotation(place.yaw, place.pitch, { silent: cfg.silent });
 
   // Only place once this look has actually been SENT — i.e. we've been aiming
   // at the same target for at least one full tick, so a movement packet carried
   // the rotation. That makes the placement look identical to a manual one.
-  const key = tx + "," + ty + "," + tz + "|" + pick.face;
+  const key = tx + "," + ty + "," + tz + "|" + place.face;
   if (key !== aimedKey) {
     aimedKey = key;
     aimedTick = tick;
@@ -167,7 +184,7 @@ mc.on("tick", () => {
     return;
   }
 
-  p.placeBlock(pick.nx, pick.ny, pick.nz, pick.face, FACE_CURSOR[pick.face]);
+  p.placeBlock(place.nx, place.ny, place.nz, place.face, FACE_CURSOR[place.face]);
   lastPlace = tick;
   status = "placed " + tx + "," + ty + "," + tz;
 });
