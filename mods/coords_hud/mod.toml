@@ -1,0 +1,8 @@
+id = "coords_hud"
+version = "1.0.0"
+tier = "js"
+api = "^0.1"
+entry = "main.js"
+capabilities = ["hud", "read_player"]
+name = "Coordinates HUD"
+description = "Shows player position, facing, and survival stats top-left."
