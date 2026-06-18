@@ -255,6 +255,9 @@ struct WinitApp {
     smoke_profile: Option<SmokeProfile>,
     pass_bench: Option<PassBench>,
     window_shown: bool,
+    /// The window is fully hidden/occluded (backgrounded, minimized, covered).
+    /// While set, rendering is skipped — see the note in `about_to_wait`.
+    occluded: bool,
 }
 
 impl WinitApp {
@@ -307,6 +310,7 @@ impl WinitApp {
             smoke_profile,
             pass_bench,
             window_shown: false,
+            occluded: false,
         }
     }
 }
@@ -450,6 +454,7 @@ impl ApplicationHandler for WinitApp {
 
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Occluded(occluded) => self.occluded = occluded,
             WindowEvent::Resized(size) => {
                 renderer.resize(size);
                 app.game.set_aspect(renderer.aspect());
@@ -815,6 +820,18 @@ impl ApplicationHandler for WinitApp {
             event_loop.exit();
         }
         sync_cursor(window, &mut self.cursor_captured, app);
+
+        // Don't render while the window is occluded/backgrounded. On macOS the
+        // swapchain occlusion-throttles, yet rendering an invisible window still
+        // rebuilds the UI, writes the per-frame uniforms and churns a Metal
+        // drawable every frame — a GPU-memory leak that, with unified memory, can
+        // bog the whole system down. Idle instead; the ticks/network above keep
+        // running so an in-world session stays in sync, and rendering resumes on
+        // un-occlude.
+        if self.occluded {
+            std::thread::sleep(Duration::from_millis(50));
+            return;
+        }
 
         if self.pass_bench.is_none() {
             if let Some(cap) = app.settings.clone().fps_limit() {
