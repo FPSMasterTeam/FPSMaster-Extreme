@@ -135,6 +135,11 @@ struct App {
     /// the loaded world once (future chunks read the renderer's global table).
     block_tints: recraft_render::TintTable,
     tints_dirty: bool,
+    /// Native render-hook geometry (latest submission) + a dirty flag to upload
+    /// it to the renderer once per change.
+    ext_geometry: Vec<recraft_render::ModelVertex>,
+    ext_indices: Vec<u32>,
+    geometry_dirty: bool,
     quit: bool,
 }
 
@@ -394,6 +399,9 @@ impl ApplicationHandler for WinitApp {
             ext: recraft_ext::ExtManager::new(),
             block_tints: recraft_render::TintTable::new(),
             tints_dirty: false,
+            ext_geometry: Vec::new(),
+            ext_indices: Vec::new(),
+            geometry_dirty: false,
             quit: false,
         };
         renderer.upload_world(&app.game.world);
@@ -807,11 +815,19 @@ impl ApplicationHandler for WinitApp {
             let (sky, water, ui, flat) = bench.config_for_frame();
             renderer.set_pass_skip(sky, water, ui, flat);
         }
+        // Per-frame extension hook (on_frame), e.g. native render geometry.
+        app.ext.dispatch_frame(&GameViews(&app.game));
+        apply_ext_commands(app);
         // Apply pending extension block-tint overrides (re-meshes the loaded
         // world once; future chunks read the renderer's global tint table).
         if app.tints_dirty && app.in_world {
             renderer.set_block_tints(app.block_tints.clone(), &app.game.world);
             app.tints_dirty = false;
+        }
+        // Upload native render-hook geometry when a mod changed it.
+        if app.geometry_dirty {
+            renderer.set_extension_geometry(&app.ext_geometry, &app.ext_indices);
+            app.geometry_dirty = false;
         }
         render_frame(
             renderer,
@@ -1261,6 +1277,18 @@ fn apply_ext_commands(app: &mut App) {
                 );
             }
             recraft_ext::ExtCommand::Render(preset) => apply_render_preset(app, preset),
+            recraft_ext::ExtCommand::SubmitGeometry { vertices, indices } => {
+                app.ext_geometry = vertices
+                    .iter()
+                    .map(|v| recraft_render::ModelVertex {
+                        position: [v[0], v[1], v[2]],
+                        color: [v[3], v[4], v[5], v[6]],
+                        uv: [v[7], v[8]],
+                    })
+                    .collect();
+                app.ext_indices = indices;
+                app.geometry_dirty = true;
+            }
         }
     }
 }

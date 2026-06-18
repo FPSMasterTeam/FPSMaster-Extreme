@@ -75,4 +75,11 @@ pub enum ExtCommand {
     },
     /// Apply a preset render modification (closed set; see [`RenderPreset`]).
     Render(RenderPreset),
+    /// Replace the native render-hook geometry. Each vertex is
+    /// `[x, y, z, r, g, b, a, u, v]` (world position, RGBA, entity-atlas UV).
+    /// Native-only; replaces the previous submission, empty clears it.
+    SubmitGeometry {
+        vertices: Vec<[f32; 9]>,
+        indices: Vec<u32>,
+    },
 }

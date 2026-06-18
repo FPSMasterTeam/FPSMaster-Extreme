@@ -12,9 +12,11 @@ use std::path::Path;
 
 use abi_stable::{
     library::RootModule,
-    std_types::{RStr, RString},
+    std_types::{RStr, RString, RVec},
 };
-use recraft_ext_api::{ExtApiRef, HostApi, PluginObj};
+use recraft_ext_api::{ExtApiRef, ExtVertex, HostApi, PluginObj};
+
+use crate::command::ExtCommand;
 
 use crate::bridge::{self, cur};
 use crate::event::Verdict;
@@ -35,12 +37,23 @@ extern "C" fn host_query(json: RString) -> RString {
 extern "C" fn host_hud(json: RString) {
     bridge::handle_hud(json.as_str());
 }
+extern "C" fn host_geometry(vertices: RVec<ExtVertex>, indices: RVec<u32>) {
+    let vertices = vertices
+        .iter()
+        .map(|v| [v.x, v.y, v.z, v.r, v.g, v.b, v.a, v.u, v.v])
+        .collect();
+    cur::push_command(ExtCommand::SubmitGeometry {
+        vertices,
+        indices: indices.into_iter().collect(),
+    });
+}
 
 fn host_api() -> HostApi {
     HostApi {
         cmd: host_cmd,
         query: host_query,
         hud: host_hud,
+        geometry: host_geometry,
     }
 }
 

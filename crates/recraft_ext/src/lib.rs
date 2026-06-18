@@ -309,9 +309,11 @@ mod tests {
         };
         let name = format!("{prefix}recraft_native_example.{ext}");
         let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target");
-        // Find the cdylib in whichever profile built it (debug and/or release —
-        // release also proves a stripped/"obfuscated" build still loads).
-        let lib = [base.join("release").join(&name), base.join("debug").join(&name)]
+        // Prefer debug (what `cargo test --workspace` rebuilds, so it matches the
+        // current ABI layout); fall back to release. A stale cdylib built against
+        // an older recraft_ext_api layout would be rejected by abi_stable — that
+        // is the version safety net working, but rebuild the example to test.
+        let lib = [base.join("debug").join(&name), base.join("release").join(&name)]
             .into_iter()
             .find(|p| p.exists());
         let Some(lib) = lib else {
@@ -330,6 +332,15 @@ mod tests {
             cmds.iter()
                 .any(|c| matches!(c, ExtCommand::Chat(s) if s == "native mod online")),
             "native mod should chat after 40 ticks: {cmds:?}"
+        );
+        // on_load submitted native render-hook geometry (a triangle).
+        assert!(
+            cmds.iter().any(|c| matches!(
+                c,
+                ExtCommand::SubmitGeometry { vertices, indices }
+                    if vertices.len() == 3 && indices.len() == 3
+            )),
+            "native mod should submit render geometry on load"
         );
     }
 

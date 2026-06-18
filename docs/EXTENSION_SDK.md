@@ -215,6 +215,28 @@ A complete, building example is `crates/recraft_native_example`.
 
 The hook argument (packet/event/input/hud-ctx) is JSON with the same shapes as the JS event payloads.
 
+### Native render hook (geometry)
+
+Native mods — and only native mods — can submit custom world-space geometry,
+drawn in the world pass right after entities (so it depth-tests against the world
+and is tone-mapped/bloomed like everything else). Vertices are `ExtVertex`
+(position + RGBA + a UV into the entity atlas; `color` modulates the sampled
+texel, so a solid-color mesh points its UVs at an opaque atlas texel):
+
+```rust
+let v = |x, y, z, r, g, b| ExtVertex { x, y, z, r, g, b, a: 1.0, u: 0.0, v: 0.0 };
+host.submit_geometry(
+    &[v(0.0, 80.0, 0.0, 1.0, 0.0, 0.0),
+      v(1.0, 80.0, 0.0, 0.0, 1.0, 0.0),
+      v(0.5, 81.0, 0.0, 0.0, 0.0, 1.0)],
+    &[0, 1, 2],
+);
+```
+
+Each call **replaces** the previous submission (empty slices clear it); resubmit
+when your geometry changes (e.g. from `on_frame`). This is the escape hatch the
+JS layer deliberately lacks.
+
 ### Building & packaging
 
 ```sh

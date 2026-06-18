@@ -563,6 +563,9 @@ pub struct Renderer {
     overlay_pipeline: wgpu::RenderPipeline,
     model_pipeline: wgpu::RenderPipeline,
     model_mesh: Option<DynamicMesh>,
+    /// Native render-hook custom geometry (model-pass format), drawn in the world
+    /// pass right after entities. `None`/empty when no native mod submits any.
+    extension_mesh: Option<DynamicMesh>,
     /// Inventory player-preview (vanilla `GuiInventory.drawEntityOnScreen`): the
     /// local-player biped baked into clip space and drawn in the UI pass,
     /// scissored to the panel's model box. Same shader as `model_pipeline` but a
@@ -3015,6 +3018,7 @@ impl Renderer {
             overlay_pipeline,
             model_pipeline,
             model_mesh: None,
+            extension_mesh: None,
             inventory_preview_pipeline,
             inventory_preview_mesh: None,
             inventory_preview_scissor: None,
@@ -3846,6 +3850,22 @@ impl Renderer {
             bytemuck::cast_slice(&mesh.indices),
             mesh.indices.len() as u32,
             "model",
+        );
+    }
+
+    /// Replace the extension custom-geometry mesh (native render hook). Model-pass
+    /// vertex format (position / color / uv into the entity atlas), drawn in the
+    /// world pass right after entities so it shares world depth + tone-map/bloom.
+    /// Pass empty slices to clear.
+    pub fn set_extension_geometry(&mut self, vertices: &[crate::ModelVertex], indices: &[u32]) {
+        fill_dynamic_mesh(
+            &self.device,
+            &self.queue,
+            &mut self.extension_mesh,
+            bytemuck::cast_slice(vertices),
+            bytemuck::cast_slice(indices),
+            indices.len() as u32,
+            "extension-geometry",
         );
     }
 
@@ -5329,6 +5349,19 @@ impl Renderer {
                 pass.set_vertex_buffer(0, model.vertex_buffer.slice(..));
                 pass.set_index_buffer(model.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..model.index_count, 0, 0..1);
+                draw_calls += 1;
+            }
+
+            // Extension custom geometry (native render hook) — same pipeline +
+            // bind groups as entities, so it depth-tests against the world and is
+            // tone-mapped/bloomed like everything else, with no bind-group leak.
+            if let Some(ext) = self.extension_mesh.as_ref().filter(|m| m.index_count > 0) {
+                pass.set_pipeline(&self.model_pipeline);
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                pass.set_bind_group(1, &self.entity_bind_group, &[]);
+                pass.set_vertex_buffer(0, ext.vertex_buffer.slice(..));
+                pass.set_index_buffer(ext.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..ext.index_count, 0, 0..1);
                 draw_calls += 1;
             }
 

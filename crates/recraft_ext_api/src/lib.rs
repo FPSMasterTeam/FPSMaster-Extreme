@@ -22,9 +22,27 @@ use abi_stable::{
     package_version_strings,
     sabi_trait,
     sabi_types::VersionStrings,
-    std_types::{RBox, RStr, RString},
+    std_types::{RBox, RStr, RString, RVec},
     StableAbi,
 };
+
+/// A vertex for a native render hook: world position, RGBA color, and a UV into
+/// the entity atlas (the host renders these with the entity/model pipeline, so a
+/// solid-color mesh points its UVs at an opaque atlas texel and lets `color`
+/// modulate). Mirrors the host's internal model vertex.
+#[repr(C)]
+#[derive(StableAbi, Copy, Clone, Debug, PartialEq)]
+pub struct ExtVertex {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    pub r: f32,
+    pub g: f32,
+    pub b: f32,
+    pub a: f32,
+    pub u: f32,
+    pub v: f32,
+}
 
 /// The native API semver, mirrored from the manifest `api` requirement. The
 /// `abi_stable` layout check is the second, stronger safety net.
@@ -33,13 +51,15 @@ pub const API_VERSION: (u32, u32, u32) = (0, 1, 0);
 /// Everything a native mod needs in scope to declare its plugin and root module.
 /// `use recraft_ext_api::prelude::*;` and implement [`NativePlugin`].
 pub mod prelude {
-    pub use crate::{ExtApi, ExtApiRef, HostApi, NativePlugin, NativePlugin_TO, PluginObj};
+    pub use crate::{
+        ExtApi, ExtApiRef, ExtVertex, HostApi, NativePlugin, NativePlugin_TO, PluginObj,
+    };
     pub use abi_stable::{
         export_root_module,
         prefix_type::PrefixTypeTrait,
         sabi_extern_fn,
         sabi_trait::TD_Opaque,
-        std_types::{RBox, RStr, RString},
+        std_types::{RBox, RStr, RString, RVec},
     };
 }
 
@@ -53,6 +73,9 @@ pub struct HostApi {
     pub cmd: extern "C" fn(RString),
     pub query: extern "C" fn(RString) -> RString,
     pub hud: extern "C" fn(RString),
+    /// Submit native render-hook geometry (replaces the previous submission;
+    /// empty clears it). Native-only — there is no JS equivalent.
+    pub geometry: extern "C" fn(RVec<ExtVertex>, RVec<u32>),
 }
 
 impl HostApi {
@@ -111,6 +134,15 @@ impl HostApi {
         self.cmd(format!(
             r#"{{"t":"render","r":"blockTint","id":{id},"meta":-1,"color":{color}}}"#
         ));
+    }
+
+    /// Submit native render-hook geometry (world-space, drawn after entities).
+    /// Replaces the previous submission; pass empties to clear. Native-only.
+    pub fn submit_geometry(&self, vertices: &[ExtVertex], indices: &[u32]) {
+        (self.geometry)(
+            RVec::from(vertices.to_vec()),
+            RVec::from(indices.to_vec()),
+        );
     }
 }
 

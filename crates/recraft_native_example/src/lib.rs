@@ -22,6 +22,18 @@ impl NativePlugin for ExampleMod {
 
     fn on_load(&mut self, host: HostApi) {
         host.log("native example mod loaded");
+        // Native render hook (JS can't do this): submit a small colored triangle
+        // floating at world (0, 80, 0). uv points at (0,0) of the entity atlas;
+        // `color` modulates. Drawn in the world pass after entities.
+        let v = |x, y, z, r, g, b| ExtVertex { x, y, z, r, g, b, a: 1.0, u: 0.0, v: 0.0 };
+        host.submit_geometry(
+            &[
+                v(0.0, 80.0, 0.0, 1.0, 0.0, 0.0),
+                v(1.0, 80.0, 0.0, 0.0, 1.0, 0.0),
+                v(0.5, 81.0, 0.0, 0.0, 0.0, 1.0),
+            ],
+            &[0, 1, 2],
+        );
     }
 
     fn on_clientbound_packet(&mut self, _host: HostApi, _packet: RStr<'_>) -> bool {
