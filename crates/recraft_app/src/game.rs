@@ -969,6 +969,16 @@ impl GameState {
         self.food
     }
 
+    /// Whether the sneak key is currently held (extension read-view).
+    pub fn player_sneaking(&self) -> bool {
+        self.input.sneak
+    }
+
+    /// Whether the local player is sprinting (extension read-view).
+    pub fn player_sprinting(&self) -> bool {
+        self.sprinting
+    }
+
     /// Heart/hunger HUD animation state (vanilla `renderPlayerStats`): the live
     /// food saturation plus the tick counters that drive the heart-shake RNG and
     /// the heart-row blink/highlight.
@@ -1143,6 +1153,31 @@ impl GameState {
         std::mem::take(&mut self.sound_queue)
     }
 
+    /// Spawn host-side particles for an extension `SpawnParticle` command.
+    /// `type_id` is the vanilla 1.8 S2A particle id; the ext path carries no
+    /// trailing VarInt args.
+    pub fn ext_spawn_particle(
+        &mut self,
+        type_id: i32,
+        pos: Vec3,
+        offset: Vec3,
+        speed: f32,
+        count: i32,
+    ) {
+        self.particles.spawn(type_id, pos, offset, speed, count, &[]);
+    }
+
+    /// Queue a positional sound for an extension `PlaySound` command (drained by
+    /// the host into the audio backend like every other queued sound).
+    pub fn ext_play_sound(&mut self, event: String, pos: Vec3, volume: f32, pitch: f32) {
+        self.sound_queue.push(QueuedSound {
+            event,
+            position: Some(pos),
+            volume,
+            pitch,
+        });
+    }
+
     /// Queue a positional sound event at a world position.
     fn queue_sound(&mut self, event: impl Into<String>, pos: Vec3, volume: f32, pitch: f32) {
         self.sound_queue.push(QueuedSound {
@@ -1273,6 +1308,24 @@ impl GameState {
         self.world.chunk_count()
     }
 
+    /// Current world time of day in ticks (0..24000) — extension read-view.
+    /// (The interpolated `world_time(alpha)` above is for the renderer's clock.)
+    pub fn world_time_ticks(&self) -> i64 {
+        self.world_time
+    }
+
+    /// Best-effort current dimension id for extensions. Only `has_sky_light` is
+    /// persisted (set from `dimension == 0` on JoinGame/Respawn), so this returns
+    /// 0 (overworld) with sky light and -1 (nether) otherwise; the End is not
+    /// distinguished without a stored dimension field.
+    pub fn dimension(&self) -> i32 {
+        if self.has_sky_light {
+            0
+        } else {
+            -1
+        }
+    }
+
     /// Player feet position in world coordinates (vanilla `posX/posY/posZ`),
     /// for the F3 debug overlay.
     pub fn player_position(&self) -> DVec3 {
@@ -1282,6 +1335,27 @@ impl GameState {
     /// Whether the player is standing on the ground (F3 debug overlay).
     pub fn player_on_ground(&self) -> bool {
         self.player.on_ground
+    }
+
+    /// Local player velocity (vanilla `motionX/Y/Z`) — extension read-view.
+    pub fn player_velocity(&self) -> DVec3 {
+        self.player.velocity
+    }
+
+    /// Local player body yaw in degrees — extension read-view.
+    pub fn player_yaw(&self) -> f32 {
+        self.player.yaw
+    }
+
+    /// Local player pitch in degrees — extension read-view.
+    pub fn player_pitch(&self) -> f32 {
+        self.player.pitch
+    }
+
+    /// The local player's network entity id, so extension read-views can skip
+    /// its (stale) row when iterating `world.entities()`.
+    pub fn player_entity_id(&self) -> EntityId {
+        self.player.id
     }
 
     pub fn screen_overlay(&self) -> ScreenOverlay {
@@ -3359,55 +3433,12 @@ impl GameState {
                 game_mode,
                 dimension,
                 ..
-            } => {
-                self.player.id = EntityId(entity_id);
-                self.has_sky_light = dimension == 0;
-                // Low 3 bits are the gamemode; bit 3 is the hardcore flag.
-                self.creative = (game_mode & 0x7) == 1;
-                self.joined_game = true;
-                self.world.upsert_entity(self.player.clone());
-                false
-            }
+            } => self.handle_join_game(entity_id, game_mode, dimension),
             ClientboundPlayPacket::UpdateHealth {
                 health,
                 food,
                 food_saturation,
-            } => {
-                // Vanilla seeds the heart-row highlight from the local player's
-                // hurtResistantTime, which the client does not simulate here. The
-                // server's UpdateHealth is the change signal instead: on a health
-                // change, blink the row (20 ticks on damage, 10 on heal) and record
-                // the pre-change health drawn in the highlight frame (vanilla `j`).
-                // The very first value is the spawn health, so it seeds no blink.
-                // The hurt *sound* is played from the EntityStatus(2) path (vanilla
-                // EntityPlayer.handleStatusUpdate), not from UpdateHealth.
-                if self.health_received {
-                    let old = self.health.ceil() as i32;
-                    let new = health.ceil() as i32;
-                    if let Some(window) = crate::gui::ingame::health_blink_window(old, new) {
-                        self.last_player_health = old;
-                        self.health_update_counter = (self.hud_update_counter + window) as i64;
-                    }
-                } else {
-                    self.last_player_health = health.ceil() as i32;
-                }
-                self.health_received = true;
-                self.health = health;
-                self.food = food;
-                self.saturation = food_saturation;
-                // A dead player is frozen by the server until it respawns. We no
-                // longer auto-respawn — the UI shows a death screen and the player
-                // clicks "respawn" (which sets needs_respawn via request_respawn).
-                if health <= 0.0 {
-                    if !self.is_dead {
-                        log::info!("player died (health {health}); showing death screen");
-                    }
-                    self.is_dead = true;
-                } else {
-                    self.is_dead = false;
-                }
-                false
-            }
+            } => self.handle_update_health(health, food, food_saturation),
             ClientboundPlayPacket::SetExperience { bar, level } => {
                 self.xp_bar = bar.clamp(0.0, 1.0);
                 self.xp_level = level;
@@ -3417,23 +3448,7 @@ impl GameState {
                 dimension,
                 game_mode,
                 ..
-            } => {
-                // The server resends chunks plus a fresh PlayerPositionLook at the
-                // respawn point; wait for that position before reporting movement
-                // again so we don't send a stale (death-location) position.
-                self.has_sky_light = dimension == 0;
-                self.creative = (game_mode & 0x7) == 1;
-                self.needs_respawn = false;
-                self.is_dead = false;
-                self.health = 20.0;
-                self.max_health = 20.0;
-                self.effects.clear();
-                self.position_synced = false;
-                self.pending_confirm = false;
-                self.player.velocity = DVec3::ZERO;
-                log::info!("respawned into dimension {dimension}");
-                false
-            }
+            } => self.handle_respawn(dimension, game_mode),
             ClientboundPlayPacket::PlayerPositionLook {
                 x,
                 y,
@@ -3441,53 +3456,7 @@ impl GameState {
                 yaw,
                 pitch,
                 flags,
-            } => {
-                let old_pos = self.player.position;
-                if flags & 0x01 != 0 {
-                    self.player.position.x += x;
-                } else {
-                    self.player.position.x = x;
-                }
-                if flags & 0x02 != 0 {
-                    self.player.position.y += y;
-                } else {
-                    self.player.position.y = y;
-                }
-                if flags & 0x04 != 0 {
-                    self.player.position.z += z;
-                } else {
-                    self.player.position.z = z;
-                }
-                if flags & 0x08 != 0 {
-                    self.player.yaw += yaw;
-                } else {
-                    self.player.yaw = yaw;
-                }
-                if flags & 0x10 != 0 {
-                    self.player.pitch += pitch;
-                } else {
-                    self.player.pitch = pitch;
-                }
-                // Vanilla zeroes motion on every position-look. Without this a
-                // falling player keeps its downward velocity after a correction
-                // and immediately falls again, fighting the server forever.
-                self.player.velocity = DVec3::ZERO;
-                self.previous_player_position = self.player.position;
-                self.player.sync_aabb_to_position();
-                // Zeroing motion (above) leaves the next tick with no downward move
-                // for the collision-based ground test to catch, so derive on_ground
-                // from actual block support here. Otherwise the client claims it is
-                // airborne while resting on the teleport target.
-                self.player.on_ground = resting_on_ground(&self.world, self.player.aabb);
-                self.world.upsert_entity(self.player.clone());
-                // Only start sending movement once the server has told us where
-                // we are, so we never report the pre-spawn placeholder position.
-                self.position_synced = true;
-                self.pending_confirm = true;
-                self.freeze_movement_after_teleport = true;
-                self.log_correction(flags, old_pos);
-                false
-            }
+            } => self.handle_player_position_look(x, y, z, yaw, pitch, flags),
             ClientboundPlayPacket::ChunkData {
                 x,
                 z,
@@ -3499,15 +3468,7 @@ impl GameState {
                 chunk_x,
                 chunk_z,
                 changes,
-            } => {
-                let mut changed = false;
-                for block in changes {
-                    let x = chunk_x * 16 + block.x as i32;
-                    let z = chunk_z * 16 + block.z as i32;
-                    changed |= self.apply_block_change(x, block.y as i32, z, block.id, block.meta);
-                }
-                changed
-            }
+            } => self.handle_multi_block_change(chunk_x, chunk_z, changes),
             ClientboundPlayPacket::BlockChange { x, y, z, id, meta } => {
                 self.apply_block_change(x, y, z, id, meta)
             }
@@ -3522,34 +3483,13 @@ impl GameState {
                 speed,
                 count,
                 args,
-            } => {
-                self.particles.spawn(
-                    particle_id,
-                    Vec3::new(x, y, z),
-                    Vec3::new(offset_x, offset_y, offset_z),
-                    speed,
-                    count,
-                    &args,
-                );
-                false
-            }
+            } => self.handle_spawn_particle(
+                particle_id, x, y, z, offset_x, offset_y, offset_z, speed, count, args,
+            ),
             ClientboundPlayPacket::ChunkBulk {
                 sky_light_sent,
                 chunks,
-            } => {
-                let mut changed = false;
-                for chunk in chunks {
-                    changed |= self.apply_raw_chunk(
-                        chunk.x,
-                        chunk.z,
-                        true,
-                        chunk.primary_bit_mask,
-                        &chunk.data,
-                        sky_light_sent,
-                    );
-                }
-                changed
-            }
+            } => self.handle_chunk_bulk(sky_light_sent, chunks),
             ClientboundPlayPacket::SpawnPlayer {
                 entity_id,
                 uuid,
@@ -3558,11 +3498,7 @@ impl GameState {
                 z,
                 yaw,
                 pitch,
-            } => {
-                self.spawn_remote_entity(entity_id, EntityKind::RemotePlayer, x, y, z, yaw, pitch);
-                self.entity_uuids.insert(EntityId(entity_id), uuid);
-                false
-            }
+            } => self.handle_spawn_player(entity_id, uuid, x, y, z, yaw, pitch),
             ClientboundPlayPacket::SpawnMob {
                 entity_id,
                 kind,
@@ -3586,53 +3522,14 @@ impl GameState {
                 pitch,
                 data,
                 velocity,
-            } => {
-                self.spawn_remote_entity(
-                    entity_id,
-                    EntityKind::Object(kind as u8),
-                    x,
-                    y,
-                    z,
-                    yaw,
-                    pitch,
-                );
-                // Seed the spawn velocity (present when data != 0, e.g. a thrown
-                // projectile) so the client can simulate the flight locally
-                // instead of waiting on server position packets.
-                if let Some((vx, vy, vz)) = velocity {
-                    if let Some(entity) = self.remote_entity_mut(entity_id) {
-                        entity.velocity = DVec3::new(vx, vy, vz);
-                    }
-                }
-                // Falling block (kind 70): the blockstate is packed into the
-                // data int (low 12 bits id, next 4 bits meta).
-                if kind == 70 {
-                    let id = (data & 0xfff) as u16;
-                    let meta = ((data >> 12) & 0xf) as u8;
-                    self.falling_blocks
-                        .insert(EntityId(entity_id), BlockState::new(id, meta));
-                }
-                false
-            }
+            } => self.handle_spawn_object(entity_id, kind, x, y, z, yaw, pitch, data, velocity),
             ClientboundPlayPacket::SpawnExperienceOrb {
                 entity_id,
                 x,
                 y,
                 z,
                 count,
-            } => {
-                self.spawn_remote_entity(
-                    entity_id,
-                    EntityKind::ExperienceOrb,
-                    x,
-                    y,
-                    z,
-                    0.0,
-                    0.0,
-                );
-                self.entity_xp.insert(EntityId(entity_id), count);
-                false
-            }
+            } => self.handle_spawn_experience_orb(entity_id, x, y, z, count),
             ClientboundPlayPacket::EntityRelativeMove {
                 entity_id,
                 dx,
@@ -3682,46 +3579,16 @@ impl GameState {
                 vx,
                 vy,
                 vz,
-            } => {
-                let velocity = DVec3::new(vx, vy, vz);
-                if entity_id == self.player.id.0 {
-                    // Server knockback: vanilla sets the player's motion directly
-                    // from this packet, then local physics carries it out.
-                    self.player.velocity = velocity;
-                } else if let Some(entity) = self.remote_entity_mut(entity_id) {
-                    entity.velocity = velocity;
-                }
-                false
-            }
+            } => self.handle_entity_velocity(entity_id, vx, vy, vz),
             ClientboundPlayPacket::OpenWindow {
                 window_id,
                 inventory_type,
                 title,
                 slots,
                 ..
-            } => {
-                // Replace any prior window and ask the host to push the screen.
-                let title = chat::flatten_chat_json(&title);
-                self.open_container = Some(Container::open(
-                    window_id,
-                    &inventory_type,
-                    title,
-                    slots as usize,
-                ));
-                self.container_drag_cancel();
-                self.window_open_pending = true;
-                false
-            }
+            } => self.handle_open_window(window_id, inventory_type, title, slots),
             ClientboundPlayPacket::CloseWindowS { window_id } => {
-                // Server force-close: drop the window and signal the host to pop
-                // the screen (vanilla closes without echoing a C0D back).
-                if self.open_container.as_ref().is_some_and(|c| c.window_id == window_id) {
-                    self.open_container = None;
-                    self.cursor_item = None;
-                    self.container_drag_cancel();
-                    self.window_close_pending = true;
-                }
-                false
+                self.handle_close_window_s(window_id)
             }
             ClientboundPlayPacket::WindowProperty {
                 window_id,
@@ -3739,35 +3606,9 @@ impl GameState {
                 window_id,
                 slot,
                 item,
-            } => {
-                // Window -1 slot -1 is the cursor stack (vanilla `setItemStack`).
-                if window_id == -1 && slot == -1 {
-                    self.cursor_item = item;
-                } else if let Some(container) = self
-                    .open_container
-                    .as_mut()
-                    .filter(|c| c.window_id as i8 == window_id)
-                {
-                    container.apply_set_slot(slot, item, &mut self.inventory);
-                } else if window_id == 0 && (0..self.inventory.len() as i16).contains(&slot) {
-                    // No matching window open: the server still syncs the player
-                    // inventory directly (item pickups, hotbar updates, …).
-                    self.inventory[slot as usize] = item;
-                }
-                false
-            }
+            } => self.handle_set_slot(window_id, slot, item),
             ClientboundPlayPacket::WindowItems { window_id, items } => {
-                if let Some(container) = self
-                    .open_container
-                    .as_mut()
-                    .filter(|c| c.window_id == window_id)
-                {
-                    container.apply_window_items(items, &mut self.inventory);
-                } else if window_id == 0 {
-                    self.inventory = items;
-                    self.inventory.resize(45, None);
-                }
-                false
+                self.handle_window_items(window_id, items)
             }
             ClientboundPlayPacket::HeldItemChange { slot } => {
                 // The server tells us which hotbar slot is selected.
@@ -3775,19 +3616,7 @@ impl GameState {
                 false
             }
             ClientboundPlayPacket::DestroyEntities { entity_ids } => {
-                for id in entity_ids {
-                    let id = EntityId(id);
-                    self.world.remove_entity(id);
-                    self.entity_uuids.remove(&id);
-                    self.entity_items.remove(&id);
-                    self.entity_xp.remove(&id);
-                    self.falling_blocks.remove(&id);
-                    self.entity_equipment.remove(&id);
-                    // Drop both directions of any mount relationship.
-                    self.vehicles.remove(&id);
-                    self.vehicles.retain(|_, vehicle| *vehicle != id);
-                }
-                false
+                self.handle_destroy_entities(entity_ids)
             }
             ClientboundPlayPacket::PlayerAbilities {
                 invulnerable,
@@ -3796,43 +3625,18 @@ impl GameState {
                 creative,
                 fly_speed,
                 walk_speed,
-            } => {
-                // Vanilla handlePlayerAbilities applies every field
-                // unconditionally (no echo from the handler itself).
-                self.capabilities = PlayerCapabilities {
-                    invulnerable,
-                    flying,
-                    allow_flying,
-                    creative,
-                    fly_speed,
-                    walk_speed,
-                };
-                false
-            }
+            } => self.handle_player_abilities(
+                invulnerable,
+                flying,
+                allow_flying,
+                creative,
+                fly_speed,
+                walk_speed,
+            ),
             ClientboundPlayPacket::EntityProperties {
                 entity_id,
                 properties,
-            } => {
-                // Only the local player's attributes feed the HUD/prediction;
-                // other entities' attributes aren't modeled.
-                if entity_id == self.player.id.0 {
-                    for property in &properties {
-                        match property.key.as_str() {
-                            "generic.movementSpeed" => {
-                                self.walk_speed_attribute =
-                                    effective_attribute_value(property, &SPRINT_SPEED_BOOST_UUID)
-                                        as f32;
-                            }
-                            "generic.maxHealth" => {
-                                self.max_health =
-                                    effective_attribute_value(property, &[0u8; 16]) as f32;
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                false
-            }
+            } => self.handle_entity_properties(entity_id, properties),
             ClientboundPlayPacket::EntityEffect {
                 entity_id,
                 effect_id,
@@ -3863,26 +3667,14 @@ impl GameState {
                 false
             }
             ClientboundPlayPacket::ChatMessage { json, position } => {
-                if position == 2 {
-                    self.chat.set_action_bar(chat::flatten_chat_json(&json));
-                } else {
-                    let segments = chat::parse_chat_components(&json);
-                    let text: String = segments.iter().map(|s| s.text.as_str()).collect();
-                    log::info!("[chat] {}", chat::strip_legacy_codes(&text));
-                    self.chat.push_components(segments);
-                }
-                false
+                self.handle_chat_message(json, position)
             }
             ClientboundPlayPacket::TabComplete { matches } => {
                 self.chat.set_completions(matches);
                 false
             }
             ClientboundPlayPacket::UpdateSign { x, y, z, lines } => {
-                // Store the four lines flattened from chat-JSON, keyed by block
-                // position; the sign block-entity renderer draws them in world.
-                let text = lines.map(|line| chat::flatten_chat_json(&line));
-                self.signs.insert([x, y, z], text);
-                false
+                self.handle_update_sign(x, y, z, lines)
             }
             ClientboundPlayPacket::ScoreboardObjective {
                 name,
@@ -3924,11 +3716,7 @@ impl GameState {
                 false
             }
             ClientboundPlayPacket::PlayerListHeaderFooter { header, footer } => {
-                self.player_list.set_header_footer(
-                    chat::flatten_chat_json(&header),
-                    chat::flatten_chat_json(&footer),
-                );
-                false
+                self.handle_player_list_header_footer(header, footer)
             }
             ClientboundPlayPacket::EntityHeadLook {
                 entity_id,
@@ -3943,66 +3731,15 @@ impl GameState {
                 entity_id,
                 vehicle_id,
                 leash,
-            } => {
-                // Leashes (leash = true) don't move the entity; only rides do.
-                if !leash {
-                    if vehicle_id == -1 {
-                        self.vehicles.remove(&EntityId(entity_id));
-                    } else {
-                        self.vehicles
-                            .insert(EntityId(entity_id), EntityId(vehicle_id));
-                    }
-                }
-                false
-            }
+            } => self.handle_attach_entity(entity_id, vehicle_id, leash),
             ClientboundPlayPacket::EntityAnimation {
                 entity_id,
                 animation,
-            } => {
-                match animation {
-                    0 => {
-                        if let Some(entity) = self.remote_entity_mut(entity_id) {
-                            entity.start_swing();
-                        }
-                    }
-                    1 => {
-                        if let Some(entity) = self.remote_entity_mut(entity_id) {
-                            entity.start_hurt();
-                        }
-                    }
-                    _ => {}
-                }
-                false
-            }
+            } => self.handle_entity_animation(entity_id, animation),
             ClientboundPlayPacket::EntityStatus {
                 entity_id,
                 status,
-            } => {
-                if status == 2 {
-                    if let Some(entity) = self.world.entity_mut(EntityId(entity_id)) {
-                        entity.start_hurt();
-                    }
-                    // The local player's own hurt animation also plays the hurt
-                    // sound (vanilla EntityPlayer.handleStatusUpdate → playHurtSound).
-                    // UpdateHealth covers damage that changes health, but EntityStatus
-                    // fires on every hit (incl. absorbed/blocked), so play it here too.
-                    if EntityId(entity_id) == self.player.id {
-                        // Drive the hurt-camera tilt off the authoritative local
-                        // player (its world copy isn't tick-interpolated, so its
-                        // hurt timer would never decrement).
-                        self.player.start_hurt();
-                        let pos = self.camera.position;
-                        self.queue_sound("game.player.hurt", pos, 1.0, 1.0);
-                    }
-                }
-                // Status 3 (death): start the fall-over + red-corpse animation.
-                if status == 3 {
-                    if let Some(entity) = self.world.entity_mut(EntityId(entity_id)) {
-                        entity.start_death();
-                    }
-                }
-                false
-            }
+            } => self.handle_entity_status(entity_id, status),
             ClientboundPlayPacket::EntityMetadata {
                 entity_id,
                 metadata,
@@ -4021,16 +3758,7 @@ impl GameState {
                 entity_id,
                 slot,
                 item,
-            } => {
-                if (0..5).contains(&slot) {
-                    let slots = self
-                        .entity_equipment
-                        .entry(EntityId(entity_id))
-                        .or_insert_with(Default::default);
-                    slots[slot as usize] = item;
-                }
-                false
-            }
+            } => self.handle_entity_equipment(entity_id, slot, item),
             ClientboundPlayPacket::CollectItem { .. } => false,
             ClientboundPlayPacket::SoundEffect {
                 name,
@@ -4039,12 +3767,7 @@ impl GameState {
                 z,
                 volume,
                 pitch,
-            } => {
-                let pos = Vec3::new(x as f32, y as f32, z as f32);
-                let rate = pitch as f32 / 63.5;
-                self.queue_sound(name, pos, volume, rate);
-                false
-            }
+            } => self.handle_sound_effect(name, x, y, z, volume, pitch),
             ClientboundPlayPacket::Effect {
                 effect_id,
                 x,
@@ -4052,13 +3775,7 @@ impl GameState {
                 z,
                 data,
                 ..
-            } => {
-                if let Some(event) = effect_event(effect_id, data) {
-                    let pos = Vec3::new(x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5);
-                    self.queue_sound(event, pos, 1.0, 1.0);
-                }
-                false
-            }
+            } => self.handle_effect(effect_id, x, y, z, data),
             ClientboundPlayPacket::BlockAction {
                 x,
                 y,
@@ -4066,45 +3783,7 @@ impl GameState {
                 action_id,
                 action_param,
                 block_type,
-            } => {
-                // Note block (block id 25): play the pitched note and puff a
-                // coloured NOTE particle. Chest/piston actions (other block
-                // types) carry no client-side sound/particle here and are
-                // ignored (T17 will extend this).
-                if block_type == 25 {
-                    let note = action_param.min(24);
-                    let pitch = 2.0_f32.powf((note as f32 - 12.0) / 12.0);
-                    let instrument = NOTE_INSTRUMENTS
-                        .get(action_id as usize)
-                        .copied()
-                        .unwrap_or("harp");
-                    let center = Vec3::new(x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5);
-                    self.queue_sound(format!("note.{instrument}"), center, 3.0, pitch);
-                    // The NOTE branch reads the rainbow colour from offset.x.
-                    let above = Vec3::new(x as f32 + 0.5, y as f32 + 1.2, z as f32 + 0.5);
-                    self.particles
-                        .spawn(23, above, Vec3::new(note as f32 / 24.0, 0.0, 0.0), 0.0, 1, &[]);
-                } else if matches!(block_type, 54 | 130 | 146) && action_id == 1 {
-                    // Chest/ender/trapped lid: action_param is the viewer count.
-                    // Drive the lid-open target and play the open/close sound on
-                    // the 0↔viewers transition (vanilla random.chestopen/closed).
-                    let pos = [x, y, z];
-                    let was_open = self.chest_open_targets.get(&pos).copied().unwrap_or(0.0) > 0.0;
-                    let now_open = action_param > 0;
-                    if now_open {
-                        self.chest_open_targets.insert(pos, 1.0);
-                        self.chest_lid_angles.entry(pos).or_insert(0.0);
-                    } else {
-                        self.chest_open_targets.insert(pos, 0.0);
-                    }
-                    if now_open != was_open {
-                        let center = Vec3::new(x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5);
-                        let event = if now_open { "random.chestopen" } else { "random.chestclosed" };
-                        self.queue_sound(event.to_string(), center, 0.5, 1.0);
-                    }
-                }
-                false
-            }
+            } => self.handle_block_action(x, y, z, action_id, action_param, block_type),
             // ConfirmTransaction is ponged on the network thread (vanilla replies
             // immediately), so the game loop never needs to act on it.
             ClientboundPlayPacket::KeepAlive { .. }
@@ -4512,6 +4191,581 @@ impl GameState {
             sneaking: self.input.sneak,
             sprinting: self.sprinting,
         }
+    }
+}
+
+/// Per-packet handlers extracted from `apply_play_packet`. Each returns the
+/// same "terrain must re-mesh" bool its match arm produced; behaviour is
+/// identical to the inlined arm bodies.
+impl GameState {
+    fn handle_join_game(&mut self, entity_id: i32, game_mode: u8, dimension: i8) -> bool {
+        self.player.id = EntityId(entity_id);
+        self.has_sky_light = dimension == 0;
+        // Low 3 bits are the gamemode; bit 3 is the hardcore flag.
+        self.creative = (game_mode & 0x7) == 1;
+        self.joined_game = true;
+        self.world.upsert_entity(self.player.clone());
+        false
+    }
+
+    fn handle_update_health(&mut self, health: f32, food: i32, food_saturation: f32) -> bool {
+        // Vanilla seeds the heart-row highlight from the local player's
+        // hurtResistantTime, which the client does not simulate here. The
+        // server's UpdateHealth is the change signal instead: on a health
+        // change, blink the row (20 ticks on damage, 10 on heal) and record
+        // the pre-change health drawn in the highlight frame (vanilla `j`).
+        // The very first value is the spawn health, so it seeds no blink.
+        // The hurt *sound* is played from the EntityStatus(2) path (vanilla
+        // EntityPlayer.handleStatusUpdate), not from UpdateHealth.
+        if self.health_received {
+            let old = self.health.ceil() as i32;
+            let new = health.ceil() as i32;
+            if let Some(window) = crate::gui::ingame::health_blink_window(old, new) {
+                self.last_player_health = old;
+                self.health_update_counter = (self.hud_update_counter + window) as i64;
+            }
+        } else {
+            self.last_player_health = health.ceil() as i32;
+        }
+        self.health_received = true;
+        self.health = health;
+        self.food = food;
+        self.saturation = food_saturation;
+        // A dead player is frozen by the server until it respawns. We no
+        // longer auto-respawn — the UI shows a death screen and the player
+        // clicks "respawn" (which sets needs_respawn via request_respawn).
+        if health <= 0.0 {
+            if !self.is_dead {
+                log::info!("player died (health {health}); showing death screen");
+            }
+            self.is_dead = true;
+        } else {
+            self.is_dead = false;
+        }
+        false
+    }
+
+    fn handle_respawn(&mut self, dimension: i32, game_mode: u8) -> bool {
+        // The server resends chunks plus a fresh PlayerPositionLook at the
+        // respawn point; wait for that position before reporting movement
+        // again so we don't send a stale (death-location) position.
+        self.has_sky_light = dimension == 0;
+        self.creative = (game_mode & 0x7) == 1;
+        self.needs_respawn = false;
+        self.is_dead = false;
+        self.health = 20.0;
+        self.max_health = 20.0;
+        self.effects.clear();
+        self.position_synced = false;
+        self.pending_confirm = false;
+        self.player.velocity = DVec3::ZERO;
+        log::info!("respawned into dimension {dimension}");
+        false
+    }
+
+    fn handle_player_position_look(
+        &mut self,
+        x: f64,
+        y: f64,
+        z: f64,
+        yaw: f32,
+        pitch: f32,
+        flags: i8,
+    ) -> bool {
+        let old_pos = self.player.position;
+        if flags & 0x01 != 0 {
+            self.player.position.x += x;
+        } else {
+            self.player.position.x = x;
+        }
+        if flags & 0x02 != 0 {
+            self.player.position.y += y;
+        } else {
+            self.player.position.y = y;
+        }
+        if flags & 0x04 != 0 {
+            self.player.position.z += z;
+        } else {
+            self.player.position.z = z;
+        }
+        if flags & 0x08 != 0 {
+            self.player.yaw += yaw;
+        } else {
+            self.player.yaw = yaw;
+        }
+        if flags & 0x10 != 0 {
+            self.player.pitch += pitch;
+        } else {
+            self.player.pitch = pitch;
+        }
+        // Vanilla zeroes motion on every position-look. Without this a
+        // falling player keeps its downward velocity after a correction
+        // and immediately falls again, fighting the server forever.
+        self.player.velocity = DVec3::ZERO;
+        self.previous_player_position = self.player.position;
+        self.player.sync_aabb_to_position();
+        // Zeroing motion (above) leaves the next tick with no downward move
+        // for the collision-based ground test to catch, so derive on_ground
+        // from actual block support here. Otherwise the client claims it is
+        // airborne while resting on the teleport target.
+        self.player.on_ground = resting_on_ground(&self.world, self.player.aabb);
+        self.world.upsert_entity(self.player.clone());
+        // Only start sending movement once the server has told us where
+        // we are, so we never report the pre-spawn placeholder position.
+        self.position_synced = true;
+        self.pending_confirm = true;
+        self.freeze_movement_after_teleport = true;
+        self.log_correction(flags, old_pos);
+        false
+    }
+
+    fn handle_multi_block_change(
+        &mut self,
+        chunk_x: i32,
+        chunk_z: i32,
+        changes: Vec<recraft_protocol::v1_8_9::packets::BlockChangeRecord>,
+    ) -> bool {
+        let mut changed = false;
+        for block in changes {
+            let x = chunk_x * 16 + block.x as i32;
+            let z = chunk_z * 16 + block.z as i32;
+            changed |= self.apply_block_change(x, block.y as i32, z, block.id, block.meta);
+        }
+        changed
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn handle_spawn_particle(
+        &mut self,
+        particle_id: i32,
+        x: f32,
+        y: f32,
+        z: f32,
+        offset_x: f32,
+        offset_y: f32,
+        offset_z: f32,
+        speed: f32,
+        count: i32,
+        args: Vec<i32>,
+    ) -> bool {
+        self.particles.spawn(
+            particle_id,
+            Vec3::new(x, y, z),
+            Vec3::new(offset_x, offset_y, offset_z),
+            speed,
+            count,
+            &args,
+        );
+        false
+    }
+
+    fn handle_chunk_bulk(
+        &mut self,
+        sky_light_sent: bool,
+        chunks: Vec<recraft_protocol::v1_8_9::packets::BulkChunkData>,
+    ) -> bool {
+        let mut changed = false;
+        for chunk in chunks {
+            changed |= self.apply_raw_chunk(
+                chunk.x,
+                chunk.z,
+                true,
+                chunk.primary_bit_mask,
+                &chunk.data,
+                sky_light_sent,
+            );
+        }
+        changed
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn handle_spawn_player(
+        &mut self,
+        entity_id: i32,
+        uuid: [u8; 16],
+        x: f64,
+        y: f64,
+        z: f64,
+        yaw: f32,
+        pitch: f32,
+    ) -> bool {
+        self.spawn_remote_entity(entity_id, EntityKind::RemotePlayer, x, y, z, yaw, pitch);
+        self.entity_uuids.insert(EntityId(entity_id), uuid);
+        false
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn handle_spawn_object(
+        &mut self,
+        entity_id: i32,
+        kind: i8,
+        x: f64,
+        y: f64,
+        z: f64,
+        yaw: f32,
+        pitch: f32,
+        data: i32,
+        velocity: Option<(f64, f64, f64)>,
+    ) -> bool {
+        self.spawn_remote_entity(
+            entity_id,
+            EntityKind::Object(kind as u8),
+            x,
+            y,
+            z,
+            yaw,
+            pitch,
+        );
+        // Seed the spawn velocity (present when data != 0, e.g. a thrown
+        // projectile) so the client can simulate the flight locally
+        // instead of waiting on server position packets.
+        if let Some((vx, vy, vz)) = velocity {
+            if let Some(entity) = self.remote_entity_mut(entity_id) {
+                entity.velocity = DVec3::new(vx, vy, vz);
+            }
+        }
+        // Falling block (kind 70): the blockstate is packed into the
+        // data int (low 12 bits id, next 4 bits meta).
+        if kind == 70 {
+            let id = (data & 0xfff) as u16;
+            let meta = ((data >> 12) & 0xf) as u8;
+            self.falling_blocks
+                .insert(EntityId(entity_id), BlockState::new(id, meta));
+        }
+        false
+    }
+
+    fn handle_spawn_experience_orb(
+        &mut self,
+        entity_id: i32,
+        x: f64,
+        y: f64,
+        z: f64,
+        count: i16,
+    ) -> bool {
+        self.spawn_remote_entity(
+            entity_id,
+            EntityKind::ExperienceOrb,
+            x,
+            y,
+            z,
+            0.0,
+            0.0,
+        );
+        self.entity_xp.insert(EntityId(entity_id), count);
+        false
+    }
+
+    fn handle_entity_velocity(&mut self, entity_id: i32, vx: f64, vy: f64, vz: f64) -> bool {
+        let velocity = DVec3::new(vx, vy, vz);
+        if entity_id == self.player.id.0 {
+            // Server knockback: vanilla sets the player's motion directly
+            // from this packet, then local physics carries it out.
+            self.player.velocity = velocity;
+        } else if let Some(entity) = self.remote_entity_mut(entity_id) {
+            entity.velocity = velocity;
+        }
+        false
+    }
+
+    fn handle_open_window(
+        &mut self,
+        window_id: u8,
+        inventory_type: String,
+        title: String,
+        slots: u8,
+    ) -> bool {
+        // Replace any prior window and ask the host to push the screen.
+        let title = chat::flatten_chat_json(&title);
+        self.open_container = Some(Container::open(
+            window_id,
+            &inventory_type,
+            title,
+            slots as usize,
+        ));
+        self.container_drag_cancel();
+        self.window_open_pending = true;
+        false
+    }
+
+    fn handle_close_window_s(&mut self, window_id: u8) -> bool {
+        // Server force-close: drop the window and signal the host to pop
+        // the screen (vanilla closes without echoing a C0D back).
+        if self.open_container.as_ref().is_some_and(|c| c.window_id == window_id) {
+            self.open_container = None;
+            self.cursor_item = None;
+            self.container_drag_cancel();
+            self.window_close_pending = true;
+        }
+        false
+    }
+
+    fn handle_set_slot(&mut self, window_id: i8, slot: i16, item: Option<SlotItem>) -> bool {
+        // Window -1 slot -1 is the cursor stack (vanilla `setItemStack`).
+        if window_id == -1 && slot == -1 {
+            self.cursor_item = item;
+        } else if let Some(container) = self
+            .open_container
+            .as_mut()
+            .filter(|c| c.window_id as i8 == window_id)
+        {
+            container.apply_set_slot(slot, item, &mut self.inventory);
+        } else if window_id == 0 && (0..self.inventory.len() as i16).contains(&slot) {
+            // No matching window open: the server still syncs the player
+            // inventory directly (item pickups, hotbar updates, …).
+            self.inventory[slot as usize] = item;
+        }
+        false
+    }
+
+    fn handle_window_items(&mut self, window_id: u8, items: Vec<Option<SlotItem>>) -> bool {
+        if let Some(container) = self
+            .open_container
+            .as_mut()
+            .filter(|c| c.window_id == window_id)
+        {
+            container.apply_window_items(items, &mut self.inventory);
+        } else if window_id == 0 {
+            self.inventory = items;
+            self.inventory.resize(45, None);
+        }
+        false
+    }
+
+    fn handle_destroy_entities(&mut self, entity_ids: Vec<i32>) -> bool {
+        for id in entity_ids {
+            let id = EntityId(id);
+            self.world.remove_entity(id);
+            self.entity_uuids.remove(&id);
+            self.entity_items.remove(&id);
+            self.entity_xp.remove(&id);
+            self.falling_blocks.remove(&id);
+            self.entity_equipment.remove(&id);
+            // Drop both directions of any mount relationship.
+            self.vehicles.remove(&id);
+            self.vehicles.retain(|_, vehicle| *vehicle != id);
+        }
+        false
+    }
+
+    fn handle_player_abilities(
+        &mut self,
+        invulnerable: bool,
+        flying: bool,
+        allow_flying: bool,
+        creative: bool,
+        fly_speed: f32,
+        walk_speed: f32,
+    ) -> bool {
+        // Vanilla handlePlayerAbilities applies every field
+        // unconditionally (no echo from the handler itself).
+        self.capabilities = PlayerCapabilities {
+            invulnerable,
+            flying,
+            allow_flying,
+            creative,
+            fly_speed,
+            walk_speed,
+        };
+        false
+    }
+
+    fn handle_entity_properties(
+        &mut self,
+        entity_id: i32,
+        properties: Vec<recraft_protocol::v1_8_9::packets::EntityProperty>,
+    ) -> bool {
+        // Only the local player's attributes feed the HUD/prediction;
+        // other entities' attributes aren't modeled.
+        if entity_id == self.player.id.0 {
+            for property in &properties {
+                match property.key.as_str() {
+                    "generic.movementSpeed" => {
+                        self.walk_speed_attribute =
+                            effective_attribute_value(property, &SPRINT_SPEED_BOOST_UUID)
+                                as f32;
+                    }
+                    "generic.maxHealth" => {
+                        self.max_health =
+                            effective_attribute_value(property, &[0u8; 16]) as f32;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        false
+    }
+
+    fn handle_chat_message(&mut self, json: String, position: i8) -> bool {
+        if position == 2 {
+            self.chat.set_action_bar(chat::flatten_chat_json(&json));
+        } else {
+            let segments = chat::parse_chat_components(&json);
+            let text: String = segments.iter().map(|s| s.text.as_str()).collect();
+            log::info!("[chat] {}", chat::strip_legacy_codes(&text));
+            self.chat.push_components(segments);
+        }
+        false
+    }
+
+    fn handle_update_sign(&mut self, x: i32, y: i32, z: i32, lines: [String; 4]) -> bool {
+        // Store the four lines flattened from chat-JSON, keyed by block
+        // position; the sign block-entity renderer draws them in world.
+        let text = lines.map(|line| chat::flatten_chat_json(&line));
+        self.signs.insert([x, y, z], text);
+        false
+    }
+
+    fn handle_player_list_header_footer(&mut self, header: String, footer: String) -> bool {
+        self.player_list.set_header_footer(
+            chat::flatten_chat_json(&header),
+            chat::flatten_chat_json(&footer),
+        );
+        false
+    }
+
+    fn handle_attach_entity(&mut self, entity_id: i32, vehicle_id: i32, leash: bool) -> bool {
+        // Leashes (leash = true) don't move the entity; only rides do.
+        if !leash {
+            if vehicle_id == -1 {
+                self.vehicles.remove(&EntityId(entity_id));
+            } else {
+                self.vehicles
+                    .insert(EntityId(entity_id), EntityId(vehicle_id));
+            }
+        }
+        false
+    }
+
+    fn handle_entity_animation(&mut self, entity_id: i32, animation: u8) -> bool {
+        match animation {
+            0 => {
+                if let Some(entity) = self.remote_entity_mut(entity_id) {
+                    entity.start_swing();
+                }
+            }
+            1 => {
+                if let Some(entity) = self.remote_entity_mut(entity_id) {
+                    entity.start_hurt();
+                }
+            }
+            _ => {}
+        }
+        false
+    }
+
+    fn handle_entity_status(&mut self, entity_id: i32, status: i8) -> bool {
+        if status == 2 {
+            if let Some(entity) = self.world.entity_mut(EntityId(entity_id)) {
+                entity.start_hurt();
+            }
+            // The local player's own hurt animation also plays the hurt
+            // sound (vanilla EntityPlayer.handleStatusUpdate → playHurtSound).
+            // UpdateHealth covers damage that changes health, but EntityStatus
+            // fires on every hit (incl. absorbed/blocked), so play it here too.
+            if EntityId(entity_id) == self.player.id {
+                // Drive the hurt-camera tilt off the authoritative local
+                // player (its world copy isn't tick-interpolated, so its
+                // hurt timer would never decrement).
+                self.player.start_hurt();
+                let pos = self.camera.position;
+                self.queue_sound("game.player.hurt", pos, 1.0, 1.0);
+            }
+        }
+        // Status 3 (death): start the fall-over + red-corpse animation.
+        if status == 3 {
+            if let Some(entity) = self.world.entity_mut(EntityId(entity_id)) {
+                entity.start_death();
+            }
+        }
+        false
+    }
+
+    fn handle_entity_equipment(
+        &mut self,
+        entity_id: i32,
+        slot: i16,
+        item: Option<SlotItem>,
+    ) -> bool {
+        if (0..5).contains(&slot) {
+            let slots = self
+                .entity_equipment
+                .entry(EntityId(entity_id))
+                .or_insert_with(Default::default);
+            slots[slot as usize] = item;
+        }
+        false
+    }
+
+    fn handle_sound_effect(
+        &mut self,
+        name: String,
+        x: f64,
+        y: f64,
+        z: f64,
+        volume: f32,
+        pitch: u8,
+    ) -> bool {
+        let pos = Vec3::new(x as f32, y as f32, z as f32);
+        let rate = pitch as f32 / 63.5;
+        self.queue_sound(name, pos, volume, rate);
+        false
+    }
+
+    fn handle_effect(&mut self, effect_id: i32, x: i32, y: i32, z: i32, data: i32) -> bool {
+        if let Some(event) = effect_event(effect_id, data) {
+            let pos = Vec3::new(x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5);
+            self.queue_sound(event, pos, 1.0, 1.0);
+        }
+        false
+    }
+
+    fn handle_block_action(
+        &mut self,
+        x: i32,
+        y: i32,
+        z: i32,
+        action_id: u8,
+        action_param: u8,
+        block_type: i32,
+    ) -> bool {
+        // Note block (block id 25): play the pitched note and puff a
+        // coloured NOTE particle. Chest/piston actions (other block
+        // types) carry no client-side sound/particle here and are
+        // ignored (T17 will extend this).
+        if block_type == 25 {
+            let note = action_param.min(24);
+            let pitch = 2.0_f32.powf((note as f32 - 12.0) / 12.0);
+            let instrument = NOTE_INSTRUMENTS
+                .get(action_id as usize)
+                .copied()
+                .unwrap_or("harp");
+            let center = Vec3::new(x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5);
+            self.queue_sound(format!("note.{instrument}"), center, 3.0, pitch);
+            // The NOTE branch reads the rainbow colour from offset.x.
+            let above = Vec3::new(x as f32 + 0.5, y as f32 + 1.2, z as f32 + 0.5);
+            self.particles
+                .spawn(23, above, Vec3::new(note as f32 / 24.0, 0.0, 0.0), 0.0, 1, &[]);
+        } else if matches!(block_type, 54 | 130 | 146) && action_id == 1 {
+            // Chest/ender/trapped lid: action_param is the viewer count.
+            // Drive the lid-open target and play the open/close sound on
+            // the 0↔viewers transition (vanilla random.chestopen/closed).
+            let pos = [x, y, z];
+            let was_open = self.chest_open_targets.get(&pos).copied().unwrap_or(0.0) > 0.0;
+            let now_open = action_param > 0;
+            if now_open {
+                self.chest_open_targets.insert(pos, 1.0);
+                self.chest_lid_angles.entry(pos).or_insert(0.0);
+            } else {
+                self.chest_open_targets.insert(pos, 0.0);
+            }
+            if now_open != was_open {
+                let center = Vec3::new(x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5);
+                let event = if now_open { "random.chestopen" } else { "random.chestclosed" };
+                self.queue_sound(event.to_string(), center, 0.5, 1.0);
+            }
+        }
+        false
     }
 }
 
