@@ -15,6 +15,7 @@ kira.workspace = true
 log.workspace = true
 pollster.workspace = true
 recraft_core = { path = "../recraft_core" }
+recraft_ext = { path = "../recraft_ext" }
 recraft_protocol = { path = "../recraft_protocol" }
 recraft_render = { path = "../recraft_render" }
 winit.workspace = true

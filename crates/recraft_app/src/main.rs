@@ -1,6 +1,7 @@
 mod auth;
 mod chat;
 mod container;
+mod ext_bridge;
 mod game;
 mod gui;
 mod item_renderer;
@@ -24,6 +25,7 @@ use std::{
 
 use anyhow::Context;
 use auth::{AuthEvent, Session};
+use ext_bridge::GameViews;
 use game::GameState;
 use gui::accounts::GuiAccounts;
 use gui::chat_screen::GuiChat;
@@ -125,6 +127,14 @@ struct App {
     /// transaction`, not the reverse (sending at frame time let a transaction
     /// land between the last flying and the click → Post "click window v1.8").
     pending_window_packets: Vec<ServerboundPacket>,
+    /// Extension host: owns loaded mods, the event bus and the command queue.
+    /// A sibling field of `game`, so `app.ext.method(&GameViews(&app.game))` is a
+    /// disjoint two-field borrow.
+    ext: recraft_ext::ExtManager,
+    /// Accumulated `setBlockTint` overrides + a dirty flag so a change re-meshes
+    /// the loaded world once (future chunks read the renderer's global table).
+    block_tints: recraft_render::TintTable,
+    tints_dirty: bool,
     quit: bool,
 }
 
@@ -346,7 +356,7 @@ impl ApplicationHandler for WinitApp {
         let auto_demo = auto_play && auto_connect.is_none();
         let username = self.config.username.clone();
 
-        let app = App {
+        let mut app = App {
             game: if auto_demo {
                 GameState::demo(self.config.demo_kind, renderer.aspect())
             } else {
@@ -381,9 +391,23 @@ impl ApplicationHandler for WinitApp {
             last_entity_key: None,
             sound: sound::SoundManager::new(),
             pending_window_packets: Vec::new(),
+            ext: recraft_ext::ExtManager::new(),
+            block_tints: recraft_render::TintTable::new(),
+            tints_dirty: false,
             quit: false,
         };
         renderer.upload_world(&app.game.world);
+        // Opt-in in-tree demo mod that validates all four ext seams (HUD / packet
+        // intercept / chat command / custom keybind).
+        if std::env::var("RECRAFT_EXT_DEMO").is_ok() {
+            app.ext.register(Box::new(recraft_ext::dev::DemoMod::new()));
+        }
+        // Load `.js` (and, later, native) mods from `mods/` next to the working
+        // directory. F10 reloads them at runtime.
+        let loaded = app.ext.load_mods(std::path::Path::new("mods"));
+        if !loaded.is_empty() {
+            log::info!("[ext] loaded {} mod(s): {:?}", loaded.len(), loaded);
+        }
 
         self.window = Some(window);
         self.renderer = Some(renderer);
@@ -421,6 +445,14 @@ impl ApplicationHandler for WinitApp {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                // F10: hot-reload `mods/` (dev convenience; never consumed by mods).
+                if event.state == ElementState::Pressed
+                    && !event.repeat
+                    && matches!(event.physical_key, PhysicalKey::Code(KeyCode::F10))
+                {
+                    let loaded = app.ext.reload_mods(std::path::Path::new("mods"));
+                    log::info!("[ext] reloaded {} mod(s): {:?}", loaded.len(), loaded);
+                }
                 if event.state == ElementState::Pressed
                     && !event.repeat
                     && matches!(event.physical_key, PhysicalKey::Code(code)
@@ -451,6 +483,17 @@ impl ApplicationHandler for WinitApp {
                     handle_actions(app, renderer, window, actions, &mut self.atlas_uv);
                 } else if app.in_world {
                     let pressed = event.state == ElementState::Pressed;
+                    // ext on_input seam: a mod may consume the key (custom binds).
+                    // Consuming skips the default gameplay handling below.
+                    if let Some(name) = key_name(&event.physical_key) {
+                        if app.ext.dispatch_input(
+                            &recraft_ext::InputEvent::new(name, pressed),
+                            &GameViews(&app.game),
+                        ) {
+                            sync_cursor(window, &mut self.cursor_captured, app);
+                            return;
+                        }
+                    }
                     let action = match event.physical_key {
                         PhysicalKey::Code(code) => app.settings.keybinds.action_for(code),
                         _ => None,
@@ -628,6 +671,9 @@ impl ApplicationHandler for WinitApp {
 
         poll_auth_events(app);
         pump_network(app, window, &mut self.cursor_captured);
+        // Drain commands queued by the clientbound/chunk ext hooks (done here, not
+        // inside pump_network, because that loop holds a borrow of app.network).
+        apply_ext_commands(app);
 
         if app.game.take_window_open() {
             app.suspend_gameplay_input(&mut self.left_held, &mut self.right_held);
@@ -723,8 +769,10 @@ impl ApplicationHandler for WinitApp {
                         }
                     }
                 }
+                app.ext.dispatch_tick(&GameViews(&app.game));
                 self.tick_accumulator -= 0.05;
             }
+            apply_ext_commands(app);
         }
         if !self.scripted_smoke_done
             && self.scripted_smoke_seconds
@@ -758,6 +806,12 @@ impl ApplicationHandler for WinitApp {
         if let Some(bench) = self.pass_bench.as_mut() {
             let (sky, water, ui, flat) = bench.config_for_frame();
             renderer.set_pass_skip(sky, water, ui, flat);
+        }
+        // Apply pending extension block-tint overrides (re-meshes the loaded
+        // world once; future chunks read the renderer's global tint table).
+        if app.tints_dirty && app.in_world {
+            renderer.set_block_tints(app.block_tints.clone(), &app.game.world);
+            app.tints_dirty = false;
         }
         render_frame(
             renderer,
@@ -1147,6 +1201,161 @@ fn poll_auth_events(app: &mut App) {
     }
 }
 
+/// Drain the ext command queue and apply each command on the main thread.
+/// Called after each dispatch seam so a mod's enqueued commands take effect the
+/// same frame.
+fn apply_ext_commands(app: &mut App) {
+    for cmd in app.ext.take_commands() {
+        match cmd {
+            recraft_ext::ExtCommand::Chat(s) => {
+                if let Some(net) = &app.network {
+                    net.send_packet(ServerboundPacket::ChatMessage { message: s });
+                }
+            }
+            recraft_ext::ExtCommand::SendServerbound(b) => {
+                if let Some(net) = &app.network {
+                    net.send_packet(ext_bridge::build_to_serverbound(b));
+                }
+            }
+            recraft_ext::ExtCommand::Log(level, msg) => {
+                let level = match level {
+                    recraft_ext::LogLevel::Error => log::Level::Error,
+                    recraft_ext::LogLevel::Warn => log::Level::Warn,
+                    recraft_ext::LogLevel::Info => log::Level::Info,
+                    recraft_ext::LogLevel::Debug => log::Level::Debug,
+                };
+                log::log!(level, "[ext] {msg}");
+            }
+            recraft_ext::ExtCommand::SpawnParticle {
+                kind,
+                x,
+                y,
+                z,
+                ox,
+                oy,
+                oz,
+                speed,
+                count,
+            } => {
+                app.game.ext_spawn_particle(
+                    kind,
+                    glam::Vec3::new(x as f32, y as f32, z as f32),
+                    glam::Vec3::new(ox, oy, oz),
+                    speed,
+                    count,
+                );
+            }
+            recraft_ext::ExtCommand::PlaySound {
+                event,
+                x,
+                y,
+                z,
+                volume,
+                pitch,
+            } => {
+                app.game.ext_play_sound(
+                    event,
+                    glam::Vec3::new(x as f32, y as f32, z as f32),
+                    volume,
+                    pitch,
+                );
+            }
+            recraft_ext::ExtCommand::Render(preset) => apply_render_preset(app, preset),
+        }
+    }
+}
+
+/// Apply a preset render modification. `BlockTint` accumulates into `app` (a
+/// dirty flag drives a re-mesh in `about_to_wait` where the renderer is in
+/// scope); the rest are not yet wired to the renderer.
+fn apply_render_preset(app: &mut App, preset: recraft_ext::RenderPreset) {
+    use recraft_ext::RenderPreset as P;
+    match preset {
+        P::BlockTint {
+            block_id,
+            meta,
+            color,
+        } => {
+            app.block_tints.set(block_id, meta, color);
+            app.tints_dirty = true;
+        }
+        other => log::debug!("[ext] render preset not yet applied: {other:?}"),
+    }
+}
+
+/// Project a winit physical key to the stable name the ext layer expects
+/// (`InputEvent.key`, e.g. `"KeyW"`, `"F6"`, `"Escape"` — winit's `KeyCode`
+/// debug name). Returns `None` for keys with no physical code.
+fn key_name(physical: &winit::keyboard::PhysicalKey) -> Option<String> {
+    match physical {
+        winit::keyboard::PhysicalKey::Code(code) => Some(format!("{code:?}")),
+        _ => None,
+    }
+}
+
+/// Replay a mod's `draw_hud` command buffer into the frame's `UiFrame`, layered
+/// over the vanilla HUD. `recraft_ext` authors coordinates in GUI pixels; the
+/// vanilla HUD authors every primitive as `<gui_px> * scale` (UiFrame divides by
+/// the pixel scale at rasterize), so we multiply coords and the text scale by
+/// `scale`. Colors are packed `0xRRGGBBAA`.
+fn replay_hud(ui: &mut recraft_render::UiFrame, draw: &recraft_ext::HudDraw, scale: i32) {
+    use recraft_ext::HudCmd;
+    use recraft_render::{UiColor, UiRect};
+
+    fn color(c: u32) -> UiColor {
+        UiColor::rgba((c >> 24) as u8, (c >> 16) as u8, (c >> 8) as u8, c as u8)
+    }
+
+    for cmd in draw.commands() {
+        match cmd {
+            HudCmd::Rect { x, y, w, h, color: c } => {
+                ui.rect(
+                    UiRect::new(x * scale, y * scale, w * scale, h * scale),
+                    color(*c),
+                );
+            }
+            HudCmd::Text {
+                x,
+                y,
+                scale: text_scale,
+                color: c,
+                text,
+                shadow,
+            } => {
+                let s = (text_scale * scale).max(1);
+                if *shadow {
+                    ui.text_shadowed(x * scale, y * scale, s, color(*c), text.clone());
+                } else {
+                    ui.text(x * scale, y * scale, s, color(*c), text.clone());
+                }
+            }
+            HudCmd::ItemIcon { x, y, w, h, item_id } => {
+                ui.item_icon(
+                    UiRect::new(x * scale, y * scale, w * scale, h * scale),
+                    *item_id,
+                );
+            }
+            HudCmd::BlockItem {
+                x,
+                y,
+                w,
+                h,
+                block_id,
+                meta,
+            } => {
+                ui.block_item(
+                    UiRect::new(x * scale, y * scale, w * scale, h * scale),
+                    *block_id,
+                    *meta,
+                );
+            }
+            HudCmd::Image { .. } => {
+                // TODO: needs a registered host texture (TexHandle -> RGBA) to blit.
+            }
+        }
+    }
+}
+
 /// Drain all pending network events. Transaction pongs are sent immediately
 /// on the network thread, so all preceding game-state packets (especially
 /// DestroyEntities) must be processed before the next tick — otherwise the
@@ -1161,13 +1370,36 @@ fn pump_network(app: &mut App, window: &winit::window::Window, cursor_captured: 
                 log::info!("logged in as {username} ({uuid})");
             }
             Ok(NetworkEvent::PlayPacket(packet)) => {
-                app.game.apply_play_packet(packet);
+                // ext seam: project a stable view + derive events BEFORE the
+                // packet is moved into apply_play_packet. A mod may `Drop` it.
+                // Commands queued here are drained after pump_network returns
+                // (we can't take &mut App while `network` borrows app.network).
+                let view = ext_bridge::clientbound_view(&packet);
+                let events = ext_bridge::derive_events(&packet);
+                let drop = app
+                    .ext
+                    .dispatch_clientbound_packet(&view, &GameViews(&app.game))
+                    == recraft_ext::Verdict::Drop;
+                if !drop {
+                    app.game.apply_play_packet(packet);
+                    for ev in events {
+                        app.ext.dispatch_event(&ev, &GameViews(&app.game));
+                    }
+                }
             }
             Ok(NetworkEvent::ChunkColumn { x, z, column }) => {
                 app.game.apply_chunk_column(x, z, &column);
+                app.ext.dispatch_event(
+                    &recraft_ext::ExtEvent::ChunkLoad { x, z },
+                    &GameViews(&app.game),
+                );
             }
             Ok(NetworkEvent::ChunkUnload { x, z }) => {
                 app.game.unload_chunk(x, z);
+                app.ext.dispatch_event(
+                    &recraft_ext::ExtEvent::ChunkUnload { x, z },
+                    &GameViews(&app.game),
+                );
             }
             Ok(NetworkEvent::Disconnected(message)) => {
                 log::warn!("network disconnected: {message}");
@@ -1697,6 +1929,7 @@ fn render_frame(
         settings,
         ms_session,
         tab_open,
+        ext,
         ..
     } = app;
     // The overlay only makes sense in pure gameplay, never under an open screen.
@@ -1760,6 +1993,19 @@ fn render_frame(
             settings.show_fps,
             screen_open,
         );
+    }
+    // ext draw_hud seam: mod HUD draws over the vanilla HUD, under the open screen.
+    if hud_visible {
+        let scale = gui::gui_scale(width, height);
+        let hud_ctx = recraft_ext::HudCtx {
+            width: width / scale,
+            height: height / scale,
+            scale,
+            screen_open,
+        };
+        let mut hud_draw = recraft_ext::HudDraw::new();
+        ext.draw_hud(&mut hud_draw, &hud_ctx, &GameViews(&*game));
+        replay_hud(&mut ui, &hud_draw, scale);
     }
     if let Some(screen) = screen.as_mut() {
         let ctx = DrawCtx {
