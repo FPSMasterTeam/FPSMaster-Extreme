@@ -6,7 +6,7 @@ recraft loads everything in this folder at startup (in dependency order); press
 
 ```
 mods/
-  recraft.d.ts          ← JS type definitions (reference it for editor autocomplete)
+  mc.d.ts               ← JS type definitions (reference it for editor autocomplete)
   coords_hud/           ← example: player position / facing / vitals HUD
     mod.toml
     main.js
@@ -22,9 +22,9 @@ See the **[`sdk/`](../sdk/)** folder for the full SDK — start with
 ## JS mod skeleton
 
 ```js
-/// <reference path="../recraft.d.ts" />
-recraft.onLoad(() => recraft.log("hi"));
-recraft.drawHud(() => hud.text(2, 2, "y=" + recraft.player().y.toFixed(1)));
+/// <reference path="../mc.d.ts" />
+mc.on("load", () => mc.log("hi"));
+mc.drawHud(() => hud.text(2, 2, "y=" + mc.player.y.toFixed(1)));
 ```
 
 ## Native mod

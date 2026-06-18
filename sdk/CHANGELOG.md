@@ -2,6 +2,30 @@
 
 All notable changes to the recraft extension API.
 
+## 0.2.0
+
+**Breaking.** The JS global was renamed `recraft` → `mc` and restructured around
+vanilla-style objects (`mc.player`, `mc.world`, `mc.connection`). Declare
+`api = "^0.2"`. The native ABI bumps to 0.2.0; `recraft.d.ts` is now `mc.d.ts`.
+
+- **Namespace**: `mc.player` / `mc.world` / `mc.connection`; `mc.log`/`warn`/`error`.
+- **Events**: unified `mc.on(name, cb)` (`tick`, `frame`, `load`, `key`, `chat`,
+  `blockChange`, `chunkLoad`, `chunkUnload`, `entitySpawn`, `entityRemove`,
+  `playerHealth`); `mc.onPacket` (clientbound, droppable); **`mc.onServerbound`**
+  (outbound pre-send hook, droppable); `mc.drawHud`.
+- **Player reads**: `heldItem`, `inventory`, `selectedSlot`, `capabilities`,
+  `effects`, `xp`, `container`; richer `mc.world.getBlock` (`isAir`, `luminance`,
+  `opaque`, `shape`); `mc.world.entity(id)`; `mc.connection.connected`.
+- **Player actions**: `placeBlock`, `dig`, `attack`, `interact`, `openInventory`,
+  `closeContainer`, `clickSlot`, `selectSlot`, `swing`, `useItem`, and silent
+  head rotation `setRotation(yaw, pitch, {silent})` / `clearRotation` (vanilla
+  pre-event style).
+- **Forge-style helpers**: `mc.keyBinding`, `mc.scheduler` (`after`/`every`/
+  `clear`), `mc.config` (`load`/`get`/`set`/`save`, persisted to
+  `<mod>/config.json`).
+- **Native**: matching `HostApi` helpers for every new read/action; new
+  `on_serverbound_packet` hook (default body, ABI-compatible for older mods).
+
 ## 0.1.0
 
 Initial release. Two-layer extension system (JS + native), sharing one API.

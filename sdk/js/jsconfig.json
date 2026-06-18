@@ -6,5 +6,5 @@
     "lib": ["ES2020"],
     "noEmit": true
   },
-  "include": ["recraft.d.ts", "examples/**/*.js", "**/*.js"]
+  "include": ["mc.d.ts", "examples/**/*.js", "**/*.js"]
 }

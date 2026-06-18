@@ -14,7 +14,7 @@ refactor and obfuscate everything behind it while native mods keep loading.
 crate-type = ["cdylib"]
 
 [dependencies]
-recraft_ext_api = "0.1"
+recraft_ext_api = "0.2"
 abi_stable = "0.11"   # the macros expand to `::abi_stable` paths
 ```
 

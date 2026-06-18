@@ -1,15 +1,16 @@
 # recraft Extension SDK
 
 Everything you need to write **recraft** mods. recraft has a two-layer extension
-system; both layers share one API surface (events, commands, read-views, HUD,
-preset render toggles) over different transports.
+system; both layers share one API surface — modelled on vanilla `mc.player` /
+`mc.world` / `mc.connection` — over different transports (events, commands,
+read-views, HUD, key bindings, a scheduler, per-mod config, preset render toggles).
 
 | Layer | Write a… | Distribute | When |
 |---|---|---|---|
 | **JS** (`tier = "js"`) | `.js` file | one file, cross-platform, hot-reloadable | behaviour, HUD, automation, config — most mods |
 | **Native** (`tier = "native"`) | Rust `cdylib` | one binary per OS × arch | heavy native code, own threads, render hooks |
 
-**API version: 0.1.0**
+**API version: 0.2.0**
 
 ## What's in here
 
@@ -19,7 +20,7 @@ sdk/
   REFERENCE.md         ← the full API reference (read this)
   CHANGELOG.md
   js/
-    recraft.d.ts       ← TypeScript typings (editor autocomplete/type-checking)
+    mc.d.ts            ← TypeScript typings (editor autocomplete/type-checking)
     jsconfig.json      ← makes editors pick up the typings for this folder
     examples/          ← coords_hud, chat_alert, block_tint, preset_demo
   native/
@@ -38,7 +39,7 @@ sdk/
    id = "hello"
    version = "1.0.0"
    tier = "js"
-   api = "^0.1"
+   api = "^0.2"
    entry = "main.js"
    capabilities = ["hud", "read_player"]
    ```
@@ -46,12 +47,12 @@ sdk/
 3. Create `mods/hello/main.js`:
 
    ```js
-   /// <reference path="../recraft.d.ts" />
-   recraft.onLoad(() => recraft.log("hello!"));
-   recraft.drawHud(() => hud.text(2, 2, "y=" + recraft.player().y.toFixed(1)));
+   /// <reference path="../mc.d.ts" />
+   mc.on("load", () => mc.log("hello!"));
+   mc.drawHud(() => hud.text(2, 2, "y=" + mc.player.y.toFixed(1)));
    ```
 
-4. Copy `js/recraft.d.ts` from this SDK to `mods/recraft.d.ts` for autocomplete.
+4. Copy `js/mc.d.ts` from this SDK to `mods/mc.d.ts` for autocomplete.
 5. Launch recraft, enter a world, see your HUD. Press **F10** to hot-reload after edits.
 
 Then read **[REFERENCE.md](REFERENCE.md)** for the full API, and crib from

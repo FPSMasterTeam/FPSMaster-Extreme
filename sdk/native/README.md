@@ -43,7 +43,7 @@ mods/my_native_mod/
 id = "my.native.mod"
 version = "0.1.0"
 tier = "native"
-api = "^0.1"
+api = "^0.2"
 entry = "libmy_native_mod.dylib"   # .so on Linux, .dll on Windows
 ```
 

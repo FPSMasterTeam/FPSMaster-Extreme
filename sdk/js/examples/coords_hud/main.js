@@ -1,7 +1,7 @@
 // Coordinates HUD — the canonical "read player state + draw HUD" mod.
 //
-// `recraft.player()` returns a live snapshot; `hud.*` records draw commands that
-// the host replays into the frame. Coordinates are in GUI pixels.
+// `mc.player` is a live snapshot (cache it in a local, like vanilla); `hud.*`
+// records draw commands the host replays into the frame. Coords are GUI pixels.
 
 const DIRS = ["South", "SW", "West", "NW", "North", "NE", "East", "SE"];
 
@@ -10,8 +10,8 @@ function facing(yaw) {
   return DIRS[i];
 }
 
-recraft.drawHud((ctx) => {
-  const p = recraft.player();
+mc.drawHud((ctx) => {
+  const p = mc.player;
   const lines = [
     "XYZ " + p.x.toFixed(2) + " / " + p.y.toFixed(2) + " / " + p.z.toFixed(2),
     "Facing " + facing(p.yaw) + " (" + p.yaw.toFixed(1) + "°)",
@@ -24,4 +24,4 @@ recraft.drawHud((ctx) => {
   }
 });
 
-recraft.onLoad(() => recraft.log("coords_hud ready"));
+mc.on("load", () => mc.log("coords_hud ready"));
