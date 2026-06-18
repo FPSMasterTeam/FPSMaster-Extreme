@@ -84,10 +84,16 @@ mc.on("tick", () => {
 
   if (!isBlockItem(p.heldItem())) return reset("no block in hand");
 
-  // Target = the block position directly under the feet.
-  const tx = Math.floor(p.x);
-  const ty = Math.floor(p.y) - 1;
-  const tz = Math.floor(p.z);
+  // The mod runs BEFORE physics, so p.{x,y,z} is the pre-move position but the
+  // flying packet will carry the POST-move position. Aim from the predicted
+  // post-move position (current + this tick's velocity) so the rotation matches
+  // where Grim ray-traces the placement from.
+  const fx = p.x + p.vx, fy = p.y + p.vy, fz = p.z + p.vz;
+
+  // Target = the block position directly under the (predicted) feet.
+  const tx = Math.floor(fx);
+  const ty = Math.floor(fy) - 1;
+  const tz = Math.floor(fz);
   if (!mc.world.getBlock(tx, ty, tz).isAir) return reset("supported"); // already standing on something
 
   // Find a real full-cube face to place against (no mid-air placement).
@@ -106,8 +112,8 @@ mc.on("tick", () => {
   const ax = pick.nx + 0.5 + 0.5 * fd[0];
   const ay = pick.ny + 0.5 + 0.5 * fd[1];
   const az = pick.nz + 0.5 + 0.5 * fd[2];
-  const eyeY = p.y + (p.sneaking ? 1.54 : 1.62);
-  const dx = ax - p.x, dy = ay - eyeY, dz = az - p.z;
+  const eyeY = fy + (p.sneaking ? 1.54 : 1.62);
+  const dx = ax - fx, dy = ay - eyeY, dz = az - fz;
   const horiz = Math.hypot(dx, dz);
   // When the block is (almost) straight down, yaw is irrelevant to the aim — keep
   // the real camera yaw so the host's strafe-remap leaves movement untouched.
