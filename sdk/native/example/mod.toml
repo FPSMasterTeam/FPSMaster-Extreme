@@ -1,0 +1,8 @@
+# Deploy this alongside the built cdylib in a recraft `mods/<id>/` folder.
+# `entry` is the actual library filename for your platform.
+id = "recraft.native.example"
+version = "1.0.0"
+tier = "native"
+api = "^0.1"
+entry = "librecraft_native_example.dylib"   # .so on Linux, .dll on Windows
+capabilities = ["hud", "chat", "render"]

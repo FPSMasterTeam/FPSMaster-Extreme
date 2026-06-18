@@ -8,6 +8,9 @@ members = [
     "crates/recraft_protocol",
     "crates/recraft_render",
 ]
+# The SDK's standalone template/example packages depend on the published
+# `recraft_ext_api` crate, so they are not part of this workspace.
+exclude = ["sdk"]
 resolver = "2"
 
 # Release "obfuscation" baseline. Rust has no true obfuscator; stripping the

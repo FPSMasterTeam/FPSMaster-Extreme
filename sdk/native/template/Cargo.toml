@@ -1,0 +1,13 @@
+[package]
+name = "my_native_mod"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+recraft_ext_api = "0.1"
+# abi_stable's macros expand to `::abi_stable` paths, so depend on it directly at
+# the same version recraft_ext_api uses.
+abi_stable = "0.11"

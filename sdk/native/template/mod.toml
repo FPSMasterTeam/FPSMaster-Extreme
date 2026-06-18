@@ -1,0 +1,6 @@
+id = "my.native.mod"
+version = "0.1.0"
+tier = "native"
+api = "^0.1"
+entry = "libmy_native_mod.dylib"   # .so on Linux, .dll on Windows
+capabilities = ["hud", "chat"]

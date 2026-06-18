@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "Stable plugin ABI for recraft native (cdylib) extensions."
+repository.workspace = true
+readme = "README.md"
+keywords = ["recraft", "minecraft", "plugin", "modding", "abi_stable"]
+categories = ["game-development", "api-bindings"]
 
 # The stable, obfuscation-exempt contract a native mod compiles against. Depends
 # only on abi_stable + a small JSON shim, never on recraft internals, so the host

@@ -12,10 +12,12 @@ mods/
     main.js
   chat_alert/           ← example: ping + banner on a chat keyword
   block_tint/           ← example: setBlockTint preset
+  preset_demo/          ← example: toggle every render preset with keys
 ```
 
-See **`docs/EXTENSION_SDK.md`** for the full guide (JS + native API, `mod.toml`,
-capabilities, building native `cdylib` mods).
+See the **[`sdk/`](../sdk/)** folder for the full SDK — start with
+[`sdk/README.md`](../sdk/README.md) and [`sdk/REFERENCE.md`](../sdk/REFERENCE.md)
+(JS + native API, `mod.toml`, capabilities, building native `cdylib` mods).
 
 ## JS mod skeleton
 
