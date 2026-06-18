@@ -1,7 +1,7 @@
 id = "block_tint"
 version = "1.0.0"
 tier = "js"
-api = "^0.1"
+api = "^0.2"
 entry = "main.js"
 capabilities = ["render"]
 name = "Block Tint Demo"

@@ -1,7 +1,7 @@
 id = "chat_alert"
 version = "1.0.0"
 tier = "js"
-api = "^0.1"
+api = "^0.2"
 entry = "main.js"
 capabilities = ["hud", "sound", "read_player"]
 name = "Chat Keyword Alert"

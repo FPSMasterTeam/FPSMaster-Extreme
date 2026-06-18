@@ -6,14 +6,17 @@
 //! these at the four hook seams (clientbound dispatch, event derivation, outbound
 //! build) and exposes [`GameViews`] as the live read-view.
 
-use recraft_core::{EntityId, EntityKind};
+use recraft_core::{EntityId, EntityKind, RenderShape};
 use recraft_ext::{
-    BlockView, EntityKindView, EntityView, ExtEvent, PacketBuild, PacketType, PacketView,
-    PlayerView, ReadViews,
+    BlockView, CapabilitiesView, ContainerInfo, EffectView, EntityKindView, EntityView, ExtEvent,
+    ItemView, PacketBuild, PacketType, PacketView, PlayerView, ReadViews,
 };
-use recraft_protocol::v1_8_9::packets::{ClientboundPlayPacket, DiggingStatus, ServerboundPacket};
+use recraft_protocol::v1_8_9::packets::{
+    ClientboundPlayPacket, DiggingStatus, ServerboundPacket, SlotItem,
+};
 
 use crate::chat::flatten_chat_json;
+use crate::container::WindowKind;
 use crate::game::GameState;
 
 /// Read-only adapter exposing the live `GameState` to extensions through the
@@ -48,6 +51,10 @@ impl ReadViews for GameViews<'_> {
         BlockView {
             id: b.id,
             meta: b.meta,
+            is_air: b.is_air(),
+            luminance: b.luminance(),
+            opaque: b.is_opaque_cube(),
+            shape: render_shape_name(b.render_shape()),
         }
     }
 
@@ -75,6 +82,107 @@ impl ReadViews for GameViews<'_> {
 
     fn loaded_chunk_count(&self) -> usize {
         self.0.loaded_chunk_count()
+    }
+
+    fn held_item(&self) -> Option<ItemView> {
+        self.0.held_item().map(slot_to_item)
+    }
+
+    fn inventory(&self) -> Vec<Option<ItemView>> {
+        self.0
+            .inventory_slots()
+            .iter()
+            .map(|s| s.as_ref().map(slot_to_item))
+            .collect()
+    }
+
+    fn selected_slot(&self) -> i32 {
+        self.0.selected_slot()
+    }
+
+    fn capabilities(&self) -> CapabilitiesView {
+        let c = self.0.capabilities();
+        CapabilitiesView {
+            invulnerable: c.invulnerable,
+            flying: c.flying,
+            allow_flying: c.allow_flying,
+            creative: c.creative,
+            fly_speed: c.fly_speed,
+            walk_speed: c.walk_speed,
+        }
+    }
+
+    fn effects(&self) -> Vec<EffectView> {
+        self.0
+            .active_effects()
+            .into_iter()
+            .map(|(id, amplifier, duration)| EffectView {
+                id,
+                amplifier,
+                duration,
+            })
+            .collect()
+    }
+
+    fn xp(&self) -> (f32, i32) {
+        (self.0.xp_bar(), self.0.xp_level())
+    }
+
+    fn open_container(&self) -> Option<ContainerInfo> {
+        self.0.open_container().map(|c| ContainerInfo {
+            window_id: c.window_id as i32,
+            kind: window_kind_name(&c.kind).to_string(),
+            size: c.slots().len(),
+        })
+    }
+
+    fn connected(&self) -> bool {
+        self.0.can_send_movement_packets()
+    }
+}
+
+/// Project an internal inventory stack into the stable [`ItemView`].
+fn slot_to_item(s: &SlotItem) -> ItemView {
+    ItemView {
+        id: s.id,
+        count: s.count,
+        damage: s.damage,
+    }
+}
+
+/// Stable render-shape name for a block (extension block read-view).
+fn render_shape_name(shape: RenderShape) -> &'static str {
+    match shape {
+        RenderShape::None => "none",
+        RenderShape::Cube => "cube",
+        RenderShape::Cross => "cross",
+        RenderShape::Rail => "rail",
+        RenderShape::Ladder => "ladder",
+        RenderShape::Boxes => "boxes",
+        RenderShape::Door => "door",
+        RenderShape::Piston => "piston",
+        RenderShape::PistonHead => "piston_head",
+        RenderShape::Torch => "torch",
+        RenderShape::Fluid => "fluid",
+        RenderShape::Fire => "fire",
+        RenderShape::Bed => "bed",
+    }
+}
+
+/// Stable window-kind name for the open container (extension read-view).
+fn window_kind_name(kind: &WindowKind) -> &'static str {
+    match kind {
+        WindowKind::Player => "player",
+        WindowKind::Chest(_) => "chest",
+        WindowKind::Dispenser => "dispenser",
+        WindowKind::Hopper => "hopper",
+        WindowKind::Furnace => "furnace",
+        WindowKind::Crafting => "crafting",
+        WindowKind::Brewing => "brewing",
+        WindowKind::Enchant => "enchant",
+        WindowKind::Anvil => "anvil",
+        WindowKind::Beacon => "beacon",
+        WindowKind::Villager => "villager",
     }
 }
 
@@ -327,6 +435,66 @@ pub fn build_to_serverbound(b: PacketBuild) -> ServerboundPacket {
             y,
             z,
             face,
+        },
+    }
+}
+
+/// Classify a serverbound packet into the stable [`PacketType`] id space.
+pub fn serverbound_type(p: &ServerboundPacket) -> PacketType {
+    match p {
+        ServerboundPacket::ChatMessage { .. } => PacketType::SbChatMessage,
+        ServerboundPacket::PlayerPosition { .. } => PacketType::SbPlayerPosition,
+        ServerboundPacket::PlayerLook { .. } => PacketType::SbPlayerLook,
+        ServerboundPacket::PlayerPositionLook { .. } => PacketType::SbPlayerPositionLook,
+        ServerboundPacket::PlayerDigging { .. } => PacketType::SbPlayerDigging,
+        ServerboundPacket::PlayerBlockPlacement { .. } => PacketType::SbPlayerBlockPlacement,
+        ServerboundPacket::HeldItemChange { .. } => PacketType::SbHeldItemChange,
+        ServerboundPacket::SwingArm => PacketType::SbAnimation,
+        ServerboundPacket::UseEntity { .. } => PacketType::SbUseEntity,
+        ServerboundPacket::EntityAction { .. } => PacketType::SbEntityAction,
+        ServerboundPacket::KeepAlive { .. } => PacketType::SbKeepAlive,
+        _ => PacketType::ServerboundOther,
+    }
+}
+
+/// Project an outgoing packet into the stable [`PacketView`] a mod observes in
+/// its `on_serverbound` (pre-send) hook. Only the mod-relevant subset carries
+/// decoded fields; everything else surfaces as [`PacketView::Other`].
+pub fn serverbound_view(p: &ServerboundPacket) -> PacketView {
+    match p {
+        ServerboundPacket::ChatMessage { message } => PacketView::OutChat {
+            message: message.clone(),
+        },
+        ServerboundPacket::PlayerPosition { x, y, z, on_ground } => PacketView::OutPlayerPosition {
+            x: *x,
+            y: *y,
+            z: *z,
+            on_ground: *on_ground,
+        },
+        ServerboundPacket::PlayerPositionLook {
+            x, y, z, on_ground, ..
+        } => PacketView::OutPlayerPosition {
+            x: *x,
+            y: *y,
+            z: *z,
+            on_ground: *on_ground,
+        },
+        ServerboundPacket::PlayerDigging {
+            status,
+            x,
+            y,
+            z,
+            face,
+        } => PacketView::OutPlayerDigging {
+            status: *status as u8,
+            x: *x,
+            y: *y,
+            z: *z,
+            face: *face,
+        },
+        other => PacketView::Other {
+            ty: serverbound_type(other),
+            raw_id: 0,
         },
     }
 }

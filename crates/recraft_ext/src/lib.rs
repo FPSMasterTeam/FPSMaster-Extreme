@@ -35,7 +35,10 @@ pub use manifest::{
     load_order, Capability, ManifestError, ModManifest, Tier, JS_API_VERSION, NATIVE_API_VERSION,
 };
 pub use packet::{PacketBuild, PacketType, PacketView};
-pub use view::{BlockView, EntityKindView, EntityView, PlayerView, ReadViews};
+pub use view::{
+    BlockView, CapabilitiesView, ContainerInfo, EffectView, EntityKindView, EntityView, ItemView,
+    PlayerView, ReadViews,
+};
 
 #[cfg(test)]
 mod tests {
@@ -62,7 +65,14 @@ mod tests {
             }
         }
         fn block_at(&self, _x: i32, _y: i32, _z: i32) -> BlockView {
-            BlockView { id: 1, meta: 0 }
+            BlockView {
+                id: 1,
+                meta: 0,
+                is_air: false,
+                luminance: 0,
+                opaque: true,
+                shape: "cube",
+            }
         }
         fn entities(&self) -> Vec<EntityView> {
             Vec::new()
@@ -79,6 +89,37 @@ mod tests {
         fn loaded_chunk_count(&self) -> usize {
             9
         }
+        fn held_item(&self) -> Option<ItemView> {
+            None
+        }
+        fn inventory(&self) -> Vec<Option<ItemView>> {
+            Vec::new()
+        }
+        fn selected_slot(&self) -> i32 {
+            0
+        }
+        fn capabilities(&self) -> CapabilitiesView {
+            CapabilitiesView {
+                invulnerable: false,
+                flying: false,
+                allow_flying: false,
+                creative: false,
+                fly_speed: 0.05,
+                walk_speed: 0.1,
+            }
+        }
+        fn effects(&self) -> Vec<EffectView> {
+            Vec::new()
+        }
+        fn xp(&self) -> (f32, i32) {
+            (0.0, 0)
+        }
+        fn open_container(&self) -> Option<ContainerInfo> {
+            None
+        }
+        fn connected(&self) -> bool {
+            true
+        }
     }
 
     #[test]
@@ -87,7 +128,7 @@ mod tests {
             id = "coords_hud"
             version = "1.0.0"
             tier = "js"
-            api = "^0.1"
+            api = "^0.2"
             entry = "main.js"
             capabilities = ["hud", "read_player"]
         "#;
@@ -406,7 +447,7 @@ mod tests {
             std::fs::write(
                 md.join("mod.toml"),
                 format!(
-                    "id = \"{id}\"\nversion = \"1.0.0\"\ntier = \"js\"\napi = \"^0.1\"\nentry = \"main.js\"\ndepends = [{depends}]\n"
+                    "id = \"{id}\"\nversion = \"1.0.0\"\ntier = \"js\"\napi = \"^0.2\"\nentry = \"main.js\"\ndepends = [{depends}]\n"
                 ),
             )
             .unwrap();

@@ -12,7 +12,10 @@ use crate::event::{ExtEvent, Verdict};
 use crate::hud::{HudCtx, HudDraw};
 use crate::input::InputEvent;
 use crate::packet::{PacketBuild, PacketView};
-use crate::view::{BlockView, EntityView, PlayerView, ReadViews};
+use crate::view::{
+    BlockView, CapabilitiesView, ContainerInfo, EffectView, EntityView, ItemView, PlayerView,
+    ReadViews,
+};
 
 /// Context handed to every hook: live read-views in, a command sink out.
 pub struct HookCtx<'a> {
@@ -66,6 +69,30 @@ impl<'a> HookCtx<'a> {
     }
     pub fn loaded_chunk_count(&self) -> usize {
         self.views.loaded_chunk_count()
+    }
+    pub fn held_item(&self) -> Option<ItemView> {
+        self.views.held_item()
+    }
+    pub fn inventory(&self) -> Vec<Option<ItemView>> {
+        self.views.inventory()
+    }
+    pub fn selected_slot(&self) -> i32 {
+        self.views.selected_slot()
+    }
+    pub fn capabilities(&self) -> CapabilitiesView {
+        self.views.capabilities()
+    }
+    pub fn effects(&self) -> Vec<EffectView> {
+        self.views.effects()
+    }
+    pub fn xp(&self) -> (f32, i32) {
+        self.views.xp()
+    }
+    pub fn open_container(&self) -> Option<ContainerInfo> {
+        self.views.open_container()
+    }
+    pub fn connected(&self) -> bool {
+        self.views.connected()
     }
 
     // ---- commands ----
@@ -135,6 +162,56 @@ impl<'a> HookCtx<'a> {
             color,
             enabled,
         });
+    }
+
+    // ---- world / player actions ----
+    pub fn place_block(&mut self, x: i32, y: i32, z: i32, face: u8, cursor: [u8; 3]) {
+        self.commands.push(ExtCommand::PlaceBlock {
+            x,
+            y,
+            z,
+            face,
+            cursor,
+        });
+    }
+    pub fn digging(&mut self, status: u8, x: i32, y: i32, z: i32, face: u8) {
+        self.commands.push(ExtCommand::Digging {
+            status,
+            x,
+            y,
+            z,
+            face,
+        });
+    }
+    pub fn attack_entity(&mut self, id: i32) {
+        self.commands.push(ExtCommand::AttackEntity { id });
+    }
+    pub fn interact_entity(&mut self, id: i32, at: Option<[f32; 3]>) {
+        self.commands.push(ExtCommand::InteractEntity { id, at });
+    }
+    pub fn container_click(&mut self, slot: i16, button: i8, mode: i8) {
+        self.commands.push(ExtCommand::ContainerClick { slot, button, mode });
+    }
+    pub fn container_close(&mut self) {
+        self.commands.push(ExtCommand::ContainerClose);
+    }
+    pub fn open_inventory(&mut self) {
+        self.commands.push(ExtCommand::OpenInventory);
+    }
+    pub fn select_slot(&mut self, slot: i32) {
+        self.commands.push(ExtCommand::SelectSlot { slot });
+    }
+    pub fn swing_arm(&mut self) {
+        self.commands.push(ExtCommand::SwingArm);
+    }
+    pub fn use_item(&mut self) {
+        self.commands.push(ExtCommand::UseItem);
+    }
+    pub fn set_rotation(&mut self, yaw: f32, pitch: f32, silent: bool) {
+        self.commands.push(ExtCommand::SetRotation { yaw, pitch, silent });
+    }
+    pub fn clear_silent_rotation(&mut self) {
+        self.commands.push(ExtCommand::ClearSilentRotation);
     }
 }
 

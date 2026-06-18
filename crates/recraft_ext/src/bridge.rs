@@ -150,6 +150,61 @@ pub(crate) fn handle_cmd(json: &str) {
             luminance: int_field(&v, "lum").clamp(0, 15) as u8,
             tint: rgb_field(&v, "tint"),
         }),
+        "place" => Some(ExtCommand::PlaceBlock {
+            x: int_field(&v, "x") as i32,
+            y: int_field(&v, "y") as i32,
+            z: int_field(&v, "z") as i32,
+            face: int_field(&v, "face") as u8,
+            cursor: [
+                int_field(&v, "cx").clamp(0, 15) as u8,
+                int_field(&v, "cy").clamp(0, 15) as u8,
+                int_field(&v, "cz").clamp(0, 15) as u8,
+            ],
+        }),
+        "dig" => Some(ExtCommand::Digging {
+            status: int_field(&v, "status") as u8,
+            x: int_field(&v, "x") as i32,
+            y: int_field(&v, "y") as i32,
+            z: int_field(&v, "z") as i32,
+            face: int_field(&v, "face") as u8,
+        }),
+        "attack" => Some(ExtCommand::AttackEntity {
+            id: int_field(&v, "id") as i32,
+        }),
+        "interact" => Some(ExtCommand::InteractEntity {
+            id: int_field(&v, "id") as i32,
+            at: if v.get("ax").is_some() {
+                Some([
+                    f64_field(&v, "ax") as f32,
+                    f64_field(&v, "ay") as f32,
+                    f64_field(&v, "az") as f32,
+                ])
+            } else {
+                None
+            },
+        }),
+        "click" => Some(ExtCommand::ContainerClick {
+            slot: int_field(&v, "slot") as i16,
+            button: int_field(&v, "button") as i8,
+            mode: int_field(&v, "mode") as i8,
+        }),
+        "close" => Some(ExtCommand::ContainerClose),
+        "openInv" => Some(ExtCommand::OpenInventory),
+        "selectSlot" => Some(ExtCommand::SelectSlot {
+            slot: int_field(&v, "slot") as i32,
+        }),
+        "swing" => Some(ExtCommand::SwingArm),
+        "useItem" => Some(ExtCommand::UseItem),
+        "rotate" => Some(ExtCommand::SetRotation {
+            yaw: f64_field(&v, "yaw") as f32,
+            pitch: f64_field(&v, "pitch") as f32,
+            silent: v.get("silent").and_then(Value::as_bool).unwrap_or(false),
+        }),
+        "clearRotate" => Some(ExtCommand::ClearSilentRotation),
+        "saveConfig" => Some(ExtCommand::SaveConfig {
+            dir: str_field(&v, "dir"),
+            json: str_field(&v, "json"),
+        }),
         _ => None,
     };
     if let Some(cmd) = cmd {
@@ -190,7 +245,11 @@ pub(crate) fn handle_query(json: &str) -> String {
                 int_field(&v, "y") as i32,
                 int_field(&v, "z") as i32,
             );
-            json!({ "id": b.id, "meta": b.meta }).to_string()
+            json!({
+                "id": b.id, "meta": b.meta, "isAir": b.is_air,
+                "luminance": b.luminance, "opaque": b.opaque, "shape": b.shape
+            })
+            .to_string()
         }
         "entities" => {
             let list: Vec<Value> = views
@@ -209,6 +268,46 @@ pub(crate) fn handle_query(json: &str) -> String {
         }
         "time" => views.world_time().to_string(),
         "dim" => views.dimension().to_string(),
+        "chunks" => views.loaded_chunk_count().to_string(),
+        "connected" => views.connected().to_string(),
+        "held" => item_json(views.held_item()),
+        "selectedSlot" => views.selected_slot().to_string(),
+        "inventory" => {
+            let list: Vec<Value> = views
+                .inventory()
+                .into_iter()
+                .map(|it| match it {
+                    Some(i) => json!({ "id": i.id, "count": i.count, "damage": i.damage }),
+                    None => Value::Null,
+                })
+                .collect();
+            Value::Array(list).to_string()
+        }
+        "capabilities" => {
+            let c = views.capabilities();
+            json!({
+                "invulnerable": c.invulnerable, "flying": c.flying,
+                "allowFlying": c.allow_flying, "creative": c.creative,
+                "flySpeed": c.fly_speed, "walkSpeed": c.walk_speed
+            })
+            .to_string()
+        }
+        "effects" => {
+            let list: Vec<Value> = views
+                .effects()
+                .into_iter()
+                .map(|e| json!({ "id": e.id, "amplifier": e.amplifier, "duration": e.duration }))
+                .collect();
+            Value::Array(list).to_string()
+        }
+        "xp" => {
+            let (bar, level) = views.xp();
+            json!({ "bar": bar, "level": level }).to_string()
+        }
+        "container" => match views.open_container() {
+            Some(c) => json!({ "windowId": c.window_id, "kind": c.kind, "size": c.size }).to_string(),
+            None => "null".to_string(),
+        },
         _ => "null".to_string(),
     })
     .unwrap_or_else(|| "null".to_string())
@@ -350,6 +449,13 @@ fn log_level(l: i64) -> LogLevel {
         1 => LogLevel::Warn,
         3 => LogLevel::Debug,
         _ => LogLevel::Info,
+    }
+}
+
+fn item_json(item: Option<crate::view::ItemView>) -> String {
+    match item {
+        Some(i) => json!({ "id": i.id, "count": i.count, "damage": i.damage }).to_string(),
+        None => "null".to_string(),
     }
 }
 

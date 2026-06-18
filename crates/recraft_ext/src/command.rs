@@ -92,4 +92,47 @@ pub enum ExtCommand {
         luminance: u8,
         tint: Option<[f32; 3]>,
     },
+
+    // ---- world / player interactions (mod -> host -> server) ----
+    /// Place the held item against a block face (C08 PlayerBlockPlacement).
+    PlaceBlock {
+        x: i32,
+        y: i32,
+        z: i32,
+        face: u8,
+        cursor: [u8; 3],
+    },
+    /// Raw block digging (C07): status 0 start, 1 cancel, 2 finish, 3 drop-stack,
+    /// 4 drop-item, 5 release-use.
+    Digging {
+        status: u8,
+        x: i32,
+        y: i32,
+        z: i32,
+        face: u8,
+    },
+    /// Attack an entity by id (C02 UseEntity Attack + swing).
+    AttackEntity { id: i32 },
+    /// Interact with / right-click an entity (`at` = hit point for InteractAt).
+    InteractEntity { id: i32, at: Option<[f32; 3]> },
+    /// Click a slot in the open window (C0E ClickWindow). `mode`/`button` are the
+    /// vanilla inventory-action codes.
+    ContainerClick { slot: i16, button: i8, mode: i8 },
+    /// Close the open window (C0D CloseWindow).
+    ContainerClose,
+    /// Open the player inventory window.
+    OpenInventory,
+    /// Select a hotbar slot 0..8 (C09 HeldItemChange).
+    SelectSlot { slot: i32 },
+    /// Swing the arm (C0A Animation).
+    SwingArm,
+    /// Use the held item with no target (C08 at -1,255,-1 — eat/draw bow/block).
+    UseItem,
+    /// Set the look the *server* sees. `silent` keeps the camera/view unchanged
+    /// (the rotation only rides the next movement packet) — the pre-event style.
+    SetRotation { yaw: f32, pitch: f32, silent: bool },
+    /// Clear a silent look override (resume sending the real camera rotation).
+    ClearSilentRotation,
+    /// Persist this mod's config JSON to `<mod dir>/config.json`.
+    SaveConfig { dir: String, json: String },
 }

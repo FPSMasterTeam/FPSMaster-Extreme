@@ -20,22 +20,68 @@ pub struct PlayerView {
     pub sprinting: bool,
 }
 
-/// A single block state (1.8 pre-flattening: numeric id + 4-bit meta).
+/// A block state (1.8 pre-flattening: numeric id + 4-bit meta) plus its resolved
+/// render/light properties.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockView {
     pub id: u16,
     pub meta: u8,
+    pub is_air: bool,
+    /// Block light this block emits, 0..=15.
+    pub luminance: u8,
+    /// Whether it fully occludes the neighbouring face.
+    pub opaque: bool,
+    /// Render shape name (`"cube"`, `"cross"`, `"fluid"`, `"none"`, …).
+    pub shape: &'static str,
 }
 
 impl BlockView {
-    pub const AIR: BlockView = BlockView { id: 0, meta: 0 };
+    pub const AIR: BlockView = BlockView {
+        id: 0,
+        meta: 0,
+        is_air: true,
+        luminance: 0,
+        opaque: false,
+        shape: "none",
+    };
 
-    /// Highest id a 1.8.9 vanilla server can send; ids above behave as air.
+    /// Highest id a 1.8.9 vanilla server can send.
     pub const MAX_VANILLA_ID: u16 = 197;
+}
 
-    pub fn is_air(&self) -> bool {
-        self.id == 0 || self.id > Self::MAX_VANILLA_ID
-    }
+/// An inventory item stack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ItemView {
+    pub id: i16,
+    pub count: u8,
+    pub damage: i16,
+}
+
+/// The local player's abilities (vanilla PlayerCapabilities).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CapabilitiesView {
+    pub invulnerable: bool,
+    pub flying: bool,
+    pub allow_flying: bool,
+    pub creative: bool,
+    pub fly_speed: f32,
+    pub walk_speed: f32,
+}
+
+/// An active potion effect on the local player.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EffectView {
+    pub id: u8,
+    pub amplifier: i8,
+    pub duration: i32,
+}
+
+/// The open window/container (without per-slot contents, for now).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerInfo {
+    pub window_id: i32,
+    pub kind: String,
+    pub size: usize,
 }
 
 /// Discriminates an entity's category for a read-view / event payload.
@@ -77,4 +123,15 @@ pub trait ReadViews {
     fn world_time(&self) -> i64;
     fn dimension(&self) -> i32;
     fn loaded_chunk_count(&self) -> usize;
+    // ---- player state / inventory ----
+    fn held_item(&self) -> Option<ItemView>;
+    fn inventory(&self) -> Vec<Option<ItemView>>;
+    fn selected_slot(&self) -> i32;
+    fn capabilities(&self) -> CapabilitiesView;
+    fn effects(&self) -> Vec<EffectView>;
+    /// (xp bar fill 0..1, xp level).
+    fn xp(&self) -> (f32, i32);
+    fn open_container(&self) -> Option<ContainerInfo>;
+    /// Whether a server connection is active.
+    fn connected(&self) -> bool;
 }

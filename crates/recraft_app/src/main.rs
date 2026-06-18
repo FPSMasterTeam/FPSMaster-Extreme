@@ -777,6 +777,10 @@ impl ApplicationHandler for WinitApp {
                     self.attack_pressed = false;
                     self.use_pressed = false;
                     let abilities = app.game.take_abilities_packet();
+                    // Extension pre-send hook (on_serverbound): a mod may observe
+                    // or drop each natural client packet this tick. Movement is
+                    // not routed through it (a dropped move would desync physics).
+                    let actions = filter_serverbound(app, actions);
                     if let Some(network) = &app.network {
                         if app.game.can_send_movement_packets() {
                             // Frame-time GUI packets (ClickWindow, …) first, then
@@ -1355,8 +1359,112 @@ fn apply_ext_commands(app: &mut App) {
                     luminance,
                 );
             }
+
+            // ---- world / player interactions ----
+            recraft_ext::ExtCommand::PlaceBlock {
+                x,
+                y,
+                z,
+                face,
+                cursor,
+            } => {
+                let packets = app.game.ext_place_block(x, y, z, face, cursor);
+                send_all(app, packets);
+            }
+            recraft_ext::ExtCommand::Digging {
+                status,
+                x,
+                y,
+                z,
+                face,
+            } => {
+                if let Some(net) = &app.network {
+                    net.send_packet(ext_bridge::build_to_serverbound(
+                        recraft_ext::PacketBuild::PlayerDigging {
+                            status,
+                            x,
+                            y,
+                            z,
+                            face,
+                        },
+                    ));
+                }
+            }
+            recraft_ext::ExtCommand::AttackEntity { id } => {
+                let packets = app.game.ext_attack_entity(id);
+                send_all(app, packets);
+            }
+            recraft_ext::ExtCommand::InteractEntity { id, at } => {
+                let packets = app.game.ext_interact_entity(id, at);
+                send_all(app, packets);
+            }
+            recraft_ext::ExtCommand::ContainerClick { slot, button, mode } => {
+                let packets = app.game.container_click(slot, button, mode);
+                send_all(app, packets);
+            }
+            recraft_ext::ExtCommand::ContainerClose => {
+                if let Some(packet) = app.game.container_close() {
+                    if let Some(net) = &app.network {
+                        net.send_packet(packet);
+                    }
+                }
+            }
+            recraft_ext::ExtCommand::OpenInventory => app.game.open_player_inventory(),
+            recraft_ext::ExtCommand::SelectSlot { slot } => {
+                let packets = app.game.ext_select_slot(slot);
+                send_all(app, packets);
+            }
+            recraft_ext::ExtCommand::SwingArm => {
+                let packets = app.game.ext_swing();
+                send_all(app, packets);
+            }
+            recraft_ext::ExtCommand::UseItem => {
+                let packets = app.game.ext_use_item();
+                send_all(app, packets);
+            }
+            recraft_ext::ExtCommand::SetRotation { yaw, pitch, silent } => {
+                app.game.ext_set_rotation(yaw, pitch, silent);
+            }
+            recraft_ext::ExtCommand::ClearSilentRotation => {
+                app.game.ext_clear_silent_rotation();
+            }
+            recraft_ext::ExtCommand::SaveConfig { dir, json } => {
+                let path = std::path::Path::new(&dir).join("config.json");
+                if let Err(e) = std::fs::write(&path, json) {
+                    log::warn!("[ext] config save failed ({}): {e}", path.display());
+                }
+            }
         }
     }
+}
+
+/// Send a batch of mod-built serverbound packets, if connected.
+fn send_all(app: &App, packets: Vec<ServerboundPacket>) {
+    if let Some(net) = &app.network {
+        for packet in packets {
+            net.send_packet(packet);
+        }
+    }
+}
+
+/// Run each natural client packet through the extension `on_serverbound`
+/// pre-send hook, keeping only the ones no mod vetoed (`Verdict::Drop`). Any
+/// commands a mod queued in the hook are drained by the next `apply_ext_commands`.
+fn filter_serverbound(app: &mut App, packets: Vec<ServerboundPacket>) -> Vec<ServerboundPacket> {
+    if app.ext.is_empty() {
+        return packets;
+    }
+    let mut kept = Vec::with_capacity(packets.len());
+    for packet in packets {
+        let view = ext_bridge::serverbound_view(&packet);
+        let verdict = app
+            .ext
+            .dispatch_serverbound_packet(&view, &GameViews(&app.game));
+        if !matches!(verdict, recraft_ext::Verdict::Drop) {
+            kept.push(packet);
+        }
+    }
+    kept
 }
 
 /// Apply a preset render modification. `BlockTint` accumulates into `app` (a

@@ -582,6 +582,10 @@ pub struct GameState {
     /// reported to the server. C09 is sent lazily (syncCurrentPlayItem) on the
     /// next interaction, not on the slot change itself.
     current_player_item: i32,
+    /// Extension silent-look override (vanilla-style "pre" rotation): when set,
+    /// the *server-visible* yaw/pitch in each movement packet is this instead of
+    /// the camera, while the rendered view stays put. Cleared by ClearSilentRotation.
+    server_look: Option<(f32, f32)>,
     /// This tick's input intents, consumed inside `tick` before the move.
     pending_actions: TickActions,
     /// Vanilla `isSprinting()`. Recomputed each tick by the `onLivingUpdate`
@@ -847,6 +851,7 @@ impl GameState {
             right_click_delay_timer: 0,
             block_hit_delay: 0,
             current_player_item: 0,
+            server_look: None,
             pending_actions: TickActions::default(),
             sprinting: false,
             sprint_toggle_timer: 0,
@@ -1059,6 +1064,19 @@ impl GameState {
         self.xp_level
     }
 
+    /// The local player's abilities (extension read-view).
+    pub fn capabilities(&self) -> PlayerCapabilities {
+        self.capabilities
+    }
+
+    /// Active potion effects as `(id, amplifier, duration)` (extension read-view).
+    pub fn active_effects(&self) -> Vec<(u8, i8, i32)> {
+        self.effects
+            .iter()
+            .map(|(id, e)| (*id, e.amplifier, e.duration))
+            .collect()
+    }
+
     pub fn title_overlay(&self, partial_ticks: f32) -> Option<TitleOverlay<'_>> {
         self.title.overlay(partial_ticks)
     }
@@ -1181,6 +1199,95 @@ impl GameState {
             volume,
             pitch,
         });
+    }
+
+    // ─── Extension actions (mod -> host -> server) ───────────────────────────
+
+    /// Place the held item against a block face (extension PlaceBlock). Runs the
+    /// vanilla `onPlayerRightClick` C08 path with a caller-supplied target/cursor,
+    /// then swings.
+    pub fn ext_place_block(
+        &mut self,
+        x: i32,
+        y: i32,
+        z: i32,
+        face: u8,
+        cursor: [u8; 3],
+    ) -> Vec<ServerboundPacket> {
+        let mut out = Vec::new();
+        self.on_player_right_click(x, y, z, face, cursor[0], cursor[1], cursor[2], &mut out);
+        self.swing_item(&mut out);
+        out
+    }
+
+    /// Attack an entity by id (extension AttackEntity): vanilla C02 ATTACK + swing.
+    pub fn ext_attack_entity(&mut self, id: i32) -> Vec<ServerboundPacket> {
+        let mut out = Vec::new();
+        self.swing_item(&mut out);
+        self.attack_entity(id, &mut out);
+        out
+    }
+
+    /// Right-click / interact with an entity (extension InteractEntity). `at` is
+    /// the hit point for the InteractAt variant (vanilla sends InteractAt then
+    /// Interact).
+    pub fn ext_interact_entity(&mut self, id: i32, at: Option<[f32; 3]>) -> Vec<ServerboundPacket> {
+        let mut out = Vec::new();
+        self.sync_current_play_item(&mut out);
+        if let Some([x, y, z]) = at {
+            out.push(ServerboundPacket::UseEntity {
+                target: id,
+                kind: UseEntityKind::InteractAt { x, y, z },
+            });
+            self.sync_current_play_item(&mut out);
+        }
+        out.push(ServerboundPacket::UseEntity {
+            target: id,
+            kind: UseEntityKind::Interact,
+        });
+        out
+    }
+
+    /// Use the held item with no target (extension UseItem): vanilla `sendUseItem`.
+    pub fn ext_use_item(&mut self) -> Vec<ServerboundPacket> {
+        let mut out = Vec::new();
+        self.send_use_item(&mut out);
+        out
+    }
+
+    /// Swing the arm (extension SwingArm): drive the animation and send C0A.
+    pub fn ext_swing(&mut self) -> Vec<ServerboundPacket> {
+        let mut out = Vec::new();
+        self.swing_item(&mut out);
+        out
+    }
+
+    /// Select a hotbar slot 0..8 (extension SelectSlot): update the local
+    /// selection and send C09 HeldItemChange.
+    pub fn ext_select_slot(&mut self, slot: i32) -> Vec<ServerboundPacket> {
+        let slot = slot.clamp(0, 8);
+        self.selected_slot = slot;
+        self.current_player_item = slot;
+        vec![ServerboundPacket::HeldItemChange { slot: slot as i16 }]
+    }
+
+    /// Set the player's look (extension SetRotation). `silent` keeps the camera
+    /// where it is and only overrides the server-visible rotation on the next
+    /// movement packet (vanilla-style "pre" rotation); otherwise it turns the
+    /// camera too and clears any silent override.
+    pub fn ext_set_rotation(&mut self, yaw: f32, pitch: f32, silent: bool) {
+        if silent {
+            self.server_look = Some((yaw, pitch.clamp(-90.0, 90.0)));
+        } else {
+            self.server_look = None;
+            self.debug_set_look(yaw, pitch);
+        }
+    }
+
+    /// Clear a silent-look override (extension ClearSilentRotation): resume
+    /// sending the real camera rotation.
+    pub fn ext_clear_silent_rotation(&mut self) {
+        self.server_look = None;
     }
 
     /// Queue a positional sound event at a world position.
@@ -4185,12 +4292,17 @@ impl GameState {
     }
 
     fn movement_snapshot(&self) -> MovementSnapshot {
+        // A silent-look override (extension `setRotation` with silent) rides the
+        // movement packet so the server sees that rotation while the camera stays.
+        let (yaw, pitch) = self
+            .server_look
+            .unwrap_or((self.player.yaw, self.player.pitch));
         MovementSnapshot {
             x: self.player.position.x,
             y: self.player.position.y,
             z: self.player.position.z,
-            yaw: self.player.yaw,
-            pitch: self.player.pitch,
+            yaw,
+            pitch,
             on_ground: self.player.on_ground,
             entity_id: self.player.id.0,
             sneaking: self.input.sneak,
