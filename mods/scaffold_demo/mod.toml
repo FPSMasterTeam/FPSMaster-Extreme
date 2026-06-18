@@ -1,0 +1,8 @@
+id = "scaffold_demo"
+version = "1.0.0"
+tier = "js"
+api = "^0.2"
+entry = "main.js"
+capabilities = ["input", "read_player", "read_world", "inject_packet", "hud"]
+name = "Scaffold (demo)"
+description = "Press G: auto-aim + place a block under your feet, vanilla-legit."
