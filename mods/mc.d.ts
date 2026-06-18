@@ -262,6 +262,9 @@ interface Mc {
   warn(...args: unknown[]): void;
   error(...args: unknown[]): void;
 
+  /** Monotonic real-time milliseconds (for rate-limiting actions in real time). */
+  now(): number;
+
   // ---- event subscription ----
   on(event: "tick" | "frame" | "load", cb: () => void): void;
   /** Return `true` to consume the key (suppress default gameplay handling). */
