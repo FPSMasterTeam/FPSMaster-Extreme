@@ -19,8 +19,8 @@ pub enum DemoKind {
 use recraft_core::{
     collision::{is_fence, is_pane, is_stairs},
     mc_math::wrap_degrees,
-    resting_on_ground, BlockState, ChunkPos, EntityId, EntityKind, EntityState, PlayerInput,
-    PlayerPhysics, RenderShape, SectionPos, World,
+    movement_direction, resting_on_ground, BlockState, ChunkPos, EntityId, EntityKind, EntityState,
+    PlayerInput, PlayerPhysics, RenderShape, SectionPos, World,
 };
 use recraft_protocol::v1_8_9::{
     chunk::{decode_chunk_column, ChunkColumnData},
@@ -708,6 +708,55 @@ fn held_item_right_state(item: Option<&SlotItem>, using_item: bool) -> u8 {
 /// Whether a held item id is a placeable block (`ItemBlock`), used to decide if
 /// a right-click on a block was consumed by placing (vanilla `onItemUse`). Block
 /// items share the block id range 1..256.
+/// Whether two yaws point meaningfully different ways (so a silent look needs
+/// the strict-movement remap). Tolerates float noise / 360 wrap.
+fn yaw_differs(a: f32, b: f32) -> bool {
+    let d = wrap_degrees(a - b).abs();
+    d > 0.01
+}
+
+/// Sign of a movement input axis as -1/0/1 (vanilla `moveForward`/`moveStrafing`
+/// are always one of these before scaling).
+fn sign3(v: f32) -> i32 {
+    if v > 0.0 {
+        1
+    } else if v < 0.0 {
+        -1
+    } else {
+        0
+    }
+}
+
+/// Remap a movement input so it stays one of the 8 legal directions but, under
+/// `silent_yaw`, points as close as possible to where the player intended to go
+/// under `real_yaw`. Preserves the input magnitude (so the sneak/use-item speed
+/// scaling is unchanged); idle stays idle. Both client and server then derive
+/// the same legal input from the silent yaw, so prediction stays in sync.
+fn remap_input_to_yaw(forward: f32, strafe: f32, real_yaw: f32, silent_yaw: f32) -> (f32, f32) {
+    let (fp, sp) = (sign3(forward), sign3(strafe));
+    if fp == 0 && sp == 0 {
+        return (forward, strafe);
+    }
+    let magnitude = forward.abs().max(strafe.abs());
+    let intended = movement_direction(fp as f32, sp as f32, real_yaw);
+    let mut best = (fp, sp);
+    let mut best_dot = f64::NEG_INFINITY;
+    for f in [-1i32, 0, 1] {
+        for s in [-1i32, 0, 1] {
+            if f == 0 && s == 0 {
+                continue;
+            }
+            let dir = movement_direction(f as f32, s as f32, silent_yaw);
+            let dot = dir.x * intended.x + dir.z * intended.z;
+            if dot > best_dot {
+                best_dot = dot;
+                best = (f, s);
+            }
+        }
+    }
+    (best.0 as f32 * magnitude, best.1 as f32 * magnitude)
+}
+
 fn is_block_item(id: i16) -> bool {
     (1..256).contains(&id)
 }
@@ -1822,6 +1871,20 @@ impl GameState {
             if self.is_using_item() {
                 input.forward *= 0.2;
                 input.strafe *= 0.2;
+            }
+            // Silent-look strict movement: when the server sees a different yaw
+            // than the camera (a silent rotation), drive the move with that yaw
+            // and snap the input to the legal direction nearest the player's
+            // intent. A player can only move in 8 directions, so this keeps the
+            // server's movement prediction in sync with the flying-packet yaw.
+            if let Some((silent_yaw, _)) = self.server_look {
+                if yaw_differs(silent_yaw, self.player.yaw) {
+                    let (f, s) =
+                        remap_input_to_yaw(input.forward, input.strafe, self.player.yaw, silent_yaw);
+                    input.forward = f;
+                    input.strafe = s;
+                    input.move_yaw = Some(silent_yaw);
+                }
             }
             self.physics.tick(&self.world, &mut self.player, input);
         } else {
@@ -7671,5 +7734,30 @@ mod interaction_tests {
             metadata: vec![MetadataEntry { index: 6, value: MetadataValue::Float(0.0) }],
         });
         assert!(g.boss_bar().is_none());
+    }
+
+    #[test]
+    fn silent_yaw_remap_keeps_idle_and_magnitude() {
+        // Idle stays idle (no spurious movement under a silent look).
+        assert_eq!(remap_input_to_yaw(0.0, 0.0, 0.0, 90.0), (0.0, 0.0));
+        // The input magnitude (here a use-item 0.2) is preserved, only the
+        // direction (sign pattern) is remapped.
+        let (f, s) = remap_input_to_yaw(0.2, 0.0, 0.0, 90.0);
+        assert!((f.abs().max(s.abs()) - 0.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn silent_yaw_remap_preserves_world_direction() {
+        // Walking forward (world +Z) while the server sees a yaw rotated by a
+        // multiple of 45° must still move the player toward world +Z — the remap
+        // picks the legal input under the silent yaw that points the same way.
+        for &ys in &[45.0_f32, 90.0, 135.0, 180.0, -90.0] {
+            let (f, s) = remap_input_to_yaw(1.0, 0.0, 0.0, ys);
+            let intended = movement_direction(1.0, 0.0, 0.0);
+            let got = movement_direction(f, s, ys);
+            let cos = (intended.x * got.x + intended.z * got.z)
+                / (intended.length() * got.length());
+            assert!(cos > 0.92, "silent yaw {ys}: world dir drifted, cos={cos}");
+        }
     }
 }
