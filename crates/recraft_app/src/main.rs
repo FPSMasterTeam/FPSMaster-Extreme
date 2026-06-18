@@ -776,6 +776,14 @@ impl ApplicationHandler for WinitApp {
                     right_held: self.right_held,
                     old_animations: app.settings.old_animations,
                 });
+                // The extension tick runs BEFORE physics — the vanilla position
+                // for input/interactions in `runTick`. A mod sets its silent look
+                // and queues interactions now, so the look lands in THIS tick's
+                // flying packet and a placement is flushed in the pre-flying
+                // window: the place-then-flying order (with a matching rotation)
+                // that Grim's RotationPlace expects.
+                app.ext.dispatch_tick(&GameViews(&app.game));
+                apply_ext_commands(app);
                 if let Some((actions, movement)) = app.game.tick(0.05) {
                     self.slot_select = None;
                     self.slot_scroll = 0;
@@ -812,10 +820,8 @@ impl ApplicationHandler for WinitApp {
                         }
                     }
                 }
-                app.ext.dispatch_tick(&GameViews(&app.game));
                 self.tick_accumulator -= 0.05;
             }
-            apply_ext_commands(app);
         }
         if !self.scripted_smoke_done
             && self.scripted_smoke_seconds
