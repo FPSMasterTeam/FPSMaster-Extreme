@@ -41,7 +41,10 @@ struct PostCamera {
 };
 @group(3) @binding(0) var scene_tex: texture_2d<f32>;
 @group(3) @binding(1) var scene_sampler: sampler;
-@group(3) @binding(2) var depth_tex: texture_depth_2d;
+// World depth, bound as an unfilterable-float texture (not texture_depth_2d): the
+// GLSL backend maps a depth texture to sampler2DShadow, which has no plain
+// textureLoad overload. As a float texture it reads back via texelFetch.
+@group(3) @binding(2) var depth_tex: texture_2d<f32>;
 @group(3) @binding(3) var<uniform> ssr_cam: PostCamera;
 
 // March the reflected ray through the depth buffer. Returns reflected colour in
@@ -66,7 +69,7 @@ fn screen_space_reflection(origin: vec3<f32>, dir: vec3<f32>) -> vec4<f32> {
             break;
         }
         let px = vec2<i32>(clamp(uv * dims, vec2<f32>(0.0), dims - 1.0));
-        let scene_depth = textureLoad(depth_tex, px, 0);
+        let scene_depth = textureLoad(depth_tex, px, 0).r;
         let delta = ndc.z - scene_depth;
         // Ray went just behind the stored surface → intersection (thickness-bounded).
         if (delta > 0.00002 && delta < 0.0025) {
