@@ -4,6 +4,9 @@
 
 struct ShadowUniform {
     light_view_proj: mat4x4<f32>,
+    // Render origin in whole blocks: subtracted from world positions so the depth
+    // is rendered in the same camera-relative frame the chunk shaders sample.
+    origin: vec4<i32>,
 };
 
 @group(0) @binding(0)
@@ -28,7 +31,9 @@ fn vs_main(
     @location(3) normal: vec4<f32>,
 ) -> VsOut {
     var out: VsOut;
-    let world = vec3<f32>(f32(pos_light.x), f32(pos_light.y), f32(pos_light.z)) / 64.0;
+    // Camera-relative: subtract the render origin in fixed-point i32 (see chunk.wgsl).
+    let rel = pos_light.xyz - shadow.origin.xyz * 64;
+    let world = vec3<f32>(f32(rel.x), f32(rel.y), f32(rel.z)) / 64.0;
     out.pos = shadow.light_view_proj * vec4<f32>(world, 1.0);
     out.uv = uv;
     out.alpha = color.a;

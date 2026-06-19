@@ -7,6 +7,9 @@ struct Camera {
     view_proj: mat4x4<f32>,
     sky_brightness: f32,
     time: f32,
+    tile_size: vec2<f32>,
+    // Render origin in whole blocks (camera-relative rendering); see chunk.wgsl.
+    origin: vec4<i32>,
 };
 
 @group(0) @binding(0) var<uniform> camera: Camera;
@@ -103,7 +106,9 @@ fn wave_height(p: vec2<f32>, t: f32) -> f32 {
 @vertex
 fn vs_main(input: VertexInput) -> VertexOutput {
     var out: VertexOutput;
-    var world_pos = vec3<f32>(f32(input.pos_light.x), f32(input.pos_light.y), f32(input.pos_light.z)) / 64.0;
+    // Camera-relative: subtract the render origin in fixed-point i32 (see chunk.wgsl).
+    let rel = input.pos_light.xyz - camera.origin.xyz * 64;
+    var world_pos = vec3<f32>(f32(rel.x), f32(rel.y), f32(rel.z)) / 64.0;
     var normal = input.normal.xyz;
 
     // Displace + perturb normals only on the top surface, and only with shaders
@@ -111,13 +116,16 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     if (lighting.flags.x > 0.5 && normal.y > 0.5) {
         let t = camera.time;
         let amp = 0.06;
-        world_pos.y += wave_height(world_pos.xz, t) * amp;
+        // Wave phase must use the ABSOLUTE world xz (add the origin back), or the
+        // pattern would slide as the render origin follows the player.
+        let wxz = world_pos.xz + vec2<f32>(f32(camera.origin.x), f32(camera.origin.z));
+        world_pos.y += wave_height(wxz, t) * amp;
         // Analytic gradient of the wave for the surface normal.
         let e = 0.35;
-        let hx = (wave_height(world_pos.xz + vec2<f32>(e, 0.0), t)
-            - wave_height(world_pos.xz - vec2<f32>(e, 0.0), t)) * amp;
-        let hz = (wave_height(world_pos.xz + vec2<f32>(0.0, e), t)
-            - wave_height(world_pos.xz - vec2<f32>(0.0, e), t)) * amp;
+        let hx = (wave_height(wxz + vec2<f32>(e, 0.0), t)
+            - wave_height(wxz - vec2<f32>(e, 0.0), t)) * amp;
+        let hz = (wave_height(wxz + vec2<f32>(0.0, e), t)
+            - wave_height(wxz - vec2<f32>(0.0, e), t)) * amp;
         normal = normalize(vec3<f32>(-hx / (2.0 * e), 1.0, -hz / (2.0 * e)));
     }
 

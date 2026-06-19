@@ -4,6 +4,12 @@ struct Camera {
     // night. Applied to each vertex's sky-light term so open ground darkens at
     // night while block-lit (torch/lava) surfaces keep their brightness.
     sky_brightness: f32,
+    time: f32,
+    tile_size: vec2<f32>,
+    // Render origin in whole blocks: subtracted from every world position so the
+    // view-projection (built with the camera at this origin) stays precise far
+    // from spawn. xyz used; w padding.
+    origin: vec4<i32>,
 };
 
 @group(0) @binding(0)
@@ -66,7 +72,10 @@ struct VertexOutput {
 @vertex
 fn vs_main(input: VertexInput) -> VertexOutput {
     var out: VertexOutput;
-    let world_pos = vec3<f32>(f32(input.pos_light.x), f32(input.pos_light.y), f32(input.pos_light.z)) / 64.0;
+    // Camera-relative: subtract the render origin in fixed-point (×64) i32 before
+    // converting to f32, so the position stays exact at any world coordinate.
+    let rel = input.pos_light.xyz - camera.origin.xyz * 64;
+    let world_pos = vec3<f32>(f32(rel.x), f32(rel.y), f32(rel.z)) / 64.0;
     out.clip_position = camera.view_proj * vec4<f32>(world_pos, 1.0);
     out.color = input.color;
     out.uv = input.uv;

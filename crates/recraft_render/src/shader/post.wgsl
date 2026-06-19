@@ -116,12 +116,14 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         }
     }
 
-    // Motion blur: reproject directly in clip space (prev_VP * inv_VP) to avoid
-    // large-world-coordinate precision loss that causes static-camera blur.
+    // Motion blur: `prev_view_proj` is the full NDC→NDC reprojection for this
+    // frame (prev_abs · inv(cur_abs)), composed in f64 on the CPU so the large
+    // world translations cancel there instead of in f32 here. Apply it straight to
+    // the current clip position — no world-space round-trip, no precision loss.
     if (params.r.w > 0.0) {
         let depth = load_depth(in.uv);
         let cur_clip = vec4<f32>(in.uv.x * 2.0 - 1.0, 1.0 - in.uv.y * 2.0, depth, 1.0);
-        let prev_clip = cam.prev_view_proj * (cam.inv_view_proj * cur_clip);
+        let prev_clip = cam.prev_view_proj * cur_clip;
         let prev_uv = vec2<f32>(
             prev_clip.x / prev_clip.w * 0.5 + 0.5,
             0.5 - prev_clip.y / prev_clip.w * 0.5,

@@ -41,17 +41,39 @@ struct CameraUniform {
     /// Atlas tile size `(du, dv)` — the greedy shader wraps `fract(repeat_uv)`
     /// within a tile. Unused by the smooth shader (it reads absolute UVs).
     tile_size: [f32; 2],
+    /// Render origin in whole blocks (xyz; w unused). `view_proj` is built with
+    /// the camera at `position - origin`, so every shader subtracts this origin
+    /// from its world position before transforming — camera-relative rendering
+    /// that keeps f32 coordinates small far from spawn. The GUI camera uses 0.
+    origin: [i32; 4],
 }
 
 impl CameraUniform {
-    fn new(view_proj: [[f32; 4]; 4], sky_brightness: f32, time: f32, tile_size: [f32; 2]) -> Self {
+    fn new(
+        view_proj: [[f32; 4]; 4],
+        sky_brightness: f32,
+        time: f32,
+        tile_size: [f32; 2],
+        origin: [i32; 4],
+    ) -> Self {
         Self {
             view_proj,
             sky_brightness,
             time,
             tile_size,
+            origin,
         }
     }
+}
+
+/// Sun shadow-map pass uniform: the light view-projection plus the same render
+/// origin as [`CameraUniform`] (the shadow vertex shader subtracts it so depth is
+/// rendered in the camera-relative frame the chunk shaders sample in).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct ShadowUniform {
+    light_view_proj: [[f32; 4]; 4],
+    origin: [i32; 4],
 }
 
 /// Shader-pack lighting uniform (chunk shader group 2): directional sun +
@@ -976,7 +998,7 @@ impl Renderer {
         surface.configure(&device, &config);
 
         let camera_uniform =
-            CameraUniform::new(Mat4::IDENTITY.to_cols_array_2d(), 1.0, 0.0, [0.0, 0.0]);
+            CameraUniform::new(Mat4::IDENTITY.to_cols_array_2d(), 1.0, 0.0, [0.0, 0.0], [0; 4]);
         let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("camera-buffer"),
             contents: bytemuck::bytes_of(&camera_uniform),
@@ -1015,6 +1037,7 @@ impl Renderer {
                 1.0,
                 0.0,
                 [0.0, 0.0],
+                [0; 4],
             )),
             usage: wgpu::BufferUsages::UNIFORM,
         });
@@ -3057,7 +3080,7 @@ impl Renderer {
         });
         let shadow_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("shadow-uniform"),
-            size: 64,
+            size: std::mem::size_of::<ShadowUniform>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -5104,7 +5127,19 @@ impl Renderer {
         // chunk lightmap (sky_brightness), the sky-gradient colors and the
         // sun/moon/star geometry.
         let sky = crate::sky::sky_colors(self.world_time);
+        // Absolute view-projection: kept for CPU frustum culling (tested against
+        // absolute section AABBs) and for the motion-blur reprojection below.
         let view_proj = camera.view_projection();
+        // Camera-relative rendering: pick a render origin at the camera's block,
+        // build the GPU matrices relative to it, and have every shader subtract it
+        // from world positions. This keeps the values fed to the f32 matrices small
+        // so they don't lose precision (jitter / z-fighting / shadow shimmer) far
+        // from the world origin. `origin` is integer-valued, so it round-trips
+        // exactly between the f32 (`origin_f`) and i32 (`origin_i`) forms.
+        let origin_f = camera.position.floor();
+        let origin_i = origin_f.as_ivec3();
+        let cam_rel = camera.position - origin_f;
+        let view_proj_rel = camera.view_projection_at_origin(origin_f);
         let time = self.start_time.elapsed().as_secs_f32();
         // Advance animated terrain tiles (water/lava/fire/…) by re-uploading the
         // current 16×16 frame into each tile's atlas cell when it changes.
@@ -5113,10 +5148,11 @@ impl Renderer {
             &self.camera_buffer,
             0,
             bytemuck::bytes_of(&CameraUniform::new(
-                view_proj.to_cols_array_2d(),
+                view_proj_rel.to_cols_array_2d(),
                 sky.sun_brightness,
                 time,
                 self.atlas_uv.tile_size(),
+                [origin_i.x, origin_i.y, origin_i.z, 0],
             )),
         );
         // Enchantment glint scroll for this frame (drives the travelling sheen).
@@ -5128,15 +5164,21 @@ impl Renderer {
                 _pad: [0.0; 3],
             }),
         );
-        // Post-pass camera (depth-aware DoF / motion blur): unproject depth and
-        // reproject into last frame. Updated before prev is overwritten.
+        // Post-pass camera (depth-aware DoF / motion blur). DoF reconstructs world
+        // position from depth with the camera-relative inverse and measures against
+        // the relative camera position. Motion blur reprojects this frame's pixels
+        // into the previous frame: `prev_view_proj` carries the full NDC→NDC
+        // reprojection (prev_abs · inv(cur_abs)) computed in f64, so the large
+        // world translations cancel at f64 precision on the CPU instead of jittering
+        // in the shader. Updated before `prev_view_proj` is overwritten.
+        let reproj = (self.prev_view_proj.as_dmat4() * view_proj.as_dmat4().inverse()).as_mat4();
         self.queue.write_buffer(
             &self.post_camera_buffer,
             0,
             bytemuck::bytes_of(&PostCamera {
-                inv_view_proj: view_proj.inverse().to_cols_array_2d(),
-                prev_view_proj: self.prev_view_proj.to_cols_array_2d(),
-                camera_pos: [camera.position.x, camera.position.y, camera.position.z, 0.0],
+                inv_view_proj: view_proj_rel.inverse().to_cols_array_2d(),
+                prev_view_proj: reproj.to_cols_array_2d(),
+                camera_pos: [cam_rel.x, cam_rel.y, cam_rel.z, 0.0],
             }),
         );
         self.prev_view_proj = view_proj;
@@ -5148,7 +5190,10 @@ impl Renderer {
             .transform_vector3(Vec3::Y)
             .normalize();
         let sb = sky.sun_brightness;
-        let cam = camera.position;
+        // Camera-relative eye for the lighting / volumetric uniforms (fog distance,
+        // specular view vector) — matches the relative world positions the shaders
+        // now produce.
+        let cam = cam_rel;
         let on = |b: bool| if b { 1.0 } else { 0.0 };
         let shadows_on = self.shaders_enabled && self.shadows_enabled;
         // Volumetric light reads the shadow map too, so render it whenever either
@@ -5178,22 +5223,11 @@ impl Renderer {
                 shadow_sun = shadow_sun.normalize();
             }
             let up = if shadow_sun.y.abs() > 0.99 { Vec3::Z } else { Vec3::Y };
-            // Texel snapping anchored to the camera-relative frustum centre (NOT the
-            // world origin). Snap the centre to whole shadow-map texels in light
-            // space so a given world surface lands in the same texel every frame.
-            // `light_rot` shares the final view's rotation but sits at the origin, so
-            // its xy is exactly the centre's light-space xy — what must be quantized.
-            // A world-origin anchor instead leaves a lever arm = the player's
-            // distance from origin, so the slow sun rotation swings the grid by many
-            // texels per frame out there: the high-frequency shadow shimmer, worst at
-            // sunset where the long shadows magnify it.
-            let light_rot = Mat4::look_at_rh(shadow_sun, Vec3::ZERO, up);
-            let units_per_texel = (2.0 * SHADOW_RADIUS) / SHADOW_DIM as f32;
-            let raw_center = camera.position + camera.direction() * (SHADOW_RADIUS * 0.5);
-            let mut c_ls = light_rot.transform_point3(raw_center);
-            c_ls.x = (c_ls.x / units_per_texel).round() * units_per_texel;
-            c_ls.y = (c_ls.y / units_per_texel).round() * units_per_texel;
-            let center = light_rot.inverse().transform_point3(c_ls);
+            // Built in the camera-relative frame (origin = `origin_f`): the shadow
+            // vertex shader subtracts the same origin, and the chunk shader samples
+            // it against relative world positions. Small magnitudes here keep the
+            // light depth precise far from spawn.
+            let center = cam_rel + camera.direction() * (SHADOW_RADIUS * 0.5);
             let eye = center + shadow_sun * (SHADOW_RADIUS * 2.5);
             let view = Mat4::look_at_rh(eye, center, up);
             let proj = Mat4::orthographic_rh(
@@ -5204,7 +5238,22 @@ impl Renderer {
                 0.1,
                 SHADOW_RADIUS * 5.0,
             );
-            proj * view
+            let mut vp = proj * view;
+            // Texel snapping in clip space, relative to the camera-local frustum.
+            // Project the frustum centre to shadow-map texels and shift the whole
+            // projection by the sub-texel remainder, so a given world surface keeps
+            // its sub-texel position every frame (no shimmer). Doing this in the
+            // view's own frame (eye ≈ camera) bounds the rotational lever arm by the
+            // frustum radius — NOT the player's distance from the world origin, which
+            // is what made the old world-anchored snap shimmer far from spawn (worst
+            // at sunset, where long shadows magnify it).
+            let half_dim = SHADOW_DIM as f32 * 0.5;
+            let center_clip = vp * center.extend(1.0);
+            let dx = ((center_clip.x * half_dim).round() - center_clip.x * half_dim) / half_dim;
+            let dy = ((center_clip.y * half_dim).round() - center_clip.y * half_dim) / half_dim;
+            vp.w_axis.x += dx;
+            vp.w_axis.y += dy;
+            vp
             };
         }
         let light_view_proj = if render_shadow_map {
@@ -5215,7 +5264,10 @@ impl Renderer {
         self.queue.write_buffer(
             &self.shadow_uniform_buffer,
             0,
-            bytemuck::bytes_of(&light_view_proj.to_cols_array_2d()),
+            bytemuck::bytes_of(&ShadowUniform {
+                light_view_proj: light_view_proj.to_cols_array_2d(),
+                origin: [origin_i.x, origin_i.y, origin_i.z, 0],
+            }),
         );
         self.queue.write_buffer(
             &self.lighting_buffer,
@@ -5255,7 +5307,7 @@ impl Renderer {
             &self.vol_uniform_buffer,
             0,
             bytemuck::bytes_of(&VolUniform {
-                inv_view_proj: view_proj.inverse().to_cols_array_2d(),
+                inv_view_proj: view_proj_rel.inverse().to_cols_array_2d(),
                 light_view_proj: light_view_proj.to_cols_array_2d(),
                 sun_dir: [sun_dir.x, sun_dir.y, sun_dir.z, 0.0],
                 sun_color: [1.0 * sb, 0.96 * sb, 0.88 * sb, 0.0],
@@ -5321,7 +5373,11 @@ impl Renderer {
         // culled to the light frustum — sections outside the shadow map's
         // coverage contribute nothing, so there's no need to draw them all.
         if redraw_shadow {
-            let light_frustum = Frustum::from_view_projection(light_view_proj);
+            // `light_view_proj` is camera-relative; section culling tests absolute
+            // world-space AABBs, so re-add the origin translation for the frustum.
+            let light_view_proj_abs =
+                light_view_proj * Mat4::from_translation(-origin_f);
+            let light_frustum = Frustum::from_view_projection(light_view_proj_abs);
             let mut sp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("shadow-pass"),
                 color_attachments: &[],

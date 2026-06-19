@@ -1,5 +1,12 @@
 struct Camera {
     view_proj: mat4x4<f32>,
+    sky_brightness: f32,
+    time: f32,
+    tile_size: vec2<f32>,
+    // Render origin in whole blocks (camera-relative rendering). World pipelines
+    // bind a camera with the real origin; the GUI binds one with origin 0, so its
+    // clip-space-baked vertices pass through unchanged.
+    origin: vec4<i32>,
 };
 
 @group(0) @binding(0)
@@ -25,7 +32,8 @@ struct VertexOutput {
 @vertex
 fn vs_main(input: VertexInput) -> VertexOutput {
     var out: VertexOutput;
-    out.clip_position = camera.view_proj * vec4<f32>(input.position, 1.0);
+    let rel = input.position - vec3<f32>(camera.origin.xyz);
+    out.clip_position = camera.view_proj * vec4<f32>(rel, 1.0);
     out.color = input.color;
     out.uv = input.uv;
     return out;

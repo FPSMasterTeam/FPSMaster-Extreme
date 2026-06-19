@@ -45,7 +45,17 @@ impl Camera {
     }
 
     pub fn view_projection(&self) -> Mat4 {
-        let view = Mat4::look_to_rh(self.position, self.direction(), Vec3::Y);
+        self.view_projection_at_origin(Vec3::ZERO)
+    }
+
+    /// View-projection with the world rendered relative to `origin` (a render
+    /// origin near the camera). The eye is placed at `position - origin` so the
+    /// matrix carries no large world translation; callers subtract the same
+    /// `origin` from every world position before transforming. This keeps all
+    /// values fed to the f32 matrix small, avoiding the catastrophic cancellation
+    /// (jitter / z-fighting) that absolute world coordinates cause far from spawn.
+    pub fn view_projection_at_origin(&self, origin: Vec3) -> Mat4 {
+        let view = Mat4::look_to_rh(self.position - origin, self.direction(), Vec3::Y);
         let projection = Mat4::perspective_rh(
             self.fovy_degrees.to_radians(),
             self.aspect.max(0.001),
