@@ -71,7 +71,10 @@ fn screen_space_reflection(origin: vec3<f32>, dir: vec3<f32>) -> vec4<f32> {
         // Ray went just behind the stored surface → intersection (thickness-bounded).
         if (delta > 0.00002 && delta < 0.0025) {
             let edge = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
-            return vec4<f32>(textureSample(scene_tex, scene_sampler, uv).rgb, smoothstep(0.0, 0.12, edge));
+            // Explicit LOD: the implicit-derivative textureSample would force FXC
+            // (DX12 backend) to unroll this varying-iteration loop and fail (X3570/
+            // X3511). Reflections are rough, so sampling mip 0 looks identical.
+            return vec4<f32>(textureSampleLevel(scene_tex, scene_sampler, uv, 0.0).rgb, smoothstep(0.0, 0.12, edge));
         }
     }
     return vec4<f32>(0.0, 0.0, 0.0, 0.0);
