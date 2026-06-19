@@ -924,7 +924,13 @@ impl Renderer {
                 &wgpu::DeviceDescriptor {
                     label: Some("recraft-device"),
                     required_features: optional_features,
-                    required_limits: wgpu::Limits::default(),
+                    // Request exactly what the adapter offers rather than the
+                    // (modern-GPU) defaults, so old GL-backend cards without
+                    // compute support — which report e.g.
+                    // `max_compute_workgroups_per_dimension = 0` — can still
+                    // create a device. recraft uses no compute, so the adapter's
+                    // own limits are always sufficient.
+                    required_limits: adapter.limits(),
                     memory_hints: wgpu::MemoryHints::default(),
                     trace: Default::default(),
                     experimental_features: Default::default(),
