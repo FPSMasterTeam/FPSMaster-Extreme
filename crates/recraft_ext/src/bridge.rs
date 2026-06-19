@@ -97,6 +97,15 @@ pub(crate) mod cur {
     }
 }
 
+/// Process-unique texture handles. A single global counter is correct because
+/// every mod's commands funnel into one host queue / one host texture registry,
+/// so handles must not collide across mods. 0 is reserved for "invalid".
+pub(crate) fn alloc_texture_handle() -> u32 {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static NEXT: AtomicU32 = AtomicU32::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 // ---- mod -> host operations (JSON) ----
 
 /// Enqueue a command from a `{"t":..}` JSON payload.
@@ -201,6 +210,17 @@ pub(crate) fn handle_cmd(json: &str) {
             silent: v.get("silent").and_then(Value::as_bool).unwrap_or(false),
         }),
         "clearRotate" => Some(ExtCommand::ClearSilentRotation),
+        "updateTexture" => Some(ExtCommand::UpdateTexture {
+            handle: int_field(&v, "handle") as u32,
+            rgba: rgba_field(&v, "rgba"),
+        }),
+        "freeTexture" => Some(ExtCommand::FreeTexture {
+            handle: int_field(&v, "handle") as u32,
+        }),
+        "postEffect" => Some(ExtCommand::SetPostEffect {
+            wgsl: str_field(&v, "wgsl"),
+        }),
+        "clearPostEffect" => Some(ExtCommand::ClearPostEffect),
         "saveConfig" => Some(ExtCommand::SaveConfig {
             dir: str_field(&v, "dir"),
             json: str_field(&v, "json"),
@@ -209,6 +229,17 @@ pub(crate) fn handle_cmd(json: &str) {
     };
     if let Some(cmd) = cmd {
         cur::push_command(cmd);
+    }
+}
+
+/// Parse a `[u8, ...]` RGBA byte array field (out-of-range values are clamped).
+fn rgba_field(v: &Value, k: &str) -> Vec<u8> {
+    match v.get(k).and_then(Value::as_array) {
+        Some(arr) => arr
+            .iter()
+            .map(|n| n.as_i64().unwrap_or(0).clamp(0, 255) as u8)
+            .collect(),
+        None => Vec::new(),
     }
 }
 
@@ -229,6 +260,39 @@ fn rgb_field(v: &Value, k: &str) -> Option<[f32; 3]> {
 pub(crate) fn handle_query(json: &str) -> String {
     let v: Value = serde_json::from_str(json).unwrap_or(Value::Null);
     let kind = v.get("k").and_then(Value::as_str).unwrap_or("");
+    // Texture registration answers a handle synchronously and enqueues the
+    // payload as a command — it needs no read-views, so handle it up front.
+    match kind {
+        "registerTexture" => {
+            let handle = alloc_texture_handle();
+            cur::push_command(ExtCommand::RegisterTexture {
+                handle,
+                width: int_field(&v, "w") as u32,
+                height: int_field(&v, "h") as u32,
+                rgba: rgba_field(&v, "rgba"),
+            });
+            return handle.to_string();
+        }
+        "createTexture" => {
+            let handle = alloc_texture_handle();
+            cur::push_command(ExtCommand::RegisterTexture {
+                handle,
+                width: int_field(&v, "w") as u32,
+                height: int_field(&v, "h") as u32,
+                rgba: Vec::new(),
+            });
+            return handle.to_string();
+        }
+        "loadTexture" => {
+            let handle = alloc_texture_handle();
+            cur::push_command(ExtCommand::LoadTexture {
+                handle,
+                path: str_field(&v, "path"),
+            });
+            return handle.to_string();
+        }
+        _ => {}
+    }
     cur::with_views(|views| match kind {
         "player" => {
             let p = views.player();
@@ -366,6 +430,43 @@ pub(crate) fn handle_hud(json: &str) {
                     int_field(&v, "meta") as u8,
                 );
             }
+            "image" => {
+                let (w, h) = (int_field(&v, "w") as i32, int_field(&v, "h") as i32);
+                let tex = crate::hud::TexHandle(int_field(&v, "tex") as u32);
+                if v.get("sw").is_some() {
+                    hud.image_src(
+                        x,
+                        y,
+                        w,
+                        h,
+                        tex,
+                        (
+                            int_field(&v, "sx") as u32,
+                            int_field(&v, "sy") as u32,
+                            int_field(&v, "sw") as u32,
+                            int_field(&v, "sh") as u32,
+                        ),
+                    );
+                } else {
+                    hud.image(x, y, w, h, tex);
+                }
+            }
+            "line" => hud.line(
+                x,
+                y,
+                int_field(&v, "x2") as i32,
+                int_field(&v, "y2") as i32,
+                int_field(&v, "c") as u32,
+                int_field(&v, "w") as i32,
+            ),
+            "gradient" => hud.gradient(
+                x,
+                y,
+                int_field(&v, "w") as i32,
+                int_field(&v, "h") as i32,
+                int_field(&v, "c") as u32,
+                int_field(&v, "c2") as u32,
+            ),
             _ => {}
         }
     });

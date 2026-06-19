@@ -75,12 +75,36 @@ pub enum ExtCommand {
     /// Apply a preset render modification (closed set; see [`RenderPreset`]).
     Render(RenderPreset),
     /// Replace the native render-hook geometry. Each vertex is
-    /// `[x, y, z, r, g, b, a, u, v]` (world position, RGBA, entity-atlas UV).
-    /// Native-only; replaces the previous submission, empty clears it.
+    /// `[x, y, z, r, g, b, a, u, v]` (world position, RGBA, UV). `texture` is a
+    /// registered texture handle whose pixels the UVs sample (normalized 0..1);
+    /// `None` samples the entity atlas (UVs point at its white texel for solid
+    /// vertex color). Native-only; replaces the previous submission, empty clears.
     SubmitGeometry {
         vertices: Vec<[f32; 9]>,
         indices: Vec<u32>,
+        texture: Option<u32>,
     },
+    /// Register an RGBA texture under `handle` (`width*height*4` bytes). `rgba`
+    /// empty means a blank (zeroed) texture to stream into later. Handles are
+    /// allocated by the bridge (process-unique); the host owns the pixels.
+    RegisterTexture {
+        handle: u32,
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+    },
+    /// Decode a PNG/JPEG file at `path` and register it under `handle`.
+    LoadTexture { handle: u32, path: String },
+    /// Replace a registered texture's pixels (same dimensions).
+    UpdateTexture { handle: u32, rgba: Vec<u8> },
+    /// Drop a registered texture.
+    FreeTexture { handle: u32 },
+    /// Install a full-screen post effect from a WGSL snippet defining
+    /// `fn effect(uv: vec2<f32>, color: vec4<f32>) -> vec4<f32>`. A compile error
+    /// is logged and the previous effect kept.
+    SetPostEffect { wgsl: String },
+    /// Remove the full-screen post effect.
+    ClearPostEffect,
     /// Register a content-mod block (full cube). Only takes effect in a
     /// recraft-authoritative world; `texture` reuses a vanilla base name until
     /// per-mod texture registration exists.

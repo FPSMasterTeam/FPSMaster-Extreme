@@ -152,6 +152,18 @@ struct App {
     ext_geometry: Vec<recraft_render::ModelVertex>,
     ext_indices: Vec<u32>,
     geometry_dirty: bool,
+    /// Texture handle the native geometry samples (`None` = entity atlas), plus a
+    /// dirty flag so its GPU copy is (re)uploaded only when the handle changes or
+    /// its pixels are updated — not on every geometry resubmission.
+    ext_geometry_texture: Option<u32>,
+    geometry_texture_dirty: bool,
+    /// Mod-registered HUD textures (handle → RGBA), resolved when replaying
+    /// `HudCmd::Image`. Shared via `Arc` so the UI frame-diff stays cheap.
+    mod_textures: std::collections::HashMap<u32, std::sync::Arc<image::RgbaImage>>,
+    /// Pending mod post-effect change, applied at render time (where the renderer
+    /// is in scope): `Some(Some(wgsl))` installs, `Some(None)` clears, `None` is
+    /// no change.
+    pending_post_effect: Option<Option<String>>,
     /// Extension preset render state: fullbright (brightness), nametag scale, and
     /// the ESP-style line overlays (target block outline / chunk borders / entity
     /// boxes). The overlays regenerate their line geometry each frame while on.
@@ -426,6 +438,10 @@ impl ApplicationHandler for WinitApp {
             block_tints: recraft_render::TintTable::new(),
             tints_dirty: false,
             ext_geometry: Vec::new(),
+            ext_geometry_texture: None,
+            geometry_texture_dirty: false,
+            mod_textures: std::collections::HashMap::new(),
+            pending_post_effect: None,
             ext_indices: Vec::new(),
             geometry_dirty: false,
             ext_fullbright: false,
@@ -906,6 +922,28 @@ impl ApplicationHandler for WinitApp {
         if app.geometry_dirty {
             renderer.set_extension_geometry(&app.ext_geometry, &app.ext_indices);
             app.geometry_dirty = false;
+        }
+        // (Re)upload the geometry's custom texture only when it actually changed,
+        // so a mod resubmitting geometry every frame doesn't re-upload pixels.
+        if app.geometry_texture_dirty {
+            let tex = app
+                .ext_geometry_texture
+                .and_then(|h| app.mod_textures.get(&h))
+                .map(|img| (img.as_raw().as_slice(), img.width(), img.height()));
+            renderer.set_geometry_texture(tex);
+            app.geometry_texture_dirty = false;
+        }
+        // Apply a pending mod full-screen post effect (compile errors are logged
+        // and the previous effect kept).
+        if let Some(change) = app.pending_post_effect.take() {
+            match change {
+                Some(wgsl) => {
+                    if let Err(e) = renderer.set_post_effect(&wgsl) {
+                        log::warn!("[ext] post effect shader rejected: {e}");
+                    }
+                }
+                None => renderer.clear_post_effect(),
+            }
         }
         // Extension preset render toggles: fullbright (force lightmap to full),
         // nametag scale, and the ESP line overlays.
@@ -1393,7 +1431,11 @@ fn apply_ext_commands(app: &mut App) {
                 );
             }
             recraft_ext::ExtCommand::Render(preset) => apply_render_preset(app, preset),
-            recraft_ext::ExtCommand::SubmitGeometry { vertices, indices } => {
+            recraft_ext::ExtCommand::SubmitGeometry {
+                vertices,
+                indices,
+                texture,
+            } => {
                 app.ext_geometry = vertices
                     .iter()
                     .map(|v| recraft_render::ModelVertex {
@@ -1404,6 +1446,67 @@ fn apply_ext_commands(app: &mut App) {
                     .collect();
                 app.ext_indices = indices;
                 app.geometry_dirty = true;
+                if texture != app.ext_geometry_texture {
+                    app.ext_geometry_texture = texture;
+                    app.geometry_texture_dirty = true;
+                }
+            }
+            recraft_ext::ExtCommand::RegisterTexture {
+                handle,
+                width,
+                height,
+                rgba,
+            } => {
+                let len = width as usize * height as usize * 4;
+                let buf = if rgba.is_empty() {
+                    vec![0u8; len]
+                } else if rgba.len() == len {
+                    rgba
+                } else {
+                    log::warn!(
+                        "[ext] registerTexture {handle}: {} bytes != {width}x{height}x4 ({len})",
+                        rgba.len()
+                    );
+                    continue;
+                };
+                if let Some(img) = image::RgbaImage::from_raw(width, height, buf) {
+                    app.mod_textures.insert(handle, std::sync::Arc::new(img));
+                }
+            }
+            recraft_ext::ExtCommand::LoadTexture { handle, path } => {
+                match std::fs::read(&path)
+                    .ok()
+                    .and_then(|b| recraft_render::texture::decode_png(&b))
+                {
+                    Some(img) => {
+                        app.mod_textures.insert(handle, std::sync::Arc::new(img));
+                    }
+                    None => log::warn!("[ext] loadTexture {handle}: failed to read/decode {path}"),
+                }
+            }
+            recraft_ext::ExtCommand::UpdateTexture { handle, rgba } => {
+                if let Some(existing) = app.mod_textures.get(&handle) {
+                    let (w, h) = existing.dimensions();
+                    if rgba.len() == w as usize * h as usize * 4 {
+                        if let Some(img) = image::RgbaImage::from_raw(w, h, rgba) {
+                            app.mod_textures.insert(handle, std::sync::Arc::new(img));
+                            if Some(handle) == app.ext_geometry_texture {
+                                app.geometry_texture_dirty = true;
+                            }
+                        }
+                    } else {
+                        log::warn!("[ext] updateTexture {handle}: size mismatch");
+                    }
+                }
+            }
+            recraft_ext::ExtCommand::FreeTexture { handle } => {
+                app.mod_textures.remove(&handle);
+            }
+            recraft_ext::ExtCommand::SetPostEffect { wgsl } => {
+                app.pending_post_effect = Some(Some(wgsl));
+            }
+            recraft_ext::ExtCommand::ClearPostEffect => {
+                app.pending_post_effect = Some(None);
             }
             recraft_ext::ExtCommand::RegisterBlock {
                 id,
@@ -1691,7 +1794,12 @@ fn key_name(physical: &winit::keyboard::PhysicalKey) -> Option<String> {
 /// vanilla HUD authors every primitive as `<gui_px> * scale` (UiFrame divides by
 /// the pixel scale at rasterize), so we multiply coords and the text scale by
 /// `scale`. Colors are packed `0xRRGGBBAA`.
-fn replay_hud(ui: &mut recraft_render::UiFrame, draw: &recraft_ext::HudDraw, scale: i32) {
+fn replay_hud(
+    ui: &mut recraft_render::UiFrame,
+    draw: &recraft_ext::HudDraw,
+    scale: i32,
+    textures: &std::collections::HashMap<u32, std::sync::Arc<image::RgbaImage>>,
+) {
     use recraft_ext::HudCmd;
     use recraft_render::{UiColor, UiRect};
 
@@ -1742,8 +1850,52 @@ fn replay_hud(ui: &mut recraft_render::UiFrame, draw: &recraft_ext::HudDraw, sca
                     *meta,
                 );
             }
-            HudCmd::Image { .. } => {
-                // TODO: needs a registered host texture (TexHandle -> RGBA) to blit.
+            HudCmd::Image {
+                x,
+                y,
+                w,
+                h,
+                tex,
+                src,
+            } => {
+                if let Some(image) = textures.get(&tex.0) {
+                    let dst = UiRect::new(x * scale, y * scale, w * scale, h * scale);
+                    match src {
+                        Some(s) => ui.raw_image_src(dst, image.clone(), *s),
+                        None => ui.raw_image(dst, image.clone()),
+                    }
+                }
+            }
+            HudCmd::Line {
+                x0,
+                y0,
+                x1,
+                y1,
+                color: c,
+                width: lw,
+            } => {
+                ui.line(
+                    x0 * scale,
+                    y0 * scale,
+                    x1 * scale,
+                    y1 * scale,
+                    color(*c),
+                    lw * scale,
+                );
+            }
+            HudCmd::Gradient {
+                x,
+                y,
+                w,
+                h,
+                top,
+                bottom,
+            } => {
+                ui.gradient_rect(
+                    UiRect::new(x * scale, y * scale, w * scale, h * scale),
+                    color(*top),
+                    color(*bottom),
+                );
             }
         }
     }
@@ -2400,6 +2552,7 @@ fn render_frame(
         ms_session,
         tab_open,
         ext,
+        mod_textures,
         ..
     } = app;
     // The overlay only makes sense in pure gameplay, never under an open screen.
@@ -2475,7 +2628,7 @@ fn render_frame(
         };
         let mut hud_draw = recraft_ext::HudDraw::new();
         ext.draw_hud(&mut hud_draw, &hud_ctx, &GameViews(&*game));
-        replay_hud(&mut ui, &hud_draw, scale);
+        replay_hud(&mut ui, &hud_draw, scale, mod_textures);
     }
     if let Some(screen) = screen.as_mut() {
         let mod_list = ext.mods();
