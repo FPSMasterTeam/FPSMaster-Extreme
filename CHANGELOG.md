@@ -15,6 +15,10 @@ to build against it. Built from the plan in `docs/PLAN_EXTENSION_SYSTEM.md`.
 Also tightens the network send/receive timing to be vanilla bit-for-bit so
 ext-driven automation stays anti-cheat-legit.
 
+The extension API is versioned `0.3.0` — a breaking bump from `0.2` (the native
+`HostApi`/`geometry` ABI grew fields for the render API), so mods must declare
+`api = "^0.3"` and native mods must be recompiled.
+
 ### Added
 
 #### Extension system — core
@@ -60,15 +64,15 @@ ext-driven automation stays anti-cheat-legit.
   (`fn effect(uv, color)`) over the composited world, with `U.time`/`U.resolution`
   uniforms and scene sampling. Shader compile errors are isolated (logged, the
   previous effect kept) rather than fatal.
-- **`render_demo` example mod** exercising all of the above.
 
 #### SDK & examples
 - **Extension SDK** (`sdk/`) — JS TypeScript typings (`mc.d.ts`), a native build
   guide + template + worked example, an API reference, and a bundled
   `recraft_ext_api` snapshot so the SDK builds without crates.io.
 - **Example mods** in `mods/` — `coords_hud`, `chat_alert`, `block_tint`,
-  `preset_demo` (toggles every render preset by key), and `scaffold_demo` (a
-  vanilla-legit auto-bridge demonstrating the `mc.*` API).
+  `preset_demo` (toggles every render preset by key), `scaffold_demo` (a
+  vanilla-legit auto-bridge demonstrating the `mc.*` API), and `render_demo`
+  (the textures / HUD primitives / post-effect surface).
 - **Mod-management screen** — a `Mods…` button on the title/pause screen to
   list / toggle / reload mods and open the mods folder; disabled state persists
   to `recraft_options.txt`.
