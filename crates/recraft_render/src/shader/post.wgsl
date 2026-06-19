@@ -24,7 +24,10 @@ struct PostCamera {
 @group(0) @binding(0) var scene_tex: texture_2d<f32>;
 @group(0) @binding(1) var scene_sampler: sampler;
 @group(0) @binding(2) var<uniform> params: Params;
-@group(0) @binding(3) var depth_tex: texture_depth_2d;
+// World depth, bound as an unfilterable-float texture (not texture_depth_2d): the
+// GLSL backend maps a depth texture to sampler2DShadow, which has no plain
+// textureLoad/texture overload. As a float texture it reads back via texelFetch.
+@group(0) @binding(3) var depth_tex: texture_2d<f32>;
 @group(0) @binding(4) var<uniform> cam: PostCamera;
 @group(0) @binding(5) var lum_tex: texture_2d<f32>;
 @group(0) @binding(6) var vol_tex: texture_2d<f32>;
@@ -40,7 +43,7 @@ fn world_from_depth(uv: vec2<f32>, depth: f32) -> vec3<f32> {
 fn load_depth(uv: vec2<f32>) -> f32 {
     let dims = vec2<f32>(textureDimensions(depth_tex));
     let px = vec2<i32>(clamp(uv * dims, vec2<f32>(0.0), dims - 1.0));
-    return textureLoad(depth_tex, px, 0);
+    return textureLoad(depth_tex, px, 0).r;
 }
 
 struct VsOut {

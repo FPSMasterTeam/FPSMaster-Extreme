@@ -1412,11 +1412,13 @@ impl Renderer {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                // World depth, read non-comparison (textureLoad) — bound as an
+                // unfilterable float so GL emits sampler2D, not sampler2DShadow.
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Depth,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
                         view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: false,
                     },
@@ -2703,12 +2705,14 @@ impl Renderer {
                     },
                     count: None,
                 },
-                // World depth (for DoF / motion blur).
+                // World depth (for DoF / motion blur), read non-comparison
+                // (textureLoad) — bound as an unfilterable float so GL emits
+                // sampler2D, not sampler2DShadow.
                 wgpu::BindGroupLayoutEntry {
                     binding: 3,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Depth,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
                         view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: false,
                     },
@@ -2987,16 +2991,19 @@ impl Renderer {
         let vol_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("volumetric-layout"),
             entries: &[
+                // World depth, read non-comparison (textureLoad) — bound as an
+                // unfilterable float so GL emits sampler2D, not sampler2DShadow.
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Depth,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
                         view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: false,
                     },
                     count: None,
                 },
+                // Sun shadow map, sampled with comparison (stays a depth texture).
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
                     visibility: wgpu::ShaderStages::FRAGMENT,

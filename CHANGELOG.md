@@ -6,6 +6,18 @@ All notable changes to recraft are documented here. The format follows
 `recraft_core`, `recraft_protocol`, `recraft_render`, `recraft_ext`,
 `recraft_ext_api`) are versioned in lockstep.
 
+## [0.3.1] - 2026-06-19
+
+### Fixed
+
+- **GL backend startup crash** — the post, water-SSR and volumetric passes read
+  the world depth buffer with a non-comparison `textureLoad`, which naga's GLSL
+  backend can't translate (it maps a depth texture to `sampler2DShadow`, which
+  has no plain load/sample overload), panicking pipeline creation on the GL
+  backend. These read-only depth inputs are now bound as unfilterable-float
+  textures (`texture_2d<f32>`) so they emit a plain `sampler2D` / `texelFetch` on
+  every backend. The shadow map (comparison-sampled) is unchanged.
+
 ## [0.3.0] - 2026-06-19
 
 The extension-system milestone. recraft grows a two-layer mod platform — a
@@ -200,5 +212,6 @@ Initial 1.8.9 client: world/chunk rendering, terrain meshing and lighting,
 player physics and collision, the 1.8.9 protocol (online and offline mode),
 basic entity rendering, and core GUIs.
 
+[0.3.1]: https://github.com/gaoyu06/MiniCraft/releases/tag/v0.3.1
 [0.3.0]: https://github.com/gaoyu06/MiniCraft/releases/tag/v0.3.0
 [0.2.0]: https://github.com/gaoyu06/MiniCraft/releases/tag/v0.2.0

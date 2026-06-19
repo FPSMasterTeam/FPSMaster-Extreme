@@ -15,7 +15,10 @@ struct Vol {
     params: vec4<f32>,     // x: density, y: max distance, z: HG g, w: intensity
 };
 
-@group(0) @binding(0) var depth_tex: texture_depth_2d;
+// World depth, bound as an unfilterable-float texture (not texture_depth_2d): the
+// GLSL backend maps a depth texture to sampler2DShadow, which has no plain
+// textureLoad overload. As a float texture it reads back via texelFetch.
+@group(0) @binding(0) var depth_tex: texture_2d<f32>;
 @group(0) @binding(1) var shadow_map: texture_depth_2d;
 @group(0) @binding(2) var shadow_sampler: sampler_comparison;
 @group(0) @binding(3) var<uniform> vol: Vol;
@@ -48,7 +51,7 @@ fn world_from_depth(uv: vec2<f32>, depth: f32) -> vec3<f32> {
 fn load_depth(uv: vec2<f32>) -> f32 {
     let dims = vec2<f32>(textureDimensions(depth_tex));
     let px = vec2<i32>(clamp(uv * dims, vec2<f32>(0.0), dims - 1.0));
-    return textureLoad(depth_tex, px, 0);
+    return textureLoad(depth_tex, px, 0).r;
 }
 
 // 4x4 Bayer dither in [0,1): offsets each pixel's first sample so the coarse step
