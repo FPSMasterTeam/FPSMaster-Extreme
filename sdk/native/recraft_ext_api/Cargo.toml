@@ -3,7 +3,7 @@
 # the template/example depend on it via a relative path.
 [package]
 name = "recraft_ext_api"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Stable plugin ABI for recraft native (cdylib) extensions."

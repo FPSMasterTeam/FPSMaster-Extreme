@@ -6,12 +6,12 @@ use std::collections::{HashMap, HashSet};
 
 /// Current JS extension API version. Bumped on any breaking change to the JS
 /// global API. A mod's `api` requirement is checked against this for JS mods.
-pub const JS_API_VERSION: (u32, u32, u32) = (0, 2, 0);
+pub const JS_API_VERSION: (u32, u32, u32) = (0, 3, 0);
 
 /// Current native extension API (`recraft_ext_api`) version, checked against a
 /// native mod's `api` requirement (the abi_stable layout is the second, runtime
 /// safety net).
-pub const NATIVE_API_VERSION: (u32, u32, u32) = (0, 2, 0);
+pub const NATIVE_API_VERSION: (u32, u32, u32) = (0, 3, 0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]

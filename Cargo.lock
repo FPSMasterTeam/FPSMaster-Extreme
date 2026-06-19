@@ -2618,7 +2618,7 @@ dependencies = [
 
 [[package]]
 name = "recraft_app"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -2641,7 +2641,7 @@ dependencies = [
 
 [[package]]
 name = "recraft_core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "glam 0.27.0",
  "log",
@@ -2651,7 +2651,7 @@ dependencies = [
 
 [[package]]
 name = "recraft_ext"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "abi_stable",
  "log",
@@ -2665,7 +2665,7 @@ dependencies = [
 
 [[package]]
 name = "recraft_ext_api"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "abi_stable",
 ]
@@ -2680,7 +2680,7 @@ dependencies = [
 
 [[package]]
 name = "recraft_protocol"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "aes",
  "base64",
@@ -2697,7 +2697,7 @@ dependencies = [
 
 [[package]]
 name = "recraft_render"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bytemuck",
  "font8x8",
