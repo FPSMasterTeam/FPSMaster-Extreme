@@ -908,7 +908,11 @@ pub struct Renderer {
 impl Renderer {
     pub fn new(window: Arc<Window>) -> Result<Self, RendererError> {
         let size = window.inner_size();
-        let instance = wgpu::Instance::default();
+        // Honour WGPU_BACKEND / WGPU_ADAPTER_NAME etc. so the backend can be picked
+        // from the environment (e.g. WGPU_BACKEND=dx12 for per-backend testing).
+        let instance = wgpu::Instance::new(
+            wgpu::InstanceDescriptor::new_without_display_handle_from_env(),
+        );
         let surface = instance.create_surface(window)
             .map_err(|err| RendererError::Surface(err.to_string()))?;
         let adapter = match pollster::block_on(instance
