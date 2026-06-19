@@ -10,6 +10,7 @@ Implemented scaffold:
 - `recraft_protocol`: multi-version protocol shell with 1.8.9 VarInt, framing, compression, login/play packet basics, and chunk-data decoder.
 - `recraft_render`: `winit`/`wgpu` renderer for a 3D block world, chunk face meshing, depth buffer, basic face lighting, and block atlas sampling.
 - `recraft_app`: desktop client loop with demo world mode and an offline-mode 1.8.9 connection skeleton.
+- `recraft_ext` / `recraft_ext_api`: the extension (mod) system — a JavaScript layer for behaviour/HUD/automation and a native (`cdylib`) layer for deep rendering and content. See [Extensions](#extensions).
 
 This is not complete yet. Physics constants and collision ordering are structured for vanilla parity but are not fully verified against 1.8.9 MCP traces yet.
 
@@ -51,6 +52,23 @@ The app currently supports keyboard movement:
 cargo test -p recraft_core -p recraft_protocol -p recraft_render
 cargo check
 ```
+
+## Extensions
+
+recraft has a two-layer mod system. Mods live in `mods/`, each with a `mod.toml`
+manifest, and are managed in-app from the **Mods…** button on the title/pause
+screen (list / toggle / reload / open folder).
+
+- **JavaScript layer** — for behaviour, HUD, automation, and preset render
+  tweaks. Mods use the `mc.*` API (`mc.player` / `mc.world` / `mc.connection`,
+  event hooks, HUD drawing, keybindings, config). Hot-reloadable and per-mod
+  error-isolated.
+- **Native layer** — `cdylib` plugins built against the `recraft_ext_api` crate
+  (stable abi_stable ABI) for deep rendering hooks and content registration.
+
+The SDK (typings, native template + example, API reference) is in [`sdk/`](sdk/);
+runnable example mods are in [`mods/`](mods/). Full guide:
+[`docs/EXTENSION_SDK.md`](docs/EXTENSION_SDK.md).
 
 ## Assets
 

@@ -39,7 +39,7 @@ sdk/
    id = "hello"
    version = "1.0.0"
    tier = "js"
-   api = "^0.2"
+   api = "^0.3"
    entry = "main.js"
    capabilities = ["hud", "read_player"]
    ```
