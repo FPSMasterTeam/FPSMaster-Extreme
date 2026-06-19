@@ -2,8 +2,93 @@
 
 All notable changes to recraft are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
-[Semantic Versioning](https://semver.org/). All four crates (`recraft_app`,
-`recraft_core`, `recraft_protocol`, `recraft_render`) are versioned in lockstep.
+[Semantic Versioning](https://semver.org/). The crates (`recraft_app`,
+`recraft_core`, `recraft_protocol`, `recraft_render`, `recraft_ext`,
+`recraft_ext_api`) are versioned in lockstep.
+
+## [0.3.0] - 2026-06-19
+
+The extension-system milestone. recraft grows a two-layer mod platform — a
+sandbox-friendly JavaScript layer for behaviour/HUD/automation and a native
+(`cdylib`) layer for deep rendering and content — plus the SDK and example mods
+to build against it. Built from the plan in `docs/PLAN_EXTENSION_SYSTEM.md`.
+Also tightens the network send/receive timing to be vanilla bit-for-bit so
+ext-driven automation stays anti-cheat-legit.
+
+### Added
+
+#### Extension system — core
+- **Two-layer mod platform** (`recraft_ext`) — a host event bus + command queue
+  threaded through four seams (clientbound packets, input, HUD assembly, tick),
+  with all mod code on the main thread and per-mod error isolation. The 6500-line
+  `game.rs` packet handler was split into discrete per-packet functions to host
+  the seams.
+- **`mods/` loader** — manifest (`mod.toml`) parsing, capability gating, load
+  ordering, and hot-reload.
+
+#### Extension system — JavaScript layer
+- **`mc.*` JS API** (rquickjs) — `mc.player` / `mc.world` / `mc.connection`
+  read-views, event subscriptions, chat/command injection, HUD drawing,
+  keybinding + scheduler + config, an `on_serverbound` pre-send hook, and
+  `mc.now()` real-time access. (Replaces the earlier `recraft.*` prototype API.)
+- **Preset render modifications** — `setBlockTint` (global tint registry +
+  re-mesh), fullbright (forced full lightmap), a built-in vanilla block outline,
+  and thick white entity hitboxes — all toggleable from JS.
+
+#### Extension system — native layer
+- **Stable native ABI** (`recraft_ext_api`, abi_stable) — `NativePlugin` trait
+  with a serverbound hook, interaction + rich read-view HostApi helpers, and
+  runtime layout/version checking that refuses to load a mismatched mod.
+- **Native render hook** — submit custom world geometry (`ExtVertex` /
+  `submit_geometry`) against real renderer resources, batched (no per-block
+  callbacks).
+- **Content blocks** — a runtime registry overlay for block ids beyond the
+  vanilla 1.8.9 range (self-owned worlds).
+
+#### Extension system — expanded render API
+- **Mod textures** — `mc.loadTexture` (PNG/JPEG from the mod folder),
+  `createTexture` + `updateTexture` (stream pixels, e.g. an off-screen renderer
+  pushing frames), and `registerTexture` (raw RGBA). Host-owned registry,
+  process-unique handles.
+- **HUD primitives** — `hud.image` (whole or sprite sub-rect of a mod texture),
+  `hud.line`, and `hud.gradient`, with native parity (`hud_image` / `hud_line` /
+  `hud_gradient` / `hud_text_ex`).
+- **Textured native geometry** — `submit_geometry_textured` lets the native
+  render hook sample a mod-registered texture instead of the entity atlas; its
+  GPU upload is decoupled from geometry resubmission.
+- **Full-screen post effect** — `mc.setPostEffect(wgsl)` runs a mod WGSL fragment
+  (`fn effect(uv, color)`) over the composited world, with `U.time`/`U.resolution`
+  uniforms and scene sampling. Shader compile errors are isolated (logged, the
+  previous effect kept) rather than fatal.
+- **`render_demo` example mod** exercising all of the above.
+
+#### SDK & examples
+- **Extension SDK** (`sdk/`) — JS TypeScript typings (`mc.d.ts`), a native build
+  guide + template + worked example, an API reference, and a bundled
+  `recraft_ext_api` snapshot so the SDK builds without crates.io.
+- **Example mods** in `mods/` — `coords_hud`, `chat_alert`, `block_tint`,
+  `preset_demo` (toggles every render preset by key), and `scaffold_demo` (a
+  vanilla-legit auto-bridge demonstrating the `mc.*` API).
+- **Mod-management screen** — a `Mods…` button on the title/pause screen to
+  list / toggle / reload mods and open the mods folder; disabled state persists
+  to `recraft_options.txt`.
+
+### Changed
+- **Anti-cheat-legit silent rotation & automation** — the extension tick now
+  runs before physics so silent yaw matches the movement physics integrates
+  with; movement is strafe-locked under a silent yaw; the silent look is
+  GCD-quantized to pass Grim's `AimModulo360`; and placement uses a real-time
+  cooldown to defeat fastplace detection. Together these let ext-driven
+  silent-aim + auto-place pass Grim/AAC.
+
+### Fixed
+- **Vanilla packet timing** — incoming packets are processed per-frame (as
+  vanilla does), and outgoing acks/commands are handled on the main thread in
+  vanilla per-tick order, instead of recraft's previous ad-hoc scheduling.
+- **macOS GPU-memory leak** — skip rendering entirely while the window is
+  occluded (the swapchain was throttled but still accumulating).
+- Scaffold-demo placement now derives from a real ray cast and only places
+  against faces it can actually see.
 
 ## [0.2.0] - 2026-06-17
 
@@ -101,4 +186,5 @@ Initial 1.8.9 client: world/chunk rendering, terrain meshing and lighting,
 player physics and collision, the 1.8.9 protocol (online and offline mode),
 basic entity rendering, and core GUIs.
 
+[0.3.0]: https://github.com/gaoyu06/MiniCraft/releases/tag/v0.3.0
 [0.2.0]: https://github.com/gaoyu06/MiniCraft/releases/tag/v0.2.0

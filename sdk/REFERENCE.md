@@ -25,7 +25,7 @@ Mods live under `mods/<id>/`, each with a `mod.toml` and an entry file. Create `
 id = "hello"
 version = "1.0.0"
 tier = "js"
-api = "^0.2"
+api = "^0.3"
 entry = "main.js"
 capabilities = ["hud", "read_player"]
 name = "Hello"
@@ -169,6 +169,46 @@ hud.rect(x, y, w, h, color);
 hud.text(x, y, "label", { color, scale, shadow });
 hud.itemIcon(x, y, itemId, { size });
 hud.blockItem(x, y, blockId, meta, { size });
+hud.image(x, y, w, h, handle, { src: [sx, sy, sw, sh] });  // mod texture (src optional)
+hud.line(x0, y0, x1, y1, color, width);
+hud.gradient(x, y, w, h, topColor, bottomColor);
+```
+
+### Mod textures
+
+Register a texture (inside a hook — the command queue isn't live during top-level
+eval), then draw it with `hud.image` or sample it from native geometry. Handles
+are process-unique.
+
+```js
+let tex;
+mc.on("load", () => {
+  tex = mc.loadTexture("ui/panel.png");      // PNG/JPEG from the mod folder
+  // or: mc.registerTexture(rgbaBytes, w, h)  // raw RGBA (w*h*4)
+  // or: mc.createTexture(w, h)               // blank, stream into it later
+});
+mc.updateTexture(tex, rgbaBytes);            // replace pixels (same dimensions)
+mc.freeTexture(tex);
+```
+
+`updateTexture` is the channel for an off-screen renderer (e.g. a CEF browser in
+OSR mode) to push frames; large per-frame updates from JS are heavy, so do HD
+streaming from a native mod.
+
+### Full-screen post effect
+
+Run a custom WGSL fragment over the composited world (the HUD is drawn after, so
+it stays crisp). The snippet defines `effect`; `U.time`/`U.resolution` and
+`src_tex`/`src_samp` are in scope. A compile error is logged and the previous
+effect kept.
+
+```js
+mc.setPostEffect(`
+  fn effect(uv: vec2<f32>, color: vec4<f32>) -> vec4<f32> {
+    let g = dot(color.rgb, vec3<f32>(0.299, 0.587, 0.114));
+    return vec4<f32>(vec3<f32>(g), color.a);  // grayscale
+  }`);
+mc.clearPostEffect();
 ```
 
 ### Preset render modifications
@@ -338,7 +378,7 @@ For when you build the JSON yourself instead of using the helpers:
 
 - **`cmd`** (`{"t": …}`): `chat{s}` · `log{l:0|1|2|3, m}` · `packet{p:{…OutPacket…}}` · `particle{kind,x,y,z,…}` · `sound{event,x,y,z,…}` · `render{r:"blockTint"|"fullbright"|"chunkBorders"|"entityBox"|"nametagScale"|"particleDensity", …}` · `block{id,texture,opaque,alpha,lum,tint}` · `place{x,y,z,face,cx,cy,cz}` · `dig{status,x,y,z,face}` · `attack{id}` · `interact{id,ax?,ay?,az?}` · `click{slot,button,mode}` · `close` · `openInv` · `selectSlot{slot}` · `swing` · `useItem` · `rotate{yaw,pitch,silent}` · `clearRotate` · `saveConfig{dir,json}`
 - **`query`** (`{"k": …}` → JSON): `player` · `block{x,y,z}` · `entities` · `entity{id}` · `time` · `dim` · `chunks` · `connected` · `held` · `selectedSlot` · `inventory` · `capabilities` · `effects` · `xp` · `container`
-- **`hud`** (`{"o": …}`): `rect{x,y,w,h,c}` · `text{x,y,s,c,text,sh}` · `item{x,y,sz,id}` · `block{x,y,sz,id,meta}`
+- **`hud`** (`{"o": …}`): `rect{x,y,w,h,c}` · `text{x,y,s,c,text,sh}` · `item{x,y,sz,id}` · `block{x,y,sz,id,meta}` · `image{x,y,w,h,tex[,sx,sy,sw,sh]}` · `line{x,y,x2,y2,c,w}` · `gradient{x,y,w,h,c,c2}`
 
 The hook argument (packet/event/input/hud-ctx) is JSON with the same shapes as the JS event payloads. An outbound packet at `on_serverbound_packet` is JSON like `{"type":"SbChatMessage","message":"…"}`.
 
@@ -358,6 +398,8 @@ host.submit_geometry(
 
 Each call **replaces** the previous submission (empty slices clear it); resubmit when your geometry changes (e.g. from `on_frame`). This is the escape hatch the JS layer deliberately lacks.
 
+To texture the geometry with your own asset instead of the entity atlas, register a texture (`host.register_texture(rgba, w, h)` / `host.load_texture(path)`) and submit with normalized UVs via `host.submit_geometry_textured(&verts, &indices, tex)`. Its GPU upload is decoupled from geometry resubmission, so streaming geometry every frame doesn't re-upload the texture. Native mods can also drive the full-screen post effect (`host.set_post_effect(wgsl)` / `host.clear_post_effect()`) and every texture/HUD helper the JS layer has.
+
 ### Building & packaging
 
 ```sh
@@ -375,4 +417,4 @@ Rust has no true obfuscator; the workspace `release` profile uses `strip = "symb
 ## 5. Versioning
 
 - `recraft_ext_api` follows semver; native loads are double-checked by `abi_stable`'s runtime layout hash.
-- The JS and native APIs share a single version (currently `0.2.0`); the host refuses a mod whose `api` requirement it doesn't satisfy. **0.2 is a breaking bump from 0.1** — the JS global was renamed `recraft` → `mc` and restructured around `mc.player`/`mc.world`/`mc.connection`; update your mods and declare `api = "^0.2"`.
+- The JS and native APIs share a single version (currently `0.3.0`); the host refuses a mod whose `api` requirement it doesn't satisfy. **0.3 is a breaking bump from 0.2** — it adds the expanded render API (mod textures, `hud.image`/`line`/`gradient`, textured native geometry, full-screen post effects) and the native `HostApi`/`geometry` ABI gained fields, so recompile native mods and declare `api = "^0.3"`. (0.2 was itself a breaking bump from 0.1: the JS global was renamed `recraft` → `mc` and restructured around `mc.player`/`mc.world`/`mc.connection`.)

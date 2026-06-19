@@ -2,6 +2,27 @@
 
 All notable changes to the recraft extension API.
 
+## 0.3.0
+
+**Breaking.** Expanded render API; the native `HostApi`/`geometry` ABI gained
+fields (recompile native mods). Declare `api = "^0.3"`.
+
+- **Mod textures**: `mc.loadTexture(path)`, `mc.registerTexture(rgba, w, h)`,
+  `mc.createTexture(w, h)`, `mc.updateTexture(handle, rgba)`, `mc.freeTexture`.
+  Native: `host.register_texture` / `load_texture` / `update_texture` /
+  `free_texture`.
+- **HUD primitives**: `hud.image(x, y, w, h, handle, { src })`,
+  `hud.line(x0, y0, x1, y1, color, width)`,
+  `hud.gradient(x, y, w, h, top, bottom)`. Native parity via `hud_image*` /
+  `hud_line` / `hud_gradient` / `hud_text_ex`.
+- **Textured native geometry**: `host.submit_geometry_textured(verts, idx, tex)`
+  samples a registered texture instead of the entity atlas.
+- **Full-screen post effect**: `mc.setPostEffect(wgsl)` / `mc.clearPostEffect()`
+  (native: `host.set_post_effect` / `clear_post_effect`). `wgsl` defines
+  `fn effect(uv: vec2<f32>, color: vec4<f32>) -> vec4<f32>`; `U.time` /
+  `U.resolution` and `src_tex`/`src_samp` are in scope. Compile errors are
+  logged and the previous effect kept.
+
 ## 0.2.0
 
 **Breaking.** The JS global was renamed `recraft` → `mc` and restructured around

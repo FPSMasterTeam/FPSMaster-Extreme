@@ -9,4 +9,5 @@ self-contained, publishable bundle:
 - `sdk/native/` — native (`cdylib`) build guide, a template, and a worked example
 
 The runnable example mods this repo loads at startup are in `mods/`; the native
-API crate is `crates/recraft_ext_api` (published to crates.io as `recraft_ext_api`).
+API crate is `crates/recraft_ext_api`, bundled with the SDK as a local snapshot
+in `sdk/native/recraft_ext_api/` (no crates.io needed).
