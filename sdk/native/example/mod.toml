@@ -3,6 +3,6 @@
 id = "recraft.native.example"
 version = "1.0.0"
 tier = "native"
-api = "^0.2"
+api = "^0.3"
 entry = "librecraft_native_example.dylib"   # .so on Linux, .dll on Windows
 capabilities = ["hud", "chat", "render"]
