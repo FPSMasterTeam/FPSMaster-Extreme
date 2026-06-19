@@ -86,6 +86,16 @@ The extension API is versioned `0.3.0` — a breaking bump from `0.2` (the nativ
   silent-aim + auto-place pass Grim/AAC.
 
 ### Fixed
+- **Large-coordinate "distance effect"** — the world is now rendered
+  camera-relative (a per-frame render origin at the camera's block, subtracted
+  from every world position before it hits an f32 matrix). Previously the whole
+  pipeline transformed absolute world coordinates, so far from spawn
+  `view_proj * world_pos` cancelled catastrophically: block/foliage jitter and
+  z-fighting, shadows that shimmered (worst while moving), and motion-blur
+  jitter. Block geometry, water, shadows, fog, volumetric light and motion blur
+  are all stable now. The shadow texel-snap was moved to clip space (removing the
+  world-origin lever arm), and motion-blur reprojection is composed in f64 on the
+  CPU so the large translations cancel there instead of in the shader.
 - **Vanilla packet timing** — incoming packets are processed per-frame (as
   vanilla does), and outgoing acks/commands are handled on the main thread in
   vanilla per-tick order, instead of recraft's previous ad-hoc scheduling.

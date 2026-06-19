@@ -11,6 +11,8 @@ struct Camera {
     sky_brightness: f32,
     time: f32,
     tile_size: vec2<f32>, // (du, dv) of one atlas tile
+    // Render origin in whole blocks (camera-relative rendering); see chunk.wgsl.
+    origin: vec4<i32>,
 };
 @group(0) @binding(0) var<uniform> camera: Camera;
 
@@ -52,7 +54,9 @@ struct VsOut {
 @vertex
 fn vs_main(in: VsIn) -> VsOut {
     var out: VsOut;
-    let world_pos = vec3<f32>(f32(in.pos_light.x), f32(in.pos_light.y), f32(in.pos_light.z)) / 64.0;
+    // Camera-relative: subtract the render origin in fixed-point i32 (see chunk.wgsl).
+    let rel = in.pos_light.xyz - camera.origin.xyz * 64;
+    let world_pos = vec3<f32>(f32(rel.x), f32(rel.y), f32(rel.z)) / 64.0;
     out.clip_position = camera.view_proj * vec4<f32>(world_pos, 1.0);
     out.color = in.color;
     out.repeat_uv = in.repeat_uv * GREEDY_UV_SCALE;
