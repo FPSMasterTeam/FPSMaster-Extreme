@@ -37,7 +37,7 @@ extern "C" fn host_query(json: RString) -> RString {
 extern "C" fn host_hud(json: RString) {
     bridge::handle_hud(json.as_str());
 }
-extern "C" fn host_geometry(vertices: RVec<ExtVertex>, indices: RVec<u32>) {
+extern "C" fn host_geometry(vertices: RVec<ExtVertex>, indices: RVec<u32>, texture: u32) {
     let vertices = vertices
         .iter()
         .map(|v| [v.x, v.y, v.z, v.r, v.g, v.b, v.a, v.u, v.v])
@@ -45,7 +45,35 @@ extern "C" fn host_geometry(vertices: RVec<ExtVertex>, indices: RVec<u32>) {
     cur::push_command(ExtCommand::SubmitGeometry {
         vertices,
         indices: indices.into_iter().collect(),
+        texture: (texture != 0).then_some(texture),
     });
+}
+extern "C" fn host_register_texture(rgba: RVec<u8>, width: u32, height: u32) -> u32 {
+    let handle = bridge::alloc_texture_handle();
+    cur::push_command(ExtCommand::RegisterTexture {
+        handle,
+        width,
+        height,
+        rgba: rgba.into_iter().collect(),
+    });
+    handle
+}
+extern "C" fn host_load_texture(path: RString) -> u32 {
+    let handle = bridge::alloc_texture_handle();
+    cur::push_command(ExtCommand::LoadTexture {
+        handle,
+        path: path.as_str().to_string(),
+    });
+    handle
+}
+extern "C" fn host_update_texture(handle: u32, rgba: RVec<u8>) {
+    cur::push_command(ExtCommand::UpdateTexture {
+        handle,
+        rgba: rgba.into_iter().collect(),
+    });
+}
+extern "C" fn host_free_texture(handle: u32) {
+    cur::push_command(ExtCommand::FreeTexture { handle });
 }
 
 fn host_api() -> HostApi {
@@ -54,6 +82,10 @@ fn host_api() -> HostApi {
         query: host_query,
         hud: host_hud,
         geometry: host_geometry,
+        register_texture: host_register_texture,
+        load_texture: host_load_texture,
+        update_texture: host_update_texture,
+        free_texture: host_free_texture,
     }
 }
 

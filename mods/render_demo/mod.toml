@@ -1,0 +1,8 @@
+id = "render_demo"
+version = "1.0.0"
+tier = "js"
+api = "^0.3"
+entry = "main.js"
+capabilities = ["render", "input", "hud"]
+name = "Render API Demo"
+description = "Showcases the 0.3 render APIs: custom HUD texture, line, gradient, and a toggleable full-screen post effect (F10)."

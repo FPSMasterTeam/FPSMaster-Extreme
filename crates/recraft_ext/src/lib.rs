@@ -128,7 +128,7 @@ mod tests {
             id = "coords_hud"
             version = "1.0.0"
             tier = "js"
-            api = "^0.2"
+            api = "^0.3"
             entry = "main.js"
             capabilities = ["hud", "read_player"]
         "#;
@@ -320,6 +320,47 @@ mod tests {
     }
 
     #[test]
+    fn js_create_texture_and_hud_image() {
+        // createTexture (in a hook, where the command queue is live) allocates a
+        // handle + enqueues RegisterTexture; hud.image records an Image cmd that
+        // references the same handle.
+        let mut mgr = js_mod(
+            "let t = 0;\
+             mc.on('load', () => { t = mc.createTexture(2, 2); });\
+             mc.drawHud(() => hud.image(5, 6, 16, 16, t));",
+        );
+        mgr.dispatch_tick(&MockViews); // runs the pending on_load
+        let cmds = mgr.take_commands();
+        let handle = cmds
+            .iter()
+            .find_map(|c| match c {
+                ExtCommand::RegisterTexture {
+                    handle,
+                    width: 2,
+                    height: 2,
+                    ..
+                } => Some(*handle),
+                _ => None,
+            })
+            .expect("createTexture should enqueue RegisterTexture");
+        let mut hud = HudDraw::new();
+        mgr.draw_hud(
+            &mut hud,
+            &HudCtx {
+                width: 320,
+                height: 240,
+                scale: 2,
+                screen_open: false,
+            },
+            &MockViews,
+        );
+        assert!(matches!(
+            hud.commands().first(),
+            Some(HudCmd::Image { tex, .. }) if tex.0 == handle
+        ));
+    }
+
+    #[test]
     fn js_handler_exception_is_isolated() {
         // First handler throws; second still runs and enqueues its command.
         let mut mgr = js_mod(
@@ -403,7 +444,7 @@ mod tests {
         assert!(
             cmds.iter().any(|c| matches!(
                 c,
-                ExtCommand::SubmitGeometry { vertices, indices }
+                ExtCommand::SubmitGeometry { vertices, indices, .. }
                     if vertices.len() == 3 && indices.len() == 3
             )),
             "native mod should submit render geometry on load"
@@ -426,7 +467,14 @@ mod tests {
         }
         let mut mgr = ExtManager::new();
         let loaded = mgr.load_mods(&root);
-        for id in ["coords_hud", "chat_alert", "block_tint", "preset_demo", "scaffold_demo"] {
+        for id in [
+            "coords_hud",
+            "chat_alert",
+            "block_tint",
+            "preset_demo",
+            "scaffold_demo",
+            "render_demo",
+        ] {
             assert!(loaded.contains(&id.to_string()), "example mod '{id}' failed to load");
         }
         // Exercise their hooks once to ensure the dispatchers run without error.
@@ -456,7 +504,7 @@ mod tests {
             std::fs::write(
                 md.join("mod.toml"),
                 format!(
-                    "id = \"{id}\"\nversion = \"1.0.0\"\ntier = \"js\"\napi = \"^0.2\"\nentry = \"main.js\"\ndepends = [{depends}]\n"
+                    "id = \"{id}\"\nversion = \"1.0.0\"\ntier = \"js\"\napi = \"^0.3\"\nentry = \"main.js\"\ndepends = [{depends}]\n"
                 ),
             )
             .unwrap();

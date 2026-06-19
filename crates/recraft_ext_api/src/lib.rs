@@ -46,7 +46,7 @@ pub struct ExtVertex {
 
 /// The native API semver, mirrored from the manifest `api` requirement. The
 /// `abi_stable` layout check is the second, stronger safety net.
-pub const API_VERSION: (u32, u32, u32) = (0, 2, 0);
+pub const API_VERSION: (u32, u32, u32) = (0, 3, 0);
 
 /// Everything a native mod needs in scope to declare its plugin and root module.
 /// `use recraft_ext_api::prelude::*;` and implement [`NativePlugin`].
@@ -74,8 +74,23 @@ pub struct HostApi {
     pub query: extern "C" fn(RString) -> RString,
     pub hud: extern "C" fn(RString),
     /// Submit native render-hook geometry (replaces the previous submission;
-    /// empty clears it). Native-only — there is no JS equivalent.
-    pub geometry: extern "C" fn(RVec<ExtVertex>, RVec<u32>),
+    /// empty clears it). The trailing `u32` is a registered texture handle the
+    /// UVs sample (`0` = the entity atlas, the pre-0.3 behaviour). Native-only —
+    /// there is no JS equivalent.
+    pub geometry: extern "C" fn(RVec<ExtVertex>, RVec<u32>, u32),
+    /// Register an RGBA texture (`width*height*4` bytes, row-major, no padding)
+    /// and return its handle. Draw it with `hud_image` / reference it from
+    /// custom geometry. Added in 0.3.
+    pub register_texture: extern "C" fn(RVec<u8>, u32, u32) -> u32,
+    /// Decode a PNG/JPEG file at `path` and register it, returning its handle
+    /// (0 on failure). Added in 0.3.
+    pub load_texture: extern "C" fn(RString) -> u32,
+    /// Replace a registered texture's pixels (`width*height*4` RGBA bytes,
+    /// matching its current dimensions). Cheap per-frame path for streamed
+    /// frames (e.g. an off-screen renderer). Added in 0.3.
+    pub update_texture: extern "C" fn(u32, RVec<u8>),
+    /// Drop a registered texture. Added in 0.3.
+    pub free_texture: extern "C" fn(u32),
 }
 
 impl HostApi {
@@ -129,6 +144,83 @@ impl HostApi {
             r#"{{"o":"rect","x":{x},"y":{y},"w":{w},"h":{h},"c":{color}}}"#
         ));
     }
+    /// HUD text with an explicit scale and shadow toggle. Added in 0.3.
+    pub fn hud_text_ex(&self, x: i32, y: i32, text: &str, color: u32, scale: i32, shadow: bool) {
+        self.hud(format!(
+            r#"{{"o":"text","x":{x},"y":{y},"s":{scale},"c":{color},"text":"{}","sh":{}}}"#,
+            esc(text),
+            shadow as u8
+        ));
+    }
+    /// Blit a registered texture (whole image) into the rect. Added in 0.3.
+    pub fn hud_image(&self, x: i32, y: i32, w: i32, h: i32, tex: u32) {
+        self.hud(format!(
+            r#"{{"o":"image","x":{x},"y":{y},"w":{w},"h":{h},"tex":{tex}}}"#
+        ));
+    }
+    /// Blit a sub-rectangle `(sx,sy,sw,sh)` of a registered texture into the
+    /// rect (sprite sheets, damage rects). Added in 0.3.
+    #[allow(clippy::too_many_arguments)]
+    pub fn hud_image_src(
+        &self,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        tex: u32,
+        sx: u32,
+        sy: u32,
+        sw: u32,
+        sh: u32,
+    ) {
+        self.hud(format!(
+            r#"{{"o":"image","x":{x},"y":{y},"w":{w},"h":{h},"tex":{tex},"sx":{sx},"sy":{sy},"sw":{sw},"sh":{sh}}}"#
+        ));
+    }
+    /// A straight HUD line from `(x0,y0)` to `(x1,y1)`, `width` px thick.
+    /// `color` is packed `0xRRGGBBAA`. Added in 0.3.
+    pub fn hud_line(&self, x0: i32, y0: i32, x1: i32, y1: i32, color: u32, width: i32) {
+        self.hud(format!(
+            r#"{{"o":"line","x":{x0},"y":{y0},"x2":{x1},"y2":{y1},"c":{color},"w":{width}}}"#
+        ));
+    }
+    /// A vertical gradient rect (`top` color at the top edge → `bottom` at the
+    /// bottom), packed `0xRRGGBBAA`. Added in 0.3.
+    pub fn hud_gradient(&self, x: i32, y: i32, w: i32, h: i32, top: u32, bottom: u32) {
+        self.hud(format!(
+            r#"{{"o":"gradient","x":{x},"y":{y},"w":{w},"h":{h},"c":{top},"c2":{bottom}}}"#
+        ));
+    }
+
+    /// Register an RGBA texture (`width*height*4` bytes) and return its handle.
+    pub fn register_texture(&self, rgba: &[u8], width: u32, height: u32) -> u32 {
+        (self.register_texture)(RVec::from(rgba.to_vec()), width, height)
+    }
+    /// Decode and register a PNG/JPEG file, returning its handle (0 on failure).
+    pub fn load_texture(&self, path: &str) -> u32 {
+        (self.load_texture)(RString::from(path))
+    }
+    /// Replace a registered texture's pixels (same dimensions as registered).
+    pub fn update_texture(&self, handle: u32, rgba: &[u8]) {
+        (self.update_texture)(handle, RVec::from(rgba.to_vec()))
+    }
+    /// Drop a registered texture.
+    pub fn free_texture(&self, handle: u32) {
+        (self.free_texture)(handle)
+    }
+
+    /// Install a full-screen post effect: `wgsl` must define
+    /// `fn effect(uv: vec2<f32>, color: vec4<f32>) -> vec4<f32>`. In scope: the
+    /// scene `color`, a `U` uniform (`U.resolution: vec2<f32>`, `U.time: f32`),
+    /// and `src_tex`/`src_samp` for arbitrary scene sampling. A compile error is
+    /// logged host-side and the previous effect kept. Added in 0.3.
+    pub fn set_post_effect(&self, wgsl: &str) {
+        self.cmd(format!(r#"{{"t":"postEffect","wgsl":"{}"}}"#, esc(wgsl)));
+    }
+    /// Remove the full-screen post effect. Added in 0.3.
+    pub fn clear_post_effect(&self) {
+        self.cmd(r#"{"t":"clearPostEffect"}"#);
+    }
     /// Statically tint a block id (all metas). `color` is packed `0xRRGGBBAA`.
     pub fn set_block_tint(&self, id: u16, color: u32) {
         self.cmd(format!(
@@ -146,11 +238,21 @@ impl HostApi {
     }
 
     /// Submit native render-hook geometry (world-space, drawn after entities).
-    /// Replaces the previous submission; pass empties to clear. Native-only.
+    /// Replaces the previous submission; pass empties to clear. UVs point at the
+    /// entity-atlas white texel, so `color` is the surface color. Native-only.
     pub fn submit_geometry(&self, vertices: &[ExtVertex], indices: &[u32]) {
+        (self.geometry)(RVec::from(vertices.to_vec()), RVec::from(indices.to_vec()), 0);
+    }
+
+    /// Like [`submit_geometry`], but the UVs (normalized 0..1) sample a
+    /// registered texture (see [`register_texture`](Self::register_texture) /
+    /// [`load_texture`](Self::load_texture)) instead of the entity atlas. Added
+    /// in 0.3.
+    pub fn submit_geometry_textured(&self, vertices: &[ExtVertex], indices: &[u32], texture: u32) {
         (self.geometry)(
             RVec::from(vertices.to_vec()),
             RVec::from(indices.to_vec()),
+            texture,
         );
     }
 

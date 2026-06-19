@@ -591,6 +591,9 @@ pub struct Renderer {
     /// Native render-hook custom geometry (model-pass format), drawn in the world
     /// pass right after entities. `None`/empty when no native mod submits any.
     extension_mesh: Option<DynamicMesh>,
+    /// Optional custom texture bound for `extension_mesh` (a mod-registered
+    /// texture); `None` falls back to the entity atlas.
+    geometry_texture: Option<wgpu::BindGroup>,
     /// Extension `nametagScale` preset: world-size multiplier for player nametags.
     nametag_scale: f32,
     /// Debug-overlay line pipeline + geometry: the built-in targeted-block
@@ -825,6 +828,15 @@ pub struct Renderer {
     /// Camera uniform for the post pass's depth-aware effects (DoF / motion blur).
     post_camera_buffer: wgpu::Buffer,
     post_bind_group: Option<wgpu::BindGroup>,
+    /// Optional mod-supplied full-screen post effect (a custom WGSL fragment that
+    /// remaps the composited world color). When set, the built-in post pass
+    /// renders into `post_fx_tex` instead of the swapchain, then this effect
+    /// samples it into the swapchain. `None` = the unmodified pipeline.
+    post_effect: Option<PostEffect>,
+    post_fx_tex: Option<wgpu::Texture>,
+    post_fx_view: Option<wgpu::TextureView>,
+    /// Wall-clock origin, fed to the post effect as `U.time` (seconds).
+    created_at: std::time::Instant,
     /// Previous frame's view-projection, for motion-blur reprojection.
     prev_view_proj: Mat4,
     /// Auto-exposure: a 1x1 average-luminance target written by a reduction pass
@@ -3148,6 +3160,7 @@ impl Renderer {
             model_pipeline,
             model_mesh: None,
             extension_mesh: None,
+            geometry_texture: None,
             nametag_scale: 1.0,
             line_pipeline,
             debug_lines: None,
@@ -3278,6 +3291,10 @@ impl Renderer {
             post_params_buffer,
             post_camera_buffer,
             post_bind_group: None,
+            post_effect: None,
+            post_fx_tex: None,
+            post_fx_view: None,
+            created_at: std::time::Instant::now(),
             prev_view_proj: Mat4::IDENTITY,
             lum_tex,
             lum_view,
@@ -3771,6 +3788,8 @@ impl Renderer {
         self.offscreen_view = Some(view);
         self.offscreen_tex = Some(color);
         self.update_post_params();
+        // The mod post-effect intermediate tracks the swapchain size.
+        self.rebuild_post_fx_target();
     }
 
     /// Write the post-pass parameters (bloom + grade) for the current off-screen
@@ -4015,6 +4034,186 @@ impl Renderer {
             indices.len() as u32,
             "extension-geometry",
         );
+    }
+
+    /// Bind a custom texture for the native render-hook geometry (its UVs sample
+    /// it, normalized 0..1). `None` falls back to the entity atlas. `texture` is
+    /// `(rgba, width, height)` with `rgba.len() == width*height*4`.
+    pub fn set_geometry_texture(&mut self, texture: Option<(&[u8], u32, u32)>) {
+        self.geometry_texture = texture.and_then(|(rgba, w, h)| {
+            if rgba.len() != (w as usize * h as usize * 4) || w == 0 || h == 0 {
+                return None;
+            }
+            Some(create_rgba_texture_bind_group(
+                &self.device,
+                &self.queue,
+                &self.model_texture_layout,
+                rgba,
+                w,
+                h,
+                "extension-geometry-texture",
+            ))
+        });
+    }
+
+    /// Install a mod full-screen post effect from a WGSL `snippet` that defines
+    /// `fn effect(uv: vec2<f32>, color: vec4<f32>) -> vec4<f32>` (see
+    /// [`POST_EFFECT_PRELUDE`] for the bindings/uniforms in scope). Returns the
+    /// shader compile error on failure (the effect is left unchanged), so a bad
+    /// mod shader is isolated rather than crashing the client.
+    pub fn set_post_effect(&mut self, snippet: &str) -> Result<(), String> {
+        let source = format!("{POST_EFFECT_PRELUDE}\n{snippet}");
+        let layout = self
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("post-effect-layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+        // Capture WGSL/pipeline validation errors instead of letting them reach
+        // the uncaptured-error handler (which would be fatal).
+        let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let module = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("post-effect-shader"),
+                source: wgpu::ShaderSource::Wgsl(source.into()),
+            });
+        let pl = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("post-effect-pipeline-layout"),
+                bind_group_layouts: &[Some(&layout)],
+                immediate_size: 0,
+            });
+        let pipeline = self
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("post-effect-pipeline"),
+                layout: Some(&pl),
+                vertex: wgpu::VertexState {
+                    module: &module,
+                    entry_point: Some("vs_main"),
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: self.config.format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                cache: None,
+                multiview_mask: None,
+            });
+        if let Some(err) = pollster::block_on(scope.pop()) {
+            return Err(err.to_string());
+        }
+        let uniform_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("post-effect-uniforms"),
+            size: 16, // vec2 resolution + f32 time + f32 pad
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("post-effect-sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        self.post_effect = Some(PostEffect {
+            pipeline,
+            layout,
+            sampler,
+            uniform_buf,
+            bind_group: None,
+        });
+        self.rebuild_post_fx_target();
+        Ok(())
+    }
+
+    /// Remove the mod post effect (restores the unmodified post pass).
+    pub fn clear_post_effect(&mut self) {
+        self.post_effect = None;
+        self.post_fx_tex = None;
+        self.post_fx_view = None;
+    }
+
+    /// (Re)create the swapchain-sized LDR intermediate the built-in post pass
+    /// writes into, and rebuild the effect's bind group against it. No-op when no
+    /// effect is set.
+    fn rebuild_post_fx_target(&mut self) {
+        let Some(effect) = self.post_effect.as_mut() else {
+            return;
+        };
+        let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("post-effect-intermediate"),
+            size: wgpu::Extent3d {
+                width: self.config.width.max(1),
+                height: self.config.height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.config.format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+        effect.bind_group = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("post-effect-bind-group"),
+            layout: &effect.layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&effect.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: effect.uniform_buf.as_entire_binding(),
+                },
+            ],
+        }));
+        self.post_fx_tex = Some(tex);
+        self.post_fx_view = Some(view);
     }
 
     /// Replace the debug-overlay line geometry (extension blockOutline /
@@ -5532,13 +5731,18 @@ impl Renderer {
                 draw_calls += 1;
             }
 
-            // Extension custom geometry (native render hook) — same pipeline +
-            // bind groups as entities, so it depth-tests against the world and is
-            // tone-mapped/bloomed like everything else, with no bind-group leak.
+            // Extension custom geometry (native render hook) — same pipeline as
+            // entities, so it depth-tests against the world and is tone-mapped/
+            // bloomed like everything else. Binds the mod's custom texture if it
+            // set one, else the entity atlas (UVs at its white texel).
             if let Some(ext) = self.extension_mesh.as_ref().filter(|m| m.index_count > 0) {
                 pass.set_pipeline(&self.model_pipeline);
                 pass.set_bind_group(0, &self.camera_bind_group, &[]);
-                pass.set_bind_group(1, &self.entity_bind_group, &[]);
+                pass.set_bind_group(
+                    1,
+                    self.geometry_texture.as_ref().unwrap_or(&self.entity_bind_group),
+                    &[],
+                );
                 pass.set_vertex_buffer(0, ext.vertex_buffer.slice(..));
                 pass.set_index_buffer(ext.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..ext.index_count, 0, 0..1);
@@ -5956,12 +6160,26 @@ impl Renderer {
         }
 
         // Post pass: HDR off-screen world → ACES tone-map + grade (+ optional
-        // bloom, + upscale) into the sRGB swapchain. Always runs.
+        // bloom, + upscale). Normally writes the sRGB swapchain; with a mod post
+        // effect active it writes the LDR intermediate, which the effect then
+        // remaps into the swapchain (so the effect sees the composited world but
+        // not the HUD).
+        let effect_active = self
+            .post_effect
+            .as_ref()
+            .and_then(|e| e.bind_group.as_ref())
+            .is_some()
+            && self.post_fx_view.is_some();
         if let Some(bind) = &self.post_bind_group {
+            let post_target = if effect_active {
+                self.post_fx_view.as_ref().unwrap()
+            } else {
+                &swapchain_view
+            };
             let mut post = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("post-composite"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &swapchain_view,
+                    view: post_target,
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
@@ -5977,6 +6195,35 @@ impl Renderer {
             post.set_pipeline(&self.post_pipeline);
             post.set_bind_group(0, bind, &[]);
             post.draw(0..3, 0..1);
+        }
+
+        // Mod full-screen post effect: remap the composited world color into the
+        // swapchain with the mod's WGSL fragment.
+        if effect_active {
+            let effect = self.post_effect.as_ref().unwrap();
+            let t = self.created_at.elapsed().as_secs_f32();
+            let uniforms = [self.config.width as f32, self.config.height as f32, t, 0.0];
+            self.queue
+                .write_buffer(&effect.uniform_buf, 0, bytemuck::cast_slice(&uniforms));
+            let mut fx = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("post-effect"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &swapchain_view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+                multiview_mask: None,
+            });
+            fx.set_pipeline(&effect.pipeline);
+            fx.set_bind_group(0, effect.bind_group.as_ref().unwrap(), &[]);
+            fx.draw(0..3, 0..1);
         }
 
         // UI pass: drawn to the swapchain AFTER the world composite, so the HUD
@@ -6938,6 +7185,114 @@ fn create_depth_view_sized(device: &wgpu::Device, width: u32, height: u32) -> (w
 
 /// Upload the entity texture atlas (player skin + white texel) and build the
 /// texture+sampler bind group the model pass samples at group 1.
+/// A compiled mod full-screen post effect (see [`Renderer::set_post_effect`]).
+struct PostEffect {
+    pipeline: wgpu::RenderPipeline,
+    layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+    uniform_buf: wgpu::Buffer,
+    /// Samples `post_fx_tex` (+ sampler + uniforms); rebuilt on resize.
+    bind_group: Option<wgpu::BindGroup>,
+}
+
+/// Fixed WGSL prepended to a mod post-effect snippet: a full-screen-triangle
+/// vertex stage, the scene-color binding, a `U` uniform (`resolution`, `time`),
+/// and an `fs_main` that calls the mod's `effect(uv, color)`.
+const POST_EFFECT_PRELUDE: &str = r#"
+struct Uniforms { resolution: vec2<f32>, time: f32, _pad: f32, };
+@group(0) @binding(0) var src_tex: texture_2d<f32>;
+@group(0) @binding(1) var src_samp: sampler;
+@group(0) @binding(2) var<uniform> U: Uniforms;
+
+struct VsOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32>, };
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+    var p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+    let xy = p[vi];
+    var o: VsOut;
+    o.pos = vec4<f32>(xy, 0.0, 1.0);
+    o.uv = vec2<f32>(xy.x * 0.5 + 0.5, 1.0 - (xy.y * 0.5 + 0.5));
+    return o;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    let color = textureSample(src_tex, src_samp, in.uv);
+    return effect(in.uv, color);
+}
+"#;
+
+/// Upload an RGBA8 image and build a `(texture, sampler)` bind group against an
+/// existing layout (used for mod-supplied native-geometry textures). Nearest
+/// filtering + clamp, matching the entity atlas.
+#[allow(clippy::too_many_arguments)]
+fn create_rgba_texture_bind_group(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    layout: &wgpu::BindGroupLayout,
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    label: &str,
+) -> wgpu::BindGroup {
+    let size = wgpu::Extent3d {
+        width,
+        height,
+        depth_or_array_layers: 1,
+    };
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        rgba,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(4 * width),
+            rows_per_image: Some(height),
+        },
+        size,
+    );
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some(label),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Nearest,
+        min_filter: wgpu::FilterMode::Nearest,
+        mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+        ..Default::default()
+    });
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some(label),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(&sampler),
+            },
+        ],
+    })
+}
+
 fn create_entity_texture_bind_group(
     device: &wgpu::Device,
     queue: &wgpu::Queue,

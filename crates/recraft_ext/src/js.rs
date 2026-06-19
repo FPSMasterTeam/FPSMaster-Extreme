@@ -129,6 +129,24 @@ const PRELUDE: &str = r#"
     // Monotonic real-time milliseconds — rate-limit actions with this, not a tick
     // count, so catch-up ticks in one frame don't bunch them up in real time.
     now: () => __rcf_now(),
+    // ---- textures (draw with hud.image / reference from registerBlock) ----
+    // Decode a PNG/JPEG from the mod folder; returns a handle (call at load).
+    loadTexture: (path) => +__rcf_query(JSON.stringify({k:'loadTexture',
+      path: (globalThis.__rcf_dir||'.') + '/' + String(path)})),
+    // Register raw RGBA bytes (w*h*4); returns a handle.
+    registerTexture: (rgba,w,h) => +__rcf_query(JSON.stringify({k:'registerTexture',
+      w:w|0, h:h|0, rgba: Array.from(rgba)})),
+    // A blank handle to stream pixels into later with updateTexture.
+    createTexture: (w,h) => +__rcf_query(JSON.stringify({k:'createTexture', w:w|0, h:h|0})),
+    // Replace a texture's pixels (same dimensions). Heavy for large per-frame
+    // updates from JS — use a native mod for HD streaming.
+    updateTexture: (handle,rgba) => cmd({t:'updateTexture', handle:handle|0, rgba: Array.from(rgba)}),
+    freeTexture: (handle) => cmd({t:'freeTexture', handle:handle|0}),
+    // ---- full-screen post effect (custom WGSL) ----
+    // wgsl must define: fn effect(uv: vec2<f32>, color: vec4<f32>) -> vec4<f32>
+    // In scope: U.resolution/U.time, src_tex/src_samp. Compile errors are logged.
+    setPostEffect: (wgsl) => cmd({t:'postEffect', wgsl: String(wgsl)}),
+    clearPostEffect: () => cmd({t:'clearPostEffect'}),
     on:(name,cb)=>{ const k=EVENTS[name];
       if(!k){ error('mc.on: unknown event "'+name+'"'); return; } RT.h[k].push(cb); },
     onPacket:(type,cb)=>{ const k=String(type); (RT.h.packet[k]||(RT.h.packet[k]=[])).push(cb); },
@@ -163,6 +181,14 @@ const PRELUDE: &str = r#"
       sz:(o.size|0)||16,id:id|0}));},
     blockItem:(x,y,id,meta,o)=>{o=o||{};__rcf_hud(JSON.stringify({o:'block',x:x|0,y:y|0,
       sz:(o.size|0)||16,id:id|0,meta:meta|0}));},
+    // Blit a registered texture handle; o.src = [sx,sy,sw,sh] for a sub-rect.
+    image:(x,y,w,h,handle,o)=>{o=o||{}; const m={o:'image',x:x|0,y:y|0,w:w|0,h:h|0,tex:handle|0};
+      if(Array.isArray(o.src)){m.sx=o.src[0]|0;m.sy=o.src[1]|0;m.sw=o.src[2]|0;m.sh=o.src[3]|0;}
+      __rcf_hud(JSON.stringify(m));},
+    line:(x0,y0,x1,y1,c,width)=>__rcf_hud(JSON.stringify({o:'line',x:x0|0,y:y0|0,
+      x2:x1|0,y2:y1|0,c:color(c),w:(width|0)||1})),
+    gradient:(x,y,w,h,top,bottom)=>__rcf_hud(JSON.stringify({o:'gradient',x:x|0,y:y|0,
+      w:w|0,h:h|0,c:color(top),c2:color(bottom)})),
   };
 
   const safe=(cb,arg,who)=>{ try{ return cb(arg); }catch(e){ error('['+who+'] '+((e&&e.stack)||e)); } };

@@ -265,6 +265,27 @@ interface Mc {
   /** Monotonic real-time milliseconds (for rate-limiting actions in real time). */
   now(): number;
 
+  // ---- textures (draw with hud.image) ----
+  /** Decode a PNG/JPEG from the mod folder; returns a handle. Call at load. */
+  loadTexture(path: string): number;
+  /** Register raw RGBA bytes (`w*h*4`); returns a handle. */
+  registerTexture(rgba: ArrayLike<number>, w: number, h: number): number;
+  /** A blank handle to stream pixels into later with `updateTexture`. */
+  createTexture(w: number, h: number): number;
+  /** Replace a texture's pixels (same dimensions). Heavy for large per-frame
+   *  updates from JS — use a native mod for HD streaming. */
+  updateTexture(handle: number, rgba: ArrayLike<number>): void;
+  freeTexture(handle: number): void;
+
+  // ---- full-screen post effect (custom WGSL) ----
+  /** Install a full-screen post effect. `wgsl` must define
+   *  `fn effect(uv: vec2<f32>, color: vec4<f32>) -> vec4<f32>`. In scope:
+   *  `U.resolution`/`U.time`, and `src_tex`/`src_samp` for scene sampling.
+   *  A compile error is logged host-side and the previous effect kept. */
+  setPostEffect(wgsl: string): void;
+  /** Remove the full-screen post effect. */
+  clearPostEffect(): void;
+
   // ---- event subscription ----
   on(event: "tick" | "frame" | "load", cb: () => void): void;
   /** Return `true` to consume the key (suppress default gameplay handling). */
@@ -288,11 +309,22 @@ interface Mc {
   config: Config;
 }
 
+interface ImageOpts {
+  /** Source sub-rect `[sx, sy, sw, sh]` for sprite sheets (default: whole image). */
+  src?: [number, number, number, number];
+}
+
 interface Hud {
   rect(x: number, y: number, w: number, h: number, color: Color): void;
   text(x: number, y: number, text: string, opts?: TextOpts): void;
   itemIcon(x: number, y: number, itemId: number, opts?: IconOpts): void;
   blockItem(x: number, y: number, blockId: number, meta: number, opts?: IconOpts): void;
+  /** Blit a registered texture handle (see `mc.loadTexture` / `mc.createTexture`). */
+  image(x: number, y: number, w: number, h: number, handle: number, opts?: ImageOpts): void;
+  /** A straight line `width` px thick. */
+  line(x0: number, y0: number, x1: number, y1: number, color: Color, width?: number): void;
+  /** A vertical gradient rect (`top` color at the top edge → `bottom`). */
+  gradient(x: number, y: number, w: number, h: number, top: Color, bottom: Color): void;
 }
 
 declare const mc: Mc;

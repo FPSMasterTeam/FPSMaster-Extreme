@@ -49,13 +49,34 @@ pub enum HudCmd {
         block_id: u16,
         meta: u8,
     },
-    /// A mod-supplied texture (registered at load time).
+    /// A mod-supplied texture (registered at load time). `src` is an optional
+    /// `(sx, sy, sw, sh)` source sub-rectangle (sprite sheets); `None` blits the
+    /// whole image.
     Image {
         x: i32,
         y: i32,
         w: i32,
         h: i32,
         tex: TexHandle,
+        src: Option<(u32, u32, u32, u32)>,
+    },
+    /// A straight line from `(x0,y0)` to `(x1,y1)`, `width` px thick.
+    Line {
+        x0: i32,
+        y0: i32,
+        x1: i32,
+        y1: i32,
+        color: u32,
+        width: i32,
+    },
+    /// A vertical gradient rect (`top` color at the top edge → `bottom`).
+    Gradient {
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        top: u32,
+        bottom: u32,
     },
 }
 
@@ -130,7 +151,56 @@ impl HudDraw {
     }
 
     pub fn image(&mut self, x: i32, y: i32, w: i32, h: i32, tex: TexHandle) {
-        self.cmds.push(HudCmd::Image { x, y, w, h, tex });
+        self.cmds.push(HudCmd::Image {
+            x,
+            y,
+            w,
+            h,
+            tex,
+            src: None,
+        });
+    }
+
+    pub fn image_src(
+        &mut self,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        tex: TexHandle,
+        src: (u32, u32, u32, u32),
+    ) {
+        self.cmds.push(HudCmd::Image {
+            x,
+            y,
+            w,
+            h,
+            tex,
+            src: Some(src),
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn line(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, color: u32, width: i32) {
+        self.cmds.push(HudCmd::Line {
+            x0,
+            y0,
+            x1,
+            y1,
+            color,
+            width: width.max(1),
+        });
+    }
+
+    pub fn gradient(&mut self, x: i32, y: i32, w: i32, h: i32, top: u32, bottom: u32) {
+        self.cmds.push(HudCmd::Gradient {
+            x,
+            y,
+            w,
+            h,
+            top,
+            bottom,
+        });
     }
 }
 

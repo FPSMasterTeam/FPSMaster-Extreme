@@ -215,12 +215,24 @@ pub enum UiCommand {
         tile_px: i32,
         tint: UiColor,
     },
-    /// Blit a free-standing RGBA image (e.g. a downloaded server favicon),
-    /// nearest-scaled and alpha-composited into `dst`. The image is shared via
-    /// `Arc` so frame-diffing stays a cheap pointer compare.
+    /// Blit a free-standing RGBA image (e.g. a downloaded server favicon, or a
+    /// mod-registered texture), nearest-scaled and alpha-composited into `dst`.
+    /// The image is shared via `Arc` so frame-diffing stays a cheap pointer
+    /// compare. `src` is an optional `(sx,sy,sw,sh)` source sub-rect.
     RawImage {
         dst: UiRect,
         image: std::sync::Arc<RgbaImage>,
+        src: Option<(u32, u32, u32, u32)>,
+    },
+    /// A straight line from `(x0,y0)` to `(x1,y1)`, `width` px thick, alpha-
+    /// composited. Coordinates are pre-scale (divided by `pixel_scale`).
+    Line {
+        x0: i32,
+        y0: i32,
+        x1: i32,
+        y1: i32,
+        color: UiColor,
+        width: i32,
     },
     /// A vertical gradient (vanilla `drawGradientRect`): `top` at the top edge
     /// lerped to `bottom` at the bottom edge, alpha-composited over the buffer.
@@ -451,9 +463,39 @@ impl UiFrame {
         });
     }
 
-    /// Blit a free-standing RGBA image (server favicon) into `dst`.
+    /// Blit a free-standing RGBA image (server favicon, mod texture) into `dst`.
     pub fn raw_image(&mut self, dst: UiRect, image: std::sync::Arc<RgbaImage>) {
-        self.commands.push(UiCommand::RawImage { dst, image });
+        self.commands.push(UiCommand::RawImage {
+            dst,
+            image,
+            src: None,
+        });
+    }
+
+    /// Blit a sub-rect `(sx,sy,sw,sh)` of a free-standing RGBA image into `dst`.
+    pub fn raw_image_src(
+        &mut self,
+        dst: UiRect,
+        image: std::sync::Arc<RgbaImage>,
+        src: (u32, u32, u32, u32),
+    ) {
+        self.commands.push(UiCommand::RawImage {
+            dst,
+            image,
+            src: Some(src),
+        });
+    }
+
+    /// A straight line from `(x0,y0)` to `(x1,y1)`, `width` px thick.
+    pub fn line(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, color: UiColor, width: i32) {
+        self.commands.push(UiCommand::Line {
+            x0,
+            y0,
+            x1,
+            y1,
+            color,
+            width: width.max(1),
+        });
     }
 
     /// Rasterize into a buffer downscaled by `pixel_scale` (the GUI pixel
@@ -538,10 +580,31 @@ impl UiFrame {
                         fill_rect(&mut pixels, width, height, dst, UiColor::rgba(28, 22, 18, 255));
                     }
                 }
-                UiCommand::RawImage { dst, image } => {
+                UiCommand::RawImage { dst, image, src } => {
                     let dst = scale_rect(*dst, s);
                     let (iw, ih) = image.dimensions();
-                    blit_image(&mut pixels, width, height, dst, image, 0, 0, iw, ih);
+                    let (sx, sy, sw, sh) = src.unwrap_or((0, 0, iw, ih));
+                    blit_image(&mut pixels, width, height, dst, image, sx, sy, sw, sh);
+                }
+                UiCommand::Line {
+                    x0,
+                    y0,
+                    x1,
+                    y1,
+                    color,
+                    width: lw,
+                } => {
+                    draw_line(
+                        &mut pixels,
+                        width,
+                        height,
+                        *x0 / s,
+                        *y0 / s,
+                        *x1 / s,
+                        *y1 / s,
+                        *color,
+                        (*lw / s).max(1),
+                    );
                 }
                 UiCommand::ItemIcon { dst, item_id } => {
                     let dst = &scale_rect(*dst, s);
@@ -779,6 +842,50 @@ fn blit_image(
             }
             let dst_a = pixels[index + 3] as f32;
             pixels[index + 3] = (texel[3] as f32 + dst_a * (1.0 - a)).round().min(255.0) as u8;
+        }
+    }
+}
+
+/// Bresenham line, `lw` px thick (a square brush), alpha-composited so a
+/// translucent line blends over the buffer.
+#[allow(clippy::too_many_arguments)]
+fn draw_line(
+    pixels: &mut [u8],
+    width: u32,
+    height: u32,
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+    color: UiColor,
+    lw: i32,
+) {
+    let (mut x, mut y) = (x0, y0);
+    let dx = (x1 - x0).abs();
+    let dy = -(y1 - y0).abs();
+    let sx = if x0 < x1 { 1 } else { -1 };
+    let sy = if y0 < y1 { 1 } else { -1 };
+    let mut err = dx + dy;
+    let r = lw / 2;
+    loop {
+        for by in (y - r)..=(y + (lw - 1 - r)) {
+            for bx in (x - r)..=(x + (lw - 1 - r)) {
+                if bx >= 0 && by >= 0 && (bx as u32) < width && (by as u32) < height {
+                    composite_pixel(pixels, width, bx as u32, by as u32, color);
+                }
+            }
+        }
+        if x == x1 && y == y1 {
+            break;
+        }
+        let e2 = 2 * err;
+        if e2 >= dy {
+            err += dy;
+            x += sx;
+        }
+        if e2 <= dx {
+            err += dx;
+            y += sy;
         }
     }
 }
