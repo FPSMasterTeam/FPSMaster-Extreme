@@ -35,6 +35,12 @@ pub struct GuiMultiplayer {
     last_click: Option<(usize, Instant)>,
     row_rects: Vec<(usize, UiRect)>,
     buttons: Vec<GuiButton>,
+    /// When set, the screen shows the "remove this server?" confirmation for
+    /// this row instead of the list (vanilla `GuiYesNo`).
+    confirm_delete: Option<usize>,
+    /// Rows visible in the list on the last draw — lets keyboard navigation keep
+    /// the selection scrolled into view without screen dimensions.
+    last_visible: i32,
 }
 
 impl GuiMultiplayer {
@@ -48,6 +54,8 @@ impl GuiMultiplayer {
             last_click: None,
             row_rects: Vec::new(),
             buttons: Vec::new(),
+            confirm_delete: None,
+            last_visible: 0,
             servers,
         };
         screen.refresh();
@@ -82,6 +90,15 @@ impl GuiMultiplayer {
     fn layout(&mut self, ctx: &DrawCtx) {
         let s = ctx.scale;
         let cx = ctx.width / 2;
+        // Confirmation mode: just the Delete / Cancel pair (vanilla `GuiYesNo`).
+        if self.confirm_delete.is_some() {
+            let y = ctx.height / 6 + 96 * s;
+            self.buttons = vec![
+                GuiButton::at_px(cx - 155 * s, y, 150 * s, s, "Delete"),
+                GuiButton::at_px(cx + 5 * s, y, 150 * s, s, "Cancel"),
+            ];
+            return;
+        }
         // Vanilla createButtons() positions (left-anchored at width/2 - 154):
         //   row1 (height-52): Select(100) @ -154, Direct(100) @ -50, Add(100) @ +54
         //   row2 (height-28): Edit(70) @ -154, Delete(70) @ -74, Refresh(70) @ +4, Cancel(75) @ +80
@@ -112,8 +129,9 @@ impl GuiMultiplayer {
         vec![GuiAction::SetScreen(Box::new(GuiMainMenu::new()))]
     }
 
-    fn delete_selected(&mut self) {
-        if let Some(index) = self.selected {
+    /// Remove the row the confirmation dialog is for, then leave confirm mode.
+    fn confirm_delete_now(&mut self) {
+        if let Some(index) = self.confirm_delete.take() {
             if index < self.servers.entries.len() {
                 self.servers.entries.remove(index);
                 self.servers.save();
@@ -121,6 +139,47 @@ impl GuiMultiplayer {
                 self.refresh();
             }
         }
+    }
+
+    /// Move the selection by `delta` rows (vanilla arrow-key navigation),
+    /// clamping to the list and keeping the selected row scrolled into view.
+    fn select_delta(&mut self, delta: i32) {
+        let count = self.servers.entries.len() as i32;
+        if count == 0 {
+            return;
+        }
+        let next = match self.selected {
+            Some(i) => (i as i32 + delta).clamp(0, count - 1),
+            None if delta > 0 => 0,
+            None => count - 1,
+        };
+        self.selected = Some(next as usize);
+        // Keep the selection inside the visible window.
+        if next < self.scroll {
+            self.scroll = next;
+        } else if self.last_visible > 0 && next >= self.scroll + self.last_visible {
+            self.scroll = next - self.last_visible + 1;
+        }
+    }
+
+    /// Reorder the selected server by `delta` (vanilla Shift+Arrow), carrying its
+    /// ping result with it and persisting the new order.
+    fn move_selected(&mut self, delta: i32) {
+        let Some(index) = self.selected else {
+            return;
+        };
+        let target = index as i32 + delta;
+        if target < 0 || target as usize >= self.servers.entries.len() {
+            return;
+        }
+        let target = target as usize;
+        self.servers.entries.swap(index, target);
+        if index < self.pings.len() && target < self.pings.len() {
+            self.pings.swap(index, target);
+        }
+        self.servers.save();
+        self.selected = Some(target);
+        self.select_delta(0); // re-clamp scroll to the moved selection
     }
 }
 
@@ -159,6 +218,39 @@ impl GuiScreen for GuiMultiplayer {
         self.layout(ctx);
         draw_default_background(ui, ctx);
         let s = ctx.scale;
+
+        // Delete confirmation (vanilla `GuiYesNo`): a prompt + the server name
+        // over the Delete / Cancel buttons, instead of the list.
+        if let Some(index) = self.confirm_delete {
+            let name = self
+                .servers
+                .entries
+                .get(index)
+                .map(|e| e.name.clone())
+                .unwrap_or_default();
+            draw_centered_text(
+                ui,
+                ctx.width,
+                ctx.height / 6 + 20 * s,
+                s,
+                TEXT_WHITE,
+                "Are you sure you want to remove this server?",
+            );
+            draw_centered_text(ui, ctx.width, ctx.height / 6 + 44 * s, s, TEXT_WHITE, &name);
+            draw_centered_text(
+                ui,
+                ctx.width,
+                ctx.height / 6 + 60 * s,
+                s,
+                TEXT_GRAY,
+                "It will be lost forever! (A long time!)",
+            );
+            for button in &self.buttons {
+                button.draw(ui, s, ctx.mouse, ctx.mouse_down);
+            }
+            return;
+        }
+
         // Vanilla title at y=20 GUI px (drawn from baseline-ish, so use 20-8/2).
         draw_centered_text(ui, ctx.width, 16 * s, s, TEXT_WHITE, &tr("multiplayer.title"));
 
@@ -169,8 +261,12 @@ impl GuiScreen for GuiMultiplayer {
         self.row_rects.clear();
         let total = self.servers.entries.len() as i32;
         let visible = list.visible_rows();
+        self.last_visible = visible;
         let max_scroll = (total - visible).max(0);
         self.scroll = self.scroll.clamp(0, max_scroll);
+        // A hover tooltip (ping latency or player sample), drawn last so it sits
+        // over the rows and buttons.
+        let mut tooltip: Option<Vec<String>> = None;
 
         if self.servers.entries.is_empty() {
             draw_centered_text(
@@ -230,13 +326,16 @@ impl GuiScreen for GuiMultiplayer {
             };
             if !pop.is_empty() {
                 let pw = text_width(&pop, s);
-                ui.text_shadowed(
-                    rect.x + rect.width - pw - 15 * s - 2 * s,
-                    rect.y + s,
-                    s,
-                    TEXT_GRAY,
-                    pop,
-                );
+                let px = rect.x + rect.width - pw - 15 * s - 2 * s;
+                ui.text_shadowed(px, rect.y + s, s, TEXT_GRAY, pop);
+                // Hovering the player count lists the online-player sample.
+                if let Some(PingOutcome::Ok(info)) = ping {
+                    if !info.sample.is_empty()
+                        && UiRect::new(px, rect.y + s, pw, 8 * s).contains(ctx.mouse.0, ctx.mouse.1)
+                    {
+                        tooltip = Some(info.sample.clone());
+                    }
+                }
             }
 
             // Lines 2-3: MOTD wrapped to 2 lines (vanilla), or status text.
@@ -258,20 +357,41 @@ impl GuiScreen for GuiMultiplayer {
 
             // Ping bars: icons.png src (k*10, 176 + l*8), 10×8, at (x+listWidth-15, y).
             let (k, l) = ping_bar_cell(ping, visible_index as i32);
+            let bar = UiRect::new(rect.x + rect.width - 15 * s, rect.y, 10 * s, 8 * s);
             ui.image(
-                UiRect::new(rect.x + rect.width - 15 * s, rect.y, 10 * s, 8 * s),
+                bar,
                 recraft_render::GuiTexture::Icons,
                 (k * 10) as u32,
                 (176 + l * 8) as u32,
                 10,
                 8,
             );
+            // Hovering the ping bar shows latency / connection status.
+            if bar.contains(ctx.mouse.0, ctx.mouse.1) {
+                tooltip = Some(vec![match ping {
+                    Some(PingOutcome::Ok(info)) => format!("{}ms", info.latency_ms),
+                    Some(PingOutcome::Failed(_)) => "(no connection)".to_owned(),
+                    None => "Pinging...".to_owned(),
+                }]);
+            }
         }
 
         list.draw_scrollbar(ui, self.scroll, max_scroll, total);
 
         for button in &self.buttons {
             button.draw(ui, s, ctx.mouse, ctx.mouse_down);
+        }
+
+        if let Some(lines) = tooltip {
+            super::draw_tooltip(
+                ui,
+                &lines,
+                ctx.mouse.0 as i32,
+                ctx.mouse.1 as i32,
+                ctx.width,
+                ctx.height,
+                s,
+            );
         }
     }
 
@@ -287,6 +407,15 @@ impl GuiScreen for GuiMultiplayer {
     }
 
     fn mouse_clicked(&mut self, x: f64, y: f64, _ctx: &mut ScreenCtx) -> Vec<GuiAction> {
+        // Confirmation dialog: only its Delete / Cancel buttons are live.
+        if self.confirm_delete.is_some() {
+            if self.buttons.first().is_some_and(|b| b.clicked(x, y)) {
+                self.confirm_delete_now();
+            } else if self.buttons.get(1).is_some_and(|b| b.clicked(x, y)) {
+                self.confirm_delete = None;
+            }
+            return Vec::new();
+        }
         // Row selection (+ double-click join).
         for (index, rect) in &self.row_rects {
             if rect.contains(x, y) {
@@ -325,7 +454,10 @@ impl GuiScreen for GuiMultiplayer {
             }
         }
         if self.buttons[4].clicked(x, y) {
-            self.delete_selected();
+            // Delete asks for confirmation first (vanilla `GuiYesNo`).
+            if self.selected.is_some_and(|i| i < self.servers.entries.len()) {
+                self.confirm_delete = self.selected;
+            }
             return Vec::new();
         }
         if self.buttons[5].clicked(x, y) {
@@ -344,16 +476,48 @@ impl GuiScreen for GuiMultiplayer {
         self.scroll = self.scroll.max(0);
     }
 
-    fn key_pressed(&mut self, event: &KeyEvent, _ctx: &mut ScreenCtx) -> Vec<GuiAction> {
+    fn key_pressed(&mut self, event: &KeyEvent, ctx: &mut ScreenCtx) -> Vec<GuiAction> {
         if event.state != ElementState::Pressed {
             return Vec::new();
         }
+        // While confirming a delete, the keyboard only confirms or cancels.
+        if self.confirm_delete.is_some() {
+            match event.physical_key {
+                PhysicalKey::Code(KeyCode::Escape) => self.confirm_delete = None,
+                PhysicalKey::Code(KeyCode::Enter | KeyCode::NumpadEnter) => self.confirm_delete_now(),
+                _ => {}
+            }
+            return Vec::new();
+        }
+        let shift = ctx.modifiers.shift_key();
         match event.physical_key {
             PhysicalKey::Code(KeyCode::Escape) => {
                 vec![GuiAction::SetScreen(Box::new(GuiMainMenu::new()))]
             }
             PhysicalKey::Code(KeyCode::Enter) | PhysicalKey::Code(KeyCode::NumpadEnter) => {
                 self.join_selected()
+            }
+            // Shift+Arrow reorders the selected server; plain Arrow moves the
+            // selection (vanilla `GuiMultiplayer.keyTyped`).
+            PhysicalKey::Code(KeyCode::ArrowUp) => {
+                if shift {
+                    self.move_selected(-1);
+                } else {
+                    self.select_delta(-1);
+                }
+                Vec::new()
+            }
+            PhysicalKey::Code(KeyCode::ArrowDown) => {
+                if shift {
+                    self.move_selected(1);
+                } else {
+                    self.select_delta(1);
+                }
+                Vec::new()
+            }
+            PhysicalKey::Code(KeyCode::F5) => {
+                self.refresh();
+                Vec::new()
             }
             _ => Vec::new(),
         }

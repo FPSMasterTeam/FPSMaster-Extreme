@@ -91,6 +91,9 @@ recraft.resourcepack.default=Default (Vanilla 1.8)
 recraft.resourcepack.none=No resource pack
 recraft.resourcepack.format=Format: %1$s  %2$s
 
+# Villager trade screen
+recraft.merchant.unavailable=Can't trade with villager at the moment
+
 # Language screen
 recraft.language.title=Select Language
 

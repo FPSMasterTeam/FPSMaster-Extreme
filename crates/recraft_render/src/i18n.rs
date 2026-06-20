@@ -105,6 +105,7 @@ fn build_name_index(en_base: &BTreeMap<String, String>) -> BTreeMap<String, Stri
             || key.starts_with("item.")
             || key.starts_with("enchantment.")
             || key.starts_with("attribute.name.")
+            || key.starts_with("potion.")
     };
     let mut counts: BTreeMap<&str, u32> = BTreeMap::new();
     for (key, value) in en_base {

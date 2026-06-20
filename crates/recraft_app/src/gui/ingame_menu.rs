@@ -28,14 +28,19 @@ impl GuiScreen for GuiIngameMenu {
 
     fn draw(&mut self, ui: &mut UiFrame, ctx: &DrawCtx) {
         let s = ctx.scale;
-        let x = (ctx.width - 200 * s) / 2;
+        let full_x = (ctx.width - 200 * s) / 2;
+        let center = ctx.width / 2;
         let top = ctx.height / 4 + 24 * s;
+        // Vanilla `GuiIngameMenu` layout: a full-width "Back to Game", a paired
+        // row (vanilla's Achievements/Statistics — here the functional
+        // Options/Mods), then a gap and the full-width leave button. The
+        // singleplayer-only "Share to LAN" button is omitted; the leave button
+        // reads "Disconnect" since recraft is always a multiplayer client.
         self.buttons = vec![
-            GuiButton::at_px(x, top, 200 * s, s, tr("menu.returnToGame")),
-            GuiButton::at_px(x, top + 24 * s, 200 * s, s, tr("menu.options")),
-            GuiButton::at_px(x, top + 48 * s, 200 * s, s, tr("recraft.menu.mods")),
-            // Vanilla separates the leave button from the rest with a gap.
-            GuiButton::at_px(x, top + 96 * s, 200 * s, s, tr("recraft.menu.quitToTitle")),
+            GuiButton::at_px(full_x, top, 200 * s, s, tr("menu.returnToGame")),
+            GuiButton::at_px(center - 100 * s, top + 24 * s, 98 * s, s, tr("menu.options")),
+            GuiButton::at_px(center + 2 * s, top + 24 * s, 98 * s, s, tr("recraft.menu.mods")),
+            GuiButton::at_px(full_x, top + 72 * s, 200 * s, s, tr("menu.disconnect")),
         ];
         draw_default_background(ui, ctx);
         draw_centered_text(ui, ctx.width, ctx.height / 4, s, super::TEXT_WHITE, &tr("menu.game"));

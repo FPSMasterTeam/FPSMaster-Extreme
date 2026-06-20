@@ -150,8 +150,15 @@ impl GuiScreen for GuiContainer {
         let scale = ctx.scale;
         let pw = container.x_size * scale;
         let ph = container.y_size * scale;
-        let px = (ctx.width - pw) / 2;
+        let mut px = (ctx.width - pw) / 2;
         let py = (ctx.height - ph) / 2;
+        // Vanilla `InventoryEffectRenderer` shifts the player inventory window
+        // 60 GUI px to the right to make room for the active-effect panel on its
+        // left (guiLeft = 160 + (W - xSize - 200)/2, i.e. centered + 60).
+        let show_effects = container.kind == WindowKind::Player && !hud.effects.is_empty();
+        if show_effects {
+            px += 60 * scale;
+        }
         // Cache the layout so the input handlers can map cursor → slot.
         self.px = px;
         self.py = py;
@@ -162,12 +169,18 @@ impl GuiScreen for GuiContainer {
         draw_background(ui, container, px, py, scale);
         draw_progress(ui, container, px, py, scale);
         draw_titles(ui, container, px, py, scale);
+        if show_effects {
+            draw_active_potion_effects(ui, hud.effects, px, py, scale);
+        }
         if container.kind == WindowKind::Enchant {
             let hovered = super::enchant::option_at(container, ctx.mouse, px, py, scale);
             super::enchant::draw_options(ui, container, px, py, scale, hovered);
         }
         if container.kind == WindowKind::Anvil {
             draw_anvil_field(ui, container, hud.inventory, px, py, scale);
+        }
+        if container.kind == WindowKind::Villager {
+            super::merchant::draw_offer(ui, container, px, py, scale, ctx.mouse);
         }
 
         let icon = 16 * scale;
@@ -207,6 +220,9 @@ impl GuiScreen for GuiContainer {
                     scale,
                 );
             }
+        } else if container.kind == WindowKind::Villager {
+            // A villager trade preview item / deprecated arrow under the cursor.
+            super::merchant::draw_tooltip(ui, container, ctx, px, py, scale);
         }
     }
 
@@ -226,6 +242,23 @@ impl GuiScreen for GuiContainer {
                     .is_some()
             {
                 return Vec::new();
+            }
+            // A villager `< >` trade-selection button: change the selection and
+            // ask the server (MC|TrSel) to fill the trade slots for that recipe.
+            if container.kind == WindowKind::Villager {
+                if let Some(button) =
+                    super::merchant::button_at(container, (x, y), self.px, self.py, self.scale)
+                {
+                    let selected = container.selected_trade();
+                    let index = match button {
+                        super::merchant::TradeButton::Prev => selected.saturating_sub(1),
+                        super::merchant::TradeButton::Next => selected + 1,
+                    };
+                    return match ctx.game.merchant_select(index) {
+                        Some(packet) => vec![GuiAction::SendPacket(packet)],
+                        None => Vec::new(),
+                    };
+                }
             }
         }
         let slot = slot_under(self, ctx, (x, y));
@@ -448,6 +481,111 @@ fn draw_anvil_field(
         let name = recraft_render::item_display_name(item.id, item.damage);
         ui.text(field.x + 7 * scale, field.y + 4 * scale, scale, UiColor::rgba(224, 224, 224, 255), name);
     }
+}
+
+/// The active potion-effect panel beside the player inventory (vanilla
+/// `InventoryEffectRenderer.drawActivePotionEffects`): one 140×32 GUI-px row per
+/// effect, anchored 124 px to the left of the window, each showing the effect
+/// icon, localized name (+ amplifier level) and remaining duration. Rows pack
+/// tighter than 33 px once more than five effects are active.
+fn draw_active_potion_effects(
+    ui: &mut UiFrame,
+    effects: &[(u8, i8, i32)],
+    px: i32,
+    py: i32,
+    scale: i32,
+) {
+    let panel_x = px - 124 * scale;
+    let step = if effects.len() > 5 {
+        132 / (effects.len() as i32 - 1)
+    } else {
+        33
+    };
+    for (n, &(id, amplifier, duration)) in effects.iter().enumerate() {
+        let Some((name, icon)) = potion_info(id) else {
+            continue;
+        };
+        let row_y = py + n as i32 * step * scale;
+        // Panel background sprite (inventory.png at 0,166 sized 140×32).
+        ui.image(
+            UiRect::new(panel_x, row_y, 140 * scale, 32 * scale),
+            GuiTexture::Inventory,
+            0,
+            166,
+            140,
+            32,
+        );
+        // Status icon (18×18 from the icon grid that starts at y=198).
+        if let Some((col, irow)) = icon {
+            ui.image(
+                UiRect::new(panel_x + 6 * scale, row_y + 7 * scale, 18 * scale, 18 * scale),
+                GuiTexture::Inventory,
+                col * 18,
+                198 + irow * 18,
+                18,
+                18,
+            );
+        }
+        let mut label = crate::i18n::localize_name(name);
+        match amplifier {
+            1 => label.push_str(" II"),
+            2 => label.push_str(" III"),
+            3 => label.push_str(" IV"),
+            _ => {}
+        }
+        ui.text_shadowed(
+            panel_x + 28 * scale,
+            row_y + 6 * scale,
+            scale,
+            UiColor::rgba(255, 255, 255, 255),
+            label,
+        );
+        ui.text_shadowed(
+            panel_x + 28 * scale,
+            row_y + 16 * scale,
+            scale,
+            UiColor::rgba(127, 127, 127, 255),
+            ticks_to_elapsed(duration),
+        );
+    }
+}
+
+/// Display name and icon-grid `(column, row)` for a potion id (vanilla `Potion`),
+/// or `None` for ids with no effect entry. The icon is `None` for the instant /
+/// iconless potions (heal, harm, saturation).
+fn potion_info(id: u8) -> Option<(&'static str, Option<(u32, u32)>)> {
+    Some(match id {
+        1 => ("Speed", Some((0, 0))),
+        2 => ("Slowness", Some((1, 0))),
+        3 => ("Haste", Some((2, 0))),
+        4 => ("Mining Fatigue", Some((3, 0))),
+        5 => ("Strength", Some((4, 0))),
+        6 => ("Instant Health", None),
+        7 => ("Instant Damage", None),
+        8 => ("Jump Boost", Some((2, 1))),
+        9 => ("Nausea", Some((3, 1))),
+        10 => ("Regeneration", Some((7, 0))),
+        11 => ("Resistance", Some((6, 1))),
+        12 => ("Fire Resistance", Some((7, 1))),
+        13 => ("Water Breathing", Some((0, 2))),
+        14 => ("Invisibility", Some((0, 1))),
+        15 => ("Blindness", Some((5, 1))),
+        16 => ("Night Vision", Some((4, 1))),
+        17 => ("Hunger", Some((1, 1))),
+        18 => ("Weakness", Some((5, 0))),
+        19 => ("Poison", Some((6, 0))),
+        20 => ("Wither", Some((1, 2))),
+        21 => ("Health Boost", Some((2, 2))),
+        22 => ("Absorption", Some((2, 2))),
+        23 => ("Saturation", None),
+        _ => return None,
+    })
+}
+
+/// Vanilla `StringUtils.ticksToElapsedTime`: `mm:ss` from a tick count.
+fn ticks_to_elapsed(ticks: i32) -> String {
+    let secs = ticks / 20;
+    format!("{}:{:02}", secs / 60, secs % 60)
 }
 
 /// Progress sprites driven by WindowProperty: the furnace flame + smelt arrow.

@@ -8,7 +8,48 @@
 //! alias the shared player inventory, exactly like vanilla's slot list mixing a
 //! container `IInventory` with `InventoryPlayer`.
 
-use recraft_protocol::v1_8_9::packets::{ServerboundPacket, SlotItem};
+use recraft_protocol::io::PacketReader;
+use recraft_protocol::v1_8_9::packets::{read_slot, ServerboundPacket, SlotItem};
+
+/// One villager trade offer (vanilla `MerchantRecipe`), parsed from the
+/// `MC|TrList` plugin message. The interactive slots are still server-driven;
+/// these recipes only feed the trade preview row and the `< >` selection.
+#[derive(Debug, Clone)]
+pub struct MerchantRecipe {
+    /// The first (primary) item the trade costs.
+    pub buy: SlotItem,
+    /// The optional second cost item.
+    pub buy_secondary: Option<SlotItem>,
+    /// The item the trade yields.
+    pub sell: SlotItem,
+    /// Whether the trade is locked out (vanilla `toolUses >= maxTradeUses`).
+    pub disabled: bool,
+}
+
+/// Parse a `MC|TrList` payload (vanilla `MerchantRecipeList.readFromBuf`,
+/// preceded by the window id): `int window_id`, `byte count`, then per recipe
+/// `buy, sell, bool hasSecond, [buy2], bool disabled, int uses, int maxUses`.
+/// Returns the window id and the offers, or `None` if the bytes are malformed.
+pub fn parse_trade_list(data: &[u8]) -> Option<(i32, Vec<MerchantRecipe>)> {
+    let mut r = PacketReader::new(data);
+    let window_id = r.read_i32().ok()?;
+    let count = r.read_u8().ok()?;
+    let mut trades = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let buy = read_slot(&mut r).ok()??;
+        let sell = read_slot(&mut r).ok()??;
+        let buy_secondary = if r.read_bool().ok()? {
+            read_slot(&mut r).ok()?
+        } else {
+            None
+        };
+        let disabled = r.read_bool().ok()?;
+        let _uses = r.read_i32().ok()?;
+        let _max_uses = r.read_i32().ok()?;
+        trades.push(MerchantRecipe { buy, buy_secondary, sell, disabled });
+    }
+    Some((window_id, trades))
+}
 
 /// Which backing inventory a window slot reads/writes: the container's own
 /// `IInventory`, or the shared 45-slot player inventory.
@@ -97,6 +138,11 @@ pub struct Container {
     drag_mode: i32,
     drag_slots: Vec<usize>,
     action: i16,
+    /// Villager trade offers (vanilla `MerchantRecipeList`), set from `MC|TrList`;
+    /// empty for non-merchant windows.
+    trades: Vec<MerchantRecipe>,
+    /// The selected trade index (vanilla `GuiMerchant.selectedMerchantRecipe`).
+    selected_trade: usize,
 }
 
 impl Container {
@@ -240,11 +286,36 @@ impl Container {
             drag_mode: 0,
             drag_slots: Vec::new(),
             action: 0,
+            trades: Vec::new(),
+            selected_trade: 0,
         }
     }
 
     pub fn slots(&self) -> &[Slot] {
         &self.slots
+    }
+
+    /// The villager trade offers (empty until `MC|TrList` arrives).
+    pub fn trades(&self) -> &[MerchantRecipe] {
+        &self.trades
+    }
+
+    /// The currently selected trade index, clamped to the offer list.
+    pub fn selected_trade(&self) -> usize {
+        self.selected_trade
+    }
+
+    /// Replace the trade offers (from `MC|TrList`), keeping the selection valid.
+    pub fn set_trades(&mut self, trades: Vec<MerchantRecipe>) {
+        if self.selected_trade >= trades.len() {
+            self.selected_trade = trades.len().saturating_sub(1);
+        }
+        self.trades = trades;
+    }
+
+    /// Select trade `index`, clamped to the available offers.
+    pub fn set_selected_trade(&mut self, index: usize) {
+        self.selected_trade = index.min(self.trades.len().saturating_sub(1));
     }
 
     /// The number of slots that belong to the container itself (not the player
@@ -798,6 +869,56 @@ fn is_non_stackable(id: i16) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Append a slot stack in the vanilla wire form (id i16, count u8, damage
+    /// i16, empty NBT) — `None` is the `-1` empty marker.
+    fn push_slot(buf: &mut Vec<u8>, item: Option<(i16, u8, i16)>) {
+        match item {
+            None => buf.extend_from_slice(&(-1i16).to_be_bytes()),
+            Some((id, count, damage)) => {
+                buf.extend_from_slice(&id.to_be_bytes());
+                buf.push(count);
+                buf.extend_from_slice(&damage.to_be_bytes());
+                buf.push(0); // NBT absent
+            }
+        }
+    }
+
+    /// `MC|TrList` parses in the vanilla field order: buy, sell, hasSecond,
+    /// [buy2], disabled, uses, maxUses — with the window id and count up front.
+    #[test]
+    fn parses_a_trade_list_payload() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&7i32.to_be_bytes()); // window id
+        buf.push(2); // two offers
+        // Offer 0: 1 emerald -> 1 diamond, with a second cost, enabled.
+        push_slot(&mut buf, Some((388, 1, 0)));
+        push_slot(&mut buf, Some((264, 1, 0)));
+        buf.push(1); // has second item
+        push_slot(&mut buf, Some((1, 16, 0)));
+        buf.push(0); // not disabled
+        buf.extend_from_slice(&3i32.to_be_bytes()); // uses
+        buf.extend_from_slice(&7i32.to_be_bytes()); // max uses
+        // Offer 1: 2 wheat -> 1 emerald, no second cost, disabled.
+        push_slot(&mut buf, Some((296, 2, 0)));
+        push_slot(&mut buf, Some((388, 1, 0)));
+        buf.push(0); // no second item
+        buf.push(1); // disabled
+        buf.extend_from_slice(&7i32.to_be_bytes());
+        buf.extend_from_slice(&7i32.to_be_bytes());
+
+        let (window_id, trades) = parse_trade_list(&buf).expect("parse");
+        assert_eq!(window_id, 7);
+        assert_eq!(trades.len(), 2);
+        assert_eq!(trades[0].buy.id, 388);
+        assert_eq!(trades[0].sell.id, 264);
+        assert_eq!(trades[0].buy_secondary.as_ref().unwrap().id, 1);
+        assert!(!trades[0].disabled);
+        assert_eq!(trades[1].buy.id, 296);
+        assert_eq!(trades[1].buy.count, 2);
+        assert!(trades[1].buy_secondary.is_none());
+        assert!(trades[1].disabled);
+    }
 
     /// The OpenWindow `inventory_type` string maps to the right kind, and chest
     /// rows derive from the container slot count.

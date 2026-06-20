@@ -89,5 +89,8 @@ recraft.resourcepack.default=默认（原版 1.8）
 recraft.resourcepack.none=无资源包
 recraft.resourcepack.format=格式：%1$s  %2$s
 
+# 村民交易界面
+recraft.merchant.unavailable=目前无法与村民交易
+
 # 语言界面
 recraft.language.title=选择语言
