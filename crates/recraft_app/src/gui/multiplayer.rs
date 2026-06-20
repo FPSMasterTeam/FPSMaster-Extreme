@@ -9,6 +9,7 @@ use recraft_render::{text_width, UiColor, UiFrame, UiRect};
 use winit::event::{ElementState, KeyEvent};
 use winit::keyboard::{KeyCode, PhysicalKey};
 
+use crate::i18n::tr;
 use crate::servers::{self, PingOutcome, ServerList};
 
 use super::edit_server::{GuiDirectConnect, GuiEditServer};
@@ -91,19 +92,19 @@ impl GuiMultiplayer {
             .is_some_and(|index| index < self.servers.entries.len());
         self.buttons = vec![
             // 0: Join (Select)
-            GuiButton::at_px(cx - 154 * s, row1, 100 * s, s, "Join Server").disabled(!has_selection),
+            GuiButton::at_px(cx - 154 * s, row1, 100 * s, s, tr("selectServer.select")).disabled(!has_selection),
             // 1: Direct Connect
-            GuiButton::at_px(cx - 50 * s, row1, 100 * s, s, "Direct Connect"),
+            GuiButton::at_px(cx - 50 * s, row1, 100 * s, s, tr("selectServer.direct")),
             // 2: Add Server
-            GuiButton::at_px(cx + 54 * s, row1, 100 * s, s, "Add Server"),
+            GuiButton::at_px(cx + 54 * s, row1, 100 * s, s, tr("recraft.server.add")),
             // 3: Edit
-            GuiButton::at_px(cx - 154 * s, row2, 70 * s, s, "Edit").disabled(!has_selection),
+            GuiButton::at_px(cx - 154 * s, row2, 70 * s, s, tr("selectServer.edit")).disabled(!has_selection),
             // 4: Delete
-            GuiButton::at_px(cx - 74 * s, row2, 70 * s, s, "Delete").disabled(!has_selection),
+            GuiButton::at_px(cx - 74 * s, row2, 70 * s, s, tr("selectServer.delete")).disabled(!has_selection),
             // 5: Refresh
-            GuiButton::at_px(cx + 4 * s, row2, 70 * s, s, "Refresh"),
+            GuiButton::at_px(cx + 4 * s, row2, 70 * s, s, tr("selectServer.refresh")),
             // 6: Cancel (back to title)
-            GuiButton::at_px(cx + 80 * s, row2, 75 * s, s, "Cancel"),
+            GuiButton::at_px(cx + 80 * s, row2, 75 * s, s, tr("gui.cancel")),
         ];
     }
 
@@ -159,7 +160,7 @@ impl GuiScreen for GuiMultiplayer {
         draw_default_background(ui, ctx);
         let s = ctx.scale;
         // Vanilla title at y=20 GUI px (drawn from baseline-ish, so use 20-8/2).
-        draw_centered_text(ui, ctx.width, 16 * s, s, TEXT_WHITE, "Play Multiplayer");
+        draw_centered_text(ui, ctx.width, 16 * s, s, TEXT_WHITE, &tr("multiplayer.title"));
 
         let list = self.list_view(ctx);
         list.draw_background(ui);
@@ -178,7 +179,7 @@ impl GuiScreen for GuiMultiplayer {
                 (list.top + list.bottom) / 2 - 4 * s,
                 s,
                 TEXT_GRAY,
-                "No servers yet — Add Server or Direct Connect below.",
+                &tr("recraft.multiplayer.empty"),
             );
         }
 
@@ -242,7 +243,7 @@ impl GuiScreen for GuiMultiplayer {
             let motd = match ping {
                 Some(PingOutcome::Ok(info)) => format!("§7{}", info.motd),
                 Some(PingOutcome::Failed(err)) => format!("§4{err}"),
-                None => "§7Pinging...".to_owned(),
+                None => format!("§7{}", tr("recraft.multiplayer.pinging")),
             };
             let lines = crate::chat::wrap_legacy(&motd, text_w - 2 * s, s);
             for (i, line) in lines.iter().take(2).enumerate() {

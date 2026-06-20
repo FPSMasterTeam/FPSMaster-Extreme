@@ -11,8 +11,14 @@ use recraft_protocol::v1_8_9::packets::SlotItem;
 
 use crate::texture::item_texture_name;
 
-/// The vanilla display name for an item/block stack (id + damage/meta).
+/// The vanilla display name for an item/block stack (id + damage/meta),
+/// localized to the active language where the name maps to a known lang key.
 pub fn item_display_name(id: i16, damage: i16) -> String {
+    crate::i18n::localize_name(&item_display_name_en(id, damage))
+}
+
+/// The hardcoded vanilla English name (the localization source / fallback).
+fn item_display_name_en(id: i16, damage: i16) -> String {
     if (1..256).contains(&id) {
         let meta = (damage.max(0) & 15) as u8;
         if let Some(name) = block_name(id, meta) {
@@ -332,7 +338,7 @@ pub fn build_tooltip(item: &SlotItem) -> Vec<String> {
     // Unbreakable (flag bit 2).
     if hide_flags & 4 == 0 {
         if nbt.and_then(|t| t.get("Unbreakable")).map(|t| t.as_bool()).unwrap_or(false) {
-            lines.push("\u{00a7}9Unbreakable".to_owned());
+            lines.push(format!("\u{00a7}9{}", crate::i18n::localize_name("Unbreakable")));
         }
     }
 
@@ -454,7 +460,7 @@ fn format_modifier(attr: &str, amount: f64, operation: i32) -> Option<String> {
         return None;
     }
 
-    let name = attribute_display_name(attr);
+    let name = crate::i18n::localize_name(attribute_display_name(attr));
     let abs = display_amount.abs();
     let formatted = format_amount(abs);
     let pct = if operation == 1 || operation == 2 { "%" } else { "" };
@@ -512,6 +518,8 @@ fn enchantment_name(id: i16, level: i16) -> Option<String> {
         62 => "Lure",
         _ => return None,
     };
+    let base = crate::i18n::localize_name(base);
+    let base = base.as_str();
     let roman = match level {
         1 => "I",
         2 => "II",

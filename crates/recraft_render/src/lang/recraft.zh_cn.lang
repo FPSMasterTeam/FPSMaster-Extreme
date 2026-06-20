@@ -1,0 +1,93 @@
+# Recraft 专有界面文本（原版没有对应键）。叠加在原版 zh_CN 表之上。
+
+# 主菜单 / 暂停菜单
+recraft.menu.accounts=账户
+recraft.menu.mods=模组…
+recraft.menu.demo=试玩世界
+recraft.menu.quitToTitle=退回标题画面
+recraft.account.notSignedIn=未登录
+recraft.account.signedInAs=已登录为
+
+# 账户界面
+recraft.accounts.title=账户
+recraft.accounts.use=使用账户
+recraft.accounts.addMicrosoft=用微软账户添加
+recraft.accounts.addToken=添加令牌
+recraft.accounts.copyToken=复制令牌
+recraft.accounts.empty=还没有账户——在下方添加。
+recraft.accounts.inUse=（使用中）
+recraft.accounts.addTitle=用刷新令牌添加
+recraft.accounts.addInstr=粘贴一个微软刷新令牌（在账户界面按 Cmd/Ctrl+V）：
+recraft.accounts.add=添加账户
+
+# 按键设置界面
+recraft.controls.bindHint=按一个键进行绑定，或按 Esc 取消
+
+# 试玩世界选择
+recraft.demo.title=选择试玩世界
+recraft.demo.landscape=风景地形
+recraft.demo.chunkStress=区块压力测试
+recraft.demo.entityStress=实体压力测试
+
+# 服务器列表 / 编辑服务器
+recraft.server.defaultName=Minecraft 服务器
+recraft.server.add=添加服务器
+recraft.multiplayer.empty=还没有服务器——在下方添加服务器或直接连接。
+recraft.multiplayer.pinging=正在 Ping…
+
+# 模组界面
+recraft.mods.title=模组
+recraft.mods.empty=未安装模组
+recraft.mods.enabledCount=已启用 %1$s/%2$s  -  点击模组以切换
+recraft.mods.on=开
+recraft.mods.off=关
+recraft.mods.help=将模组放入 'mods' 文件夹，然后点击重新加载。
+recraft.mods.reload=重新加载
+recraft.mods.openFolder=打开文件夹
+recraft.mods.builtin=内置
+
+# 视频 / 选项（Recraft 专有设置标签）
+recraft.options.renderScale=渲染缩放
+recraft.options.autoRes=自动分辨率
+recraft.options.resolution=分辨率
+recraft.options.showFps=显示 FPS
+recraft.options.oldAnimations=旧版动画
+recraft.options.shaders=光影…
+recraft.options.native=原生
+recraft.unit.chunks=区块
+
+# 光影界面
+recraft.shaders.title=光影
+recraft.shaders.shaders=光影
+recraft.shaders.shadows=阴影
+recraft.shaders.specular=高光
+recraft.shaders.fog=雾
+recraft.shaders.bloom=泛光
+recraft.shaders.volLight=体积光
+recraft.shaders.vignette=暗角
+recraft.shaders.chroma=色散
+recraft.shaders.dof=景深
+recraft.shaders.motion=动态模糊
+recraft.shaders.autoExp=自动曝光
+recraft.shaders.clouds=云
+
+# 进度 / 连接 / 登录界面
+recraft.progress.loadingWorld=正在加载世界…
+recraft.progress.connecting=正在连接服务器…
+recraft.progress.chunksLoaded=已加载 %s 个区块
+recraft.auth.title=微软登录
+recraft.auth.openBrowser=打开浏览器并访问：
+recraft.auth.enterCode=输入代码：
+recraft.auth.waiting=正在等待登录…按 ESC 取消
+recraft.server.startFailed=服务器启动失败
+recraft.server.startTimeout=服务器在 60 秒内未响应
+recraft.server.starting=正在启动本地服务器…
+recraft.server.waiting=正在等待服务器启动
+
+# 资源包界面
+recraft.resourcepack.default=默认（原版 1.8）
+recraft.resourcepack.none=无资源包
+recraft.resourcepack.format=格式：%1$s  %2$s
+
+# 语言界面
+recraft.language.title=选择语言

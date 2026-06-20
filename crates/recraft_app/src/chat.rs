@@ -440,46 +440,22 @@ fn color_name_to_code(name: &str) -> Option<char> {
     })
 }
 
-/// The translation strings a client actually sees in normal play. Unknown keys
-/// fall back to the joined arguments (or the key itself when there are none) —
-/// readable even without the full language table.
+/// Resolve a server-sent translation component against the active language
+/// table (vanilla `%s`/`%n$s` patterns). Unknown keys fall back to the joined
+/// arguments (or the key itself when there are none) — readable even without a
+/// matching entry.
 fn format_translation(key: &str, args: &[String]) -> String {
-    let pattern = match key {
-        "chat.type.text" => "<{0}> {1}",
-        "chat.type.announcement" => "[{0}] {1}",
-        "chat.type.emote" => "* {0} {1}",
-        "chat.type.admin" => "[{0}: {1}]",
-        "multiplayer.player.joined" => "{0} joined the game",
-        "multiplayer.player.left" => "{0} left the game",
-        "commands.message.display.incoming" => "{0} whispers to you: {1}",
-        "commands.message.display.outgoing" => "You whisper to {0}: {1}",
-        _ => {
-            return if args.is_empty() {
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    match crate::i18n::translate_opt(key) {
+        Some(pattern) => crate::i18n::format_args_str(&pattern, &argv),
+        None => {
+            if args.is_empty() {
                 key.to_owned()
             } else {
                 args.join(" ")
-            };
-        }
-    };
-    let mut out = String::with_capacity(pattern.len() + 16);
-    let mut chars = pattern.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '{' {
-            let mut index = String::new();
-            for d in chars.by_ref() {
-                if d == '}' {
-                    break;
-                }
-                index.push(d);
             }
-            if let Some(arg) = index.parse::<usize>().ok().and_then(|i| args.get(i)) {
-                out.push_str(arg);
-            }
-        } else {
-            out.push(c);
         }
     }
-    out
 }
 
 // ─── Legacy § code utilities (shared with the HUD renderer) ─────────────────

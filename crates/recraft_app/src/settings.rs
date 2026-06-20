@@ -89,6 +89,9 @@ pub struct Settings {
     /// Ids of mods the user has disabled from the mod-management screen. Disabled
     /// mods load but their hooks are not dispatched. Persisted comma-separated.
     pub disabled_mods: Vec<String>,
+    /// Active UI language code (`en_US`, `zh_CN`, …), matching a vanilla `.lang`
+    /// file in the assets. Drives [`crate::i18n`].
+    pub language: String,
 }
 
 /// Selectable resolutions (None = native). Common 16:9 modes most panels scale.
@@ -149,6 +152,7 @@ impl Default for Settings {
             resource_pack: None,
             keybinds: Keybinds::default(),
             disabled_mods: Vec::new(),
+            language: crate::i18n::DEFAULT_LANG.to_owned(),
         }
     }
 }
@@ -313,6 +317,11 @@ impl Settings {
                         s.resource_pack = Some(val.to_owned());
                     }
                 }
+                "language" => {
+                    if !val.is_empty() {
+                        s.language = val.to_owned();
+                    }
+                }
                 "disabled_mods" => {
                     s.disabled_mods = val
                         .split(',')
@@ -387,6 +396,7 @@ impl Settings {
             self.resource_pack.as_deref().unwrap_or(""),
         );
         text.push_str(&format!("disabled_mods={}\n", self.disabled_mods.join(",")));
+        text.push_str(&format!("language={}\n", self.language));
         for &(action, code) in self.keybinds.iter() {
             text.push_str(&format!(
                 "key.{}={}\n",
@@ -422,7 +432,7 @@ impl Settings {
 
     pub fn fps_label(self) -> String {
         match self.fps_limit() {
-            None => "Unlimited".to_owned(),
+            None => crate::i18n::tr("options.framerateLimit.max"),
             Some(cap) => format!("{cap} FPS"),
         }
     }
@@ -495,7 +505,7 @@ impl Settings {
 
     pub fn mipmap_label(self) -> String {
         if self.mipmap_levels == 0 {
-            "OFF".to_owned()
+            crate::i18n::tr("options.off")
         } else {
             self.mipmap_levels.to_string()
         }
@@ -512,7 +522,7 @@ impl Settings {
 
     pub fn resolution_label(self) -> String {
         match self.resolution {
-            None => "Native".to_owned(),
+            None => crate::i18n::tr("recraft.options.native"),
             Some((w, h)) => format!("{w}x{h}"),
         }
     }

@@ -5,6 +5,7 @@ use recraft_render::{UiFrame, UiRect};
 use winit::event::{ElementState, KeyEvent};
 use winit::keyboard::{KeyCode, PhysicalKey};
 
+use crate::i18n::tr;
 use crate::servers::{self, ServerEntry, ServerList};
 use crate::text_input::TextInput;
 
@@ -22,7 +23,7 @@ pub struct GuiEditServer {
 
 impl GuiEditServer {
     pub fn add() -> Self {
-        Self::with_values(None, "Minecraft Server", "")
+        Self::with_values(None, &tr("recraft.server.defaultName"), "")
     }
 
     pub fn edit(index: usize, entry: ServerEntry) -> Self {
@@ -51,8 +52,8 @@ impl GuiEditServer {
         self.address.rect = UiRect::new(x, top + 48 * s, field_w, 16 * s);
         let done_y = top + 80 * s;
         self.buttons = vec![
-            GuiButton::at_px(x, done_y, 98 * s, s, "Done"),
-            GuiButton::at_px(x + 102 * s, done_y, 98 * s, s, "Cancel"),
+            GuiButton::at_px(x, done_y, 98 * s, s, tr("gui.done")),
+            GuiButton::at_px(x + 102 * s, done_y, 98 * s, s, tr("gui.cancel")),
         ];
     }
 
@@ -87,18 +88,18 @@ impl GuiScreen for GuiEditServer {
         let s = ctx.scale;
         let top = ctx.height / 4;
         let title = if self.editing.is_some() {
-            "Edit Server Info"
+            tr("addServer.title")
         } else {
-            "Add Server"
+            tr("recraft.server.add")
         };
-        draw_centered_text(ui, ctx.width, top - 24 * s, s, super::TEXT_WHITE, title);
-        ui.text_shadowed(self.name.rect.x, top + 2 * s, s, super::TEXT_GRAY, "Server Name");
+        draw_centered_text(ui, ctx.width, top - 24 * s, s, super::TEXT_WHITE, &title);
+        ui.text_shadowed(self.name.rect.x, top + 2 * s, s, super::TEXT_GRAY, tr("addServer.enterName"));
         ui.text_shadowed(
             self.address.rect.x,
             top + 38 * s,
             s,
             super::TEXT_GRAY,
-            "Server Address",
+            tr("addServer.enterIp"),
         );
         self.name.draw(ui, s);
         self.address.draw(ui, s);
@@ -176,8 +177,8 @@ impl GuiDirectConnect {
         self.address.rect = UiRect::new(x, top + 16 * s, field_w, 16 * s);
         let done_y = top + 48 * s;
         self.buttons = vec![
-            GuiButton::at_px(x, done_y, 98 * s, s, "Join Server"),
-            GuiButton::at_px(x + 102 * s, done_y, 98 * s, s, "Cancel"),
+            GuiButton::at_px(x, done_y, 98 * s, s, tr("selectServer.select")),
+            GuiButton::at_px(x + 102 * s, done_y, 98 * s, s, tr("gui.cancel")),
         ];
     }
 
@@ -199,13 +200,13 @@ impl GuiScreen for GuiDirectConnect {
         draw_default_background(ui, ctx);
         let s = ctx.scale;
         let top = ctx.height / 4;
-        draw_centered_text(ui, ctx.width, top - 24 * s, s, super::TEXT_WHITE, "Direct Connect");
+        draw_centered_text(ui, ctx.width, top - 24 * s, s, super::TEXT_WHITE, &tr("selectServer.direct"));
         ui.text_shadowed(
             self.address.rect.x,
             top + 6 * s,
             s,
             super::TEXT_GRAY,
-            "Server Address",
+            tr("addServer.enterIp"),
         );
         self.address.draw(ui, s);
         for button in &self.buttons {

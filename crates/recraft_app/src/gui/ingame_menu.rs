@@ -8,6 +8,7 @@ use super::mods::GuiModList;
 use super::options::GuiOptions;
 use super::widgets::GuiButton;
 use super::{draw_centered_text, draw_default_background, DrawCtx, GuiAction, GuiScreen, ScreenCtx};
+use crate::i18n::tr;
 
 #[derive(Default)]
 pub struct GuiIngameMenu {
@@ -30,14 +31,14 @@ impl GuiScreen for GuiIngameMenu {
         let x = (ctx.width - 200 * s) / 2;
         let top = ctx.height / 4 + 24 * s;
         self.buttons = vec![
-            GuiButton::at_px(x, top, 200 * s, s, "Back to Game"),
-            GuiButton::at_px(x, top + 24 * s, 200 * s, s, "Options..."),
-            GuiButton::at_px(x, top + 48 * s, 200 * s, s, "Mods..."),
+            GuiButton::at_px(x, top, 200 * s, s, tr("menu.returnToGame")),
+            GuiButton::at_px(x, top + 24 * s, 200 * s, s, tr("menu.options")),
+            GuiButton::at_px(x, top + 48 * s, 200 * s, s, tr("recraft.menu.mods")),
             // Vanilla separates the leave button from the rest with a gap.
-            GuiButton::at_px(x, top + 96 * s, 200 * s, s, "Quit to Title"),
+            GuiButton::at_px(x, top + 96 * s, 200 * s, s, tr("recraft.menu.quitToTitle")),
         ];
         draw_default_background(ui, ctx);
-        draw_centered_text(ui, ctx.width, ctx.height / 4, s, super::TEXT_WHITE, "Game Menu");
+        draw_centered_text(ui, ctx.width, ctx.height / 4, s, super::TEXT_WHITE, &tr("menu.game"));
         for button in &self.buttons {
             button.draw(ui, s, ctx.mouse, ctx.mouse_down);
         }

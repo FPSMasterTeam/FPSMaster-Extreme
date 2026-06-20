@@ -424,7 +424,7 @@ fn draw_titles(ui: &mut UiFrame, container: &Container, px: i32, py: i32, scale:
         py + (container.y_size - 96 + 2) * scale,
         scale,
         TITLE_COLOR,
-        "Inventory",
+        crate::i18n::tr("container.inventory"),
     );
 }
 
