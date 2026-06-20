@@ -3168,10 +3168,22 @@ impl Renderer {
         let chunk_cutout = ChunkLayer::new("mega-cutout");
         let chunk_transparent = ChunkLayer::new("mega-transparent");
         let chunk_water = ChunkLayer::new("mega-water");
+        // The indirect command buffer is only consumed by multi_draw_indexed_indirect.
+        // Old GPUs (e.g. GLES adapters) lack the INDIRECT_EXECUTION downlevel flag, so
+        // creating an INDIRECT buffer there is a validation error — fall back to a tiny
+        // dummy buffer and the per-command draw_indexed path below.
         let indirect_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("indirect-cmds"),
-            size: 4096 * std::mem::size_of::<IndirectCmd>() as u64 * 3,
-            usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
+            size: if multi_draw {
+                4096 * std::mem::size_of::<IndirectCmd>() as u64 * 3
+            } else {
+                4
+            },
+            usage: if multi_draw {
+                wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST
+            } else {
+                wgpu::BufferUsages::COPY_DST
+            },
             mapped_at_creation: false,
         });
 
@@ -5600,7 +5612,10 @@ impl Renderer {
                 let total_cmds: usize = solid_batches.iter().chain(&cutout_batches)
                     .chain(&trans_batches)
                     .map(|b| b.cmds.len()).sum();
-                if total_cmds > 0 {
+                // Only multi_draw consumes the indirect buffer; the fallback path draws
+                // each command directly, so skip packing (and the INDIRECT realloc that
+                // unsupported GPUs would reject).
+                if self.multi_draw && total_cmds > 0 {
                     let cmd_size = std::mem::size_of::<IndirectCmd>() as u64;
                     let needed = total_cmds as u64 * cmd_size;
                     if needed > self.indirect_buf.size() {
