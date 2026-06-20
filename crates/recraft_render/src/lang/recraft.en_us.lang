@@ -1,0 +1,107 @@
+# Recraft-specific UI strings (no vanilla equivalent). Layered over the vanilla
+# en_US table. Keys that DO have a vanilla translation are looked up directly
+# (menu.*, gui.*, options.*, selectServer.*, deathScreen.*, …) and are not here.
+
+# Main menu / pause menu additions
+recraft.menu.accounts=Accounts
+recraft.menu.mods=Mods...
+recraft.menu.demo=Demo World
+recraft.menu.quitToTitle=Quit to Title
+recraft.account.notSignedIn=Not signed in
+recraft.account.signedInAs=Signed in as
+
+# Accounts screen
+recraft.accounts.title=Accounts
+recraft.accounts.use=Use Account
+recraft.accounts.addMicrosoft=Add with Microsoft
+recraft.accounts.addToken=Add Token
+recraft.accounts.copyToken=Copy Token
+recraft.accounts.empty=No accounts yet — add one below.
+recraft.accounts.inUse=(in use)
+recraft.accounts.addTitle=Add with Refresh Token
+recraft.accounts.addInstr=Paste a Microsoft refresh token (Cmd/Ctrl+V on the Accounts screen):
+recraft.accounts.add=Add Account
+
+# Controls screen
+recraft.controls.bindHint=Press a key to bind, or Escape to cancel
+
+# Demo world select
+recraft.demo.title=Select Demo World
+recraft.demo.landscape=Landscape
+recraft.demo.chunkStress=Chunk Stress Test
+recraft.demo.entityStress=Entity Stress Test
+
+# Server list / edit server
+recraft.server.defaultName=Minecraft Server
+recraft.server.add=Add Server
+recraft.multiplayer.empty=No servers yet — Add Server or Direct Connect below.
+recraft.multiplayer.pinging=Pinging...
+
+# Mods screen
+recraft.mods.title=Mods
+recraft.mods.empty=No mods installed
+recraft.mods.enabledCount=%1$s/%2$s enabled  -  click a mod to toggle
+recraft.mods.on=ON
+recraft.mods.off=OFF
+recraft.mods.help=Drop mods into the 'mods' folder, then Reload.
+recraft.mods.reload=Reload
+recraft.mods.openFolder=Open Folder
+recraft.mods.builtin=built-in
+
+# Video / options additions (labels for recraft-only settings)
+recraft.options.renderScale=Render Scale
+recraft.options.autoRes=Auto Res
+recraft.options.resolution=Res
+recraft.options.showFps=Show FPS
+recraft.options.oldAnimations=Old Animations
+recraft.options.shaders=Shaders...
+recraft.options.native=Native
+recraft.unit.chunks=chunks
+
+# Shaders screen
+recraft.shaders.title=Shaders
+recraft.shaders.shaders=Shaders
+recraft.shaders.shadows=Shadows
+recraft.shaders.specular=Specular
+recraft.shaders.fog=Fog
+recraft.shaders.bloom=Bloom
+recraft.shaders.volLight=VolLight
+recraft.shaders.vignette=Vignette
+recraft.shaders.chroma=Chroma
+recraft.shaders.dof=DoF
+recraft.shaders.motion=Motion
+recraft.shaders.autoExp=AutoExp
+recraft.shaders.clouds=Clouds
+
+# Progress / connect / auth screens
+recraft.progress.loadingWorld=Loading world...
+recraft.progress.connecting=Connecting to server...
+recraft.progress.chunksLoaded=%s chunks loaded
+recraft.auth.title=Microsoft Login
+recraft.auth.openBrowser=Open your browser and go to:
+recraft.auth.enterCode=Enter code:
+recraft.auth.waiting=Waiting for login... ESC to cancel
+recraft.server.startFailed=Failed to start server
+recraft.server.startTimeout=Server did not respond within 60 seconds
+recraft.server.starting=Starting local server...
+recraft.server.waiting=Waiting for server to start
+
+# Resource pack screen
+recraft.resourcepack.default=Default (Vanilla 1.8)
+recraft.resourcepack.none=No resource pack
+recraft.resourcepack.format=Format: %1$s  %2$s
+
+# Language screen
+recraft.language.title=Select Language
+
+# Server-sent chat translation patterns, embedded so messages still format
+# correctly when the vanilla language tables are unavailable (offline / tests).
+# Identical to vanilla en_US, which overrides these when assets are present.
+chat.type.text=<%s> %s
+chat.type.announcement=[%s] %s
+chat.type.emote=* %s %s
+chat.type.admin=[%s: %s]
+multiplayer.player.joined=%s joined the game
+multiplayer.player.left=%s left the game
+commands.message.display.incoming=%s whispers to you: %s
+commands.message.display.outgoing=You whisper to %s: %s

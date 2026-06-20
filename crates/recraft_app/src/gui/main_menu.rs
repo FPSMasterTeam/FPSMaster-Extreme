@@ -3,6 +3,8 @@
 
 use recraft_render::{GuiTexture, UiColor, UiFrame, UiRect};
 
+use crate::i18n::tr;
+
 use super::accounts::GuiAccounts;
 use super::demo_select::GuiDemoSelect;
 use super::mods::GuiModList;
@@ -31,20 +33,20 @@ impl GuiMainMenu {
 
         self.buttons = vec![
             // [0] Singleplayer: (cx-100, j), 200×20
-            GuiButton::at_px(cx - 100 * s, j, 200 * s, s, "Singleplayer"),
+            GuiButton::at_px(cx - 100 * s, j, 200 * s, s, tr("menu.singleplayer")),
             // [1] Multiplayer: (cx-100, j+24), 200×20
-            GuiButton::at_px(cx - 100 * s, j + 24 * s, 200 * s, s, "Multiplayer"),
+            GuiButton::at_px(cx - 100 * s, j + 24 * s, 200 * s, s, tr("menu.multiplayer")),
             // [2] Accounts: (cx-100, j+48), 200×20 (our equivalent of Realms)
-            GuiButton::at_px(cx - 100 * s, j + 48 * s, 200 * s, s, "Accounts"),
+            GuiButton::at_px(cx - 100 * s, j + 48 * s, 200 * s, s, tr("recraft.menu.accounts")),
             // [3] Demo World: (cx-100, j+72), 200×20
-            GuiButton::at_px(cx - 100 * s, j + 72 * s, 200 * s, s, "Demo World"),
+            GuiButton::at_px(cx - 100 * s, j + 72 * s, 200 * s, s, tr("recraft.menu.demo")),
             // [4] Mods: (cx-100, j+96), 200×20 (recraft addition)
-            GuiButton::at_px(cx - 100 * s, j + 96 * s, 200 * s, s, "Mods..."),
+            GuiButton::at_px(cx - 100 * s, j + 96 * s, 200 * s, s, tr("recraft.menu.mods")),
             // Bottom split row, vanilla-style: Options + Quit side by side.
             // [5] Options: (cx-100, j+120), 98×20
-            GuiButton::at_px(cx - 100 * s, j + 120 * s, 98 * s, s, "Options..."),
+            GuiButton::at_px(cx - 100 * s, j + 120 * s, 98 * s, s, tr("menu.options")),
             // [6] Quit: (cx+2, j+120), 98×20
-            GuiButton::at_px(cx + 2 * s, j + 120 * s, 98 * s, s, "Quit Game"),
+            GuiButton::at_px(cx + 2 * s, j + 120 * s, 98 * s, s, tr("menu.quit")),
         ];
     }
 }
@@ -102,8 +104,8 @@ impl GuiScreen for GuiMainMenu {
 
         // Account status: bottom-left, just above the version line.
         let account = match ctx.session_username {
-            Some(name) => format!("Signed in as §a{name}"),
-            None => "§7Not signed in".to_owned(),
+            Some(name) => format!("{} §a{name}", tr("recraft.account.signedInAs")),
+            None => format!("§7{}", tr("recraft.account.notSignedIn")),
         };
         ui.text_shadowed(
             2 * s,

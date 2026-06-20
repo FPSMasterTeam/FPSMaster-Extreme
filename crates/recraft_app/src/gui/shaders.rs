@@ -8,6 +8,7 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use super::options::GuiOptions;
 use super::widgets::GuiButton;
 use super::{draw_centered_text, draw_default_background, DrawCtx, GuiAction, GuiScreen, ScreenCtx};
+use crate::i18n::tr;
 
 #[derive(Default)]
 pub struct GuiShaders {
@@ -69,16 +70,12 @@ impl GuiShaders {
         self.motion_blur = Some(GuiButton::at_px(xr, row(3), cw, s, "").disabled(off));
         self.auto_exposure = Some(GuiButton::at_px(xr, row(4), cw, s, "").disabled(off));
         self.clouds = Some(GuiButton::at_px(xr, row(5), cw, s, "").disabled(off));
-        self.done = Some(GuiButton::at_px(x, row(6) + 12 * s, 200 * s, s, "Done"));
+        self.done = Some(GuiButton::at_px(x, row(6) + 12 * s, 200 * s, s, tr("gui.done")));
     }
 }
 
-fn on_off(b: bool) -> &'static str {
-    if b {
-        "ON"
-    } else {
-        "OFF"
-    }
+fn on_off(b: bool) -> String {
+    tr(if b { "options.on" } else { "options.off" })
 }
 
 impl GuiScreen for GuiShaders {
@@ -107,7 +104,7 @@ impl GuiScreen for GuiShaders {
         self.layout(ctx);
         draw_default_background(ui, ctx);
         let s = ctx.scale;
-        draw_centered_text(ui, ctx.width, 15 * s, s, super::TEXT_WHITE, "Shaders");
+        draw_centered_text(ui, ctx.width, 15 * s, s, super::TEXT_WHITE, &tr("recraft.shaders.title"));
         let st = ctx.settings;
 
         let mut draw = |btn: &mut Option<GuiButton>, label: String| {
@@ -116,21 +113,19 @@ impl GuiScreen for GuiShaders {
                 b.draw(ui, s, ctx.mouse, ctx.mouse_down);
             }
         };
-        draw(&mut self.shaders, format!("Shaders: {}", on_off(st.shaders)));
-        draw(&mut self.shadows, format!("Shadows: {}", on_off(st.shader_shadows)));
-        draw(&mut self.specular, format!("Specular: {}", on_off(st.shader_specular)));
-        draw(&mut self.fog, format!("Fog: {}", on_off(st.shader_fog)));
-        draw(&mut self.bloom, format!("Bloom: {}", on_off(st.shader_bloom)));
-        draw(
-            &mut self.volumetric,
-            format!("VolLight: {}", on_off(st.volumetric_light)),
-        );
-        draw(&mut self.vignette, format!("Vignette: {}", on_off(st.post_vignette)));
-        draw(&mut self.chromatic, format!("Chroma: {}", on_off(st.post_chromatic)));
-        draw(&mut self.dof, format!("DoF: {}", on_off(st.post_dof)));
-        draw(&mut self.motion_blur, format!("Motion: {}", on_off(st.post_motion_blur)));
-        draw(&mut self.auto_exposure, format!("AutoExp: {}", on_off(st.post_auto_exposure)));
-        draw(&mut self.clouds, format!("Clouds: {}", on_off(st.volumetric_clouds)));
+        let entry = |key: &str, on: bool| format!("{}: {}", tr(key), on_off(on));
+        draw(&mut self.shaders, entry("recraft.shaders.shaders", st.shaders));
+        draw(&mut self.shadows, entry("recraft.shaders.shadows", st.shader_shadows));
+        draw(&mut self.specular, entry("recraft.shaders.specular", st.shader_specular));
+        draw(&mut self.fog, entry("recraft.shaders.fog", st.shader_fog));
+        draw(&mut self.bloom, entry("recraft.shaders.bloom", st.shader_bloom));
+        draw(&mut self.volumetric, entry("recraft.shaders.volLight", st.volumetric_light));
+        draw(&mut self.vignette, entry("recraft.shaders.vignette", st.post_vignette));
+        draw(&mut self.chromatic, entry("recraft.shaders.chroma", st.post_chromatic));
+        draw(&mut self.dof, entry("recraft.shaders.dof", st.post_dof));
+        draw(&mut self.motion_blur, entry("recraft.shaders.motion", st.post_motion_blur));
+        draw(&mut self.auto_exposure, entry("recraft.shaders.autoExp", st.post_auto_exposure));
+        draw(&mut self.clouds, entry("recraft.shaders.clouds", st.volumetric_clouds));
         if let Some(b) = &self.done {
             b.draw(ui, s, ctx.mouse, ctx.mouse_down);
         }

@@ -16,6 +16,11 @@ mod settings;
 mod sound;
 mod text_input;
 
+// The i18n engine lives in `recraft_render` (it owns asset access and is shared
+// with item/block name localization); re-export it so the rest of the app keeps
+// referring to it as `crate::i18n`.
+use recraft_render::i18n;
+
 use std::{
     env,
     path::PathBuf,
@@ -356,6 +361,7 @@ impl ApplicationHandler for WinitApp {
 
         let mut renderer = Renderer::new(window.clone()).expect("create renderer");
         let mut settings = Settings::load();
+        crate::i18n::set_language(&settings.language);
         let auto_play = self.config.scripted_smoke_seconds
             .or(self.config.bench_passes_seconds)
             .is_some();

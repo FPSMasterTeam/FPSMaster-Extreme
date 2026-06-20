@@ -4,6 +4,7 @@ use recraft_render::{UiColor, UiFrame, UiRect};
 
 use super::widgets::GuiButton;
 use super::{draw_centered_text, DrawCtx, GuiAction, GuiScreen, ScreenCtx};
+use crate::i18n::tr;
 
 #[derive(Default)]
 pub struct GuiGameOver {
@@ -26,8 +27,8 @@ impl GuiScreen for GuiGameOver {
         let x = (ctx.width - 200 * s) / 2;
         let top = ctx.height / 4 + 48 * s;
         self.buttons = vec![
-            GuiButton::at_px(x, top, 200 * s, s, "Respawn"),
-            GuiButton::at_px(x, top + 24 * s, 200 * s, s, "Title Screen"),
+            GuiButton::at_px(x, top, 200 * s, s, tr("deathScreen.respawn")),
+            GuiButton::at_px(x, top + 24 * s, 200 * s, s, tr("deathScreen.titleScreen")),
         ];
         ui.rect(
             UiRect::new(0, 0, ctx.width, ctx.height),
@@ -39,7 +40,7 @@ impl GuiScreen for GuiGameOver {
             ctx.height / 4,
             2 * s,
             super::TEXT_WHITE,
-            "You Died!",
+            &tr("deathScreen.title"),
         );
         for button in &self.buttons {
             button.draw(ui, s, ctx.mouse, ctx.mouse_down);

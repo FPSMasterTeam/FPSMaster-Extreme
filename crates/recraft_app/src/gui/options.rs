@@ -12,6 +12,12 @@ use super::ingame_menu::GuiIngameMenu;
 use super::main_menu::GuiMainMenu;
 use super::widgets::{GuiButton, BUTTON_HEIGHT};
 use super::{draw_centered_text, draw_default_background, DrawCtx, GuiAction, GuiScreen, ScreenCtx};
+use crate::i18n::tr;
+
+/// Localized `ON`/`OFF` for a boolean toggle button.
+fn on_off(value: bool) -> String {
+    tr(if value { "options.on" } else { "options.off" })
+}
 
 /// The root screen to return to when leaving the options flow: the title screen
 /// when options were opened from there, otherwise the in-game pause menu.
@@ -93,6 +99,7 @@ pub struct GuiOptions {
     video_btn: Option<GuiButton>,
     controls_btn: Option<GuiButton>,
     resource_packs_btn: Option<GuiButton>,
+    language_btn: Option<GuiButton>,
     done: Option<GuiButton>,
     dragging: Option<Slider>,
     /// Whether this was opened from the title screen (Done returns there) vs.
@@ -119,12 +126,15 @@ impl GuiOptions {
         let top = ctx.height / 4 - 16 * s;
         self.sensitivity_rect = UiRect::new(x, top, 200 * s, BUTTON_HEIGHT * s);
         self.brightness_rect = UiRect::new(x, top + 24 * s, 200 * s, BUTTON_HEIGHT * s);
-        self.video_btn = Some(GuiButton::at_px(x, top + 48 * s, 98 * s, s, "Video Settings..."));
-        self.controls_btn = Some(GuiButton::at_px(x + 102 * s, top + 48 * s, 98 * s, s, "Controls..."));
+        self.video_btn = Some(GuiButton::at_px(x, top + 48 * s, 98 * s, s, tr("options.video")));
+        self.controls_btn =
+            Some(GuiButton::at_px(x + 102 * s, top + 48 * s, 98 * s, s, tr("options.controls")));
         self.resource_packs_btn =
-            Some(GuiButton::at_px(x, top + 72 * s, 200 * s, s, "Resource Packs..."));
+            Some(GuiButton::at_px(x, top + 72 * s, 200 * s, s, tr("options.resourcepack")));
+        self.language_btn =
+            Some(GuiButton::at_px(x, top + 96 * s, 200 * s, s, tr("options.language")));
         // A gap above Done, echoing vanilla's separated bottom button.
-        self.done = Some(GuiButton::at_px(x, top + 108 * s, 200 * s, s, "Done"));
+        self.done = Some(GuiButton::at_px(x, top + 132 * s, 200 * s, s, tr("gui.done")));
     }
 
     fn apply_drag(&mut self, x: f64, ctx: &mut ScreenCtx) {
@@ -146,6 +156,7 @@ impl GuiScreen for GuiOptions {
             self.video_btn.as_ref(),
             self.controls_btn.as_ref(),
             self.resource_packs_btn.as_ref(),
+            self.language_btn.as_ref(),
             self.done.as_ref(),
         ]
         .into_iter()
@@ -157,21 +168,21 @@ impl GuiScreen for GuiOptions {
         self.layout(ctx);
         draw_default_background(ui, ctx);
         let s = ctx.scale;
-        draw_centered_text(ui, ctx.width, 15 * s, s, super::TEXT_WHITE, "Options");
+        draw_centered_text(ui, ctx.width, 15 * s, s, super::TEXT_WHITE, &tr("options.title"));
 
         draw_slider(
             ui,
             self.sensitivity_rect,
             s,
             ctx.settings.sensitivity,
-            &format!("Sensitivity: {:.0}%", ctx.settings.clone().sensitivity_percent()),
+            &format!("{}: {:.0}%", tr("options.sensitivity"), ctx.settings.clone().sensitivity_percent()),
         );
         draw_slider(
             ui,
             self.brightness_rect,
             s,
             ctx.settings.clone().brightness_fraction(),
-            &format!("Brightness: {}%", ctx.settings.clone().brightness_percent()),
+            &format!("{}: {}%", tr("options.gamma"), ctx.settings.clone().brightness_percent()),
         );
         if let Some(b) = &self.video_btn {
             b.draw(ui, s, ctx.mouse, ctx.mouse_down);
@@ -180,6 +191,9 @@ impl GuiScreen for GuiOptions {
             b.draw(ui, s, ctx.mouse, ctx.mouse_down);
         }
         if let Some(b) = &self.resource_packs_btn {
+            b.draw(ui, s, ctx.mouse, ctx.mouse_down);
+        }
+        if let Some(b) = &self.language_btn {
             b.draw(ui, s, ctx.mouse, ctx.mouse_down);
         }
         if let Some(done) = &self.done {
@@ -218,6 +232,14 @@ impl GuiScreen for GuiOptions {
                 GuiAction::SetScreen(Box::new(
                     super::resource_packs::GuiResourcePacks::new(self.from_main_menu, ctx.settings),
                 )),
+            ];
+        }
+        if self.language_btn.as_ref().is_some_and(|b| b.clicked(x, y)) {
+            return vec![
+                GuiAction::SaveSettings,
+                GuiAction::SetScreen(Box::new(super::language::GuiLanguage::new(
+                    self.from_main_menu,
+                ))),
             ];
         }
         if self.done.as_ref().is_some_and(|b| b.clicked(x, y)) {
@@ -328,13 +350,14 @@ impl GuiVideoSettings {
         self.mipmaps = Some(GuiButton::at_px(x + 102 * s, top + 96 * s, 98 * s, s, ""));
         self.resolution = Some(GuiButton::at_px(x, top + 120 * s, 98 * s, s, ""));
         self.fullscreen = Some(GuiButton::at_px(x + 102 * s, top + 120 * s, 98 * s, s, ""));
-        self.shaders_btn = Some(GuiButton::at_px(x, top + 144 * s, 98 * s, s, "Shaders..."));
+        self.shaders_btn =
+            Some(GuiButton::at_px(x, top + 144 * s, 98 * s, s, tr("recraft.options.shaders")));
         self.smooth_light = Some(GuiButton::at_px(x + 102 * s, top + 144 * s, 98 * s, s, ""));
         self.show_fps = Some(GuiButton::at_px(x, top + 168 * s, 98 * s, s, ""));
         self.old_animations =
             Some(GuiButton::at_px(x + 102 * s, top + 168 * s, 98 * s, s, ""));
         // A gap above Done, echoing vanilla's separated bottom button.
-        self.done = Some(GuiButton::at_px(x, top + 192 * s, 200 * s, s, "Done"));
+        self.done = Some(GuiButton::at_px(x, top + 192 * s, 200 * s, s, tr("gui.done")));
     }
 
     fn apply_drag(&mut self, x: f64, ctx: &mut ScreenCtx) {
@@ -377,83 +400,93 @@ impl GuiScreen for GuiVideoSettings {
         self.layout(ctx);
         draw_default_background(ui, ctx);
         let s = ctx.scale;
-        draw_centered_text(ui, ctx.width, 15 * s, s, super::TEXT_WHITE, "Video Settings");
+        draw_centered_text(ui, ctx.width, 15 * s, s, super::TEXT_WHITE, &tr("options.videoTitle"));
 
         draw_slider(
             ui,
             self.fps_rect,
             s,
             ctx.settings.clone().fps_fraction(),
-            &format!("Max Framerate: {}", ctx.settings.clone().fps_label()),
+            &format!("{}: {}", tr("options.framerateLimit"), ctx.settings.clone().fps_label()),
         );
         draw_slider(
             ui,
             self.render_scale_rect,
             s,
             ctx.settings.clone().render_scale_fraction(),
-            &format!("Render Scale: {}%", ctx.settings.clone().render_scale_percent()),
+            &format!("{}: {}%", tr("recraft.options.renderScale"), ctx.settings.clone().render_scale_percent()),
         );
         draw_slider(
             ui,
             self.render_distance_rect,
             s,
             ctx.settings.clone().render_distance_fraction(),
-            &format!("Render Distance: {} chunks", ctx.settings.render_distance),
+            &format!(
+                "{}: {} {}",
+                tr("options.renderDistance"),
+                ctx.settings.render_distance,
+                tr("recraft.unit.chunks")
+            ),
         );
         if let Some(vsync) = &mut self.vsync {
-            vsync.label = format!("VSync: {}", if ctx.settings.vsync { "ON" } else { "OFF" });
+            vsync.label = format!("{}: {}", tr("options.vsync"), on_off(ctx.settings.vsync));
             vsync.draw(ui, s, ctx.mouse, ctx.mouse_down);
         }
         if let Some(adaptive) = &mut self.adaptive {
             adaptive.label = format!(
-                "Auto Res: {}",
-                if ctx.settings.adaptive_resolution { "ON" } else { "OFF" }
+                "{}: {}",
+                tr("recraft.options.autoRes"),
+                on_off(ctx.settings.adaptive_resolution)
             );
             adaptive.draw(ui, s, ctx.mouse, ctx.mouse_down);
         }
         if let Some(graphics) = &mut self.graphics {
             graphics.label = format!(
-                "Graphics: {}",
-                if ctx.settings.fancy_graphics { "Fancy" } else { "Fast" }
+                "{}: {}",
+                tr("options.graphics"),
+                tr(if ctx.settings.fancy_graphics {
+                    "options.graphics.fancy"
+                } else {
+                    "options.graphics.fast"
+                })
             );
             graphics.draw(ui, s, ctx.mouse, ctx.mouse_down);
         }
         if let Some(mipmaps) = &mut self.mipmaps {
-            mipmaps.label = format!("Mipmaps: {}", ctx.settings.clone().mipmap_label());
+            mipmaps.label =
+                format!("{}: {}", tr("options.mipmapLevels"), ctx.settings.clone().mipmap_label());
             mipmaps.draw(ui, s, ctx.mouse, ctx.mouse_down);
         }
         if let Some(resolution) = &mut self.resolution {
-            resolution.label = format!("Res: {}", ctx.settings.clone().resolution_label());
+            resolution.label = format!(
+                "{}: {}",
+                tr("recraft.options.resolution"),
+                ctx.settings.clone().resolution_label()
+            );
             resolution.draw(ui, s, ctx.mouse, ctx.mouse_down);
         }
         if let Some(fullscreen) = &mut self.fullscreen {
-            fullscreen.label = format!(
-                "Fullscreen: {}",
-                if ctx.settings.fullscreen { "ON" } else { "OFF" }
-            );
+            fullscreen.label =
+                format!("{}: {}", tr("options.fullscreen"), on_off(ctx.settings.fullscreen));
             fullscreen.draw(ui, s, ctx.mouse, ctx.mouse_down);
         }
         if let Some(b) = &self.shaders_btn {
             b.draw(ui, s, ctx.mouse, ctx.mouse_down);
         }
         if let Some(smooth) = &mut self.smooth_light {
-            smooth.label = format!(
-                "Smooth Light: {}",
-                if ctx.settings.smooth_lighting { "ON" } else { "OFF" }
-            );
+            smooth.label = format!("{}: {}", tr("options.ao"), on_off(ctx.settings.smooth_lighting));
             smooth.draw(ui, s, ctx.mouse, ctx.mouse_down);
         }
         if let Some(show_fps) = &mut self.show_fps {
-            show_fps.label = format!(
-                "Show FPS: {}",
-                if ctx.settings.show_fps { "ON" } else { "OFF" }
-            );
+            show_fps.label =
+                format!("{}: {}", tr("recraft.options.showFps"), on_off(ctx.settings.show_fps));
             show_fps.draw(ui, s, ctx.mouse, ctx.mouse_down);
         }
         if let Some(old_anim) = &mut self.old_animations {
             old_anim.label = format!(
-                "Old Animations: {}",
-                if ctx.settings.old_animations { "ON" } else { "OFF" }
+                "{}: {}",
+                tr("recraft.options.oldAnimations"),
+                on_off(ctx.settings.old_animations)
             );
             old_anim.draw(ui, s, ctx.mouse, ctx.mouse_down);
         }

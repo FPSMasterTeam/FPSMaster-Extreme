@@ -15,6 +15,7 @@ use super::{
     ScreenCtx, TEXT_WHITE,
 };
 use crate::settings::{keycode_name, GameAction};
+use crate::i18n::tr;
 
 const CONFLICT_RED: UiColor = UiColor::rgba(255, 85, 85, 255);
 
@@ -65,7 +66,7 @@ impl GuiScreen for GuiControls {
     fn draw(&mut self, ui: &mut UiFrame, ctx: &DrawCtx) {
         draw_default_background(ui, ctx);
         let s = ctx.scale;
-        draw_centered_text(ui, ctx.width, 8 * s, s, TEXT_WHITE, "Controls");
+        draw_centered_text(ui, ctx.width, 8 * s, s, TEXT_WHITE, &tr("controls.title"));
 
         let list = ListView::new(ctx, 220, 24, 52);
         list.draw_background(ui);
@@ -108,14 +109,14 @@ impl GuiScreen for GuiControls {
 
         // A hint line while waiting for a key.
         if self.binding.is_some() {
-            let hint = "Press a key to bind, or Escape to cancel";
-            let w = text_width(hint, s);
-            ui.text_shadowed((ctx.width - w) / 2, ctx.height - 40 * s, s, CONFLICT_RED, hint);
+            let hint = tr("recraft.controls.bindHint");
+            let w = text_width(&hint, s);
+            ui.text_shadowed((ctx.width - w) / 2, ctx.height - 40 * s, s, CONFLICT_RED, &hint);
         }
 
         let bx = (ctx.width - 200 * s) / 2;
         let by = ctx.height - 28 * s;
-        self.done = Some(GuiButton::at_px(bx, by, 200 * s, s, "Done"));
+        self.done = Some(GuiButton::at_px(bx, by, 200 * s, s, tr("gui.done")));
         if let Some(done) = &self.done {
             done.draw(ui, s, ctx.mouse, ctx.mouse_down);
         }

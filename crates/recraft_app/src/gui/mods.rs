@@ -11,6 +11,7 @@ use super::{
     draw_centered_text, draw_default_background, fit_text, DrawCtx, GuiAction, GuiScreen, ListView,
     ScreenCtx, TEXT_GRAY, TEXT_WHITE,
 };
+use crate::i18n::{tr, tr_args};
 
 pub struct GuiModList {
     /// Whether we entered from the title screen (Back returns there) vs the
@@ -60,13 +61,13 @@ impl GuiScreen for GuiModList {
     fn draw(&mut self, ui: &mut UiFrame, ctx: &DrawCtx) {
         draw_default_background(ui, ctx);
         let s = ctx.scale;
-        draw_centered_text(ui, ctx.width, 8 * s, s, TEXT_WHITE, "Mods");
+        draw_centered_text(ui, ctx.width, 8 * s, s, TEXT_WHITE, &tr("recraft.mods.title"));
         let count = ctx.mods.len();
         let subtitle = if count == 0 {
-            "No mods installed".to_owned()
+            tr("recraft.mods.empty")
         } else {
             let enabled = ctx.mods.iter().filter(|m| m.enabled).count();
-            format!("{enabled}/{count} enabled  -  click a mod to toggle")
+            tr_args("recraft.mods.enabledCount", &[&enabled.to_string(), &count.to_string()])
         };
         draw_centered_text(ui, ctx.width, 20 * s, s, TEXT_GRAY, &subtitle);
 
@@ -95,7 +96,7 @@ impl GuiScreen for GuiModList {
             // Title line: name (fallback to id), version, and the on/off state.
             let title_color = if m.enabled { TEXT_WHITE } else { TEXT_GRAY };
             let display_name = m.name.as_deref().unwrap_or(&m.id);
-            let state = if m.enabled { "§aON" } else { "§7OFF" };
+            let state = if m.enabled { format!("§a{}", tr("recraft.mods.on")) } else { format!("§7{}", tr("recraft.mods.off")) };
             let title = format!("{display_name} §8v{}  {state}", m.version);
             ui.text_shadowed(text_x, text_y, s, title_color, fit_text(&title, max_w, s));
 
@@ -110,7 +111,7 @@ impl GuiScreen for GuiModList {
                 _ => m
                     .tier
                     .map(|t| format!("{t:?} mod"))
-                    .unwrap_or_else(|| "built-in".to_owned()),
+                    .unwrap_or_else(|| tr("recraft.mods.builtin")),
             };
             let detail_color = if m.enabled { TEXT_GRAY } else { UiColor::rgba(110, 110, 110, 255) };
             ui.text_shadowed(text_x, text_y + 12 * s, s, detail_color, fit_text(&detail, max_w, s));
@@ -124,16 +125,16 @@ impl GuiScreen for GuiModList {
                 ctx.height / 2,
                 s,
                 TEXT_GRAY,
-                "Drop mods into the 'mods' folder, then Reload.",
+                &tr("recraft.mods.help"),
             );
         }
 
         // Bottom button row: Reload | Open Folder, then Done below.
         let cx = ctx.width / 2;
         let by = ctx.height - 52 * s;
-        let reload = GuiButton::at_px(cx - 154 * s, by, 150 * s, s, "Reload");
-        let open = GuiButton::at_px(cx + 4 * s, by, 150 * s, s, "Open Folder");
-        let done = GuiButton::at_px(cx - 100 * s, by + 24 * s, 200 * s, s, "Done");
+        let reload = GuiButton::at_px(cx - 154 * s, by, 150 * s, s, tr("recraft.mods.reload"));
+        let open = GuiButton::at_px(cx + 4 * s, by, 150 * s, s, tr("recraft.mods.openFolder"));
+        let done = GuiButton::at_px(cx - 100 * s, by + 24 * s, 200 * s, s, tr("gui.done"));
         reload.draw(ui, s, ctx.mouse, ctx.mouse_down);
         open.draw(ui, s, ctx.mouse, ctx.mouse_down);
         done.draw(ui, s, ctx.mouse, ctx.mouse_down);

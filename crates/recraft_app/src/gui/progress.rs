@@ -15,6 +15,7 @@ use super::{
     draw_centered_text, draw_default_background, DrawCtx, GuiAction, GuiScreen, ScreenCtx,
     TEXT_GRAY, TEXT_WHITE, TEXT_YELLOW,
 };
+use crate::i18n::{tr, tr_args};
 
 /// Where a screen's "Back" leads.
 #[derive(Debug, Clone, Copy)]
@@ -70,12 +71,12 @@ impl GuiScreen for GuiConnecting {
         let s = ctx.scale;
         let (title, detail) = if ctx.chunk_count > 0 {
             (
-                "Loading world...".to_owned(),
-                format!("{} chunks loaded", ctx.chunk_count),
+                tr("recraft.progress.loadingWorld"),
+                tr_args("recraft.progress.chunksLoaded", &[&ctx.chunk_count.to_string()]),
             )
         } else {
             (
-                "Connecting to server...".to_owned(),
+                tr("recraft.progress.connecting"),
                 format!("{}:{}", self.host, self.port),
             )
         };
@@ -95,17 +96,17 @@ impl GuiScreen for GuiAuthCode {
         draw_default_background(ui, ctx);
         let s = ctx.scale;
         let mid = ctx.height / 2;
-        draw_centered_text(ui, ctx.width, mid - 40 * s, s, TEXT_WHITE, "Microsoft Login");
+        draw_centered_text(ui, ctx.width, mid - 40 * s, s, TEXT_WHITE, &tr("recraft.auth.title"));
         draw_centered_text(
             ui,
             ctx.width,
             mid - 20 * s,
             s,
             TEXT_GRAY,
-            "Open your browser and go to:",
+            &tr("recraft.auth.openBrowser"),
         );
         draw_centered_text(ui, ctx.width, mid - 8 * s, s, TEXT_WHITE, &self.verification_uri);
-        draw_centered_text(ui, ctx.width, mid + 8 * s, s, TEXT_GRAY, "Enter code:");
+        draw_centered_text(ui, ctx.width, mid + 8 * s, s, TEXT_GRAY, &tr("recraft.auth.enterCode"));
         draw_centered_text(ui, ctx.width, mid + 20 * s, 2 * s, TEXT_YELLOW, &self.user_code);
         draw_centered_text(
             ui,
@@ -113,7 +114,7 @@ impl GuiScreen for GuiAuthCode {
             mid + 44 * s,
             s,
             TEXT_GRAY,
-            "Waiting for login... ESC to cancel",
+            &tr("recraft.auth.waiting"),
         );
     }
 
@@ -158,7 +159,7 @@ impl GuiScreen for GuiDisconnected {
             ctx.height / 2 + 24 * s,
             200 * s,
             s,
-            "Back",
+            tr("gui.back"),
         )];
         draw_default_background(ui, ctx);
         draw_centered_text(ui, ctx.width, ctx.height / 2 - 30 * s, s, TEXT_WHITE, &self.title);
@@ -218,7 +219,7 @@ impl GuiScreen for GuiStartingServer {
             ctx.height / 2 + 24 * s,
             200 * s,
             s,
-            "Cancel",
+            tr("gui.cancel"),
         );
         draw_default_background(ui, ctx);
         draw_centered_text(
@@ -227,7 +228,7 @@ impl GuiScreen for GuiStartingServer {
             ctx.height / 2 - 16 * s,
             s,
             TEXT_WHITE,
-            "Starting local server...",
+            &tr("recraft.server.starting"),
         );
         draw_centered_text(
             ui,
@@ -235,7 +236,7 @@ impl GuiScreen for GuiStartingServer {
             ctx.height / 2 + 4 * s,
             s,
             TEXT_GRAY,
-            "Waiting for server to start",
+            &tr("recraft.server.waiting"),
         );
         cancel.draw(ui, s, ctx.mouse, ctx.mouse_down);
         self.cancel = Some(cancel);
@@ -248,8 +249,8 @@ impl GuiScreen for GuiStartingServer {
                 port: self.port,
             }],
             Ok(false) => vec![GuiAction::SetScreen(Box::new(GuiDisconnected::new(
-                "Failed to start server",
-                "Server did not respond within 60 seconds",
+                tr("recraft.server.startFailed"),
+                tr("recraft.server.startTimeout"),
                 Parent::MainMenu,
             )))],
             Err(_) => Vec::new(),

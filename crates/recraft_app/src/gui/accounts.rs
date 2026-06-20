@@ -4,6 +4,7 @@ use recraft_render::{text_width, UiFrame, UiRect};
 use winit::event::{ElementState, KeyEvent};
 use winit::keyboard::{KeyCode, PhysicalKey};
 
+use crate::i18n::tr;
 use crate::text_input::TextInput;
 
 use super::main_menu::GuiMainMenu;
@@ -49,13 +50,13 @@ impl GuiAccounts {
             .selected
             .is_some_and(|index| index < ctx.accounts.len());
         self.buttons = vec![
-            GuiButton::at_px(x, row, half, s, "Use Account").disabled(!has_selection),
-            GuiButton::at_px(x + step, row, half, s, "Add with Microsoft"),
-            GuiButton::at_px(x + 2 * step, row, half, s, "Add Token"),
+            GuiButton::at_px(x, row, half, s, tr("recraft.accounts.use")).disabled(!has_selection),
+            GuiButton::at_px(x + step, row, half, s, tr("recraft.accounts.addMicrosoft")),
+            GuiButton::at_px(x + 2 * step, row, half, s, tr("recraft.accounts.addToken")),
             // Second row: delete / copy token / back.
-            GuiButton::at_px(x, row - 24 * s, half, s, "Delete").disabled(!has_selection),
-            GuiButton::at_px(x + step, row - 24 * s, half, s, "Copy Token"),
-            GuiButton::at_px(x + 2 * step, row - 24 * s, half, s, "Back"),
+            GuiButton::at_px(x, row - 24 * s, half, s, tr("selectServer.delete")).disabled(!has_selection),
+            GuiButton::at_px(x + step, row - 24 * s, half, s, tr("recraft.accounts.copyToken")),
+            GuiButton::at_px(x + 2 * step, row - 24 * s, half, s, tr("gui.back")),
         ];
     }
 
@@ -70,7 +71,7 @@ impl GuiScreen for GuiAccounts {
         self.layout(ctx);
         draw_default_background(ui, ctx);
         let s = ctx.scale;
-        draw_centered_text(ui, ctx.width, 16 * s, s, TEXT_WHITE, "Accounts");
+        draw_centered_text(ui, ctx.width, 16 * s, s, TEXT_WHITE, &tr("recraft.accounts.title"));
 
         let list = self.list_view(ctx);
         list.draw_background(ui);
@@ -88,7 +89,7 @@ impl GuiScreen for GuiAccounts {
                 (list.top + list.bottom) / 2 - 4 * s,
                 s,
                 TEXT_GRAY,
-                "No accounts yet — add one below.",
+                &tr("recraft.accounts.empty"),
             );
         }
 
@@ -114,8 +115,8 @@ impl GuiScreen for GuiAccounts {
             );
             // Active tag, right-aligned on the first line.
             if account.active {
-                let tag = "§a(in use)";
-                let tw = text_width(tag, s);
+                let tag = format!("§a{}", tr("recraft.accounts.inUse"));
+                let tw = text_width(&tag, s);
                 ui.text_shadowed(rect.x + rect.width - tw - pad, rect.y + pad, s, TEXT_GREEN, tag);
             }
             // Second line: the UUID, dimmed.
@@ -221,8 +222,8 @@ impl GuiAddToken {
         let btn_y = top + 48 * s;
         let bx = (ctx.width - 200 * s) / 2;
         self.buttons = vec![
-            GuiButton::at_px(bx, btn_y, 98 * s, s, "Add Account"),
-            GuiButton::at_px(bx + 102 * s, btn_y, 98 * s, s, "Cancel"),
+            GuiButton::at_px(bx, btn_y, 98 * s, s, tr("recraft.accounts.add")),
+            GuiButton::at_px(bx + 102 * s, btn_y, 98 * s, s, tr("gui.cancel")),
         ];
     }
 
@@ -245,14 +246,14 @@ impl GuiScreen for GuiAddToken {
         draw_default_background(ui, ctx);
         let s = ctx.scale;
         let top = ctx.height / 4;
-        draw_centered_text(ui, ctx.width, top - 24 * s, s, TEXT_WHITE, "Add with Refresh Token");
+        draw_centered_text(ui, ctx.width, top - 24 * s, s, TEXT_WHITE, &tr("recraft.accounts.addTitle"));
         draw_centered_text(
             ui,
             ctx.width,
             top + 4 * s,
             s,
             TEXT_GRAY,
-            "Paste a Microsoft refresh token (Cmd/Ctrl+V on the Accounts screen):",
+            &tr("recraft.accounts.addInstr"),
         );
         self.token.draw(ui, s);
         for button in &self.buttons {

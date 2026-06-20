@@ -16,6 +16,7 @@ pub mod game_over;
 pub mod ingame;
 pub mod ingame_menu;
 pub mod inventory;
+pub mod language;
 pub mod main_menu;
 pub mod mods;
 pub mod multiplayer;

@@ -1601,6 +1601,51 @@ pub(crate) fn load_asset_bytes(asset: &str) -> Option<Vec<u8>> {
     None
 }
 
+/// Read a UTF-8 text asset (e.g. a `.lang` file) from the active asset paths,
+/// decoding lossily. Thin wrapper over [`load_asset_bytes`] for the i18n loader.
+pub fn read_asset_string(asset: &str) -> Option<String> {
+    load_asset_bytes(asset).map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// List the language codes (`en_US`, `zh_CN`, …) of every `<code>.lang` file
+/// found under `assets/minecraft/lang/` across the active asset paths (jar/zip
+/// or directory). Deduplicated and sorted.
+pub fn list_lang_codes() -> Vec<String> {
+    let mut codes = std::collections::BTreeSet::new();
+    for path in candidate_asset_paths() {
+        if path.is_dir() {
+            for dir in ["assets/minecraft/lang", "minecraft/lang"] {
+                if let Ok(entries) = fs::read_dir(path.join(dir)) {
+                    for entry in entries.flatten() {
+                        if let Some(code) = entry
+                            .file_name()
+                            .to_str()
+                            .and_then(|name| name.strip_suffix(".lang"))
+                        {
+                            codes.insert(code.to_owned());
+                        }
+                    }
+                }
+            }
+        } else if let Some(zip) = File::open(&path)
+            .ok()
+            .and_then(|file| ZipArchive::new(file).ok())
+        {
+            for name in zip.file_names() {
+                if let Some(code) = name
+                    .strip_prefix("assets/minecraft/lang/")
+                    .and_then(|rest| rest.strip_suffix(".lang"))
+                {
+                    if !code.contains('/') {
+                        codes.insert(code.to_owned());
+                    }
+                }
+            }
+        }
+    }
+    codes.into_iter().collect()
+}
+
 /// Side length in pixels of one slot in the entity texture atlas grid. Each
 /// slot is `ENTITY_SLOT_PX` square; mob textures sit at their NATIVE resolution
 /// in the slot's top-left corner (so a 64px mob occupies the top-left quarter

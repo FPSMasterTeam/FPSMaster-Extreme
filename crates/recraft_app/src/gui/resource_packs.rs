@@ -9,6 +9,7 @@ use super::{
     ListView, ScreenCtx, TEXT_GRAY, TEXT_WHITE,
 };
 use crate::settings::Settings;
+use crate::i18n::{tr, tr_args};
 
 struct PackEntry {
     name: String,
@@ -79,7 +80,7 @@ impl GuiScreen for GuiResourcePacks {
     fn draw(&mut self, ui: &mut UiFrame, ctx: &DrawCtx) {
         draw_default_background(ui, ctx);
         let s = ctx.scale;
-        draw_centered_text(ui, ctx.width, 8 * s, s, TEXT_WHITE, "Resource Packs");
+        draw_centered_text(ui, ctx.width, 8 * s, s, TEXT_WHITE, &tr("resourcePack.title"));
 
         let list = ListView::new(ctx, 200, 36, 64);
         list.draw_background(ui);
@@ -100,14 +101,14 @@ impl GuiScreen for GuiResourcePacks {
             let text_y = rect.y + 2 * s;
             let max_w = rect.width - 8 * s;
             if idx == 0 {
-                let label = fit_text("Default (Vanilla 1.8)", max_w, s);
+                let label = fit_text(&tr("recraft.resourcepack.default"), max_w, s);
                 ui.text_shadowed(text_x, text_y, s, TEXT_WHITE, &label);
-                ui.text_shadowed(text_x, text_y + 12 * s, s, TEXT_GRAY, "No resource pack");
+                ui.text_shadowed(text_x, text_y + 12 * s, s, TEXT_GRAY, &tr("recraft.resourcepack.none"));
             } else {
                 let pack = &self.packs[idx as usize - 1];
                 let label = fit_text(&pack.name, max_w, s);
                 ui.text_shadowed(text_x, text_y, s, TEXT_WHITE, &label);
-                let info = format!("Format: {}  {}", pack.meta.pack_format, pack.meta.description);
+                let info = tr_args("recraft.resourcepack.format", &[&pack.meta.pack_format.to_string(), &pack.meta.description]);
                 let info = fit_text(&info, max_w, s);
                 ui.text_shadowed(text_x, text_y + 12 * s, s, TEXT_GRAY, &info);
             }
@@ -116,7 +117,7 @@ impl GuiScreen for GuiResourcePacks {
 
         let bx = (ctx.width - 200 * s) / 2;
         let by = ctx.height - 52 * s;
-        self.done = Some(GuiButton::at_px(bx, by, 200 * s, s, "Done"));
+        self.done = Some(GuiButton::at_px(bx, by, 200 * s, s, tr("gui.done")));
         if let Some(done) = &self.done {
             done.draw(ui, s, ctx.mouse, ctx.mouse_down);
         }

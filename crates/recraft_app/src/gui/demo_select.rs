@@ -6,6 +6,8 @@ use super::{draw_default_background, DrawCtx, GuiAction, GuiScreen, ScreenCtx};
 
 use recraft_render::UiFrame;
 
+use crate::i18n::tr;
+
 pub struct GuiDemoSelect {
     buttons: Vec<GuiButton>,
 }
@@ -23,10 +25,10 @@ impl GuiDemoSelect {
         let top = ctx.height / 4 + 24 * s;
 
         self.buttons = vec![
-            GuiButton::at_px(cx - 100 * s, top, 200 * s, s, "Landscape"),
-            GuiButton::at_px(cx - 100 * s, top + 24 * s, 200 * s, s, "Chunk Stress Test"),
-            GuiButton::at_px(cx - 100 * s, top + 48 * s, 200 * s, s, "Entity Stress Test"),
-            GuiButton::at_px(cx - 100 * s, top + 84 * s, 200 * s, s, "Back"),
+            GuiButton::at_px(cx - 100 * s, top, 200 * s, s, tr("recraft.demo.landscape")),
+            GuiButton::at_px(cx - 100 * s, top + 24 * s, 200 * s, s, tr("recraft.demo.chunkStress")),
+            GuiButton::at_px(cx - 100 * s, top + 48 * s, 200 * s, s, tr("recraft.demo.entityStress")),
+            GuiButton::at_px(cx - 100 * s, top + 84 * s, 200 * s, s, tr("gui.back")),
         ];
     }
 }
@@ -42,9 +44,9 @@ impl GuiScreen for GuiDemoSelect {
 
         let s = ctx.scale;
         let cx = ctx.width / 2;
-        let title = "Select Demo World";
-        let tw = recraft_render::text_width(title, s);
-        ui.text_shadowed(cx - tw / 2, ctx.height / 4, s, super::TEXT_WHITE, title);
+        let title = tr("recraft.demo.title");
+        let tw = recraft_render::text_width(&title, s);
+        ui.text_shadowed(cx - tw / 2, ctx.height / 4, s, super::TEXT_WHITE, &title);
 
         for button in &self.buttons {
             button.draw(ui, s, ctx.mouse, ctx.mouse_down);
