@@ -736,6 +736,12 @@ pub enum ClientboundPlayPacket {
         z: i32,
         lines: [String; 4],
     },
+    /// S3F PluginMessage — a custom-payload channel and its raw bytes (e.g.
+    /// `MC|TrList` for villager trade offers, `MC|Brand` for the server brand).
+    PluginMessage {
+        channel: String,
+        data: Vec<u8>,
+    },
     Unknown {
         id: i32,
         body: Vec<u8>,
@@ -1607,6 +1613,11 @@ impl ClientboundPlayPacket {
                     body.read_string(32767)?,
                 ];
                 Ok(Self::UpdateSign { x, y, z, lines })
+            }
+            0x3f => {
+                let channel = body.read_string(32767)?;
+                let data = body.read_remaining().to_vec();
+                Ok(Self::PluginMessage { channel, data })
             }
             id => Ok(Self::Unknown {
                 id,
@@ -2746,7 +2757,7 @@ fn read_metadata(body: &mut PacketReader<'_>) -> Result<Vec<MetadataEntry>> {
 
 /// Read a 1.8 Slot: Short id (-1 = empty), then Byte count, Short damage and
 /// an optional NBT compound.
-fn read_slot(body: &mut PacketReader<'_>) -> Result<Option<SlotItem>> {
+pub fn read_slot(body: &mut PacketReader<'_>) -> Result<Option<SlotItem>> {
     let id = body.read_i16()?;
     if id == -1 {
         return Ok(None);

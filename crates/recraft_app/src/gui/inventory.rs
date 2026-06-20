@@ -179,6 +179,9 @@ impl GuiScreen for GuiContainer {
         if container.kind == WindowKind::Anvil {
             draw_anvil_field(ui, container, hud.inventory, px, py, scale);
         }
+        if container.kind == WindowKind::Villager {
+            super::merchant::draw_offer(ui, container, px, py, scale, ctx.mouse);
+        }
 
         let icon = 16 * scale;
         let hovered = self.slot_at(ctx.mouse, container);
@@ -217,6 +220,9 @@ impl GuiScreen for GuiContainer {
                     scale,
                 );
             }
+        } else if container.kind == WindowKind::Villager {
+            // A villager trade preview item / deprecated arrow under the cursor.
+            super::merchant::draw_tooltip(ui, container, ctx, px, py, scale);
         }
     }
 
@@ -236,6 +242,23 @@ impl GuiScreen for GuiContainer {
                     .is_some()
             {
                 return Vec::new();
+            }
+            // A villager `< >` trade-selection button: change the selection and
+            // ask the server (MC|TrSel) to fill the trade slots for that recipe.
+            if container.kind == WindowKind::Villager {
+                if let Some(button) =
+                    super::merchant::button_at(container, (x, y), self.px, self.py, self.scale)
+                {
+                    let selected = container.selected_trade();
+                    let index = match button {
+                        super::merchant::TradeButton::Prev => selected.saturating_sub(1),
+                        super::merchant::TradeButton::Next => selected + 1,
+                    };
+                    return match ctx.game.merchant_select(index) {
+                        Some(packet) => vec![GuiAction::SendPacket(packet)],
+                        None => Vec::new(),
+                    };
+                }
             }
         }
         let slot = slot_under(self, ctx, (x, y));
