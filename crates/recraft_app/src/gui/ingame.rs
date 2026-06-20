@@ -32,6 +32,9 @@ pub struct HudState<'a> {
     pub container: Option<&'a crate::container::Container>,
     /// The stack carried on the cursor in an open inventory (vanilla slot -1).
     pub cursor_item: Option<&'a SlotItem>,
+    /// The local player's active potion effects as `(id, amplifier, duration)`,
+    /// drawn beside the player inventory window (vanilla `InventoryEffectRenderer`).
+    pub effects: &'a [(u8, i8, i32)],
     pub chat: &'a ChatState,
     pub scoreboard: &'a Scoreboard,
     /// Tab-list roster; drawn as the player-list overlay while `tab_open`.
