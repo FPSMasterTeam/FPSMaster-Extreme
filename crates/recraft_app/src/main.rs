@@ -2557,6 +2557,7 @@ fn render_frame(
     } = app;
     // The overlay only makes sense in pure gameplay, never under an open screen.
     let tab_open = *tab_open && screen.is_none();
+    let active_effects = game.active_effects();
     let hud = HudState {
         health: game.health(),
         food: game.food(),
@@ -2569,6 +2570,7 @@ fn render_frame(
         inventory: game.inventory_slots(),
         container: game.open_container(),
         cursor_item: game.cursor_item(),
+        effects: &active_effects,
         chat: &game.chat,
         scoreboard: &game.scoreboard,
         player_list: &game.player_list,
