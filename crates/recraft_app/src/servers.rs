@@ -122,6 +122,9 @@ pub struct PingInfo {
     pub motd: String,
     /// "online/max".
     pub players: String,
+    /// The player-name sample from the ping (vanilla shows it on hover), if the
+    /// server provided one.
+    pub sample: Vec<String>,
     /// Server version name from the ping; parsed and kept but not surfaced yet
     /// (vanilla only shows it on a protocol mismatch, which we don't flag).
     #[allow(dead_code)]
@@ -183,11 +186,21 @@ fn parse_status(json: &str, latency_ms: u32) -> PingInfo {
         value["players"]["max"].as_i64().unwrap_or(0),
     );
     let version = value["version"]["name"].as_str().unwrap_or("?").to_owned();
+    let sample = value["players"]["sample"]
+        .as_array()
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|e| e["name"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
     let favicon = value["favicon"].as_str().and_then(decode_favicon);
     PingInfo {
         motd,
         players,
         version,
+        sample,
         latency_ms,
         favicon,
     }
