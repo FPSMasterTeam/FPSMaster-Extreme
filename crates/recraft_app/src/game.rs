@@ -1420,6 +1420,18 @@ impl GameState {
         })
     }
 
+    /// Select villager trade `index` (vanilla `GuiMerchant` `MC|TrSel`): clamp +
+    /// store the selection locally and return the plugin-message packet that asks
+    /// the server to fill the trade slots with that recipe.
+    pub fn merchant_select(&mut self, index: usize) -> Option<ServerboundPacket> {
+        let container = self.open_container.as_mut()?;
+        container.set_selected_trade(index);
+        Some(ServerboundPacket::PluginMessage {
+            channel: "MC|TrSel".to_string(),
+            data: (container.selected_trade() as i32).to_be_bytes().to_vec(),
+        })
+    }
+
     /// Begin accumulating a paint-drag (local only until [`container_drag_commit`]).
     pub fn container_drag_begin(&mut self, button: i8) {
         if self.cursor_item.is_some() {
@@ -3988,6 +4000,19 @@ impl GameState {
             } => self.handle_block_action(x, y, z, action_id, action_param, block_type),
             // ConfirmTransaction is ponged on the network thread (vanilla replies
             // immediately), so the game loop never needs to act on it.
+            ClientboundPlayPacket::PluginMessage { channel, data } => {
+                // MC|TrList carries a villager's trade offers for the open window.
+                if channel == "MC|TrList" {
+                    if let Some((window_id, trades)) = crate::container::parse_trade_list(&data) {
+                        if let Some(container) = self.open_container.as_mut() {
+                            if container.window_id as i32 == window_id {
+                                container.set_trades(trades);
+                            }
+                        }
+                    }
+                }
+                false
+            }
             ClientboundPlayPacket::KeepAlive { .. }
             | ClientboundPlayPacket::ConfirmTransaction { .. }
             | ClientboundPlayPacket::Unknown { .. } => false,

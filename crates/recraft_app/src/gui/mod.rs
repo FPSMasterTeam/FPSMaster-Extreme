@@ -17,6 +17,7 @@ pub mod ingame;
 pub mod ingame_menu;
 pub mod inventory;
 pub mod main_menu;
+pub mod merchant;
 pub mod mods;
 pub mod multiplayer;
 pub mod options;
