@@ -74,8 +74,14 @@ fn sample_history(uv: vec2<f32>, dims: vec2<f32>) -> vec3<f32> {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    let dims = vec2<f32>(textureDimensions(scene_tex));
-    let texel = 1.0 / dims;
+    // Scene colour + motion vectors are at render resolution (low); history and
+    // the output are at display resolution (high). render_scale < 1 makes these
+    // differ and the resolve upscales (FSR2-style); render_scale == 1 makes them
+    // equal (pure temporal AA). `cur` is a bilinear lift of the low-res scene to
+    // the display pixel — the jitter + history accumulation recover the detail.
+    let low_dims = vec2<f32>(textureDimensions(scene_tex));
+    let high_dims = vec2<f32>(textureDimensions(history_tex));
+    let texel = 1.0 / low_dims;
     let cur = textureSampleLevel(scene_tex, samp, in.uv, 0.0).rgb;
 
     // Variance clipping of the 3x3 neighbourhood (Salvi): clip the reprojected
@@ -108,7 +114,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let cmax = mean + gamma * sigma;
 
     // Reproject into the previous frame: mv = cur_uv - prev_uv, so prev_uv = uv - mv.
-    let px = vec2<i32>(clamp(in.uv * dims, vec2<f32>(0.0), dims - 1.0));
+    let px = vec2<i32>(clamp(in.uv * low_dims, vec2<f32>(0.0), low_dims - 1.0));
     let mv = textureLoad(mv_tex, px, 0).rg;
     let hist_uv = in.uv - mv;
 
@@ -117,14 +123,14 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         return vec4<f32>(cur, 1.0);
     }
 
-    var hist = sample_history(hist_uv, dims);
+    var hist = sample_history(hist_uv, high_dims);
     hist = clamp(hist, cmin, cmax);
 
     // Keep the history weight high so the sub-pixel jitter is averaged out (a low
     // weight shows the raw jittered frame, which flickers under rotation). The
     // tight neighbourhood clamp above does the ghost/smear rejection. Only a mild
     // drop at high on-screen speed, for disocclusion safety.
-    let speed_px = length(mv * dims);
+    let speed_px = length(mv * high_dims);
     let hist_weight = mix(0.9, 0.8, clamp(speed_px / 40.0, 0.0, 1.0));
     return vec4<f32>(mix(cur, hist, hist_weight), 1.0);
 }

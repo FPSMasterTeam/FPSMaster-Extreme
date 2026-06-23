@@ -61,6 +61,11 @@ recraft.unit.chunks=区块
 recraft.perf.title=性能
 recraft.perf.taa=TAA 时间性抗锯齿
 recraft.perf.fsr=FSR 超分辨率
+recraft.perf.fsr.off=关闭
+recraft.perf.fsr.quality=质量
+recraft.perf.fsr.balanced=均衡
+recraft.perf.fsr.performance=性能
+recraft.perf.fsr.custom=自定义
 recraft.perf.dlss=DLSS
 recraft.perf.unavailable=未实现
 

@@ -4043,12 +4043,19 @@ impl Renderer {
         // downstream passes sample — the resolved target with TAA on, the raw
         // jittered scene otherwise.
         let (taa_resolved, taa_resolved_view, taa_history, taa_history_view) = if self.taa_enabled {
+            // TAA resolves at DISPLAY resolution, not the (possibly lower) render
+            // resolution: at render_scale 1 that's identical (pure AA), but at
+            // render_scale < 1 the resolve upscales the low-res jittered scene into
+            // the full-res history — i.e. FSR2-style temporal upscaling. The scene,
+            // depth and motion vectors stay at render res; only these targets and
+            // the downstream post/bloom/exposure reads move to display res.
+            let (dw, dh) = (self.config.width.max(1), self.config.height.max(1));
             let mk = |label: &str, extra: wgpu::TextureUsages| {
                 self.device.create_texture(&wgpu::TextureDescriptor {
                     label: Some(label),
                     size: wgpu::Extent3d {
-                        width: w,
-                        height: h,
+                        width: dw,
+                        height: dh,
                         depth_or_array_layers: 1,
                     },
                     mip_level_count: 1,
@@ -6869,7 +6876,8 @@ impl Renderer {
                     tp.set_bind_group(0, tb, &[]);
                     tp.draw(0..3, 0..1);
                 }
-                let (rw, rh) = self.scaled_dims();
+                // taa_tex / taa_history are at display resolution (the resolve may
+                // upscale into them), so the history copy spans the full surface.
                 encoder.copy_texture_to_texture(
                     wgpu::TexelCopyTextureInfo {
                         texture: tt,
@@ -6884,8 +6892,8 @@ impl Renderer {
                         aspect: wgpu::TextureAspect::All,
                     },
                     wgpu::Extent3d {
-                        width: rw,
-                        height: rh,
+                        width: self.config.width.max(1),
+                        height: self.config.height.max(1),
                         depth_or_array_layers: 1,
                     },
                 );

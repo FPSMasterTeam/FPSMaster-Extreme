@@ -63,6 +63,11 @@ recraft.unit.chunks=chunks
 recraft.perf.title=Performance
 recraft.perf.taa=TAA
 recraft.perf.fsr=FSR
+recraft.perf.fsr.off=Off
+recraft.perf.fsr.quality=Quality
+recraft.perf.fsr.balanced=Balanced
+recraft.perf.fsr.performance=Performance
+recraft.perf.fsr.custom=Custom
 recraft.perf.dlss=DLSS
 recraft.perf.unavailable=N/A
 
