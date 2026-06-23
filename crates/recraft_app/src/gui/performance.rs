@@ -11,6 +11,29 @@ use super::widgets::GuiButton;
 use super::{draw_centered_text, draw_default_background, DrawCtx, GuiAction, GuiScreen, ScreenCtx};
 use crate::i18n::tr;
 
+/// FSR quality presets as render-scale factors: Off (native), then the standard
+/// AMD ratios. "FSR" here is temporal upscaling — render at the scale, resolve to
+/// display res via the TAA path — so picking a preset also forces TAA on.
+const FSR_PRESETS: [f32; 4] = [1.0, 0.67, 0.59, 0.5];
+const FSR_KEYS: [&str; 4] = [
+    "recraft.perf.fsr.off",
+    "recraft.perf.fsr.quality",
+    "recraft.perf.fsr.balanced",
+    "recraft.perf.fsr.performance",
+];
+
+/// Which preset the current render scale matches (within a tolerance), if any.
+fn fsr_index(scale: f32) -> Option<usize> {
+    FSR_PRESETS.iter().position(|&p| (p - scale).abs() < 0.02)
+}
+
+fn fsr_label(scale: f32) -> String {
+    match fsr_index(scale) {
+        Some(i) => tr(FSR_KEYS[i]),
+        None => tr("recraft.perf.fsr.custom"),
+    }
+}
+
 #[derive(Default)]
 pub struct GuiPerformance {
     taa: Option<GuiButton>,
@@ -39,8 +62,9 @@ impl GuiPerformance {
         let top = ctx.height / 4;
         let row = |i: i32| top + i * 24 * s;
         self.taa = Some(GuiButton::at_px(x, row(0), cw, s, ""));
-        // Not implemented yet — disabled placeholders for the planned upscalers.
-        self.fsr = Some(GuiButton::at_px(x, row(1), cw, s, "").disabled(true));
+        // FSR = temporal upscaling (render scale preset + the TAA resolve).
+        self.fsr = Some(GuiButton::at_px(x, row(1), cw, s, ""));
+        // DLSS isn't implemented (NVIDIA / Vulkan / Windows only) — placeholder.
         self.dlss = Some(GuiButton::at_px(x, row(2), cw, s, "").disabled(true));
         self.done = Some(GuiButton::at_px(x, row(3) + 12 * s, cw, s, tr("gui.done")));
     }
@@ -81,7 +105,10 @@ impl GuiScreen for GuiPerformance {
             &mut self.taa,
             format!("{}: {}", tr("recraft.perf.taa"), on_off(st.taa)),
         );
-        draw(&mut self.fsr, format!("{}: {}", tr("recraft.perf.fsr"), soon));
+        draw(
+            &mut self.fsr,
+            format!("{}: {}", tr("recraft.perf.fsr"), fsr_label(st.render_scale)),
+        );
         draw(&mut self.dlss, format!("{}: {}", tr("recraft.perf.dlss"), soon));
         if let Some(b) = &self.done {
             b.draw(ui, s, ctx.mouse, ctx.mouse_down);
@@ -93,7 +120,22 @@ impl GuiScreen for GuiPerformance {
             ctx.settings.taa = !ctx.settings.taa;
             return vec![GuiAction::SetTaa(ctx.settings.taa)];
         }
-        // FSR / DLSS are disabled placeholders; their buttons never report clicked.
+        if self.fsr.as_ref().is_some_and(|b| b.clicked(x, y)) {
+            // Cycle Off -> Quality -> Balanced -> Performance. A custom slider
+            // scale counts as "off" so the first click snaps to Quality.
+            let next = (fsr_index(ctx.settings.render_scale).unwrap_or(0) + 1) % FSR_PRESETS.len();
+            let scale = FSR_PRESETS[next];
+            ctx.settings.render_scale = scale;
+            let mut actions = vec![GuiAction::SetRenderScale(scale)];
+            // A non-native preset upscales, which needs the temporal resolve on.
+            if next != 0 && !ctx.settings.taa {
+                ctx.settings.taa = true;
+                actions.push(GuiAction::SetTaa(true));
+            }
+            actions.push(GuiAction::SaveSettings);
+            return actions;
+        }
+        // DLSS is a disabled placeholder; its button never reports clicked.
         if self.done.as_ref().is_some_and(|b| b.clicked(x, y)) {
             return vec![GuiAction::SaveSettings, GuiAction::SetScreen(self.back_screen())];
         }
