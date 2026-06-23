@@ -78,19 +78,34 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let texel = 1.0 / dims;
     let cur = textureSampleLevel(scene_tex, samp, in.uv, 0.0).rgb;
 
-    // 3x3 neighbourhood colour AABB of the current frame; the reprojected history
-    // is clamped into it so stale samples (ghosts) are pulled back to plausible
-    // values instead of smearing.
-    var cmin = cur;
-    var cmax = cur;
+    // Variance clipping of the 3x3 neighbourhood (Salvi): clip the reprojected
+    // history to mean +/- gamma*stddev instead of the min/max box. On
+    // high-frequency content (grass, leaves) the min/max box is so wide that a
+    // wrong reprojected sample fits inside it and accumulates into a smear —
+    // worst on forward/zoom motion. The statistical box is far tighter, so stale
+    // history is rejected and the streaking disappears (at the cost of a little
+    // more aliasing while moving, which is the right trade).
+    var m1 = vec3<f32>(0.0);
+    var m2 = vec3<f32>(0.0);
     for (var y = -1; y <= 1; y = y + 1) {
         for (var x = -1; x <= 1; x = x + 1) {
             let c = textureSampleLevel(
                 scene_tex, samp, in.uv + vec2<f32>(f32(x), f32(y)) * texel, 0.0).rgb;
-            cmin = min(cmin, c);
-            cmax = max(cmax, c);
+            m1 += c;
+            m2 += c * c;
         }
     }
+    let inv_n = 1.0 / 9.0;
+    let mean = m1 * inv_n;
+    let sigma = sqrt(max(m2 * inv_n - mean * mean, vec3<f32>(0.0)));
+    // Tight statistical box (mean +/- 0.6 sigma): rejects mis-reprojected history
+    // (the forward-motion grass smear) while still allowing in-distribution
+    // history to accumulate for anti-aliasing. This — not a low history weight —
+    // is what kills the smear, so the weight can stay high enough to average out
+    // the jitter (otherwise rotation shows the raw jittered frame and flickers).
+    let gamma = 0.6;
+    let cmin = mean - gamma * sigma;
+    let cmax = mean + gamma * sigma;
 
     // Reproject into the previous frame: mv = cur_uv - prev_uv, so prev_uv = uv - mv.
     let px = vec2<i32>(clamp(in.uv * dims, vec2<f32>(0.0), dims - 1.0));
@@ -105,10 +120,11 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     var hist = sample_history(hist_uv, dims);
     hist = clamp(hist, cmin, cmax);
 
-    // Velocity-weighted blend: 0.9 history when still (max AA, sharpest static
-    // result), falling toward 0.6 as on-screen motion reaches ~20 px/frame so
-    // fast movement leans on the sharp current frame instead of soft history.
+    // Keep the history weight high so the sub-pixel jitter is averaged out (a low
+    // weight shows the raw jittered frame, which flickers under rotation). The
+    // tight neighbourhood clamp above does the ghost/smear rejection. Only a mild
+    // drop at high on-screen speed, for disocclusion safety.
     let speed_px = length(mv * dims);
-    let hist_weight = mix(0.9, 0.6, clamp(speed_px / 20.0, 0.0, 1.0));
+    let hist_weight = mix(0.9, 0.8, clamp(speed_px / 40.0, 0.0, 1.0));
     return vec4<f32>(mix(cur, hist, hist_weight), 1.0);
 }
