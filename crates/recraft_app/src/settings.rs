@@ -35,6 +35,9 @@ pub struct Settings {
     /// Lighting"). OFF switches to flat per-face light with greedy-merged cube
     /// faces — far fewer triangles on open terrain, at the cost of AO/gradients.
     pub smooth_lighting: bool,
+    /// Temporal anti-aliasing: jittered sampling + history reprojection, resolved
+    /// against the motion-vector buffer. Suppresses the post motion blur while on.
+    pub taa: bool,
     /// Fancy graphics: sky gradient + see-through (alpha-blended) water. Off =
     /// flat horizon sky + opaque water, skipping the heaviest per-pixel work.
     pub fancy_graphics: bool,
@@ -130,6 +133,7 @@ impl Default for Settings {
             render_distance: 12,
             adaptive_resolution: false,
             smooth_lighting: true,
+            taa: false,
             fancy_graphics: true,
             mipmap_levels: MIPMAP_MAX,
             resolution: None,
@@ -205,6 +209,11 @@ impl Settings {
                 "adaptive_resolution" => {
                     if let Ok(v) = val.parse() {
                         s.adaptive_resolution = v;
+                    }
+                }
+                "taa" => {
+                    if let Ok(v) = val.parse() {
+                        s.taa = v;
                     }
                 }
                 "smooth_lighting" => {
@@ -395,6 +404,7 @@ impl Settings {
             self.old_animations,
             self.resource_pack.as_deref().unwrap_or(""),
         );
+        text.push_str(&format!("taa={}\n", self.taa));
         text.push_str(&format!("disabled_mods={}\n", self.disabled_mods.join(",")));
         text.push_str(&format!("language={}\n", self.language));
         for &(action, code) in self.keybinds.iter() {

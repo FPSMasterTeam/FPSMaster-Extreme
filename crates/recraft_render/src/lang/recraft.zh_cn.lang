@@ -53,8 +53,16 @@ recraft.options.resolution=分辨率
 recraft.options.showFps=显示 FPS
 recraft.options.oldAnimations=旧版动画
 recraft.options.shaders=光影…
+recraft.options.performance=性能…
 recraft.options.native=原生
 recraft.unit.chunks=区块
+
+# 性能界面
+recraft.perf.title=性能
+recraft.perf.taa=TAA 时间性抗锯齿
+recraft.perf.fsr=FSR 超分辨率
+recraft.perf.dlss=DLSS
+recraft.perf.unavailable=未实现
 
 # 光影界面
 recraft.shaders.title=光影
