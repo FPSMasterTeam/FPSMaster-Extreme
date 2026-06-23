@@ -37,6 +37,13 @@ impl ModelVertex {
 pub struct ModelMesh {
     pub vertices: Vec<ModelVertex>,
     pub indices: Vec<u32>,
+    /// Per-vertex motion data for the TAA/DLSS motion-vector pass, kept in
+    /// lockstep with `vertices`: xyz = the entity's world-space movement this
+    /// frame (rigid root translation; 0 for static geometry), w = 1.0 for
+    /// screen-locked geometry (the first-person hand) which gets zero motion.
+    /// Filled per entity with `fill_motion` after that entity's vertices are
+    /// appended. Empty when motion vectors aren't being produced.
+    pub motion: Vec<[f32; 4]>,
     /// Transient: the death fall-over tilt (radians) applied by `push_parts`
     /// about the model's forward axis through the feet. Set by `push_entity` /
     /// `push_armor` from `EntityAnim::death_roll` for the current entity and
@@ -167,11 +174,21 @@ impl ModelMesh {
     pub fn clear(&mut self) {
         self.vertices.clear();
         self.indices.clear();
+        self.motion.clear();
         self.death_roll = 0.0;
     }
 
     pub fn is_empty(&self) -> bool {
         self.indices.is_empty()
+    }
+
+    /// Tag every vertex appended since the last `fill_motion` with `motion`
+    /// (world-space delta xyz + screen-locked flag w). Call once after appending
+    /// an entity's geometry so its whole vertex range carries that entity's
+    /// rigid motion. `Vec::resize` only fills the newly-added tail, leaving
+    /// already-tagged ranges untouched.
+    pub fn fill_motion(&mut self, motion: [f32; 4]) {
+        self.motion.resize(self.vertices.len(), motion);
     }
 
     /// Append an axis-aligned solid-color box (no texture). Used by objects,
