@@ -67,7 +67,11 @@ recraft.perf.fsr.balanced=均衡
 recraft.perf.fsr.performance=性能
 recraft.perf.fsr.custom=自定义
 recraft.perf.dlss=DLSS
-recraft.perf.unavailable=未实现
+recraft.perf.rt=光线追踪
+recraft.perf.rt.quality=光追质量
+recraft.perf.rt.low=低
+recraft.perf.rt.medium=中
+recraft.perf.rt.high=高
 
 # 光影界面
 recraft.shaders.title=光影

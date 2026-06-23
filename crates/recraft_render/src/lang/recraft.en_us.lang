@@ -69,7 +69,11 @@ recraft.perf.fsr.balanced=Balanced
 recraft.perf.fsr.performance=Performance
 recraft.perf.fsr.custom=Custom
 recraft.perf.dlss=DLSS
-recraft.perf.unavailable=N/A
+recraft.perf.rt=Ray Tracing
+recraft.perf.rt.quality=RT Quality
+recraft.perf.rt.low=Low
+recraft.perf.rt.medium=Medium
+recraft.perf.rt.high=High
 
 # Shaders screen
 recraft.shaders.title=Shaders

@@ -1,5 +1,9 @@
 pub mod camera;
 pub mod chunk_mesh;
+/// NVIDIA DLSS upscaler (Vulkan + RTX only). Compiled only with `--features dlss`
+/// (see docs/dlss.md); absent from the default cross-platform build.
+#[cfg(feature = "dlss")]
+pub mod dlss;
 pub mod font;
 pub mod i18n;
 pub mod gui_item;
