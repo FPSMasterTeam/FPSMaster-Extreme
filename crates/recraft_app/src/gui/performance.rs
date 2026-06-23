@@ -1,7 +1,7 @@
-//! The Performance settings screen: temporal anti-aliasing and (future) temporal
-//! upscalers. TAA is functional; FSR and DLSS are placeholders for upscalers that
-//! aren't implemented yet (DLSS is NVIDIA/Vulkan/Windows-only), shown disabled so
-//! the planned feature set is visible.
+//! The Performance settings screen: temporal anti-aliasing, temporal upscalers
+//! and ray tracing. TAA and FSR (render-scale presets) drive the renderer. DLSS
+//! and ray tracing have no renderer path yet — they are live, persisted
+//! placeholders so the choice is remembered and the planned feature set shows.
 
 use winit::event::{ElementState, KeyEvent};
 use winit::keyboard::{KeyCode, PhysicalKey};
@@ -34,11 +34,25 @@ fn fsr_label(scale: f32) -> String {
     }
 }
 
+/// Ray-tracing quality presets (placeholder — no RT path yet). Indices match
+/// `Settings::rt_quality` (Low/Medium/High).
+const RT_QUALITY_KEYS: [&str; 3] = [
+    "recraft.perf.rt.low",
+    "recraft.perf.rt.medium",
+    "recraft.perf.rt.high",
+];
+
+fn rt_quality_label(q: u32) -> String {
+    tr(RT_QUALITY_KEYS[(q as usize).min(RT_QUALITY_KEYS.len() - 1)])
+}
+
 #[derive(Default)]
 pub struct GuiPerformance {
     taa: Option<GuiButton>,
     fsr: Option<GuiButton>,
     dlss: Option<GuiButton>,
+    rt: Option<GuiButton>,
+    rt_quality: Option<GuiButton>,
     done: Option<GuiButton>,
     from_main_menu: bool,
 }
@@ -64,9 +78,11 @@ impl GuiPerformance {
         self.taa = Some(GuiButton::at_px(x, row(0), cw, s, ""));
         // FSR = temporal upscaling (render scale preset + the TAA resolve).
         self.fsr = Some(GuiButton::at_px(x, row(1), cw, s, ""));
-        // DLSS isn't implemented (NVIDIA / Vulkan / Windows only) — placeholder.
-        self.dlss = Some(GuiButton::at_px(x, row(2), cw, s, "").disabled(true));
-        self.done = Some(GuiButton::at_px(x, row(3) + 12 * s, cw, s, tr("gui.done")));
+        // DLSS and ray tracing have no renderer path yet — live, persisted placeholders.
+        self.dlss = Some(GuiButton::at_px(x, row(2), cw, s, ""));
+        self.rt = Some(GuiButton::at_px(x, row(3), cw, s, ""));
+        self.rt_quality = Some(GuiButton::at_px(x, row(4), cw, s, ""));
+        self.done = Some(GuiButton::at_px(x, row(5) + 12 * s, cw, s, tr("gui.done")));
     }
 }
 
@@ -80,6 +96,8 @@ impl GuiScreen for GuiPerformance {
             self.taa.as_ref(),
             self.fsr.as_ref(),
             self.dlss.as_ref(),
+            self.rt.as_ref(),
+            self.rt_quality.as_ref(),
             self.done.as_ref(),
         ]
         .into_iter()
@@ -93,7 +111,6 @@ impl GuiScreen for GuiPerformance {
         let s = ctx.scale;
         draw_centered_text(ui, ctx.width, 15 * s, s, super::TEXT_WHITE, &tr("recraft.perf.title"));
         let st = ctx.settings;
-        let soon = tr("recraft.perf.unavailable");
 
         let mut draw = |btn: &mut Option<GuiButton>, label: String| {
             if let Some(b) = btn {
@@ -109,7 +126,12 @@ impl GuiScreen for GuiPerformance {
             &mut self.fsr,
             format!("{}: {}", tr("recraft.perf.fsr"), fsr_label(st.render_scale)),
         );
-        draw(&mut self.dlss, format!("{}: {}", tr("recraft.perf.dlss"), soon));
+        draw(&mut self.dlss, format!("{}: {}", tr("recraft.perf.dlss"), on_off(st.dlss)));
+        draw(&mut self.rt, format!("{}: {}", tr("recraft.perf.rt"), on_off(st.ray_tracing)));
+        draw(
+            &mut self.rt_quality,
+            format!("{}: {}", tr("recraft.perf.rt.quality"), rt_quality_label(st.rt_quality)),
+        );
         if let Some(b) = &self.done {
             b.draw(ui, s, ctx.mouse, ctx.mouse_down);
         }
@@ -135,7 +157,20 @@ impl GuiScreen for GuiPerformance {
             actions.push(GuiAction::SaveSettings);
             return actions;
         }
-        // DLSS is a disabled placeholder; its button never reports clicked.
+        // DLSS and ray tracing are persisted placeholders — no renderer path yet,
+        // so a click only records the choice (saved on the way out).
+        if self.dlss.as_ref().is_some_and(|b| b.clicked(x, y)) {
+            ctx.settings.dlss = !ctx.settings.dlss;
+            return vec![GuiAction::SaveSettings];
+        }
+        if self.rt.as_ref().is_some_and(|b| b.clicked(x, y)) {
+            ctx.settings.ray_tracing = !ctx.settings.ray_tracing;
+            return vec![GuiAction::SaveSettings];
+        }
+        if self.rt_quality.as_ref().is_some_and(|b| b.clicked(x, y)) {
+            ctx.settings.rt_quality = (ctx.settings.rt_quality + 1) % RT_QUALITY_KEYS.len() as u32;
+            return vec![GuiAction::SaveSettings];
+        }
         if self.done.as_ref().is_some_and(|b| b.clicked(x, y)) {
             return vec![GuiAction::SaveSettings, GuiAction::SetScreen(self.back_screen())];
         }
