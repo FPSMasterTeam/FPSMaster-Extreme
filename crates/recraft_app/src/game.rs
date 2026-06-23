@@ -405,10 +405,6 @@ pub struct GameState {
     previous_player_position: DVec3,
     physics: PlayerPhysics,
     has_sky_light: bool,
-    /// Run a client-side block-light flood-fill on placement/break. Demos have no
-    /// server lightmap, so emissive blocks must be lit locally; off in multiplayer
-    /// (the server is authoritative for light there).
-    local_lighting: bool,
     /// World time of day in ticks (0..24000), driving the day/night sky and
     /// lightmap. Advanced locally each tick and resynced by S03 TimeUpdate;
     /// starts at noon until the server reports otherwise.
@@ -507,6 +503,11 @@ pub struct GameState {
     /// Passenger → vehicle mount relationships (S1B AttachEntity). Drives the
     /// rider render offset and the local player following its mount.
     vehicles: std::collections::HashMap<EntityId, EntityId>,
+    /// Each entity's interpolated render position from the PREVIOUS rendered
+    /// frame, used to compute its per-frame world movement for the TAA/DLSS
+    /// motion-vector pass. Refreshed by `snapshot_entity_render_pos` after each
+    /// entity-model rebuild; absent entries (new spawns) yield zero motion.
+    entity_prev_render_pos: std::collections::HashMap<EntityId, DVec3>,
     dirty_chunks: HashSet<SectionPos>,
     /// Sections changed by local place/break prediction. They are submitted to
     /// the background mesher before ordinary dirty sections, but never rebuilt on
@@ -788,7 +789,6 @@ impl GameState {
         world.recompute_vertical_skylight();
         let mut state = Self::new(world, EntityId(0), spawn, aspect);
         state.capabilities.allow_flying = true;
-        state.local_lighting = true;
         if matches!(kind, DemoKind::ChunkStress) {
             state.camera.pitch = 45.0;
         }
@@ -844,7 +844,6 @@ impl GameState {
             player,
             physics: PlayerPhysics::default(),
             has_sky_light: true,
-            local_lighting: false,
             world_time: 6000,
             daylight_cycle: true,
             time_rate: 1,
@@ -880,6 +879,7 @@ impl GameState {
             falling_blocks: std::collections::HashMap::new(),
             entity_equipment: std::collections::HashMap::new(),
             vehicles: std::collections::HashMap::new(),
+            entity_prev_render_pos: std::collections::HashMap::new(),
             dirty_chunks: HashSet::new(),
             urgent_remesh: HashSet::new(),
             evicted_columns: HashSet::new(),
@@ -2156,7 +2156,32 @@ impl GameState {
                     v.color[2] *= 0.7;
                 }
             }
+            // Tag this entity's vertices with its per-frame world movement (rigid
+            // translation) for the motion-vector pass. Missing from the cache (a
+            // fresh spawn) => zero motion, so it doesn't streak on its first frame.
+            let cur_pos = entity.render_position(tick_alpha as f64);
+            let prev_pos = self
+                .entity_prev_render_pos
+                .get(&entity.id)
+                .copied()
+                .unwrap_or(cur_pos);
+            let d = to_render_vec3(cur_pos) - to_render_vec3(prev_pos);
+            mesh.fill_motion([d.x, d.y, d.z, 0.0]);
         }
+    }
+
+    /// Snapshot every entity's current interpolated render position so the next
+    /// frame can diff against it for motion vectors. Called after the entity
+    /// model is rebuilt; `entity.render_position` is the same value the build
+    /// used, so the diff is exactly one frame of movement.
+    pub fn snapshot_entity_render_pos(&mut self, tick_alpha: f32) {
+        let snap: Vec<(EntityId, DVec3)> = self
+            .world
+            .entities()
+            .map(|e| (e.id, e.render_position(tick_alpha as f64)))
+            .collect();
+        self.entity_prev_render_pos.clear();
+        self.entity_prev_render_pos.extend(snap);
     }
 
     /// Append the chest block-entities near the camera to the entity model.
@@ -3322,20 +3347,25 @@ impl GameState {
         }
     }
 
-    /// Offline/demo block-light update: flood-fill block light around an edit and
-    /// queue every affected section for an urgent re-mesh. No-op in multiplayer.
+    /// Client-side relight after a block edit: flood-fill block light, and (in
+    /// dimensions with a sky) recompute the column's sky-light, queuing every
+    /// affected section for an urgent re-mesh. Runs in both single-player and
+    /// multiplayer: the 1.8 protocol doesn't re-send light for a single block
+    /// change, so the client recomputes it locally (as vanilla does). Without
+    /// this, freshly exposed faces keep the chunk's load-time light and render
+    /// black until the chunk reloads.
     fn relight_after_edit(&mut self, x: i32, y: i32, z: i32, old: BlockState) {
-        if !self.local_lighting {
-            return;
-        }
         let block_light = self.world.update_block_light(x, y, z, old);
-        // Also recompute the column's sky-light so roofing over darkens the space
-        // below (and digging a shaft lets daylight back in).
-        let sky_light = self.world.update_sky_light(x, y, z, old);
         self.dirty_chunks.extend(block_light.iter().copied());
-        self.dirty_chunks.extend(sky_light.iter().copied());
         self.urgent_remesh.extend(block_light);
-        self.urgent_remesh.extend(sky_light);
+        // Sky-light only exists in the overworld; the nether/end have none, and
+        // forcing open columns to 15 there would wrongly brighten the world.
+        if self.has_sky_light {
+            // Roofing over darkens the space below; a dug shaft lets daylight in.
+            let sky_light = self.world.update_sky_light(x, y, z, old);
+            self.dirty_chunks.extend(sky_light.iter().copied());
+            self.urgent_remesh.extend(sky_light);
+        }
     }
 
     /// Vanilla `ItemBlock.canPlaceBlockOnSide` → `World.canBlockBePlaced`:
@@ -4266,6 +4296,7 @@ impl GameState {
 
     fn apply_block_change(&mut self, x: i32, y: i32, z: i32, id: u16, meta: u8) -> bool {
         let block = BlockState::new(id, meta);
+        let old = self.world.block_at(x, y, z);
         if !self.world.set_block_if_chunk_loaded(x, y, z, block) {
             // Chunk not loaded yet — buffer and replay when it arrives so we
             // don't lose blocks the server places before sending the chunk.
@@ -4276,6 +4307,7 @@ impl GameState {
             return false;
         }
         self.mark_block_dirty(x, y, z);
+        self.relight_after_edit(x, y, z, old);
         true
     }
 

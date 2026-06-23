@@ -312,6 +312,7 @@ pub struct GuiVideoSettings {
     resolution: Option<GuiButton>,
     fullscreen: Option<GuiButton>,
     shaders_btn: Option<GuiButton>,
+    perf_btn: Option<GuiButton>,
     smooth_light: Option<GuiButton>,
     show_fps: Option<GuiButton>,
     old_animations: Option<GuiButton>,
@@ -356,8 +357,15 @@ impl GuiVideoSettings {
         self.show_fps = Some(GuiButton::at_px(x, top + 168 * s, 98 * s, s, ""));
         self.old_animations =
             Some(GuiButton::at_px(x + 102 * s, top + 168 * s, 98 * s, s, ""));
+        self.perf_btn = Some(GuiButton::at_px(
+            x,
+            top + 192 * s,
+            200 * s,
+            s,
+            tr("recraft.options.performance"),
+        ));
         // A gap above Done, echoing vanilla's separated bottom button.
-        self.done = Some(GuiButton::at_px(x, top + 192 * s, 200 * s, s, tr("gui.done")));
+        self.done = Some(GuiButton::at_px(x, top + 216 * s, 200 * s, s, tr("gui.done")));
     }
 
     fn apply_drag(&mut self, x: f64, ctx: &mut ScreenCtx) {
@@ -386,6 +394,7 @@ impl GuiScreen for GuiVideoSettings {
             self.resolution.as_ref(),
             self.fullscreen.as_ref(),
             self.shaders_btn.as_ref(),
+            self.perf_btn.as_ref(),
             self.smooth_light.as_ref(),
             self.show_fps.as_ref(),
             self.old_animations.as_ref(),
@@ -473,6 +482,9 @@ impl GuiScreen for GuiVideoSettings {
         if let Some(b) = &self.shaders_btn {
             b.draw(ui, s, ctx.mouse, ctx.mouse_down);
         }
+        if let Some(b) = &self.perf_btn {
+            b.draw(ui, s, ctx.mouse, ctx.mouse_down);
+        }
         if let Some(smooth) = &mut self.smooth_light {
             smooth.label = format!("{}: {}", tr("options.ao"), on_off(ctx.settings.smooth_lighting));
             smooth.draw(ui, s, ctx.mouse, ctx.mouse_down);
@@ -539,6 +551,14 @@ impl GuiScreen for GuiVideoSettings {
             return vec![
                 GuiAction::SaveSettings,
                 GuiAction::SetScreen(Box::new(super::shaders::GuiShaders::new(self.from_main_menu))),
+            ];
+        }
+        if self.perf_btn.as_ref().is_some_and(|b| b.clicked(x, y)) {
+            return vec![
+                GuiAction::SaveSettings,
+                GuiAction::SetScreen(Box::new(super::performance::GuiPerformance::new(
+                    self.from_main_menu,
+                ))),
             ];
         }
         if self.smooth_light.as_ref().is_some_and(|b| b.clicked(x, y)) {

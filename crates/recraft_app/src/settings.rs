@@ -35,6 +35,19 @@ pub struct Settings {
     /// Lighting"). OFF switches to flat per-face light with greedy-merged cube
     /// faces — far fewer triangles on open terrain, at the cost of AO/gradients.
     pub smooth_lighting: bool,
+    /// Temporal anti-aliasing: jittered sampling + history reprojection, resolved
+    /// against the motion-vector buffer. Suppresses the post motion blur while on.
+    pub taa: bool,
+    /// Ray tracing master toggle. Placeholder: persisted and shown on the
+    /// Performance screen, but the renderer has no RT path yet, so toggling it
+    /// does not change rendering.
+    pub ray_tracing: bool,
+    /// Ray-tracing quality preset index in `0..=RT_QUALITY_MAX` (Low/Medium/High).
+    /// Persisted alongside `ray_tracing`; inert until a real RT path lands.
+    pub rt_quality: u32,
+    /// DLSS upscaler master toggle (NVIDIA-only in reality). Placeholder like
+    /// `ray_tracing` — persisted and clickable, not yet wired to an upscaler.
+    pub dlss: bool,
     /// Fancy graphics: sky gradient + see-through (alpha-blended) water. Off =
     /// flat horizon sky + opaque water, skipping the heaviest per-pixel work.
     pub fancy_graphics: bool,
@@ -114,6 +127,8 @@ pub const RENDER_DIST_MIN: u32 = 2;
 pub const RENDER_DIST_MAX: u32 = 32;
 /// Highest selectable mipmap level (16px tiles → mips 0..4).
 pub const MIPMAP_MAX: u32 = 4;
+/// Highest ray-tracing quality preset index (Low = 0, Medium = 1, High = 2).
+pub const RT_QUALITY_MAX: u32 = 2;
 // Brightness is a gamma knob (0 = darkest shadows, 1 = neutral), not a flat
 // multiplier — it pulls the dark/low-light end down while leaving fully-lit
 // surfaces alone.
@@ -130,6 +145,10 @@ impl Default for Settings {
             render_distance: 12,
             adaptive_resolution: false,
             smooth_lighting: true,
+            taa: false,
+            ray_tracing: false,
+            rt_quality: 1,
+            dlss: false,
             fancy_graphics: true,
             mipmap_levels: MIPMAP_MAX,
             resolution: None,
@@ -205,6 +224,26 @@ impl Settings {
                 "adaptive_resolution" => {
                     if let Ok(v) = val.parse() {
                         s.adaptive_resolution = v;
+                    }
+                }
+                "taa" => {
+                    if let Ok(v) = val.parse() {
+                        s.taa = v;
+                    }
+                }
+                "ray_tracing" => {
+                    if let Ok(v) = val.parse() {
+                        s.ray_tracing = v;
+                    }
+                }
+                "rt_quality" => {
+                    if let Ok(v) = val.parse() {
+                        s.rt_quality = v;
+                    }
+                }
+                "dlss" => {
+                    if let Ok(v) = val.parse() {
+                        s.dlss = v;
                     }
                 }
                 "smooth_lighting" => {
@@ -347,6 +386,7 @@ impl Settings {
         s.render_scale = s.render_scale.clamp(RENDER_SCALE_MIN, 1.0);
         s.render_distance = s.render_distance.clamp(RENDER_DIST_MIN, RENDER_DIST_MAX);
         s.mipmap_levels = s.mipmap_levels.min(MIPMAP_MAX);
+        s.rt_quality = s.rt_quality.min(RT_QUALITY_MAX);
         s.brightness = s.brightness.clamp(BRIGHTNESS_MIN, BRIGHTNESS_MAX);
         s.resolution = if res_w > 0 && res_h > 0 {
             Some((res_w, res_h))
@@ -395,6 +435,10 @@ impl Settings {
             self.old_animations,
             self.resource_pack.as_deref().unwrap_or(""),
         );
+        text.push_str(&format!("taa={}\n", self.taa));
+        text.push_str(&format!("ray_tracing={}\n", self.ray_tracing));
+        text.push_str(&format!("rt_quality={}\n", self.rt_quality));
+        text.push_str(&format!("dlss={}\n", self.dlss));
         text.push_str(&format!("disabled_mods={}\n", self.disabled_mods.join(",")));
         text.push_str(&format!("language={}\n", self.language));
         for &(action, code) in self.keybinds.iter() {
@@ -913,6 +957,9 @@ mod tests {
         original.mipmap_levels = 2;
         original.brightness = 0.55;
         original.old_animations = true;
+        original.ray_tracing = true;
+        original.rt_quality = 2;
+        original.dlss = true;
         original.save_to(&path);
 
         let loaded = Settings::load_from(&path);
@@ -924,6 +971,9 @@ mod tests {
         assert_eq!(loaded.mipmap_levels, 2);
         assert!((loaded.brightness - 0.55).abs() < 1e-6);
         assert!(loaded.old_animations);
+        assert!(loaded.ray_tracing);
+        assert_eq!(loaded.rt_quality, 2);
+        assert!(loaded.dlss);
 
         let _ = std::fs::remove_file(&path);
     }
