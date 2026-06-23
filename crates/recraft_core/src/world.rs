@@ -247,8 +247,8 @@ impl World {
         }
     }
 
-    /// Flood-fill block-light around a just-changed block (offline/demo worlds,
-    /// which have no server lightmap). `old` is the block previously at (x,y,z);
+    /// Flood-fill block-light around a just-changed block. `old` is the block
+    /// previously at (x,y,z);
     /// the new block must already be set. Runs the classic Minecraft two-phase
     /// update (remove the old light, then re-propagate) and returns every section
     /// whose light changed so the caller can re-mesh them. Only spreads into

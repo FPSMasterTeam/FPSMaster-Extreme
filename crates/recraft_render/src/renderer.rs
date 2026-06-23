@@ -107,6 +107,20 @@ struct PostCamera {
     camera_pos: [f32; 4],
 }
 
+/// Uniform for the per-entity motion-vector pass (model_velocity.wgsl). Current
+/// and previous camera-relative view-projections (un-jittered, so the motion
+/// vectors are jitter-free) plus the render origins of each frame and this
+/// frame's NDC jitter (re-applied only to the rasterized depth position).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct VelUniform {
+    cur_view_proj: [[f32; 4]; 4],
+    prev_view_proj: [[f32; 4]; 4],
+    jitter: [f32; 4],
+    cur_origin: [i32; 4],
+    prev_origin: [i32; 4],
+}
+
 /// Uniform for the volumetric-light raymarch pass: unproject depth to a world ray,
 /// project samples into the shadow map, and shade in-scatter toward the sun.
 #[repr(C)]
@@ -165,6 +179,21 @@ struct GlintUniform {
 /// scaled UV. Continuous (not wrapped) is fine since the texture is REPEAT.
 pub fn glint_scroll(time_secs: f32) -> f32 {
     time_secs * 2.0
+}
+
+/// Radical-inverse Halton point for sample `index` in `base`. Drives the
+/// sub-pixel camera jitter (base 2 for x, base 3 for y) — a low-discrepancy
+/// sequence the temporal resolve relies on for an even sample distribution.
+fn halton(index: u32, base: u32) -> f32 {
+    let mut f = 1.0_f32;
+    let mut r = 0.0_f32;
+    let mut i = index;
+    while i > 0 {
+        f /= base as f32;
+        r += f * (i % base) as f32;
+        i /= base;
+    }
+    r
 }
 
 /// A vertex+index buffer pair that persists across frames and is refilled in
@@ -880,6 +909,51 @@ pub struct Renderer {
     vol_tex: Option<wgpu::Texture>,
     vol_view: Option<wgpu::TextureView>,
     vol_bind_group: Option<wgpu::BindGroup>,
+    /// Motion-vector G-buffer (RG16F screen-space velocity), the foundation for
+    /// temporal upscaling (TAA / FSR2 / DLSS). Camera-reprojection only for now
+    /// (see motion_vector.wgsl). Produced only when `mv_debug` or a temporal
+    /// consumer needs it, so it costs nothing on the default path.
+    mv_pipeline: wgpu::RenderPipeline,
+    mv_layout: wgpu::BindGroupLayout,
+    mv_tex: Option<wgpu::Texture>,
+    mv_view: Option<wgpu::TextureView>,
+    mv_bind_group: Option<wgpu::BindGroup>,
+    /// Debug blit of the motion-vector buffer over the swapchain (env RECRAFT_MV).
+    mv_debug: bool,
+    mv_debug_pipeline: wgpu::RenderPipeline,
+    mv_debug_layout: wgpu::BindGroupLayout,
+    mv_debug_bind_group: Option<wgpu::BindGroup>,
+    /// Sub-pixel camera jitter (Halton 2,3) added to the projection so a temporal
+    /// resolve can accumulate samples. Disabled until a resolve consumes it —
+    /// jitter with no consumer only shimmers. `jitter_offset` is this frame's
+    /// NDC offset (also exposed in pixels for DLSS later).
+    jitter_enabled: bool,
+    jitter_index: u32,
+    jitter_offset: glam::Vec2,
+    /// Temporal anti-aliasing: resolves the jittered scene against the previous
+    /// frame (reprojected by the motion vectors). When enabled, jitter + the
+    /// motion-vector pass turn on, and post/bloom/exposure read the resolved
+    /// target instead of the raw scene. `taa_history` holds the previous
+    /// resolved frame (copied from `taa_tex` each frame). Env RECRAFT_TAA.
+    taa_enabled: bool,
+    taa_pipeline: wgpu::RenderPipeline,
+    taa_layout: wgpu::BindGroupLayout,
+    taa_tex: Option<wgpu::Texture>,
+    taa_view: Option<wgpu::TextureView>,
+    taa_history_tex: Option<wgpu::Texture>,
+    taa_history_view: Option<wgpu::TextureView>,
+    taa_bind_group: Option<wgpu::BindGroup>,
+    /// Per-entity motion vectors: re-renders the entity model into the MV buffer
+    /// with each entity's own movement. `model_motion_buffer` is the per-vertex
+    /// motion attribute (lockstep with the model mesh). Needs the previous
+    /// frame's camera-relative matrix + origin to reproject moving geometry.
+    vel_pipeline: wgpu::RenderPipeline,
+    vel_uniform_buffer: wgpu::Buffer,
+    vel_bind_group: wgpu::BindGroup,
+    model_motion_buffer: wgpu::Buffer,
+    model_motion_capacity: u64,
+    prev_view_proj_rel: Mat4,
+    prev_origin: glam::IVec3,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     chunk_solid: ChunkLayer,
@@ -3069,6 +3143,298 @@ impl Renderer {
             multiview_mask: None,
         });
 
+        // Motion-vector pass: world depth (unfilterable float, binding 0) + the
+        // shared post-camera uniform (binding 1) -> RG16F screen-space velocity.
+        let mv_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("motion-vector-shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shader/motion_vector.wgsl").into()),
+        });
+        let mv_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("motion-vector-layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let mv_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("motion-vector-pipeline-layout"),
+            bind_group_layouts: &[Some(&mv_layout)],
+            immediate_size: 0,
+        });
+        let mv_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("motion-vector-pipeline"),
+            layout: Some(&mv_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &mv_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &mv_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rg16Float,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            cache: None,
+            multiview_mask: None,
+        });
+
+        // Debug blit: motion-vector buffer (filterable) + the shared post sampler
+        // -> swapchain. Only bound/drawn when `mv_debug` is set.
+        let mv_debug_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("mv-debug-shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shader/mv_debug.wgsl").into()),
+        });
+        let mv_debug_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("mv-debug-layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let mv_debug_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("mv-debug-pipeline-layout"),
+                bind_group_layouts: &[Some(&mv_debug_layout)],
+                immediate_size: 0,
+            });
+        let mv_debug_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("mv-debug-pipeline"),
+            layout: Some(&mv_debug_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &mv_debug_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &mv_debug_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            cache: None,
+            multiview_mask: None,
+        });
+
+        // Temporal AA resolve: current scene (0, filterable) + history (1,
+        // filterable) + motion vectors (2, unfilterable -> textureLoad) + linear
+        // sampler (3) -> resolved HDR.
+        let taa_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("taa-shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shader/taa.wgsl").into()),
+        });
+        let taa_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("taa-layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let taa_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("taa-pipeline-layout"),
+            bind_group_layouts: &[Some(&taa_layout)],
+            immediate_size: 0,
+        });
+        let taa_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("taa-pipeline"),
+            layout: Some(&taa_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &taa_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &taa_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: HDR_FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            cache: None,
+            multiview_mask: None,
+        });
+
+        // Per-entity motion-vector pipeline: ModelVertex (slot 0, position used) +
+        // the per-vertex motion attribute (slot 1, @location(3)) -> RG16F velocity.
+        // Depth-tested (LessEqual, no write) against the world depth so only the
+        // visible entity pixels overwrite the camera-only vectors.
+        let vel_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("model-velocity-shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shader/model_velocity.wgsl").into()),
+        });
+        let vel_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("model-velocity-layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let vel_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("model-velocity-pipeline-layout"),
+            bind_group_layouts: &[Some(&vel_layout)],
+            immediate_size: 0,
+        });
+        let vel_motion_attrs = wgpu::vertex_attr_array![3 => Float32x4];
+        let vel_motion_layout = wgpu::VertexBufferLayout {
+            array_stride: 16,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &vel_motion_attrs,
+        };
+        let vel_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("model-velocity-pipeline"),
+            layout: Some(&vel_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &vel_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[ModelVertex::layout(), vel_motion_layout],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &vel_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rg16Float,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            cache: None,
+            multiview_mask: None,
+        });
+        let vel_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("model-velocity-uniform"),
+            size: std::mem::size_of::<VelUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let vel_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("model-velocity-bind-group"),
+            layout: &vel_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: vel_uniform_buffer.as_entire_binding(),
+            }],
+        });
+        let model_motion_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("model-motion-buffer"),
+            size: 256,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         // Sun shadow-map pass: render chunk depth from the light's view. Solid is
         // depth-only (no fragment); cutout alpha-tests so leaves cast shaped
         // shadows. Both target only a depth attachment.
@@ -3362,6 +3728,33 @@ impl Renderer {
             vol_tex: None,
             vol_view: None,
             vol_bind_group: None,
+            mv_pipeline,
+            mv_layout,
+            mv_tex: None,
+            mv_view: None,
+            mv_bind_group: None,
+            mv_debug: std::env::var("RECRAFT_MV").is_ok(),
+            mv_debug_pipeline,
+            mv_debug_layout,
+            mv_debug_bind_group: None,
+            jitter_enabled: std::env::var("RECRAFT_JITTER").is_ok(),
+            jitter_index: 0,
+            jitter_offset: glam::Vec2::ZERO,
+            taa_enabled: std::env::var("RECRAFT_TAA").is_ok(),
+            taa_pipeline,
+            taa_layout,
+            taa_tex: None,
+            taa_view: None,
+            taa_history_tex: None,
+            taa_history_view: None,
+            taa_bind_group: None,
+            vel_pipeline,
+            vel_uniform_buffer,
+            vel_bind_group,
+            model_motion_buffer,
+            model_motion_capacity: 256,
+            prev_view_proj_rel: Mat4::IDENTITY,
+            prev_origin: glam::IVec3::ZERO,
             camera_buffer,
             camera_bind_group,
             chunk_solid,
@@ -3618,6 +4011,41 @@ impl Renderer {
             view_formats: &[],
         });
         let view = color.create_view(&wgpu::TextureViewDescriptor::default());
+        // Temporal AA targets (only allocated when TAA is on): `taa_resolved` is
+        // written by the resolve pass and read by bloom / auto-exposure / post in
+        // place of the raw scene; `taa_history` holds the previous resolved frame
+        // (copied from `taa_resolved` each frame). `scene_input` is what those
+        // downstream passes sample — the resolved target with TAA on, the raw
+        // jittered scene otherwise.
+        let (taa_resolved, taa_resolved_view, taa_history, taa_history_view) = if self.taa_enabled {
+            let mk = |label: &str, extra: wgpu::TextureUsages| {
+                self.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some(label),
+                    size: wgpu::Extent3d {
+                        width: w,
+                        height: h,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: HDR_FORMAT,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | extra,
+                    view_formats: &[],
+                })
+            };
+            let resolved = mk(
+                "taa-resolved-hdr",
+                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            );
+            let history = mk("taa-history-hdr", wgpu::TextureUsages::COPY_DST);
+            let rv = resolved.create_view(&wgpu::TextureViewDescriptor::default());
+            let hv = history.create_view(&wgpu::TextureViewDescriptor::default());
+            (Some(resolved), Some(rv), Some(history), Some(hv))
+        } else {
+            (None, None, None, None)
+        };
+        let scene_input: &wgpu::TextureView = taa_resolved_view.as_ref().unwrap_or(&view);
         // The SSR scene/depth copies are sampled only by the shaders-on water pass,
         // so skip those two full-screen textures (~25MB at 1080p) and their bind
         // group when shaders are off — the SSR pass guards on scene_copy_tex.
@@ -3750,7 +4178,7 @@ impl Renderer {
                 ],
             })
         };
-        self.bloom_bright_bind_group = Some(bloom_bg("bloom-bright-bg", &view));
+        self.bloom_bright_bind_group = Some(bloom_bg("bloom-bright-bg", scene_input));
         self.bloom_blur_bind_group = Some(bloom_bg("bloom-blur-bg", &bloom_a_view));
         self.vol_bind_group = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("volumetric-bind-group"),
@@ -3780,7 +4208,7 @@ impl Renderer {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
+                    resource: wgpu::BindingResource::TextureView(scene_input),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -3814,6 +4242,54 @@ impl Renderer {
         }));
         self.vol_tex = Some(vol);
         self.vol_view = Some(vol_view);
+        // Motion-vector buffer at world-render resolution (RG16F). Its bind group
+        // reads the final world depth + the shared post-camera uniform (carrying
+        // the NDC->NDC reprojection); the debug bind group samples it for the blit.
+        let mv = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("motion-vectors-rg16f"),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rg16Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let mv_view = mv.create_view(&wgpu::TextureViewDescriptor::default());
+        self.mv_bind_group = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("motion-vector-bind-group"),
+            layout: &self.mv_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&self.depth_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.post_camera_buffer.as_entire_binding(),
+                },
+            ],
+        }));
+        self.mv_debug_bind_group = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("mv-debug-bind-group"),
+            layout: &self.mv_debug_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&mv_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.post_sampler),
+                },
+            ],
+        }));
+        self.mv_tex = Some(mv);
+        self.mv_view = Some(mv_view);
         self.bloom_a_tex = Some(bloom_a);
         self.bloom_a_view = Some(bloom_a_view);
         self.bloom_b_tex = Some(bloom_b);
@@ -3825,7 +4301,7 @@ impl Renderer {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
+                    resource: wgpu::BindingResource::TextureView(scene_input),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -3837,6 +4313,44 @@ impl Renderer {
                 },
             ],
         }));
+        // TAA resolve bind group: current raw scene (0) + previous resolved
+        // history (1) + motion vectors (2) + linear sampler (3). Built last so it
+        // can borrow `view` (the current scene) before it is moved into
+        // `offscreen_view`, and `self.mv_view` after it is stored above.
+        self.taa_bind_group = if self.taa_enabled {
+            Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("taa-bind-group"),
+                layout: &self.taa_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(
+                            taa_history_view.as_ref().unwrap(),
+                        ),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(
+                            self.mv_view.as_ref().unwrap(),
+                        ),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::Sampler(&self.post_sampler),
+                    },
+                ],
+            }))
+        } else {
+            None
+        };
+        self.taa_tex = taa_resolved;
+        self.taa_view = taa_resolved_view;
+        self.taa_history_tex = taa_history;
+        self.taa_history_view = taa_history_view;
         self.offscreen_view = Some(view);
         self.offscreen_tex = Some(color);
         self.update_post_params();
@@ -4070,6 +4584,23 @@ impl Renderer {
             mesh.indices.len() as u32,
             "model",
         );
+        // Per-vertex motion attribute for the entity motion-vector pass, in
+        // lockstep with the model vertices. Only uploaded when motion vectors are
+        // produced; the build pads `motion` to the vertex count.
+        if (self.mv_debug || self.taa_enabled) && !mesh.motion.is_empty() {
+            let bytes: &[u8] = bytemuck::cast_slice(&mesh.motion);
+            if bytes.len() as u64 > self.model_motion_capacity {
+                let cap = grow_capacity(bytes.len() as u64);
+                self.model_motion_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("model-motion-buffer"),
+                    size: cap,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                self.model_motion_capacity = cap;
+            }
+            self.queue.write_buffer(&self.model_motion_buffer, 0, bytes);
+        }
     }
 
     /// Replace the extension custom-geometry mesh (native render hook). Model-pass
@@ -5163,6 +5694,22 @@ impl Renderer {
         let origin_i = origin_f.as_ivec3();
         let cam_rel = camera.position - origin_f;
         let view_proj_rel = camera.view_projection_at_origin(origin_f);
+        // Sub-pixel camera jitter for temporal accumulation. Off by default (no
+        // temporal resolve consumes it yet). Applied as an NDC translation so the
+        // rendered colour + depth shift sub-pixel, while the un-jittered
+        // `view_proj` above still drives frustum culling and the jitter-free
+        // motion vectors (the resolve is told the jitter separately).
+        let jittered_rel = if self.jitter_enabled || self.taa_enabled {
+            let (rw, rh) = self.scaled_dims();
+            let jx = (halton(self.jitter_index + 1, 2) - 0.5) * 2.0 / rw as f32;
+            let jy = (halton(self.jitter_index + 1, 3) - 0.5) * 2.0 / rh as f32;
+            self.jitter_index = (self.jitter_index + 1) % 16;
+            self.jitter_offset = glam::Vec2::new(jx, jy);
+            glam::Mat4::from_translation(glam::Vec3::new(jx, jy, 0.0)) * view_proj_rel
+        } else {
+            self.jitter_offset = glam::Vec2::ZERO;
+            view_proj_rel
+        };
         let time = self.start_time.elapsed().as_secs_f32();
         // Advance animated terrain tiles (water/lava/fire/…) by re-uploading the
         // current 16×16 frame into each tile's atlas cell when it changes.
@@ -5171,7 +5718,7 @@ impl Renderer {
             &self.camera_buffer,
             0,
             bytemuck::bytes_of(&CameraUniform::new(
-                view_proj_rel.to_cols_array_2d(),
+                jittered_rel.to_cols_array_2d(),
                 sky.sun_brightness,
                 time,
                 self.atlas_uv.tile_size(),
@@ -5199,12 +5746,34 @@ impl Renderer {
             &self.post_camera_buffer,
             0,
             bytemuck::bytes_of(&PostCamera {
-                inv_view_proj: view_proj_rel.inverse().to_cols_array_2d(),
+                // Inverse of the matrix that actually rendered depth (jittered when
+                // enabled) so depth-reconstruction effects stay consistent; `reproj`
+                // stays un-jittered to keep the motion vectors jitter-free.
+                inv_view_proj: jittered_rel.inverse().to_cols_array_2d(),
                 prev_view_proj: reproj.to_cols_array_2d(),
                 camera_pos: [cam_rel.x, cam_rel.y, cam_rel.z, 0.0],
             }),
         );
         self.prev_view_proj = view_proj;
+        // Per-entity motion-vector uniform: current + previous camera-relative
+        // matrices (un-jittered) and origins, plus this frame's jitter (re-applied
+        // to the rasterized depth only). Written with last frame's stored values
+        // before they're overwritten below.
+        if self.mv_debug || self.taa_enabled {
+            self.queue.write_buffer(
+                &self.vel_uniform_buffer,
+                0,
+                bytemuck::bytes_of(&VelUniform {
+                    cur_view_proj: view_proj_rel.to_cols_array_2d(),
+                    prev_view_proj: self.prev_view_proj_rel.to_cols_array_2d(),
+                    jitter: [self.jitter_offset.x, self.jitter_offset.y, 0.0, 0.0],
+                    cur_origin: [origin_i.x, origin_i.y, origin_i.z, 0],
+                    prev_origin: [self.prev_origin.x, self.prev_origin.y, self.prev_origin.z, 0],
+                }),
+            );
+        }
+        self.prev_view_proj_rel = view_proj_rel;
+        self.prev_origin = origin_i;
         self.prepare_sky(camera, &sky);
 
         // Shader-pack lighting uniform: directional sun (day/night scaled) +
@@ -5524,10 +6093,12 @@ impl Renderer {
                     view: &self.depth_view,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(1.0),
-                        // Keep depth only when a later pass needs it (DoF/motion
-                        // blur in post, or the SSR water pass) — all of which
-                        // require shaders. Otherwise discard it (cheaper).
-                        store: if self.shaders_enabled {
+                        // Keep depth when a later pass needs it: DoF/motion blur in
+                        // post and the SSR water pass (shaders on), OR the
+                        // motion-vector pass that feeds TAA / the MV debug view.
+                        // Otherwise discard it (cheaper). Without this, TAA reads
+                        // undefined depth and the whole scene ghosts on motion.
+                        store: if self.shaders_enabled || self.taa_enabled || self.mv_debug {
                             wgpu::StoreOp::Store
                         } else {
                             wgpu::StoreOp::Discard
@@ -6161,6 +6732,127 @@ impl Renderer {
             }
         }
 
+        // Motion-vector pass: write the RG16F screen-space velocity from the final
+        // world depth. Runs whenever the buffer is needed (debug or the TAA
+        // resolve); skipped otherwise so the default path pays nothing. Outside
+        // the shaders gate — depth exists in every mode.
+        if self.mv_debug || self.taa_enabled {
+            if let (Some(mvv), Some(mvb)) = (&self.mv_view, &self.mv_bind_group) {
+                let mut mp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("motion-vector-pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: mvv,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    occlusion_query_set: None,
+                    timestamp_writes: None,
+                    multiview_mask: None,
+                });
+                mp.set_pipeline(&self.mv_pipeline);
+                mp.set_bind_group(0, mvb, &[]);
+                mp.draw(0..3, 0..1);
+            }
+            // Entity motion vectors: re-render the entity model into the MV buffer
+            // (depth-tested against world depth) so visible entity pixels carry
+            // their own camera+rigid motion, overwriting the camera-only vectors.
+            if let (Some(mvv), Some(model)) = (
+                &self.mv_view,
+                self.model_mesh.as_ref().filter(|m| m.index_count > 0),
+            ) {
+                let mut ep = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("entity-velocity-pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: mvv,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &self.depth_view,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Discard,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    occlusion_query_set: None,
+                    timestamp_writes: None,
+                    multiview_mask: None,
+                });
+                ep.set_pipeline(&self.vel_pipeline);
+                ep.set_bind_group(0, &self.vel_bind_group, &[]);
+                ep.set_vertex_buffer(0, model.vertex_buffer.slice(..));
+                ep.set_vertex_buffer(1, self.model_motion_buffer.slice(..));
+                ep.set_index_buffer(model.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                ep.draw_indexed(0..model.index_count, 0, 0..1);
+            }
+        }
+
+        // Temporal AA resolve: blend the current jittered scene with the
+        // reprojected previous frame into `taa_tex`, then copy that into
+        // `taa_history` for the next frame. Downstream passes (auto-exposure /
+        // bloom / post) read `taa_tex` via their bind groups (rebuilt to point at
+        // it when TAA is on), so this must run before them.
+        if self.taa_enabled {
+            if let (Some(tv), Some(tb), Some(tt), Some(th)) = (
+                &self.taa_view,
+                &self.taa_bind_group,
+                &self.taa_tex,
+                &self.taa_history_tex,
+            ) {
+                {
+                    let mut tp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("taa-resolve-pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: tv,
+                            resolve_target: None,
+                            depth_slice: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        occlusion_query_set: None,
+                        timestamp_writes: None,
+                        multiview_mask: None,
+                    });
+                    tp.set_pipeline(&self.taa_pipeline);
+                    tp.set_bind_group(0, tb, &[]);
+                    tp.draw(0..3, 0..1);
+                }
+                let (rw, rh) = self.scaled_dims();
+                encoder.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: tt,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture: th,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::Extent3d {
+                        width: rw,
+                        height: rh,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
+        }
+
         // Auto-exposure: reduce the HDR scene to a 1x1 average luminance the post
         // pass reads. Gated by the master toggle (the post pass ignores it
         // otherwise) so it costs nothing with shaders off.
@@ -6312,6 +7004,33 @@ impl Renderer {
             fx.set_pipeline(&effect.pipeline);
             fx.set_bind_group(0, effect.bind_group.as_ref().unwrap(), &[]);
             fx.draw(0..3, 0..1);
+        }
+
+        // Motion-vector debug: overwrite the composited world with the velocity
+        // visualization (HUD still draws on top afterwards). Static scene => flat
+        // grey; camera motion tints toward the motion direction.
+        if self.mv_debug {
+            if let Some(mvd) = &self.mv_debug_bind_group {
+                let mut dp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("mv-debug-blit"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &swapchain_view,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    occlusion_query_set: None,
+                    timestamp_writes: None,
+                    multiview_mask: None,
+                });
+                dp.set_pipeline(&self.mv_debug_pipeline);
+                dp.set_bind_group(0, mvd, &[]);
+                dp.draw(0..3, 0..1);
+            }
         }
 
         // UI pass: drawn to the swapchain AFTER the world composite, so the HUD
@@ -7972,7 +8691,39 @@ fn create_panorama_resources(
 
 #[cfg(test)]
 mod tests {
-    use super::glint_scroll;
+    use super::{glint_scroll, halton};
+
+    #[test]
+    fn halton_matches_known_radical_inverse() {
+        // Base-2 Halton: 1/2, 1/4, 3/4, 1/8, 5/8 ...
+        assert!((halton(1, 2) - 0.5).abs() < 1e-6);
+        assert!((halton(2, 2) - 0.25).abs() < 1e-6);
+        assert!((halton(3, 2) - 0.75).abs() < 1e-6);
+        // Base-3 Halton: 1/3, 2/3, 1/9 ...
+        assert!((halton(1, 3) - 1.0 / 3.0).abs() < 1e-6);
+        assert!((halton(2, 3) - 2.0 / 3.0).abs() < 1e-6);
+        assert!((halton(3, 3) - 1.0 / 9.0).abs() < 1e-6);
+        // Every point lies in [0, 1).
+        for i in 1..64u32 {
+            let h = halton(i, 2);
+            assert!((0.0..1.0).contains(&h));
+        }
+    }
+
+    #[test]
+    fn jitter_offset_is_sub_pixel() {
+        // The NDC jitter is (halton - 0.5) * 2 / dim, i.e. within ±1 pixel: |offset|
+        // must stay below one NDC pixel (2/dim) so it never shifts the image by a
+        // whole pixel, which would defeat temporal accumulation.
+        let dim = 1920.0_f32;
+        let ndc_pixel = 2.0 / dim;
+        for i in 1..64u32 {
+            let jx = (halton(i, 2) - 0.5) * 2.0 / dim;
+            let jy = (halton(i, 3) - 0.5) * 2.0 / dim;
+            assert!(jx.abs() < ndc_pixel);
+            assert!(jy.abs() < ndc_pixel);
+        }
+    }
 
     #[test]
     fn glint_scroll_advances_over_time() {
