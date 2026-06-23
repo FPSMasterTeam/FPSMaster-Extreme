@@ -388,6 +388,7 @@ impl ApplicationHandler for WinitApp {
         renderer.set_auto_exposure_enabled(settings.post_auto_exposure);
         renderer.set_clouds_enabled(settings.volumetric_clouds);
         renderer.set_volumetric_light_enabled(settings.volumetric_light);
+        renderer.set_taa_enabled(settings.taa);
         if !settings.fullscreen {
             apply_display(&window, &settings);
         }
@@ -1265,6 +1266,7 @@ fn handle_actions(
                 renderer.set_smooth_lighting(on);
                 app.game.mark_all_sections_dirty();
             }
+            GuiAction::SetTaa(on) => renderer.set_taa_enabled(on),
             GuiAction::SetFancyGraphics(on) => {
                 renderer.set_fancy_graphics(on);
                 // Leaf geometry depends on Fast/Fancy, so re-mesh the world (the

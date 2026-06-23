@@ -3937,6 +3937,18 @@ impl Renderer {
         }
     }
 
+    /// Toggle temporal anti-aliasing. Rebuilds the scaled targets because TAA
+    /// allocates its resolve/history buffers and repoints post/bloom/exposure at
+    /// the resolved target (and frees them again when off). Jitter, the
+    /// motion-vector pass and motion-blur suppression all follow `taa_enabled`.
+    pub fn set_taa_enabled(&mut self, on: bool) {
+        if on != self.taa_enabled {
+            self.taa_enabled = on;
+            self.rebuild_scaled_targets();
+            self.update_post_params();
+        }
+    }
+
     /// Max chunk render distance (square cull around the camera). Cheap to change
     /// — it only narrows the per-frame visible set, allocating nothing.
     pub fn set_render_distance(&mut self, chunks: u32) {
