@@ -4414,7 +4414,12 @@ impl Renderer {
             on(self.bloom_enabled, 1.0),
             on(self.vignette_enabled, 0.45),
             on(self.chromatic_enabled, 0.004),
-            on(self.dof_enabled, 1.0),
+            // Near-field DoF is suppressed while FSR upscaling is active (TAA on +
+            // render_scale < 1). The temporal resolve already lifts a low-res scene
+            // to display res, so it leans on the soft bilinear `cur` during motion;
+            // stacking the DoF disk blur on top of that double-softens the frame.
+            // Pure TAA (render_scale == 1) is a sharp resolve, so DoF is kept there.
+            on(self.dof_enabled && !(self.taa_enabled && self.render_scale < 1.0), 1.0),
             // Post motion blur is suppressed while TAA is active: TAA's whole job
             // is a stable, sharp temporal resolve, and this directional blur (which
             // only works at all because TAA stores depth — without TAA the
