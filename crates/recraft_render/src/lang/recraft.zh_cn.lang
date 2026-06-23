@@ -53,8 +53,25 @@ recraft.options.resolution=分辨率
 recraft.options.showFps=显示 FPS
 recraft.options.oldAnimations=旧版动画
 recraft.options.shaders=光影…
+recraft.options.performance=性能…
 recraft.options.native=原生
 recraft.unit.chunks=区块
+
+# 性能界面
+recraft.perf.title=性能
+recraft.perf.taa=TAA 时间性抗锯齿
+recraft.perf.fsr=FSR 超分辨率
+recraft.perf.fsr.off=关闭
+recraft.perf.fsr.quality=质量
+recraft.perf.fsr.balanced=均衡
+recraft.perf.fsr.performance=性能
+recraft.perf.fsr.custom=自定义
+recraft.perf.dlss=DLSS
+recraft.perf.rt=光线追踪
+recraft.perf.rt.quality=光追质量
+recraft.perf.rt.low=低
+recraft.perf.rt.medium=中
+recraft.perf.rt.high=高
 
 # 光影界面
 recraft.shaders.title=光影

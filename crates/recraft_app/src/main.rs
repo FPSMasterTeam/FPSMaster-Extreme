@@ -388,6 +388,7 @@ impl ApplicationHandler for WinitApp {
         renderer.set_auto_exposure_enabled(settings.post_auto_exposure);
         renderer.set_clouds_enabled(settings.volumetric_clouds);
         renderer.set_volumetric_light_enabled(settings.volumetric_light);
+        renderer.set_taa_enabled(settings.taa);
         if !settings.fullscreen {
             apply_display(&window, &settings);
         }
@@ -1265,6 +1266,7 @@ fn handle_actions(
                 renderer.set_smooth_lighting(on);
                 app.game.mark_all_sections_dirty();
             }
+            GuiAction::SetTaa(on) => renderer.set_taa_enabled(on),
             GuiAction::SetFancyGraphics(on) => {
                 renderer.set_fancy_graphics(on);
                 // Leaf geometry depends on Fast/Fancy, so re-mesh the world (the
@@ -2437,6 +2439,9 @@ fn render_frame(
                 tick_alpha,
                 entity_max_dist_sq,
             );
+            // Chests/signs are static world geometry: zero rigid motion, so the
+            // motion-vector pass reprojects them by camera movement only.
+            app.entity_model.fill_motion([0.0, 0.0, 0.0, 0.0]);
             // Signs, enchanting-table books and end-portal surfaces share the
             // model pass too; sign text is drawn separately on the board faces.
             let sign_texts = app.game.build_block_entity_models(
@@ -2446,6 +2451,7 @@ fn render_frame(
                 entity_max_dist_sq,
             );
             renderer.set_sign_text(&sign_texts);
+            app.entity_model.fill_motion([0.0, 0.0, 0.0, 0.0]);
             if hud_visible {
                 // Light the first-person hand + held item by the lightmap at the eye,
                 // so they darken at night/in caves like the rest of the scene.
@@ -2461,6 +2467,9 @@ fn render_frame(
                     v.color[1] *= hand_light;
                     v.color[2] *= hand_light;
                 }
+                // The first-person arm is screen-locked: flag it for zero motion
+                // so TAA doesn't reproject (and smear) it on camera movement.
+                app.entity_model.fill_motion([0.0, 0.0, 0.0, 1.0]);
                 let mut held = ItemRenderer::build_held_item(
                     &app.game.camera,
                     &first_person,
@@ -2483,8 +2492,15 @@ fn render_frame(
                 renderer.set_first_person_item_glint(&[], &[]);
                 renderer.set_nametags(&app.game.camera, &[]);
             }
+            // Safety pad: any geometry appended without an explicit motion tag
+            // gets zero (camera-only reprojection), keeping `motion` in lockstep
+            // with `vertices` for the velocity pass.
+            app.entity_model.fill_motion([0.0, 0.0, 0.0, 0.0]);
             renderer.upload_model(&app.entity_model);
             renderer.set_entity_glint(&app.entity_glint);
+            // Record this frame's positions so the next frame's rebuild can diff
+            // against them for per-entity motion vectors.
+            app.game.snapshot_entity_render_pos(tick_alpha);
         }
         // Dropped items, projectile sprites and falling-block cubes all share
         // the world-item pass (it binds the block/item atlas). Projectiles reuse

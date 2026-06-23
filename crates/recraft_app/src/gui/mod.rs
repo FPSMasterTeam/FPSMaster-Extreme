@@ -22,6 +22,7 @@ pub mod merchant;
 pub mod mods;
 pub mod multiplayer;
 pub mod options;
+pub mod performance;
 pub mod progress;
 pub mod resource_packs;
 pub mod shaders;
@@ -159,6 +160,8 @@ pub enum GuiAction {
     SetAdaptiveResolution(bool),
     /// Toggle smooth lighting (OFF = flat + greedy meshing); re-meshes the world.
     SetSmoothLighting(bool),
+    /// Toggle temporal anti-aliasing.
+    SetTaa(bool),
     /// Toggle fancy graphics (sky gradient + transparent water).
     SetFancyGraphics(bool),
     /// Set the block-atlas mipmap level (0 = off .. MIPMAP_MAX).

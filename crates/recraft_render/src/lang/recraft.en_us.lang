@@ -55,8 +55,25 @@ recraft.options.resolution=Res
 recraft.options.showFps=Show FPS
 recraft.options.oldAnimations=Old Animations
 recraft.options.shaders=Shaders...
+recraft.options.performance=Performance...
 recraft.options.native=Native
 recraft.unit.chunks=chunks
+
+# Performance screen
+recraft.perf.title=Performance
+recraft.perf.taa=TAA
+recraft.perf.fsr=FSR
+recraft.perf.fsr.off=Off
+recraft.perf.fsr.quality=Quality
+recraft.perf.fsr.balanced=Balanced
+recraft.perf.fsr.performance=Performance
+recraft.perf.fsr.custom=Custom
+recraft.perf.dlss=DLSS
+recraft.perf.rt=Ray Tracing
+recraft.perf.rt.quality=RT Quality
+recraft.perf.rt.low=Low
+recraft.perf.rt.medium=Medium
+recraft.perf.rt.high=High
 
 # Shaders screen
 recraft.shaders.title=Shaders
