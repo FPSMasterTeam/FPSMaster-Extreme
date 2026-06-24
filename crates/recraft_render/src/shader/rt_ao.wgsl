@@ -18,6 +18,9 @@ struct RtParams {
     quality: vec4<f32>,
 };
 @group(0) @binding(1) var<uniform> rt: RtParams;
+// Per-triangle packed colour (8:8:8 RGB), indexed by instance_custom_data (the section's
+// base offset) + primitive_index — gives the exact hit block's colour for GI bleeding.
+@group(0) @binding(2) var<storage, read> tri_colors: array<u32>;
 
 // group(1): depth + camera for world-position reconstruction.
 struct PostCamera {
@@ -140,11 +143,17 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // Ray-origin bias grows with view distance to clear depth-reconstruction error +
     // the derivative-estimated normal, avoiding self-intersection stripes.
     let origin = p + n * (0.04 + length(p) * 0.0015);
-    // Diffuse sky irradiance: cosine-weighted hemisphere, accumulating the sky radiance
-    // only for unoccluded directions (occluded rays contribute 0). The mean over N
-    // samples IS the diffuse response (the cosine PDF cancels the cosine + 1/pi), so
-    // `albedo * irradiance` (composited additively) is the ray-traced sky lighting at
-    // this surface — directional, sky-coloured, and occlusion-aware in one term.
+    // Diffuse GI: cosine-weighted hemisphere. For each direction take the CLOSEST hit:
+    //  - miss  -> the sky: accumulate its gradient radiance (sky GI).
+    //  - hit   -> ONE bounce of sunlight: if the hit surface is itself sunlit (a second,
+    //             shadow ray to the sun is unobstructed) it reflects warm light back, so
+    //             accumulate sun_colour * a constant bounce albedo (the hit material
+    //             isn't available without a geometry/material binding, so a flat terrain
+    //             albedo stands in). This fills shadowed nooks with indirect sun light.
+    // The mean over N is the diffuse response; `albedo * irradiance` is composited add-
+    // itively as the ray-traced indirect lighting.
+    let sun = sky.sun_dir.xyz;
+    let sun_color = vec3<f32>(1.0, 0.96, 0.88) * sky.cloud_params.w; // day-scaled
     var irradiance = vec3<f32>(0.0);
     for (var i = 0; i < samples; i = i + 1) {
         let u1 = rand(&seed);
@@ -153,8 +162,27 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         let a = 6.2831853 * u2;
         let local = vec3<f32>(r * cos(a), r * sin(a), sqrt(max(0.0, 1.0 - u1)));
         let dir = bn * local;
-        if (!occluded(origin, dir, tmax)) {
+        var rq: ray_query;
+        // No terminate flag -> closest hit (opaque BLAS commits the nearest).
+        rayQueryInitialize(&rq, tlas, RayDesc(0x00u, 0xFFu, 0.02, tmax, origin, dir));
+        rayQueryProceed(&rq);
+        let it = rayQueryGetCommittedIntersection(&rq);
+        if (it.kind == 0u) {
             irradiance = irradiance + sky_color(dir);
+        } else if (sky.cloud_params.w > 0.02) {
+            let hit_pos = origin + dir * it.t;
+            if (!occluded(hit_pos + sun * 0.05, sun, tmax)) {
+                // Per-block bounce tint: fetch the exact hit triangle's colour from the
+                // shared pool (section base = instance_custom_data, + primitive_index).
+                let packed = tri_colors[it.instance_custom_data + it.primitive_index];
+                let hit_albedo = vec3<f32>(
+                    f32((packed >> 16u) & 0xFFu),
+                    f32((packed >> 8u) & 0xFFu),
+                    f32(packed & 0xFFu),
+                ) * (1.0 / 255.0);
+                // rt.quality.w is the debug exaggeration (0 in normal play).
+                irradiance = irradiance + sun_color * hit_albedo * (1.6 + rt.quality.w);
+            }
         }
     }
     // `strength` (quality.z) doubles as the GI intensity scale.

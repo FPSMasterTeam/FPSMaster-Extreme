@@ -1027,6 +1027,8 @@ pub struct Renderer {
     rt_cutout_pipeline: Option<wgpu::RenderPipeline>,
     /// The acceleration structures + bind group; `Some` only while ray tracing is on.
     ray_tracer: Option<RayTracer>,
+    /// Atlas pixels for sampling per-triangle surface colour at section upload (GI).
+    rt_atlas: Option<std::sync::Arc<image::RgbaImage>>,
     /// Screen-space RTAO + à-trous denoise (Some only when RT is supported). The AO is
     /// cast into `rtao_raw`, bilaterally denoised into `rtao_denoised`, then multiplied
     /// onto the offscreen scene before the temporal upscale — so the noise never
@@ -1307,6 +1309,10 @@ impl Renderer {
             block_atlas_texture,
             animated_tiles,
         ) = create_texture_bind_group(&device, &queue);
+        // Shared copy of the atlas pixels so the ray tracer can sample each triangle's
+        // surface colour (texture × tint) for GI colour bleeding — the vertex colour
+        // alone is just the biome tint (white for most blocks).
+        let rt_atlas = block_image.as_ref().map(|img| std::sync::Arc::new(img.clone()));
         // Force the first per-frame upload of every animated tile (sentinel index).
         let animated_last_frame = vec![usize::MAX; animated_tiles.len()];
         let (entity_texture_layout, entity_bind_group, entity_texture) =
@@ -4413,6 +4419,7 @@ impl Renderer {
             rt_solid_pipeline,
             rt_cutout_pipeline,
             ray_tracer: None,
+            rt_atlas,
             rtao_pipeline,
             rtao_aux_layout,
             rtao_aux_bind_group: None,
@@ -4643,7 +4650,12 @@ impl Renderer {
             // Generous cap on simultaneously-traced sections (~10-chunk RT range).
             const RT_MAX_INSTANCES: u32 = 16384;
             if let Some(layout) = &self.rt_layout {
-                self.ray_tracer = Some(RayTracer::new(&self.device, layout, RT_MAX_INSTANCES));
+                self.ray_tracer = Some(RayTracer::new(
+                    &self.device,
+                    layout,
+                    RT_MAX_INSTANCES,
+                    self.rt_atlas.clone(),
+                ));
             }
         } else {
             self.ray_tracer = None;
@@ -7073,13 +7085,20 @@ impl Renderer {
                 1 => (1.0, 6.0, 0.0, 0.5),
                 _ => (8.0, 8.0, 0.02, 0.6),
             };
+            // Debug knob: RECRAFT_GI_DEBUG=<n> exaggerates the GI bounce so per-block
+            // colour bleeding is unmistakable (verifies the per-triangle colour lookup).
+            let gi_debug = std::env::var("RECRAFT_GI_DEBUG")
+                .ok()
+                .and_then(|s| s.parse::<f32>().ok())
+                .unwrap_or(0.0);
             self.queue.write_buffer(
                 rt.params_buffer(),
                 0,
                 bytemuck::bytes_of(&RtParams {
                     // x shadow tmax, y AO tmax (blocks), z frame counter, w sun radius.
                     config: [160.0, 3.0, self.rt_frame as f32, sun_radius],
-                    quality: [shadow_samples, ao_samples, ao_strength, 0.0],
+                    // w = GI bounce debug multiplier.
+                    quality: [shadow_samples, ao_samples, ao_strength, gi_debug],
                 }),
             );
             rt.build(&mut encoder, origin_i);
