@@ -24,6 +24,9 @@ struct RtParams {
     quality: vec4<f32>,
 };
 @group(3) @binding(1) var<uniform> rt: RtParams;
+// Per-triangle packed surface colour (8:8:8 RGB), indexed by a hit's
+// instance_custom_data (section base) + primitive_index — for ray-traced reflections.
+@group(3) @binding(2) var<storage, read> rt_tri_colors: array<u32>;
 
 // Ray flag: stop at the first hit. All BLAS geometry is OPAQUE, so any committed
 // hit means the point is occluded — no need to find the closest one.
@@ -143,6 +146,48 @@ fn rt_ao_factor(world_pos: vec3<f32>, geo_n: vec3<f32>, pixel: vec2<f32>) -> f32
 fn sun_sky_gate(sky: f32, world_pos: vec3<f32>) -> f32 {
     let beyond = smoothstep(120.0, 160.0, length(world_pos));
     return mix(1.0, sky, beyond);
+}
+
+// Cheap sky radiance for a reflected ray that escapes to the sky (horizon = fog colour
+// up to a brighter zenith, plus a soft sun disc).
+fn rt_sky(dir: vec3<f32>) -> vec3<f32> {
+    let up = clamp(dir.y, 0.0, 1.0);
+    let horizon = lighting.fog_color.rgb;
+    let zenith = horizon * 0.6 + vec3<f32>(0.10, 0.20, 0.40) * camera.sky_brightness;
+    var col = mix(horizon, zenith, up);
+    let sun = max(dot(normalize(dir), lighting.sun_dir.xyz), 0.0);
+    col = col + lighting.sun_color.rgb * pow(sun, 64.0) * 1.5;
+    return col;
+}
+
+// Hardware ray-traced reflection: cast `dir` from `origin` at the TLAS. Miss -> the sky;
+// hit -> the reflected surface's real colour (per-triangle pool) relit by ambient + a
+// sun shadow ray. Returns the reflected radiance; a==1 (the caller weights it by the
+// surface's reflectivity). The no-op stub returns a==0.
+fn rt_reflect(origin: vec3<f32>, dir: vec3<f32>) -> vec4<f32> {
+    var rq: ray_query;
+    rayQueryInitialize(&rq, rt_tlas, RayDesc(0u, 0xFFu, 0.05, 160.0, origin, dir));
+    rayQueryProceed(&rq);
+    let it = rayQueryGetCommittedIntersection(&rq);
+    if (it.kind == 0u) {
+        return vec4<f32>(rt_sky(dir), 1.0);
+    }
+    let packed = rt_tri_colors[it.instance_custom_data + it.primitive_index];
+    let albedo = vec3<f32>(
+        f32((packed >> 16u) & 0xFFu),
+        f32((packed >> 8u) & 0xFFu),
+        f32(packed & 0xFFu),
+    ) * (1.0 / 255.0);
+    let hit = origin + dir * it.t;
+    let sun = lighting.sun_dir.xyz;
+    var lit = lighting.ambient.rgb * 0.6;
+    var srq: ray_query;
+    rayQueryInitialize(&srq, rt_tlas, RayDesc(RT_TERMINATE_ON_FIRST_HIT, 0xFFu, 0.05, 160.0, hit + sun * 0.05, sun));
+    rayQueryProceed(&srq);
+    if (rayQueryGetCommittedIntersection(&srq).kind == 0u) {
+        lit = lit + lighting.sun_color.rgb * 0.9;
+    }
+    return vec4<f32>(albedo * lit, 1.0);
 }
 
 // Flat sky-ambient scale. When the screen-space sky GI is active (AO samples > 0) it

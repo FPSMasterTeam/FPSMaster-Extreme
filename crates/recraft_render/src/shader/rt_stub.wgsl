@@ -28,3 +28,9 @@ fn sun_sky_gate(sky: f32, world_pos: vec3<f32>) -> f32 {
 fn gi_ambient_scale() -> f32 {
     return 1.0;
 }
+
+// No ray-traced reflection in the default build: a == 0 so the chunk shader adds
+// nothing (it keeps its crude ambient env-spec).
+fn rt_reflect(origin: vec3<f32>, dir: vec3<f32>) -> vec4<f32> {
+    return vec4<f32>(0.0);
+}

@@ -72,12 +72,15 @@ fn aces_scalar(x: f32) -> f32 {
     return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
 }
 
-// Tone-map on luminance only and rescale the colour, so hue and saturation are
-// preserved (no per-channel ACES hue shift / highlight desaturation). Keeps the
-// filmic highlight roll-off without the colour cast.
+// Filmic tone map: blend a hue-preserving luminance map with a per-channel ACES map.
+// The per-channel part gives the cinematic highlight roll-off (bright values desaturate
+// toward white instead of clipping to a flat colour), while keeping enough of the
+// luminance map that mid-tones don't pick up an ACES colour cast.
 fn tonemap(c: vec3<f32>) -> vec3<f32> {
     let l = max(dot(c, vec3<f32>(0.2126, 0.7152, 0.0722)), 1e-4);
-    return c * (aces_scalar(l) / l);
+    let lum_mapped = c * (aces_scalar(l) / l);
+    let per_channel = vec3<f32>(aces_scalar(c.r), aces_scalar(c.g), aces_scalar(c.b));
+    return mix(lum_mapped, per_channel, 0.55);
 }
 
 @fragment
@@ -176,8 +179,16 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         // Saturation around luma.
         let l = dot(color, vec3<f32>(0.2126, 0.7152, 0.0722));
         color = mix(vec3<f32>(l), color, params.q.y);
-        // Contrast around mid-grey.
-        color = clamp((color - 0.5) * params.q.z + 0.5, vec3<f32>(0.0), vec3<f32>(1.0));
+        // Filmic contrast: a gentle S-curve around mid-grey (smootherstep-shaped) rather
+        // than a straight linear stretch — deepens shadows + lifts highlights cinematically.
+        let cc = clamp((color - 0.5) * params.q.z + 0.5, vec3<f32>(0.0), vec3<f32>(1.0));
+        let s = cc * cc * cc * (cc * (cc * 6.0 - 15.0) + 10.0);
+        color = mix(cc, s, 0.35);
+        // Subtle cinematic split-tone: cool the shadows, warm the highlights.
+        let lg = dot(color, vec3<f32>(0.2126, 0.7152, 0.0722));
+        let cool = vec3<f32>(0.96, 0.99, 1.06);
+        let warm = vec3<f32>(1.06, 1.005, 0.94);
+        color = clamp(color * mix(cool, warm, smoothstep(0.15, 0.85, lg)), vec3<f32>(0.0), vec3<f32>(1.0));
     }
 
     // Vignette: darken toward the corners. r.x is the strength (0 = off).

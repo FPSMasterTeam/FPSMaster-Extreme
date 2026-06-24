@@ -42,8 +42,14 @@ fn fs_bright(in: VsOut) -> @location(0) vec4<f32> {
     c += textureSampleLevel(src_tex, src_sampler, in.uv + vec2<f32>(o.x, o.y), 0.0).rgb;
     c *= 0.25;
     let lum = dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
-    let bright = max(lum - params.p.x, 0.0);
-    return vec4<f32>(c * (bright / max(lum, 0.0001)), 1.0);
+    // Soft-knee bright-pass (Karis): a quadratic shoulder around the threshold so the
+    // bloom fades in gradually instead of popping at a hard cutoff.
+    let threshold = params.p.x;
+    let knee = max(threshold * 0.7, 1e-4);
+    var soft = clamp(lum - threshold + knee, 0.0, 2.0 * knee);
+    soft = soft * soft / (4.0 * knee);
+    let contrib = max(soft, lum - threshold) / max(lum, 1e-4);
+    return vec4<f32>(c * contrib, 1.0);
 }
 
 // Pass 2: wide Gaussian on the small bloom texture (cheap — it reads the eighth-res
