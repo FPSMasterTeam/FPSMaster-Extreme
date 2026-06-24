@@ -132,3 +132,15 @@ fn rt_ao_factor(world_pos: vec3<f32>, geo_n: vec3<f32>, pixel: vec2<f32>) -> f32
     let ao = 1.0 - (occ / f32(samples)) * rt.quality.z;
     return clamp(ao, 0.0, 1.0);
 }
+
+// Direct-sun sky gating. With RT the ray-traced shadow is the authority on sun
+// visibility, so within the TLAS range we DROP the voxel sky-light gating (return 1) —
+// the sun reaches wherever a ray to it is unobstructed, regardless of how the voxel
+// skylight propagated. Beyond the TLAS range (nothing to shadow against) fall back to
+// the voxel sky-light so distant overhangs stay shaded, blended over 120..160 blocks
+// so there's no hard line at the range boundary. `world_pos` is camera-relative, so
+// its length is the view distance.
+fn sun_sky_gate(sky: f32, world_pos: vec3<f32>) -> f32 {
+    let beyond = smoothstep(120.0, 160.0, length(world_pos));
+    return mix(1.0, sky, beyond);
+}

@@ -17,3 +17,9 @@ fn sun_visibility(world_pos: vec3<f32>, geo_n: vec3<f32>, ndotl: f32, pixel: vec
 fn rt_ao_factor(world_pos: vec3<f32>, geo_n: vec3<f32>, pixel: vec2<f32>) -> f32 {
     return 1.0;
 }
+
+// Direct-sun sky gating. No RT here: the voxel sky-light gates the sun (the sun only
+// reaches where skylight propagated), as it always has.
+fn sun_sky_gate(sky: f32, world_pos: vec3<f32>) -> f32 {
+    return sky;
+}

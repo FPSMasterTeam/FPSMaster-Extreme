@@ -211,8 +211,9 @@ fn apply_lighting(albedo: vec3<f32>, in: VertexOutput) -> vec3<f32> {
     let sky = in.light.x;
     let block = in.light.y;
     let day = max(camera.sky_brightness, 0.04);
-    // Ray-traced ambient occlusion darkens the ambient term (1.0 = no RTAO).
-    let ambient = lighting.ambient.rgb * (0.08 + 0.92 * sky * day) * rt_ao_factor(in.world_pos, geo_n, in.clip_position.xy);
+    // Ambient term. RTAO is no longer applied inline — it's a denoised screen-space
+    // pass (rt_ao.wgsl) multiplied onto the scene before the temporal upscale.
+    let ambient = lighting.ambient.rgb * (0.08 + 0.92 * sky * day);
     let torch = vec3<f32>(1.0, 0.82, 0.55) * block;
 
     if (pbr_on) {
@@ -232,7 +233,7 @@ fn apply_lighting(albedo: vec3<f32>, in: VertexOutput) -> vec3<f32> {
         let F = fresnel_schlick(vdoth, f0);
         let spec_brdf = (D * G * F) / max(4.0 * ndotv * ndotl, 0.001);
         let kd = (vec3<f32>(1.0) - F) * (1.0 - metallic);
-        let sun_light = lighting.sun_color.rgb * (ndotl * shadow * sky);
+        let sun_light = lighting.sun_color.rgb * (ndotl * shadow * sun_sky_gate(sky, in.world_pos));
         let ao = clamp(dot(n, geo_n), 0.3, 1.0);
         var lit = (kd * albedo + spec_brdf) * sun_light
             + albedo * light_curve(ambient * ao + torch, gamma);
@@ -242,7 +243,7 @@ fn apply_lighting(albedo: vec3<f32>, in: VertexOutput) -> vec3<f32> {
         return lit;
     }
 
-    let sun = lighting.sun_color.rgb * (ndotl * shadow * sky);
+    let sun = lighting.sun_color.rgb * (ndotl * shadow * sun_sky_gate(sky, in.world_pos));
     var lit = albedo * light_curve(ambient + sun + torch, gamma);
     if (lighting.flags.z > 0.5) {
         let view_dir = normalize(lighting.camera_pos.xyz - in.world_pos);
@@ -300,4 +301,22 @@ fn fs_cutout(input: VertexOutput) -> @location(0) vec4<f32> {
     }
     let rgb = apply_fog(apply_lighting(texel.rgb * input.color.rgb, input), input.world_pos);
     return vec4<f32>(rgb, 1.0);
+}
+
+// Normal G-buffer output: encode the geometric normal as 0.5 + 0.5*n into an
+// Rgba8 target, feeding the screen-space RTAO pass an exact, stable per-pixel normal
+// (instead of the jitter-sensitive depth-derivative reconstruction). Solid + cutout
+// variants; cutout alpha-tests so holes don't write a normal.
+@fragment
+fn fs_normal(input: VertexOutput) -> @location(0) vec4<f32> {
+    return vec4<f32>(normalize(input.normal) * 0.5 + 0.5, 1.0);
+}
+
+@fragment
+fn fs_normal_cutout(input: VertexOutput) -> @location(0) vec4<f32> {
+    let texel = textureSample(block_atlas, block_sampler, input.uv);
+    if (texel.a * input.color.a < 0.5) {
+        discard;
+    }
+    return vec4<f32>(normalize(input.normal) * 0.5 + 0.5, 1.0);
 }
