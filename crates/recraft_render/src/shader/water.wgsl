@@ -134,20 +134,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let n = normalize(in.normal);
     let view_dir = normalize(lighting.camera_pos.xyz - in.world_pos);
 
-    // Lit base (diffuse sun + day/night ambient), gated by skylight.
     let sky = in.light.x;
-    let ndotl = max(dot(n, lighting.sun_dir.xyz), 0.0);
-    let day = max(camera.sky_brightness, 0.04);
-    let ambient = lighting.ambient.rgb * (0.2 + 0.8 * sky * day);
-    let diffuse = lighting.sun_color.rgb * (ndotl * sky * 0.5);
-    var color = base * (ambient + diffuse);
 
-    // Refraction: the rendered scene BEHIND the water (the real, textured underwater
-    // terrain), shifted by the wave normal so it ripples, tinted by water absorption.
-    // Screen-space (samples the copied scene) so the bottom keeps its texture detail.
-    let refr = refract_water(in.clip_position.xy, n);
-    let watertint = vec3<f32>(0.42, 0.62, 0.78);
-    color = mix(color, refr.rgb * watertint, refr.a * 0.7);
+    // Underwater body: the refracted scene with depth-based (Beer-Lambert) absorption —
+    // clear and textured in the shallows, darkening to a deep teal with depth so the
+    // water reads as a real body of water rather than a transparent sheet.
+    let refr = refract_water(in.clip_position.xy, in.world_pos, n);
+    var color = refr.rgb;
 
     // Fresnel: more mirror-like at grazing angles. Raised floor so even a
     // top-down view keeps a clear reflection.

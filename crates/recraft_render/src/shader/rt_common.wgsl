@@ -195,5 +195,7 @@ fn rt_reflect(origin: vec3<f32>, dir: vec3<f32>) -> vec4<f32> {
 // down to avoid double-counting (a floor is kept so unlit cavities aren't pitch black).
 // Low quality (no GI pass) keeps the full flat ambient.
 fn gi_ambient_scale() -> f32 {
-    return select(1.0, 0.4, rt.quality.y > 0.0);
+    // Low flat floor so the occlusion-aware RT sky GI dominates the ambient — that's
+    // what makes corners/cavities visibly darker than open sky (the AO read).
+    return select(1.0, 0.18, rt.quality.y > 0.0);
 }
