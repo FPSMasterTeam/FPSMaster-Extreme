@@ -51,7 +51,20 @@ struct RtSection {
     /// Section world origin in blocks; the TLAS instance translates by this minus
     /// the camera origin each frame.
     origin: IVec3,
+    /// Average vertex colour (RGB), packed 8:8:8 into the 24-bit TLAS instance custom
+    /// data so a ray that hits this section can tint its GI bounce by the surface
+    /// Per-triangle packed colour (8:8:8 RGB) for this section, in BLAS primitive
+    /// order. Kept CPU-side so the shared colour pool can be re-packed when it fills.
+    tri_colors: Vec<u32>,
+    /// This section's base offset into the shared `tri_color_pool` — written into the
+    /// 24-bit TLAS instance custom data so a ray hit can fetch the exact triangle's
+    /// colour via `tri_color_pool[custom_data + primitive_index]`.
+    tri_base: u32,
 }
+
+/// Capacity (in triangles / u32s) of the shared per-triangle colour pool. 16M is the
+/// 24-bit instance-custom-data ceiling; well above the in-range triangle count.
+const TRI_POOL_CAPACITY: u32 = 1 << 23; // 8M triangles = 32 MiB
 
 pub struct RayTracer {
     sections: HashMap<SectionPos, RtSection>,
@@ -62,6 +75,13 @@ pub struct RayTracer {
     /// Instances written last frame, so the unused tail can be cleared to None.
     prev_instance_count: u32,
     params_buffer: wgpu::Buffer,
+    /// Shared per-triangle colour pool (storage buffer, one packed RGB per triangle of
+    /// every section), bump-allocated; re-packed compactly when it would overflow.
+    tri_color_pool: wgpu::Buffer,
+    tri_top: u32,
+    /// Atlas pixels, sampled per triangle so the GI bounce colour is the real surface
+    /// colour (texture × tint), not just the biome tint.
+    atlas: Option<std::sync::Arc<image::RgbaImage>>,
     bind_group: wgpu::BindGroup,
 }
 
@@ -90,11 +110,29 @@ impl RayTracer {
                     },
                     count: None,
                 },
+                // binding 2: the per-triangle colour pool (read-only storage). Only the
+                // RT AO/GI pass reads it; the chunk RT pipelines that share this layout
+                // simply don't reference it.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         })
     }
 
-    pub fn new(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, max_instances: u32) -> Self {
+    pub fn new(
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        max_instances: u32,
+        atlas: Option<std::sync::Arc<image::RgbaImage>>,
+    ) -> Self {
         let tlas = device.create_tlas(&wgpu::CreateTlasDescriptor {
             label: Some("rt-tlas"),
             max_instances,
@@ -105,6 +143,12 @@ impl RayTracer {
             label: Some("rt-params"),
             size: std::mem::size_of::<RtParams>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let tri_color_pool = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rt-tri-color-pool"),
+            size: TRI_POOL_CAPACITY as u64 * 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -119,6 +163,10 @@ impl RayTracer {
                     binding: 1,
                     resource: params_buffer.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: tri_color_pool.as_entire_binding(),
+                },
             ],
         });
         Self {
@@ -128,8 +176,28 @@ impl RayTracer {
             max_instances,
             prev_instance_count: 0,
             params_buffer,
+            tri_color_pool,
+            tri_top: 0,
+            atlas,
             bind_group,
         }
+    }
+
+    /// Re-pack the per-triangle colour pool compactly (drops dead ranges left by removed
+    /// / re-meshed sections). Called when a fresh allocation would overflow the pool.
+    /// Each section's `tri_base` is updated; the next `build()` re-stamps the instances.
+    fn repack(&mut self, queue: &wgpu::Queue) {
+        let mut top = 0u32;
+        for sec in self.sections.values_mut() {
+            sec.tri_base = top;
+            queue.write_buffer(
+                &self.tri_color_pool,
+                top as u64 * 4,
+                bytemuck::cast_slice(&sec.tri_colors),
+            );
+            top += sec.tri_colors.len() as u32;
+        }
+        self.tri_top = top;
     }
 
     pub fn bind_group(&self) -> &wgpu::BindGroup {
@@ -180,6 +248,63 @@ impl RayTracer {
         let base = solid.vertices.len() as u32;
         indices.extend(cutout.indices.iter().map(|&i| i as u32 + base));
 
+        // Per-triangle surface colour (8:8:8 RGB) in BLAS primitive order — fetched at a
+        // ray hit via tri_color_pool[instance_custom_data + primitive_index] for per-block
+        // GI colour bleeding. The colour is the atlas texel at the triangle's centroid UV
+        // (the real block colour) times the vertex tint (biome colour × face shade); the
+        // vertex colour alone is just the tint, white for most blocks.
+        let solid_n = solid.vertices.len();
+        let vert = |i: u32| -> &ChunkVertex {
+            let i = i as usize;
+            if i < solid_n {
+                &solid.vertices[i]
+            } else {
+                &cutout.vertices[i - solid_n]
+            }
+        };
+        let tri_count_usize = indices.len() / 3;
+        let tri_colors: Vec<u32> = {
+            let atlas = self.atlas.as_ref();
+            (0..tri_count_usize)
+                .map(|t| {
+                    let v0 = vert(indices[t * 3]);
+                    let tint = v0.color;
+                    let tex = match atlas {
+                        Some(a) => {
+                            let v1 = vert(indices[t * 3 + 1]);
+                            let v2 = vert(indices[t * 3 + 2]);
+                            let cu = (v0.uv[0] as u32 + v1.uv[0] as u32 + v2.uv[0] as u32) / 3;
+                            let cv = (v0.uv[1] as u32 + v1.uv[1] as u32 + v2.uv[1] as u32) / 3;
+                            let px = ((cu as f32 / 65535.0 * a.width() as f32) as u32)
+                                .min(a.width().saturating_sub(1));
+                            let py = ((cv as f32 / 65535.0 * a.height() as f32) as u32)
+                                .min(a.height().saturating_sub(1));
+                            a.get_pixel(px, py).0
+                        }
+                        None => [255, 255, 255, 255],
+                    };
+                    let r = tex[0] as u32 * tint[0] as u32 / 255;
+                    let g = tex[1] as u32 * tint[1] as u32 / 255;
+                    let b = tex[2] as u32 * tint[2] as u32 / 255;
+                    (r << 16) | (g << 8) | b
+                })
+                .collect()
+        };
+        // Bump-allocate a range in the shared pool, re-packing if it would overflow.
+        let tri_count = tri_colors.len() as u32;
+        if self.tri_top + tri_count > TRI_POOL_CAPACITY {
+            self.repack(queue);
+        }
+        let tri_base = self.tri_top;
+        self.tri_top += tri_count;
+        if tri_count > 0 {
+            queue.write_buffer(
+                &self.tri_color_pool,
+                tri_base as u64 * 4,
+                bytemuck::cast_slice(&tri_colors),
+            );
+        }
+
         let vertex_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("rt-section-verts"),
             size: (positions.len() * std::mem::size_of::<[f32; 3]>()) as u64,
@@ -223,6 +348,8 @@ impl RayTracer {
                 index_buf,
                 size,
                 origin,
+                tri_colors,
+                tri_base,
             },
         );
         self.dirty.push(pos);
@@ -260,7 +387,8 @@ impl RayTracer {
                 0.0, 1.0, 0.0, ty, //
                 0.0, 0.0, 1.0, tz, //
             ];
-            self.tlas[count as usize] = Some(wgpu::TlasInstance::new(&sec.blas, transform, 0, 0xFF));
+            self.tlas[count as usize] =
+                Some(wgpu::TlasInstance::new(&sec.blas, transform, sec.tri_base, 0xFF));
             count += 1;
         }
         // Clear instance slots used last frame but not this one.
