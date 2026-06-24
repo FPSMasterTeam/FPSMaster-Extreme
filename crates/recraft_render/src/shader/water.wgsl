@@ -33,55 +33,9 @@ struct Lighting {
 @group(2) @binding(4) var specular_atlas: texture_2d<f32>;
 @group(2) @binding(5) var pbr_sampler: sampler;
 
-// Group 3: screen-space reflection inputs (copied opaque scene + depth + camera).
-struct PostCamera {
-    inv_view_proj: mat4x4<f32>,
-    prev_view_proj: mat4x4<f32>,
-    camera_pos: vec4<f32>,
-};
-@group(3) @binding(0) var scene_tex: texture_2d<f32>;
-@group(3) @binding(1) var scene_sampler: sampler;
-// World depth, bound as an unfilterable-float texture (not texture_depth_2d): the
-// GLSL backend maps a depth texture to sampler2DShadow, which has no plain
-// textureLoad overload. As a float texture it reads back via texelFetch.
-@group(3) @binding(2) var depth_tex: texture_2d<f32>;
-@group(3) @binding(3) var<uniform> ssr_cam: PostCamera;
-
-// March the reflected ray through the depth buffer. Returns reflected colour in
-// rgb and a hit confidence in a (0 = miss). World-space steps that grow with
-// distance, projected to screen each step and tested against stored depth.
-fn screen_space_reflection(origin: vec3<f32>, dir: vec3<f32>) -> vec4<f32> {
-    let dims = vec2<f32>(textureDimensions(depth_tex));
-    var p = origin;
-    // Fewer steps that grow a touch faster — keeps most of the reflection range at
-    // ~35% less marching cost (reflections are rough, so coarser steps are fine).
-    var step = 0.5;
-    for (var i = 0; i < 18; i = i + 1) {
-        p = p + dir * step;
-        step = step * 1.22;
-        let clip = camera.view_proj * vec4<f32>(p, 1.0);
-        if (clip.w <= 0.0) {
-            break;
-        }
-        let ndc = clip.xyz / clip.w;
-        let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
-        if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
-            break;
-        }
-        let px = vec2<i32>(clamp(uv * dims, vec2<f32>(0.0), dims - 1.0));
-        let scene_depth = textureLoad(depth_tex, px, 0).r;
-        let delta = ndc.z - scene_depth;
-        // Ray went just behind the stored surface → intersection (thickness-bounded).
-        if (delta > 0.00002 && delta < 0.0025) {
-            let edge = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
-            // Explicit LOD: the implicit-derivative textureSample would force FXC
-            // (DX12 backend) to unroll this varying-iteration loop and fail (X3570/
-            // X3511). Reflections are rough, so sampling mip 0 looks identical.
-            return vec4<f32>(textureSampleLevel(scene_tex, scene_sampler, uv, 0.0).rgb, smoothstep(0.0, 0.12, edge));
-        }
-    }
-    return vec4<f32>(0.0, 0.0, 0.0, 0.0);
-}
+// The reflected-ray lookup (`reflect_ray`) + its group(3) bindings are supplied by a
+// prepended module: water_ssr.wgsl (screen-space march, default) or water_rt.wgsl
+// (hardware ray trace). Both return reflected colour in rgb + a hit confidence in a.
 
 struct VertexInput {
     @location(0) pos_light: vec4<i32>,
@@ -195,8 +149,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Screen-space reflection of the terrain, falling back to the sky where the
     // ray leaves the screen or hits nothing.
     var reflection = sky_reflection(refl_dir);
-    let ssr = screen_space_reflection(in.world_pos + n * 0.05, refl_dir);
-    reflection = mix(reflection, ssr.rgb, ssr.a);
+    let refl = reflect_ray(in.world_pos + n * 0.05, refl_dir);
+    reflection = mix(reflection, refl.rgb, refl.a);
     // Stronger reflection overall.
     color = mix(color, reflection, fresnel);
 

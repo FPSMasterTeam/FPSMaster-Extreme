@@ -818,6 +818,9 @@ pub struct Renderer {
     water_opaque_pipeline: wgpu::RenderPipeline,
     /// Dedicated water-surface pipeline: animated waves + fresnel reflection.
     water_pipeline: wgpu::RenderPipeline,
+    /// Ray-traced water reflection pipeline (Some only when RT is supported); used
+    /// instead of `water_pipeline` while ray tracing is active.
+    water_rt_pipeline: Option<wgpu::RenderPipeline>,
     /// Startup instant, for animated effects (water).
     start_time: Instant,
     /// Shadow re-render throttle: the map is rebuilt every other frame and the
@@ -1357,9 +1360,32 @@ impl Renderer {
             label: Some("overlay-shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("../shader/overlay.wgsl").into()),
         });
+        // Water shader: the reflection (`reflect_ray`) + its group(3) bindings come from
+        // a prepended module — water_ssr.wgsl (screen-space, default) or, when RT is
+        // supported, water_rt.wgsl (hardware ray-traced reflection against the TLAS).
         let water_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("water-shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shader/water.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(
+                format!(
+                    "{}\n{}",
+                    include_str!("../shader/water_ssr.wgsl"),
+                    include_str!("../shader/water.wgsl"),
+                )
+                .into(),
+            ),
+        });
+        let water_rt_shader = rt_supported.then(|| {
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("water-rt-shader"),
+                source: wgpu::ShaderSource::Wgsl(
+                    format!(
+                        "{}\n{}",
+                        include_str!("../shader/water_rt.wgsl"),
+                        include_str!("../shader/water.wgsl"),
+                    )
+                    .into(),
+                ),
+            })
         });
         let sky_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("sky-shader"),
@@ -2530,6 +2556,63 @@ impl Renderer {
         cache: None,
         multiview_mask: None,
         });
+        // Ray-traced water reflection variant: identical pipeline, but group 3 is the
+        // RayTracer bind group (TLAS + per-triangle colours) rather than the SSR inputs.
+        // Used in place of `water_pipeline` while ray tracing is active.
+        let water_rt_pipeline = match (water_rt_shader.as_ref(), rt_layout.as_ref()) {
+            (Some(shader), Some(rt_layout)) => {
+                let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("water-rt-pipeline-layout"),
+                    bind_group_layouts: &[
+                        Some(&camera_layout),
+                        Some(&texture_layout),
+                        Some(&lighting_layout),
+                        Some(rt_layout),
+                    ],
+                    immediate_size: 0,
+                });
+                Some(device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("water-rt-pipeline"),
+                    layout: Some(&layout),
+                    vertex: wgpu::VertexState {
+                        module: shader,
+                        entry_point: Some("vs_main"),
+                        compilation_options: Default::default(),
+                        buffers: &[ChunkVertex::layout()],
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: shader,
+                        entry_point: Some("fs_main"),
+                        compilation_options: Default::default(),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format,
+                            blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                    }),
+                    primitive: wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::TriangleList,
+                        strip_index_format: None,
+                        front_face: wgpu::FrontFace::Ccw,
+                        cull_mode: Some(wgpu::Face::Back),
+                        polygon_mode: wgpu::PolygonMode::Fill,
+                        unclipped_depth: false,
+                        conservative: false,
+                    },
+                    depth_stencil: Some(wgpu::DepthStencilState {
+                        format: DEPTH_FORMAT,
+                        depth_write_enabled: Some(false),
+                        depth_compare: Some(wgpu::CompareFunction::Less),
+                        stencil: wgpu::StencilState::default(),
+                        bias: wgpu::DepthBiasState::default(),
+                    }),
+                    multisample: wgpu::MultisampleState::default(),
+                    cache: None,
+                    multiview_mask: None,
+                }))
+            }
+            _ => None,
+        };
         // Greedy (flat-lighting) chunk pipelines: same lit layout + world target,
         // but the greedy vertex layout (repeat-uv + tile origin) and shader. Used
         // for the merged-cube meshes when smooth lighting is off.
@@ -4294,6 +4377,7 @@ impl Renderer {
             pbr_enabled: false,
             water_opaque_pipeline,
             water_pipeline,
+            water_rt_pipeline,
             start_time: Instant::now(),
             shadow_tick: 0,
             cached_light_view_proj: Mat4::IDENTITY,
@@ -8034,11 +8118,22 @@ impl Renderer {
                 timestamp_writes: None,
             multiview_mask: None,
             });
-            wp.set_pipeline(&self.water_pipeline);
+            // Ray-traced reflection when RT is on: the RT water pipeline + the TLAS bind
+            // group at group 3, instead of the screen-space pipeline + SSR inputs.
+            let rt_water = self.ray_tracer.is_some() && self.water_rt_pipeline.is_some();
+            wp.set_pipeline(if rt_water {
+                self.water_rt_pipeline.as_ref().unwrap()
+            } else {
+                &self.water_pipeline
+            });
             wp.set_bind_group(0, &self.camera_bind_group, &[]);
             wp.set_bind_group(1, &self.texture_bind_groups[self.mipmap_levels as usize], &[]);
             wp.set_bind_group(2, &self.lighting_bind_group, &[]);
-            wp.set_bind_group(3, self.water_ssr_bind_group.as_ref().unwrap(), &[]);
+            if rt_water {
+                wp.set_bind_group(3, self.ray_tracer.as_ref().unwrap().bind_group(), &[]);
+            } else {
+                wp.set_bind_group(3, self.water_ssr_bind_group.as_ref().unwrap(), &[]);
+            }
             for (page, c) in &water_draws {
                 let p = &self.chunk_water.pages[*page];
                 wp.set_vertex_buffer(0, p.vertex_buf.slice(..));
