@@ -11,6 +11,30 @@ DLSS 是时域上采样器：低分辨率渲染 + 抖动，用运动矢量把历
 
 ---
 
+## 0. 实现状态（2026-06，已完整接入并实测工作）
+
+DLSS 已**完整接入渲染器并实测产出正确画面**（RTX 5060）：
+
+- **设备层**：`Renderer::new` 在 `--features dlss` 下走 `dlss_wgpu::create_instance` /
+  `request_device`（强制 Vulkan + NGX 扩展），记录 `super_resolution_supported`。
+- **⚠️ 上下文必须延后创建（关键，否则黑屏）**：`DlssSuperResolution` 上下文**不能在设备初始化时建**
+  —— 那时建出来的 NGX feature 评估结果是**全黑**。必须在**第一帧渲染时惰性创建**
+  （`Renderer::ensure_dlss`，在 `render_inner` 开头调用；resize/关闭时丢弃重建）。这与 Bevy
+  参考集成一致（它在 render-prepare 阶段建）。
+- **每帧**：`dlss_active` 时 `scaled_dims()` 返回 DLSS 渲染分辨率，jitter 用 `suggested_jitter`，
+  **跳过 TAA resolve、改调 `dlss.render()`**；NGX 写专用输出贴图，再拷进 `taa_resolved` 供后处理。
+  一帧拆两次提交保证 NGX 的写在 post 读之前完成；输出贴图先清屏定义布局。
+- **feature flags**：`HighDynamicRange | LowResolutionMotionVectors | AutoExposure` + `Exposure::Automatic`，
+  `partial_texture_size = Some([渲染宽,渲染高])`（render_resolution() 是 MIN，≠ MAX）。**不设** InvertedDepth
+  （recraft 是标准深度 0=近，非 reverse-Z）。
+- **互斥**：DLSS / TAA 在 UI 和渲染器 setter 两层都互斥。
+- **仍需肉眼确认（§4.5）**：运动矢量**符号** —— Bevy 传 `motion_vector_scale = -渲染分辨率`（取负），
+  recraft 现传正值；若放大后走动有**反向拖影**,把它取负即可。`reset`（§6）接传送/维度切换,目前恒 `false`。
+
+运行时需把 `nvngx_dlss.dll`（`$DLSS_SDK\lib\Windows_x86_64\rel\`）放到 exe 同目录。
+
+---
+
 ## 1. 现状（已在仓库里）
 
 - **feature gate**：`recraft_render` 的可选依赖 `dlss_wgpu = { version = "4", optional = true }`

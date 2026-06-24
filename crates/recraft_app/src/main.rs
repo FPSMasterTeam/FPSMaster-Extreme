@@ -389,6 +389,10 @@ impl ApplicationHandler for WinitApp {
         renderer.set_clouds_enabled(settings.volumetric_clouds);
         renderer.set_volumetric_light_enabled(settings.volumetric_light);
         renderer.set_taa_enabled(settings.taa);
+        renderer.set_ray_tracing(settings.ray_tracing);
+        renderer.set_rt_quality(settings.rt_quality);
+        renderer.set_dlss_quality(settings.dlss_quality);
+        renderer.set_dlss(settings.dlss);
         if !settings.fullscreen {
             apply_display(&window, &settings);
         }
@@ -1267,6 +1271,16 @@ fn handle_actions(
                 app.game.mark_all_sections_dirty();
             }
             GuiAction::SetTaa(on) => renderer.set_taa_enabled(on),
+            GuiAction::SetRayTracing(on) => {
+                renderer.set_ray_tracing(on);
+                // RT builds a per-section BLAS from each section's opaque mesh as it
+                // uploads, so re-mesh the loaded world to populate (or free) the
+                // acceleration structures; the meshing budget spreads it over frames.
+                app.game.mark_all_sections_dirty();
+            }
+            GuiAction::SetRtQuality(q) => renderer.set_rt_quality(q),
+            GuiAction::SetDlss(on) => renderer.set_dlss(on),
+            GuiAction::SetDlssQuality(q) => renderer.set_dlss_quality(q),
             GuiAction::SetFancyGraphics(on) => {
                 renderer.set_fancy_graphics(on);
                 // Leaf geometry depends on Fast/Fancy, so re-mesh the world (the

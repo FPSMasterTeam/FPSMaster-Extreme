@@ -23,3 +23,9 @@ serde_json.workspace = true
 ureq.workspace = true
 base64.workspace = true
 image.workspace = true
+
+[features]
+# Pass-through to the renderer's DLSS upscaler so the whole app can be built with
+# `cargo run -p recraft_app --features dlss` (needs DLSS_SDK + Vulkan SDK + clang on
+# an RTX/Vulkan box — see docs/DLSS.md). Off by default → fully cross-platform.
+dlss = ["recraft_render/dlss"]
