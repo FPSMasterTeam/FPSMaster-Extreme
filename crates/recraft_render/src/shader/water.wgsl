@@ -142,6 +142,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let diffuse = lighting.sun_color.rgb * (ndotl * sky * 0.5);
     var color = base * (ambient + diffuse);
 
+    // Refraction: the rendered scene BEHIND the water (the real, textured underwater
+    // terrain), shifted by the wave normal so it ripples, tinted by water absorption.
+    // Screen-space (samples the copied scene) so the bottom keeps its texture detail.
+    let refr = refract_water(in.clip_position.xy, n);
+    let watertint = vec3<f32>(0.42, 0.62, 0.78);
+    color = mix(color, refr.rgb * watertint, refr.a * 0.7);
+
     // Fresnel: more mirror-like at grazing angles. Raised floor so even a
     // top-down view keeps a clear reflection.
     let fresnel = clamp(0.12 + 0.88 * pow(1.0 - max(dot(n, view_dir), 0.0), 5.0), 0.0, 1.0);
@@ -170,7 +177,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     // Lower visibility (less see-through): a high opacity floor, rising toward
-    // opaque at grazing angles where the reflection dominates.
+    // opaque at grazing angles where the reflection dominates. Where RT refraction
+    // already supplied the underwater view, the surface is fully opaque (the shader,
+    // not the alpha blend, provides the see-through — otherwise it double-composites).
+    // Where refraction supplied the underwater view, the surface is opaque (the shader,
+    // not the alpha blend, provides the see-through — otherwise it double-composites the
+    // background). Otherwise keep the alpha-blended translucency.
     alpha = clamp(max(alpha, 0.72) + fresnel * 0.28, 0.0, 1.0);
+    alpha = max(alpha, refr.a);
     return vec4<f32>(color, alpha);
 }

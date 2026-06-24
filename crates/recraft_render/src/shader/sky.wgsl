@@ -103,6 +103,13 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         color = mix(color, sky.sunset.rgb, amount);
     }
 
+    // Bright HDR sun halo: a tight radiant core + a softer surround around the sun
+    // direction, so the sky near the sun overflows into bloom (the "epic" sun). Scaled
+    // by the day factor so it fades out at night.
+    let to_sun = max(dot(dir, sky.sun_dir.xyz), 0.0);
+    let day = max(sky.cloud_params.w, 0.0);
+    color += vec3<f32>(1.0, 0.96, 0.86) * (pow(to_sun, 350.0) * 8.0 + pow(to_sun, 22.0) * 0.5) * day;
+
     if (sky.cloud_params.x > 0.5) {
         let c = clouds(dir);
         color = mix(color, c.rgb, c.a);
