@@ -2431,11 +2431,24 @@ impl Renderer {
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: Some("fs_main"),
+                // Stained-glass colour filter: MULTIPLY the scene behind by the glass
+                // colour (src * dst) so coloured glass tints the view through it.
+                entry_point: Some("fs_glass"),
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::Dst,
+                            dst_factor: wgpu::BlendFactor::Zero,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                        alpha: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::Zero,
+                            dst_factor: wgpu::BlendFactor::One,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                    }),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
@@ -7095,10 +7108,13 @@ impl Renderer {
             // High adds soft sun shadows. AO strength is gentler than the old inline
             // value because it now multiplies the whole scene (not just ambient).
             // AO uses a short 3-block contact radius (less variance).
+            // ao_strength doubles as the GI intensity. Pushed up so the occlusion-aware
+            // sky lighting (corners darker than open sky) reads clearly — with a low flat
+            // ambient floor (gi_ambient_scale) the GI is now the dominant ambient.
             let (shadow_samples, ao_samples, sun_radius, ao_strength) = match self.rt_quality {
                 0 => (1.0, 0.0, 0.0, 0.0),
-                1 => (1.0, 6.0, 0.0, 0.5),
-                _ => (8.0, 8.0, 0.02, 0.6),
+                1 => (1.0, 6.0, 0.0, 1.6),
+                _ => (8.0, 8.0, 0.02, 1.9),
             };
             // Debug knob: RECRAFT_GI_DEBUG=<n> exaggerates the GI bounce so per-block
             // colour bleeding is unmistakable (verifies the per-triangle colour lookup).

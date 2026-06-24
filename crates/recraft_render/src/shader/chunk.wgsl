@@ -265,6 +265,14 @@ fn apply_lighting(albedo: vec3<f32>, in: VertexOutput) -> vec3<f32> {
         let spec = pow(max(dot(n, half_dir), 0.0), 48.0);
         lit = lit + lighting.sun_color.rgb * (spec * shadow * sky * 0.25);
     }
+    // Self-emissive glow: a bright, WARM surface at full block-light is a light source
+    // (lava, glowstone, fire, magma) — push it to HDR so it overflows into bloom and
+    // reads as actually emitting. The warmth + block-light gates exclude sunlit-bright
+    // or cool-bright blocks (snow/white wool) that aren't emitters.
+    let e_bright = dot(albedo, vec3<f32>(0.3, 0.5, 0.2));
+    let e_warm = clamp(albedo.r - albedo.b * 0.7, 0.0, 1.0);
+    let emit = smoothstep(0.32, 0.65, e_bright) * smoothstep(0.3, 0.6, e_warm) * smoothstep(0.6, 0.9, block);
+    lit = lit + albedo * emit * 3.5;
     return lit;
 }
 
@@ -333,6 +341,27 @@ fn fs_cutout(input: VertexOutput) -> @location(0) vec4<f32> {
     }
     let rgb = apply_fog(apply_lighting(texel.rgb * input.color.rgb, input), input.world_pos);
     return vec4<f32>(rgb, 1.0);
+}
+
+// Stained-glass colour filter. Drawn with MULTIPLY blending (framebuffer = src * dst),
+// so the scene behind the glass is tinted by the glass colour: clear glass (~white)
+// passes light through, coloured glass filters it (white light through red glass → red).
+// A faint sun glint is added on top so the pane still reads as a surface, not a void.
+@fragment
+fn fs_glass(input: VertexOutput) -> @location(0) vec4<f32> {
+    let texel = textureSample(block_atlas, block_sampler, input.uv);
+    // The glass colour (stained glass = a coloured texture). MULTIPLY blend tints the
+    // scene behind by this, so use the colour STRONGLY — only a small white floor so a
+    // dark frame doesn't crush to black, and so the saturated channels really filter
+    // (red glass kills green/blue). Clear glass (~white texture) → barely changes.
+    let glass = texel.rgb * input.color.rgb;
+    let tinted = mix(glass, vec3<f32>(1.0), 0.1);
+    // A small additive sun glint so the pane reads as a surface, not air.
+    let geo_n = normalize(input.normal);
+    let view_dir = normalize(lighting.camera_pos.xyz - input.world_pos);
+    let half_dir = normalize(lighting.sun_dir.xyz + view_dir);
+    let glint = pow(max(dot(geo_n, half_dir), 0.0), 120.0) * max(camera.sky_brightness, 0.0);
+    return vec4<f32>(clamp(tinted + glint * 0.4, vec3<f32>(0.0), vec3<f32>(2.0)), 1.0);
 }
 
 // G-buffer for the screen-space RT sky-lighting pass: location 0 = geometric normal
