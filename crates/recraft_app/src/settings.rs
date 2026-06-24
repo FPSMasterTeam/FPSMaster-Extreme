@@ -45,9 +45,12 @@ pub struct Settings {
     /// Ray-tracing quality preset index in `0..=RT_QUALITY_MAX` (Low/Medium/High).
     /// Persisted alongside `ray_tracing`; inert until a real RT path lands.
     pub rt_quality: u32,
-    /// DLSS upscaler master toggle (NVIDIA-only in reality). Placeholder like
-    /// `ray_tracing` — persisted and clickable, not yet wired to an upscaler.
+    /// DLSS upscaler master toggle (NVIDIA RTX + Vulkan; only active in the `dlss`
+    /// build). Replaces FSR/TAA when on.
     pub dlss: bool,
+    /// DLSS quality preset: 0 Auto / 1 Quality / 2 Balanced / 3 Performance / 4 DLAA.
+    /// Higher = higher render resolution = less RT noise (but smaller FPS gain).
+    pub dlss_quality: u32,
     /// Fancy graphics: sky gradient + see-through (alpha-blended) water. Off =
     /// flat horizon sky + opaque water, skipping the heaviest per-pixel work.
     pub fancy_graphics: bool,
@@ -149,6 +152,7 @@ impl Default for Settings {
             ray_tracing: false,
             rt_quality: 1,
             dlss: false,
+            dlss_quality: 1,
             fancy_graphics: true,
             mipmap_levels: MIPMAP_MAX,
             resolution: None,
@@ -244,6 +248,11 @@ impl Settings {
                 "dlss" => {
                     if let Ok(v) = val.parse() {
                         s.dlss = v;
+                    }
+                }
+                "dlss_quality" => {
+                    if let Ok(v) = val.parse() {
+                        s.dlss_quality = v;
                     }
                 }
                 "smooth_lighting" => {
@@ -439,6 +448,7 @@ impl Settings {
         text.push_str(&format!("ray_tracing={}\n", self.ray_tracing));
         text.push_str(&format!("rt_quality={}\n", self.rt_quality));
         text.push_str(&format!("dlss={}\n", self.dlss));
+        text.push_str(&format!("dlss_quality={}\n", self.dlss_quality));
         text.push_str(&format!("disabled_mods={}\n", self.disabled_mods.join(",")));
         text.push_str(&format!("language={}\n", self.language));
         for &(action, code) in self.keybinds.iter() {

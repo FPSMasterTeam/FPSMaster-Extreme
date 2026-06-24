@@ -37,3 +37,4 @@ dlss = ["dep:dlss_wgpu", "dep:uuid"]
 
 [dev-dependencies]
 pollster = "0.4"
+env_logger.workspace = true

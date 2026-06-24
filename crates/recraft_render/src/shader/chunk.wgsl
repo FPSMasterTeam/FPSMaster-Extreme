@@ -203,14 +203,16 @@ fn apply_lighting(albedo: vec3<f32>, in: VertexOutput) -> vec3<f32> {
     let pbr_on = lighting.fog_color.w > 0.5;
     let n = select(geo_n, sample_pbr_normal(in.uv, geo_n), pbr_on);
     let ndotl = max(dot(n, lighting.sun_dir.xyz), 0.0);
-    var shadow = 1.0;
-    if (lighting.flags.y > 0.5) {
-        shadow = sun_shadow(in.world_pos, ndotl);
-    }
+    // Sun visibility (1 = lit, 0 = shadowed): rasterized shadow-map PCF by default,
+    // or hardware ray-traced (sharp/soft) when ray tracing is active. The two
+    // variants are supplied by the prepended rt_stub.wgsl / rt_common.wgsl.
+    // `in.clip_position.xy` is the framebuffer pixel coord, used to seed the RT noise.
+    let shadow = sun_visibility(in.world_pos, geo_n, ndotl, in.clip_position.xy);
     let sky = in.light.x;
     let block = in.light.y;
     let day = max(camera.sky_brightness, 0.04);
-    let ambient = lighting.ambient.rgb * (0.08 + 0.92 * sky * day);
+    // Ray-traced ambient occlusion darkens the ambient term (1.0 = no RTAO).
+    let ambient = lighting.ambient.rgb * (0.08 + 0.92 * sky * day) * rt_ao_factor(in.world_pos, geo_n, in.clip_position.xy);
     let torch = vec3<f32>(1.0, 0.82, 0.55) * block;
 
     if (pbr_on) {
