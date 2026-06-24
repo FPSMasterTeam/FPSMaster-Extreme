@@ -162,6 +162,15 @@ pub enum GuiAction {
     SetSmoothLighting(bool),
     /// Toggle temporal anti-aliasing.
     SetTaa(bool),
+    /// Toggle hardware ray-traced sun shadows + ambient occlusion.
+    SetRayTracing(bool),
+    /// Set the ray-tracing quality preset (0 Low / 1 Medium / 2 High).
+    SetRtQuality(u32),
+    /// Toggle DLSS upscaling (NVIDIA RTX only; the renderer path is gated behind the
+    /// `dlss` build feature — a no-op fallback otherwise).
+    SetDlss(bool),
+    /// Set the DLSS quality preset (0 Auto / 1 Quality / 2 Balanced / 3 Performance / 4 DLAA).
+    SetDlssQuality(u32),
     /// Toggle fancy graphics (sky gradient + transparent water).
     SetFancyGraphics(bool),
     /// Set the block-atlas mipmap level (0 = off .. MIPMAP_MAX).

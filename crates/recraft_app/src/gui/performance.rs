@@ -1,7 +1,7 @@
 //! The Performance settings screen: temporal anti-aliasing, temporal upscalers
-//! and ray tracing. TAA and FSR (render-scale presets) drive the renderer. DLSS
-//! and ray tracing have no renderer path yet — they are live, persisted
-//! placeholders so the choice is remembered and the planned feature set shows.
+//! and ray tracing. TAA, FSR (render-scale presets) and hardware ray tracing
+//! (sun shadows + RTAO) drive the renderer. DLSS drives it too when built with the
+//! `dlss` feature; otherwise the toggle persists and falls back to FSR/TAA.
 
 use winit::event::{ElementState, KeyEvent};
 use winit::keyboard::{KeyCode, PhysicalKey};
@@ -46,11 +46,21 @@ fn rt_quality_label(q: u32) -> String {
     tr(RT_QUALITY_KEYS[(q as usize).min(RT_QUALITY_KEYS.len() - 1)])
 }
 
+/// DLSS quality presets (index = `Settings::dlss_quality`). Higher render resolution
+/// (Quality/DLAA) = less RT noise; lower (Performance) = more FPS. Not localised — an
+/// advanced/NVIDIA-specific control.
+const DLSS_QUALITY_LABELS: [&str; 5] = ["Auto", "Quality", "Balanced", "Performance", "DLAA"];
+
+fn dlss_quality_label(q: u32) -> &'static str {
+    DLSS_QUALITY_LABELS[(q as usize).min(DLSS_QUALITY_LABELS.len() - 1)]
+}
+
 #[derive(Default)]
 pub struct GuiPerformance {
     taa: Option<GuiButton>,
     fsr: Option<GuiButton>,
     dlss: Option<GuiButton>,
+    dlss_quality: Option<GuiButton>,
     rt: Option<GuiButton>,
     rt_quality: Option<GuiButton>,
     done: Option<GuiButton>,
@@ -78,11 +88,12 @@ impl GuiPerformance {
         self.taa = Some(GuiButton::at_px(x, row(0), cw, s, ""));
         // FSR = temporal upscaling (render scale preset + the TAA resolve).
         self.fsr = Some(GuiButton::at_px(x, row(1), cw, s, ""));
-        // DLSS and ray tracing have no renderer path yet — live, persisted placeholders.
+        // DLSS toggle + quality (renderer path gated behind the `dlss` build feature).
         self.dlss = Some(GuiButton::at_px(x, row(2), cw, s, ""));
-        self.rt = Some(GuiButton::at_px(x, row(3), cw, s, ""));
-        self.rt_quality = Some(GuiButton::at_px(x, row(4), cw, s, ""));
-        self.done = Some(GuiButton::at_px(x, row(5) + 12 * s, cw, s, tr("gui.done")));
+        self.dlss_quality = Some(GuiButton::at_px(x, row(3), cw, s, ""));
+        self.rt = Some(GuiButton::at_px(x, row(4), cw, s, ""));
+        self.rt_quality = Some(GuiButton::at_px(x, row(5), cw, s, ""));
+        self.done = Some(GuiButton::at_px(x, row(6) + 12 * s, cw, s, tr("gui.done")));
     }
 }
 
@@ -96,6 +107,7 @@ impl GuiScreen for GuiPerformance {
             self.taa.as_ref(),
             self.fsr.as_ref(),
             self.dlss.as_ref(),
+            self.dlss_quality.as_ref(),
             self.rt.as_ref(),
             self.rt_quality.as_ref(),
             self.done.as_ref(),
@@ -126,7 +138,18 @@ impl GuiScreen for GuiPerformance {
             &mut self.fsr,
             format!("{}: {}", tr("recraft.perf.fsr"), fsr_label(st.render_scale)),
         );
-        draw(&mut self.dlss, format!("{}: {}", tr("recraft.perf.dlss"), on_off(st.dlss)));
+        // In a non-DLSS build the upscaler isn't available, so show the build hint
+        // instead of an on/off the toggle can't honour.
+        let dlss_value = if cfg!(feature = "dlss") {
+            on_off(st.dlss)
+        } else {
+            "--features dlss".to_string()
+        };
+        draw(&mut self.dlss, format!("{}: {}", tr("recraft.perf.dlss"), dlss_value));
+        draw(
+            &mut self.dlss_quality,
+            format!("DLSS {}: {}", tr("recraft.perf.rt.quality"), dlss_quality_label(st.dlss_quality)),
+        );
         draw(&mut self.rt, format!("{}: {}", tr("recraft.perf.rt"), on_off(st.ray_tracing)));
         draw(
             &mut self.rt_quality,
@@ -154,22 +177,65 @@ impl GuiScreen for GuiPerformance {
                 ctx.settings.taa = true;
                 actions.push(GuiAction::SetTaa(true));
             }
+            // FSR and DLSS are competing upscalers; picking an FSR preset turns DLSS off.
+            if next != 0 && ctx.settings.dlss {
+                ctx.settings.dlss = false;
+                actions.push(GuiAction::SetDlss(false));
+            }
             actions.push(GuiAction::SaveSettings);
             return actions;
         }
-        // DLSS and ray tracing are persisted placeholders — no renderer path yet,
-        // so a click only records the choice (saved on the way out).
+        // DLSS is a temporal upscaler — mutually exclusive with FSR + TAA, so enabling
+        // it disables them (the renderer path is gated behind the `dlss` build feature).
         if self.dlss.as_ref().is_some_and(|b| b.clicked(x, y)) {
+            // No DLSS in this build (needs `--features dlss`): make the toggle inert so
+            // it doesn't confusingly drop FSR/TAA with no upscaler behind it.
+            if !cfg!(feature = "dlss") {
+                return Vec::new();
+            }
             ctx.settings.dlss = !ctx.settings.dlss;
-            return vec![GuiAction::SaveSettings];
+            let mut actions = vec![GuiAction::SetDlss(ctx.settings.dlss)];
+            if ctx.settings.dlss {
+                if ctx.settings.taa {
+                    ctx.settings.taa = false;
+                    actions.push(GuiAction::SetTaa(false));
+                }
+                if (ctx.settings.render_scale - 1.0).abs() > f32::EPSILON {
+                    ctx.settings.render_scale = 1.0;
+                    actions.push(GuiAction::SetRenderScale(1.0));
+                }
+            }
+            actions.push(GuiAction::SaveSettings);
+            return actions;
         }
+        // DLSS quality: cycle Auto/Quality/Balanced/Performance/DLAA. Higher render res
+        // = less RT noise. Inert without the dlss build.
+        if self.dlss_quality.as_ref().is_some_and(|b| b.clicked(x, y)) {
+            if !cfg!(feature = "dlss") {
+                return Vec::new();
+            }
+            ctx.settings.dlss_quality =
+                (ctx.settings.dlss_quality + 1) % DLSS_QUALITY_LABELS.len() as u32;
+            return vec![
+                GuiAction::SetDlssQuality(ctx.settings.dlss_quality),
+                GuiAction::SaveSettings,
+            ];
+        }
+        // Ray tracing (shadows + RTAO) is orthogonal to the upscalers — it can run
+        // alongside TAA, which also denoises the soft-shadow / RTAO samples.
         if self.rt.as_ref().is_some_and(|b| b.clicked(x, y)) {
             ctx.settings.ray_tracing = !ctx.settings.ray_tracing;
-            return vec![GuiAction::SaveSettings];
+            return vec![
+                GuiAction::SetRayTracing(ctx.settings.ray_tracing),
+                GuiAction::SaveSettings,
+            ];
         }
         if self.rt_quality.as_ref().is_some_and(|b| b.clicked(x, y)) {
             ctx.settings.rt_quality = (ctx.settings.rt_quality + 1) % RT_QUALITY_KEYS.len() as u32;
-            return vec![GuiAction::SaveSettings];
+            return vec![
+                GuiAction::SetRtQuality(ctx.settings.rt_quality),
+                GuiAction::SaveSettings,
+            ];
         }
         if self.done.as_ref().is_some_and(|b| b.clicked(x, y)) {
             return vec![GuiAction::SaveSettings, GuiAction::SetScreen(self.back_screen())];
