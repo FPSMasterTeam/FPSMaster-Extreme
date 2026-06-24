@@ -269,17 +269,50 @@ impl RayTracer {
                 .map(|t| {
                     let v0 = vert(indices[t * 3]);
                     let tint = v0.color;
+                    let v1 = vert(indices[t * 3 + 1]);
+                    let v2 = vert(indices[t * 3 + 2]);
                     let tex = match atlas {
                         Some(a) => {
-                            let v1 = vert(indices[t * 3 + 1]);
-                            let v2 = vert(indices[t * 3 + 2]);
+                            let to_px = |u: u32, vv: u32| -> [u8; 4] {
+                                let px = ((u as f32 / 65535.0 * a.width() as f32) as u32)
+                                    .min(a.width().saturating_sub(1));
+                                let py = ((vv as f32 / 65535.0 * a.height() as f32) as u32)
+                                    .min(a.height().saturating_sub(1));
+                                a.get_pixel(px, py).0
+                            };
                             let cu = (v0.uv[0] as u32 + v1.uv[0] as u32 + v2.uv[0] as u32) / 3;
                             let cv = (v0.uv[1] as u32 + v1.uv[1] as u32 + v2.uv[1] as u32) / 3;
-                            let px = ((cu as f32 / 65535.0 * a.width() as f32) as u32)
-                                .min(a.width().saturating_sub(1));
-                            let py = ((cv as f32 / 65535.0 * a.height() as f32) as u32)
-                                .min(a.height().saturating_sub(1));
-                            a.get_pixel(px, py).0
+                            let c = to_px(cu, cv);
+                            if c[3] >= 128 {
+                                c // opaque centroid (the common solid-block case)
+                            } else {
+                                // Cutout hole at the centroid (flowers/grass/leaves):
+                                // alpha-weighted average over the triangle's UV box so the
+                                // colour is the real petal/leaf colour, not a black void.
+                                let umin = v0.uv[0].min(v1.uv[0]).min(v2.uv[0]) as u32;
+                                let umax = v0.uv[0].max(v1.uv[0]).max(v2.uv[0]) as u32;
+                                let vmin = v0.uv[1].min(v1.uv[1]).min(v2.uv[1]) as u32;
+                                let vmax = v0.uv[1].max(v1.uv[1]).max(v2.uv[1]) as u32;
+                                let mut s = [0u32; 3];
+                                let mut wsum = 0u32;
+                                for iy in 0..4u32 {
+                                    for ix in 0..4u32 {
+                                        let u = umin + (umax - umin) * (ix * 2 + 1) / 8;
+                                        let vv = vmin + (vmax - vmin) * (iy * 2 + 1) / 8;
+                                        let p = to_px(u, vv);
+                                        let aw = p[3] as u32;
+                                        s[0] += p[0] as u32 * aw;
+                                        s[1] += p[1] as u32 * aw;
+                                        s[2] += p[2] as u32 * aw;
+                                        wsum += aw;
+                                    }
+                                }
+                                if wsum > 0 {
+                                    [(s[0] / wsum) as u8, (s[1] / wsum) as u8, (s[2] / wsum) as u8, 255]
+                                } else {
+                                    [255, 255, 255, 255]
+                                }
+                            }
                         }
                         None => [255, 255, 255, 255],
                     };

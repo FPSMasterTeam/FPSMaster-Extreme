@@ -46,5 +46,11 @@ fn vs_main(input: VertexInput) -> VertexOutput {
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let texel = textureSample(sky_atlas, sky_sampler, input.uv);
-    return vec4<f32>(texel.rgb * input.color.rgb, texel.a * input.color.a);
+    let c = texel.rgb * input.color.rgb;
+    // HDR boost for the bright sun disc so it overflows into a radiant bloom (the
+    // "epic"/divine sun). Gated on luminance, so the much dimmer moon and stars are
+    // barely touched.
+    let lum = dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
+    let hdr = c * (1.0 + smoothstep(0.45, 0.85, lum) * 7.0);
+    return vec4<f32>(hdr, texel.a * input.color.a);
 }
