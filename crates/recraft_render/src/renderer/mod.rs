@@ -651,7 +651,17 @@ pub struct Renderer {
     transparent_pipeline: wgpu::RenderPipeline,
     overlay_pipeline: wgpu::RenderPipeline,
     model_pipeline: wgpu::RenderPipeline,
+    /// First-person arm (empty hand): same as `model_pipeline` but the depth
+    /// test always passes and it writes near depth, so the arm is never occluded
+    /// by world blocks the player stands against. Draws the trailing
+    /// `arm_index_start..` range of `model_mesh`.
+    first_person_arm_pipeline: wgpu::RenderPipeline,
     model_mesh: Option<DynamicMesh>,
+    /// First index of the first-person arm geometry within `model_mesh` (it is
+    /// appended last). The range before it is drawn depth-tested with
+    /// `model_pipeline`; the arm range is drawn on top with
+    /// `first_person_arm_pipeline`. `None` when no arm is present this frame.
+    arm_index_start: Option<u32>,
     /// Native render-hook custom geometry (model-pass format), drawn in the world
     /// pass right after entities. `None`/empty when no native mod submits any.
     extension_mesh: Option<DynamicMesh>,
@@ -1043,6 +1053,10 @@ pub struct Renderer {
     normal_cutout_pipeline: Option<wgpu::RenderPipeline>,
     normal_gbuffer_tex: Option<wgpu::Texture>,
     normal_gbuffer_view: Option<wgpu::TextureView>,
+    /// Surface albedo G-buffer (written alongside the normal); the additive sky-GI
+    /// composite lights it as `albedo * irradiance`.
+    albedo_gbuffer_tex: Option<wgpu::Texture>,
+    albedo_gbuffer_view: Option<wgpu::TextureView>,
     /// Monotonic frame counter feeding the RT sample rotation (so a temporal resolve
     /// averages the soft-shadow / RTAO noise across frames).
     rt_frame: u32,
@@ -2071,7 +2085,12 @@ impl Renderer {
                 // AO pass group(1): depth + post-camera + normal G-buffer.
                 let aux_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                     label: Some("rtao-aux-layout"),
-                    entries: &[entry(0, unfilterable), entry(1, uniform), entry(2, unfilterable)],
+                    entries: &[
+                        entry(0, unfilterable),
+                        entry(1, uniform),
+                        entry(2, unfilterable),
+                        entry(3, uniform),
+                    ],
                 });
                 // Denoise group(0): ao_raw + depth + post-camera.
                 let denoise_layout =
@@ -2079,20 +2098,20 @@ impl Renderer {
                         label: Some("rtao-denoise-layout"),
                         entries: &[entry(0, unfilterable), entry(1, unfilterable), entry(2, uniform)],
                     });
-                // Apply group(0): denoised AO (filterable) + sampler.
+                // Apply group(0): denoised sky irradiance (0) + albedo G-buffer (1),
+                // both filterable, + a sampler (2). Composited as albedo * irradiance.
+                let filterable_tex = wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                };
                 let apply_layout =
                     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                         label: Some("rtao-apply-layout"),
                         entries: &[
-                            entry(
-                                0,
-                                wgpu::BindingType::Texture {
-                                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                                    view_dimension: wgpu::TextureViewDimension::D2,
-                                    multisampled: false,
-                                },
-                            ),
-                            entry(1, wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering)),
+                            entry(0, filterable_tex),
+                            entry(1, filterable_tex),
+                            entry(2, wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering)),
                         ],
                     });
                 let make_fs = |label: &str,
@@ -2122,7 +2141,7 @@ impl Renderer {
                     })
                 };
                 let r8 = wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::R8Unorm,
+                    format: HDR_FORMAT,
                     blend: Some(wgpu::BlendState::REPLACE),
                     write_mask: wgpu::ColorWrites::ALL,
                 };
@@ -2150,10 +2169,12 @@ impl Renderer {
                     &apply_shader,
                     wgpu::ColorTargetState {
                         format: HDR_FORMAT,
+                        // Additive: scene += albedo * sky-irradiance (the ray-traced
+                        // diffuse sky lighting), leaving alpha untouched.
                         blend: Some(wgpu::BlendState {
                             color: wgpu::BlendComponent {
-                                src_factor: wgpu::BlendFactor::Dst,
-                                dst_factor: wgpu::BlendFactor::Zero,
+                                src_factor: wgpu::BlendFactor::One,
+                                dst_factor: wgpu::BlendFactor::One,
                                 operation: wgpu::BlendOperation::Add,
                             },
                             alpha: wgpu::BlendComponent {
@@ -2211,7 +2232,7 @@ impl Renderer {
                         module: &shader,
                         entry_point: Some(entry),
                         compilation_options: Default::default(),
-                        targets: &[Some(normal_target.clone())],
+                        targets: &[Some(normal_target.clone()), Some(normal_target.clone())],
                     }),
                     primitive: wgpu::PrimitiveState {
                         topology: wgpu::PrimitiveTopology::TriangleList,
@@ -2649,6 +2670,58 @@ impl Renderer {
                 format: DEPTH_FORMAT,
                 depth_write_enabled: Some(true),
                 depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+        cache: None,
+        multiview_mask: None,
+        });
+        // First-person arm: identical to the model pipeline but the depth test
+        // always passes and it writes near depth, so the empty-hand arm is drawn
+        // over the world instead of clipping into blocks the player stands
+        // against (same treatment as the first-person held item). Writing depth
+        // also keeps the later SSR water pass from painting over the arm.
+        //
+        // Back-face culling (the model pipeline disables it) is REQUIRED here:
+        // under `Always` the faces don't depth-test against each other, so
+        // without culling the arm's far faces would paint over its near ones. The
+        // arm is a single convex box whose faces are outward-CCW in world space
+        // (the build chain preserves the winding), so culling the back faces
+        // leaves exactly one face per pixel — no self-occlusion, like the held
+        // item cube.
+        let first_person_arm_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("first-person-arm-pipeline"),
+            layout: Some(&model_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &model_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[ModelVertex::layout()],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &model_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: Some(wgpu::Face::Back),
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Always),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
@@ -4132,7 +4205,9 @@ impl Renderer {
             transparent_pipeline,
             overlay_pipeline,
             model_pipeline,
+            first_person_arm_pipeline,
             model_mesh: None,
+            arm_index_start: None,
             extension_mesh: None,
             geometry_texture: None,
             nametag_scale: 1.0,
@@ -4356,6 +4431,8 @@ impl Renderer {
             normal_cutout_pipeline,
             normal_gbuffer_tex: None,
             normal_gbuffer_view: None,
+            albedo_gbuffer_tex: None,
+            albedo_gbuffer_view: None,
             rt_frame: 0,
             dlss_enabled: false,
             #[cfg(feature = "dlss")]
@@ -5136,7 +5213,7 @@ impl Renderer {
                     mip_level_count: 1,
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
-                    format: wgpu::TextureFormat::R8Unorm,
+                    format: HDR_FORMAT,
                     usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                         | wgpu::TextureUsages::TEXTURE_BINDING,
                     view_formats: &[],
@@ -5157,6 +5234,17 @@ impl Renderer {
                 view_formats: &[],
             });
             let normal_view = normal_gbuffer.create_view(&wgpu::TextureViewDescriptor::default());
+            let albedo_gbuffer = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("rtao-albedo-gbuffer"),
+                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            let albedo_view = albedo_gbuffer.create_view(&wgpu::TextureViewDescriptor::default());
             self.rtao_aux_bind_group =
                 Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("rtao-aux-bind-group"),
@@ -5173,6 +5261,10 @@ impl Renderer {
                         wgpu::BindGroupEntry {
                             binding: 2,
                             resource: wgpu::BindingResource::TextureView(&normal_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: self.sky_uniform_buffer.as_entire_binding(),
                         },
                     ],
                 }));
@@ -5206,6 +5298,10 @@ impl Renderer {
                         },
                         wgpu::BindGroupEntry {
                             binding: 1,
+                            resource: wgpu::BindingResource::TextureView(&albedo_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
                             resource: wgpu::BindingResource::Sampler(
                                 self.rtao_sampler.as_ref().unwrap(),
                             ),
@@ -5218,6 +5314,8 @@ impl Renderer {
             self.rtao_denoised_view = Some(den_view);
             self.normal_gbuffer_tex = Some(normal_gbuffer);
             self.normal_gbuffer_view = Some(normal_view);
+            self.albedo_gbuffer_tex = Some(albedo_gbuffer);
+            self.albedo_gbuffer_view = Some(albedo_view);
         }
 
         self.bloom_a_tex = Some(bloom_a);
@@ -5555,6 +5653,14 @@ impl Renderer {
             }
             self.queue.write_buffer(&self.model_motion_buffer, 0, bytes);
         }
+    }
+
+    /// Mark where the first-person arm begins in the uploaded model mesh (the arm
+    /// is appended last). That trailing range is drawn over the world so it isn't
+    /// occluded by nearby blocks; the range before it draws depth-tested as usual.
+    /// Pass `None` when no arm is present this frame.
+    pub fn set_arm_index_start(&mut self, start: Option<u32>) {
+        self.arm_index_start = start;
     }
 
     /// Replace the extension custom-geometry mesh (native render hook). Model-pass
@@ -7432,15 +7538,23 @@ impl Renderer {
                 draw_calls += 1;
             }
 
-            // Entities and the first-person hand.
+            // Entities (and the first-person arm, which trails the mesh). The arm
+            // range is split off and drawn on top later so it isn't occluded by
+            // nearby blocks; everything before it depth-tests against the world.
             if let Some(model) = self.model_mesh.as_ref().filter(|m| m.index_count > 0) {
-                pass.set_pipeline(&self.model_pipeline);
-                pass.set_bind_group(0, &self.camera_bind_group, &[]);
-                pass.set_bind_group(1, &self.entity_bind_group, &[]);
-                pass.set_vertex_buffer(0, model.vertex_buffer.slice(..));
-                pass.set_index_buffer(model.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..model.index_count, 0, 0..1);
-                draw_calls += 1;
+                let world_end = self
+                    .arm_index_start
+                    .filter(|&s| s <= model.index_count)
+                    .unwrap_or(model.index_count);
+                if world_end > 0 {
+                    pass.set_pipeline(&self.model_pipeline);
+                    pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                    pass.set_bind_group(1, &self.entity_bind_group, &[]);
+                    pass.set_vertex_buffer(0, model.vertex_buffer.slice(..));
+                    pass.set_index_buffer(model.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(0..world_end, 0, 0..1);
+                    draw_calls += 1;
+                }
             }
 
             // Extension custom geometry (native render hook) — same pipeline as
@@ -7629,6 +7743,24 @@ impl Renderer {
                 }
             }
 
+            // First-person arm (empty hand): the trailing range of the model mesh,
+            // drawn with the always-on-top pipeline so it isn't occluded by blocks
+            // the player stands against. The arm and a held item are mutually
+            // exclusive, so this range is empty whenever an item is shown.
+            if let Some(model) = self.model_mesh.as_ref().filter(|m| m.index_count > 0) {
+                if let Some(arm_start) =
+                    self.arm_index_start.filter(|&s| s < model.index_count)
+                {
+                    pass.set_pipeline(&self.first_person_arm_pipeline);
+                    pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                    pass.set_bind_group(1, &self.entity_bind_group, &[]);
+                    pass.set_vertex_buffer(0, model.vertex_buffer.slice(..));
+                    pass.set_index_buffer(model.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(arm_start..model.index_count, 0, 0..1);
+                    draw_calls += 1;
+                }
+            }
+
             // First-person held item, textured from the block/item atlas. Drawn
             // with the always-on-top pipeline so it isn't occluded by the world.
             if let Some(item) = self.first_person_item.as_ref().filter(|m| m.index_count > 0) {
@@ -7687,6 +7819,7 @@ impl Renderer {
                 Some(nsolid),
                 Some(ncutout),
                 Some(ngbuf),
+                Some(agbuf),
             ) = (
                 self.ray_tracer.as_ref(),
                 self.rtao_pipeline.as_ref(),
@@ -7700,28 +7833,41 @@ impl Renderer {
                 self.normal_solid_pipeline.as_ref(),
                 self.normal_cutout_pipeline.as_ref(),
                 self.normal_gbuffer_view.as_ref(),
+                self.albedo_gbuffer_view.as_ref(),
             ) {
                 // 0. Normal G-buffer: re-draw opaque chunks (depth-tested, no write) with
                 //    fs_normal so the AO pass reads an exact, stable per-pixel normal.
                 {
                     let mut np = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("normal-gbuffer-pass"),
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: ngbuf,
-                            resolve_target: None,
-                            depth_slice: None,
-                            ops: wgpu::Operations {
-                                // Clear to encoded zero-normal so unwritten pixels (sky /
-                                // entities) get no AO.
-                                load: wgpu::LoadOp::Clear(wgpu::Color {
-                                    r: 0.5,
-                                    g: 0.5,
-                                    b: 0.5,
-                                    a: 1.0,
-                                }),
-                                store: wgpu::StoreOp::Store,
-                            },
-                        })],
+                        color_attachments: &[
+                            Some(wgpu::RenderPassColorAttachment {
+                                view: ngbuf,
+                                resolve_target: None,
+                                depth_slice: None,
+                                ops: wgpu::Operations {
+                                    // Clear to encoded zero-normal so unwritten pixels
+                                    // (sky / entities) get no GI.
+                                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                                        r: 0.5,
+                                        g: 0.5,
+                                        b: 0.5,
+                                        a: 1.0,
+                                    }),
+                                    store: wgpu::StoreOp::Store,
+                                },
+                            }),
+                            Some(wgpu::RenderPassColorAttachment {
+                                view: agbuf,
+                                resolve_target: None,
+                                depth_slice: None,
+                                ops: wgpu::Operations {
+                                    // Clear albedo to black → no GI added on unwritten px.
+                                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                    store: wgpu::StoreOp::Store,
+                                },
+                            }),
+                        ],
                         depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                             view: &self.depth_view,
                             depth_ops: Some(wgpu::Operations {

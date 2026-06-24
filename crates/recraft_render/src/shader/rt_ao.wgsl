@@ -30,6 +30,33 @@ struct PostCamera {
 // Geometric normal G-buffer (0.5 + 0.5*n), written by the opaque chunk normal pass.
 // Exact + stable at every angle, unlike a depth-derivative normal.
 @group(1) @binding(2) var normal_tex: texture_2d<f32>;
+// Sky uniform (reused from the sky pass); only the gradient colours are read, so the
+// occlusion is tinted by whatever sky each hemisphere ray actually sees.
+struct Sky {
+    inv_view_proj: mat4x4<f32>,
+    horizon: vec4<f32>,
+    zenith: vec4<f32>,
+    sun_dir: vec4<f32>, // xyz: dir to sun, w: sunset glow strength
+    sunset: vec4<f32>,
+    camera_pos: vec4<f32>,
+    cloud_params: vec4<f32>,
+};
+@group(1) @binding(3) var<uniform> sky: Sky;
+
+// Sky radiance in a direction — the same gradient sky.wgsl draws (horizon->zenith +
+// sunset glow toward the sun).
+fn sky_color(dir: vec3<f32>) -> vec3<f32> {
+    let t = smoothstep(0.0, 0.55, clamp(dir.y, 0.0, 1.0));
+    var color = mix(sky.horizon.rgb, sky.zenith.rgb, t);
+    let glow = sky.sun_dir.w;
+    if (glow > 0.0) {
+        let toward = max(dot(dir, sky.sun_dir.xyz), 0.0);
+        let band = 1.0 - smoothstep(0.0, 0.35, abs(dir.y));
+        let amount = clamp(pow(toward, 4.0) * band * glow, 0.0, 1.0);
+        color = mix(color, sky.sunset.rgb, amount);
+    }
+    return color;
+}
 
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
@@ -81,23 +108,23 @@ fn occluded(origin: vec3<f32>, dir: vec3<f32>, tmax: f32) -> bool {
 }
 
 @fragment
-fn fs_main(in: VsOut) -> @location(0) f32 {
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let dims = vec2<f32>(textureDimensions(depth_tex));
     let px = vec2<i32>(clamp(in.uv * dims, vec2<f32>(0.0), dims - vec2<f32>(1.0)));
     let depth = textureLoad(depth_tex, px, 0).r;
     if (depth >= 1.0) {
-        return 1.0; // sky / far plane: fully open
+        return vec4<f32>(0.0); // sky / far plane: no surface to light
     }
     let samples = i32(rt.quality.y);
     if (samples <= 0) {
-        return 1.0;
+        return vec4<f32>(0.0);
     }
     // Exact geometric normal from the G-buffer (decode 0.5+0.5*n). Near-zero length =
     // a pixel the opaque chunk normal pass didn't write (entities / no geometry) — skip
     // AO there rather than darken with a bogus normal.
     let n_enc = textureLoad(normal_tex, px, 0).xyz * 2.0 - 1.0;
     if (dot(n_enc, n_enc) < 0.25) {
-        return 1.0;
+        return vec4<f32>(0.0);
     }
     let n = normalize(n_enc);
     let p = world_from_uv(in.uv, depth);
@@ -113,18 +140,23 @@ fn fs_main(in: VsOut) -> @location(0) f32 {
     // Ray-origin bias grows with view distance to clear depth-reconstruction error +
     // the derivative-estimated normal, avoiding self-intersection stripes.
     let origin = p + n * (0.04 + length(p) * 0.0015);
-    var occ = 0.0;
+    // Diffuse sky irradiance: cosine-weighted hemisphere, accumulating the sky radiance
+    // only for unoccluded directions (occluded rays contribute 0). The mean over N
+    // samples IS the diffuse response (the cosine PDF cancels the cosine + 1/pi), so
+    // `albedo * irradiance` (composited additively) is the ray-traced sky lighting at
+    // this surface — directional, sky-coloured, and occlusion-aware in one term.
+    var irradiance = vec3<f32>(0.0);
     for (var i = 0; i < samples; i = i + 1) {
         let u1 = rand(&seed);
         let u2 = rand(&seed);
-        // Cosine-weighted hemisphere direction.
         let r = sqrt(u1);
         let a = 6.2831853 * u2;
         let local = vec3<f32>(r * cos(a), r * sin(a), sqrt(max(0.0, 1.0 - u1)));
         let dir = bn * local;
-        if (occluded(origin, dir, tmax)) {
-            occ = occ + 1.0;
+        if (!occluded(origin, dir, tmax)) {
+            irradiance = irradiance + sky_color(dir);
         }
     }
-    return clamp(1.0 - (occ / f32(samples)) * strength, 0.0, 1.0);
+    // `strength` (quality.z) doubles as the GI intensity scale.
+    return vec4<f32>(irradiance * (strength / f32(samples)), 1.0);
 }

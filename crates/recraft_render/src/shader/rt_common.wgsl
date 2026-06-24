@@ -144,3 +144,11 @@ fn sun_sky_gate(sky: f32, world_pos: vec3<f32>) -> f32 {
     let beyond = smoothstep(120.0, 160.0, length(world_pos));
     return mix(1.0, sky, beyond);
 }
+
+// Flat sky-ambient scale. When the screen-space sky GI is active (AO samples > 0) it
+// supplies the directional sky lighting additively, so dial the flat voxel sky-ambient
+// down to avoid double-counting (a floor is kept so unlit cavities aren't pitch black).
+// Low quality (no GI pass) keeps the full flat ambient.
+fn gi_ambient_scale() -> f32 {
+    return select(1.0, 0.4, rt.quality.y > 0.0);
+}

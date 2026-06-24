@@ -37,17 +37,17 @@ fn world_at(px: vec2<i32>, dims: vec2<i32>, depth: f32) -> vec3<f32> {
 }
 
 @fragment
-fn fs_main(in: VsOut) -> @location(0) f32 {
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let dims = vec2<i32>(textureDimensions(ao_tex));
     let c = vec2<i32>(clamp(in.uv * vec2<f32>(dims), vec2<f32>(0.0), vec2<f32>(dims) - vec2<f32>(1.0)));
     let cd = textureLoad(depth_tex, c, 0).r;
     if (cd >= 1.0) {
-        return 1.0;
+        return vec4<f32>(1.0);
     }
     let cp = world_at(c, dims, cd);
     // à-trous dilation: a 7x7 tap grid with a 2px step covers ~12px while staying cheap.
     let step = 2;
-    var sum = 0.0;
+    var sum = vec3<f32>(0.0);
     var wsum = 0.0;
     for (var dy = -3; dy <= 3; dy = dy + 1) {
         for (var dx = -3; dx <= 3; dx = dx + 1) {
@@ -64,9 +64,9 @@ fn fs_main(in: VsOut) -> @location(0) f32 {
             let r2 = f32(dx * dx + dy * dy);
             let sw = exp(-r2 * 0.15);
             let w = dw * sw;
-            sum = sum + textureLoad(ao_tex, p, 0).r * w;
+            sum = sum + textureLoad(ao_tex, p, 0).rgb * w;
             wsum = wsum + w;
         }
     }
-    return select(1.0, sum / wsum, wsum > 0.0);
+    return vec4<f32>(select(vec3<f32>(1.0), sum / wsum, wsum > 0.0), 1.0);
 }
