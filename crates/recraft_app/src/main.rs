@@ -2475,6 +2475,10 @@ fn render_frame(
                     tick_alpha,
                 );
                 let arm_start = app.entity_model.vertices.len();
+                // First index of the arm: it is appended last, so the renderer
+                // draws this trailing range on top of the world (empty when an
+                // item is held, since render_arm only emits the empty hand).
+                let arm_index_start = app.entity_model.indices.len() as u32;
                 ItemRenderer::render_arm(&mut app.entity_model, &app.game.camera, &first_person);
                 for v in &mut app.entity_model.vertices[arm_start..] {
                     v.color[0] *= hand_light;
@@ -2484,6 +2488,7 @@ fn render_frame(
                 // The first-person arm is screen-locked: flag it for zero motion
                 // so TAA doesn't reproject (and smear) it on camera movement.
                 app.entity_model.fill_motion([0.0, 0.0, 0.0, 1.0]);
+                renderer.set_arm_index_start(Some(arm_index_start));
                 let mut held = ItemRenderer::build_held_item(
                     &app.game.camera,
                     &first_person,
@@ -2505,6 +2510,7 @@ fn render_frame(
                 renderer.set_first_person_item(&[], &[]);
                 renderer.set_first_person_item_glint(&[], &[]);
                 renderer.set_nametags(&app.game.camera, &[]);
+                renderer.set_arm_index_start(None);
             }
             // Safety pad: any geometry appended without an explicit motion tag
             // gets zero (camera-only reprojection), keeping `motion` in lockstep
@@ -2555,6 +2561,7 @@ fn render_frame(
     } else {
         app.last_entity_key = None;
         renderer.upload_model(&recraft_render::ModelMesh::new());
+        renderer.set_arm_index_start(None);
         renderer.set_entity_glint(&recraft_render::ModelMesh::new());
         renderer.set_first_person_item(&[], &[]);
         renderer.set_first_person_item_glint(&[], &[]);

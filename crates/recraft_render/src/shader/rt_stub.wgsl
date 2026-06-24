@@ -23,3 +23,8 @@ fn rt_ao_factor(world_pos: vec3<f32>, geo_n: vec3<f32>, pixel: vec2<f32>) -> f32
 fn sun_sky_gate(sky: f32, world_pos: vec3<f32>) -> f32 {
     return sky;
 }
+
+// Flat sky-ambient scale. No RT sky GI here, so keep the full voxel sky-ambient.
+fn gi_ambient_scale() -> f32 {
+    return 1.0;
+}

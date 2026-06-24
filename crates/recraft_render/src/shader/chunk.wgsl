@@ -211,9 +211,10 @@ fn apply_lighting(albedo: vec3<f32>, in: VertexOutput) -> vec3<f32> {
     let sky = in.light.x;
     let block = in.light.y;
     let day = max(camera.sky_brightness, 0.04);
-    // Ambient term. RTAO is no longer applied inline — it's a denoised screen-space
-    // pass (rt_ao.wgsl) multiplied onto the scene before the temporal upscale.
-    let ambient = lighting.ambient.rgb * (0.08 + 0.92 * sky * day);
+    // Ambient term. The sky-dependent part is scaled down when the ray-traced sky GI
+    // is active (it adds the directional sky lighting additively afterward); a small
+    // base is always kept. With RT off, gi_ambient_scale() = 1 (unchanged).
+    let ambient = lighting.ambient.rgb * (0.08 + 0.92 * sky * day * gi_ambient_scale());
     let torch = vec3<f32>(1.0, 0.82, 0.55) * block;
 
     if (pbr_on) {
@@ -303,20 +304,32 @@ fn fs_cutout(input: VertexOutput) -> @location(0) vec4<f32> {
     return vec4<f32>(rgb, 1.0);
 }
 
-// Normal G-buffer output: encode the geometric normal as 0.5 + 0.5*n into an
-// Rgba8 target, feeding the screen-space RTAO pass an exact, stable per-pixel normal
-// (instead of the jitter-sensitive depth-derivative reconstruction). Solid + cutout
-// variants; cutout alpha-tests so holes don't write a normal.
+// G-buffer for the screen-space RT sky-lighting pass: location 0 = geometric normal
+// (0.5 + 0.5*n) for an exact, stable per-pixel normal; location 1 = surface albedo
+// (texture x tint) so the additive composite can light it (albedo x sky irradiance).
+// Solid + cutout variants; cutout alpha-tests so holes write nothing.
+struct NormalOut {
+    @location(0) normal: vec4<f32>,
+    @location(1) albedo: vec4<f32>,
+};
+
 @fragment
-fn fs_normal(input: VertexOutput) -> @location(0) vec4<f32> {
-    return vec4<f32>(normalize(input.normal) * 0.5 + 0.5, 1.0);
+fn fs_normal(input: VertexOutput) -> NormalOut {
+    let texel = textureSample(block_atlas, block_sampler, input.uv);
+    var o: NormalOut;
+    o.normal = vec4<f32>(normalize(input.normal) * 0.5 + 0.5, 1.0);
+    o.albedo = vec4<f32>(texel.rgb * input.color.rgb, 1.0);
+    return o;
 }
 
 @fragment
-fn fs_normal_cutout(input: VertexOutput) -> @location(0) vec4<f32> {
+fn fs_normal_cutout(input: VertexOutput) -> NormalOut {
     let texel = textureSample(block_atlas, block_sampler, input.uv);
     if (texel.a * input.color.a < 0.5) {
         discard;
     }
-    return vec4<f32>(normalize(input.normal) * 0.5 + 0.5, 1.0);
+    var o: NormalOut;
+    o.normal = vec4<f32>(normalize(input.normal) * 0.5 + 0.5, 1.0);
+    o.albedo = vec4<f32>(texel.rgb * input.color.rgb, 1.0);
+    return o;
 }
