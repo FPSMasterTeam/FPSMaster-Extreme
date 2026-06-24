@@ -500,6 +500,7 @@ impl ChunkLayer {
     }
 }
 
+#[derive(Clone)]
 struct PageBatch {
     page: usize,
     cmds: Vec<IndirectCmd>,
@@ -922,6 +923,9 @@ pub struct Renderer {
     /// raymarched from the world depth + shadow map, added to the scene in post.
     volumetric_enabled: bool,
     vol_pipeline: wgpu::RenderPipeline,
+    /// Ray-traced volumetric pipeline (Some only when RT is supported); used instead of
+    /// `vol_pipeline` while ray tracing is active, casting sun rays at the TLAS.
+    vol_rt_pipeline: Option<wgpu::RenderPipeline>,
     vol_layout: wgpu::BindGroupLayout,
     vol_uniform_buffer: wgpu::Buffer,
     vol_tex: Option<wgpu::Texture>,
@@ -1013,6 +1017,32 @@ pub struct Renderer {
     rt_cutout_pipeline: Option<wgpu::RenderPipeline>,
     /// The acceleration structures + bind group; `Some` only while ray tracing is on.
     ray_tracer: Option<RayTracer>,
+    /// Screen-space RTAO + à-trous denoise (Some only when RT is supported). The AO is
+    /// cast into `rtao_raw`, bilaterally denoised into `rtao_denoised`, then multiplied
+    /// onto the offscreen scene before the temporal upscale — so the noise never
+    /// reaches TAA/DLSS. `rtao_aux` = depth + post-camera (group 1 of the AO pass);
+    /// group 0 is the RayTracer's TLAS+params bind group, set at draw time.
+    rtao_pipeline: Option<wgpu::RenderPipeline>,
+    rtao_aux_layout: Option<wgpu::BindGroupLayout>,
+    rtao_aux_bind_group: Option<wgpu::BindGroup>,
+    rtao_denoise_pipeline: Option<wgpu::RenderPipeline>,
+    rtao_denoise_layout: Option<wgpu::BindGroupLayout>,
+    rtao_denoise_bind_group: Option<wgpu::BindGroup>,
+    rtao_apply_pipeline: Option<wgpu::RenderPipeline>,
+    rtao_apply_layout: Option<wgpu::BindGroupLayout>,
+    rtao_apply_bind_group: Option<wgpu::BindGroup>,
+    rtao_sampler: Option<wgpu::Sampler>,
+    rtao_raw_tex: Option<wgpu::Texture>,
+    rtao_raw_view: Option<wgpu::TextureView>,
+    rtao_denoised_tex: Option<wgpu::Texture>,
+    rtao_denoised_view: Option<wgpu::TextureView>,
+    /// Geometric normal G-buffer for the AO pass: a dedicated pass re-draws the opaque
+    /// chunks (depth-test, no write) with `fs_normal` into this, giving the AO pass an
+    /// exact per-pixel normal instead of a jitter-flickering depth-derivative one.
+    normal_solid_pipeline: Option<wgpu::RenderPipeline>,
+    normal_cutout_pipeline: Option<wgpu::RenderPipeline>,
+    normal_gbuffer_tex: Option<wgpu::Texture>,
+    normal_gbuffer_view: Option<wgpu::TextureView>,
     /// Monotonic frame counter feeding the RT sample rotation (so a temporal resolve
     /// averages the soft-shadow / RTAO noise across frames).
     rt_frame: u32,
@@ -1989,6 +2019,227 @@ impl Renderer {
                 (Some(solid), Some(cutout))
             }
             _ => (None, None),
+        };
+
+        // Screen-space RTAO + denoiser pipelines (only when RT is supported). The AO
+        // pass casts occlusion rays into an R8 buffer (group 0 = RayTracer TLAS+params,
+        // group 1 = depth+camera); the denoise pass bilaterally filters it; the apply
+        // pass multiplies it onto the HDR scene. See shader/rt_ao*.wgsl.
+        let (
+            rtao_pipeline,
+            rtao_aux_layout,
+            rtao_denoise_pipeline,
+            rtao_denoise_layout,
+            rtao_apply_pipeline,
+            rtao_apply_layout,
+            rtao_sampler,
+        ) = match rt_layout.as_ref() {
+            Some(rt_layout) => {
+                let ao_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("rt-ao-shader"),
+                    source: wgpu::ShaderSource::Wgsl(include_str!("../shader/rt_ao.wgsl").into()),
+                });
+                let denoise_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("rt-denoise-shader"),
+                    source: wgpu::ShaderSource::Wgsl(
+                        include_str!("../shader/rt_denoise.wgsl").into(),
+                    ),
+                });
+                let apply_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("rt-ao-apply-shader"),
+                    source: wgpu::ShaderSource::Wgsl(
+                        include_str!("../shader/rt_ao_apply.wgsl").into(),
+                    ),
+                });
+                let unfilterable = wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                };
+                let uniform = wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                };
+                let frag = wgpu::ShaderStages::FRAGMENT;
+                let entry = |binding, ty| wgpu::BindGroupLayoutEntry {
+                    binding,
+                    visibility: frag,
+                    ty,
+                    count: None,
+                };
+                // AO pass group(1): depth + post-camera + normal G-buffer.
+                let aux_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("rtao-aux-layout"),
+                    entries: &[entry(0, unfilterable), entry(1, uniform), entry(2, unfilterable)],
+                });
+                // Denoise group(0): ao_raw + depth + post-camera.
+                let denoise_layout =
+                    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                        label: Some("rtao-denoise-layout"),
+                        entries: &[entry(0, unfilterable), entry(1, unfilterable), entry(2, uniform)],
+                    });
+                // Apply group(0): denoised AO (filterable) + sampler.
+                let apply_layout =
+                    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                        label: Some("rtao-apply-layout"),
+                        entries: &[
+                            entry(
+                                0,
+                                wgpu::BindingType::Texture {
+                                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                                    view_dimension: wgpu::TextureViewDimension::D2,
+                                    multisampled: false,
+                                },
+                            ),
+                            entry(1, wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering)),
+                        ],
+                    });
+                let make_fs = |label: &str,
+                               pl: &wgpu::PipelineLayout,
+                               module: &wgpu::ShaderModule,
+                               target: wgpu::ColorTargetState| {
+                    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                        label: Some(label),
+                        layout: Some(pl),
+                        vertex: wgpu::VertexState {
+                            module,
+                            entry_point: Some("vs_main"),
+                            compilation_options: Default::default(),
+                            buffers: &[],
+                        },
+                        fragment: Some(wgpu::FragmentState {
+                            module,
+                            entry_point: Some("fs_main"),
+                            compilation_options: Default::default(),
+                            targets: &[Some(target)],
+                        }),
+                        primitive: wgpu::PrimitiveState::default(),
+                        depth_stencil: None,
+                        multisample: wgpu::MultisampleState::default(),
+                        cache: None,
+                        multiview_mask: None,
+                    })
+                };
+                let r8 = wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::R8Unorm,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                };
+                let ao_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("rtao-pipeline-layout"),
+                    bind_group_layouts: &[Some(rt_layout), Some(&aux_layout)],
+                    immediate_size: 0,
+                });
+                let denoise_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("rtao-denoise-pipeline-layout"),
+                    bind_group_layouts: &[Some(&denoise_layout)],
+                    immediate_size: 0,
+                });
+                let apply_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("rtao-apply-pipeline-layout"),
+                    bind_group_layouts: &[Some(&apply_layout)],
+                    immediate_size: 0,
+                });
+                let ao_pipe = make_fs("rtao-pipeline", &ao_pl, &ao_shader, r8.clone());
+                let denoise_pipe = make_fs("rtao-denoise-pipeline", &denoise_pl, &denoise_shader, r8);
+                // Multiply blend: framebuffer (scene) *= AO, alpha preserved.
+                let apply_pipe = make_fs(
+                    "rtao-apply-pipeline",
+                    &apply_pl,
+                    &apply_shader,
+                    wgpu::ColorTargetState {
+                        format: HDR_FORMAT,
+                        blend: Some(wgpu::BlendState {
+                            color: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::Dst,
+                                dst_factor: wgpu::BlendFactor::Zero,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                            alpha: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::Zero,
+                                dst_factor: wgpu::BlendFactor::One,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                        }),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    },
+                );
+                let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+                    label: Some("rtao-sampler"),
+                    address_mode_u: wgpu::AddressMode::ClampToEdge,
+                    address_mode_v: wgpu::AddressMode::ClampToEdge,
+                    address_mode_w: wgpu::AddressMode::ClampToEdge,
+                    mag_filter: wgpu::FilterMode::Linear,
+                    min_filter: wgpu::FilterMode::Linear,
+                    mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+                    ..Default::default()
+                });
+                (
+                    Some(ao_pipe),
+                    Some(aux_layout),
+                    Some(denoise_pipe),
+                    Some(denoise_layout),
+                    Some(apply_pipe),
+                    Some(apply_layout),
+                    Some(sampler),
+                )
+            }
+            None => (None, None, None, None, None, None, None),
+        };
+
+        // Normal G-buffer pipelines (RT only): re-draw the opaque chunks with fs_normal
+        // into the AO pass's normal target, depth-tested (LessEqual, no write) against
+        // the world depth so only visible surfaces write. Uses the non-RT chunk module.
+        let (normal_solid_pipeline, normal_cutout_pipeline) = if rt_supported {
+            let normal_target = wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            };
+            let make_normal = |label: &str, entry: &'static str| {
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some(label),
+                    layout: Some(&lit_pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &shader,
+                        entry_point: Some("vs_main"),
+                        compilation_options: Default::default(),
+                        buffers: &[ChunkVertex::layout()],
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &shader,
+                        entry_point: Some(entry),
+                        compilation_options: Default::default(),
+                        targets: &[Some(normal_target.clone())],
+                    }),
+                    primitive: wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::TriangleList,
+                        strip_index_format: None,
+                        front_face: wgpu::FrontFace::Ccw,
+                        cull_mode: Some(wgpu::Face::Back),
+                        polygon_mode: wgpu::PolygonMode::Fill,
+                        unclipped_depth: false,
+                        conservative: false,
+                    },
+                    depth_stencil: Some(wgpu::DepthStencilState {
+                        format: DEPTH_FORMAT,
+                        depth_write_enabled: Some(false),
+                        depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                        stencil: wgpu::StencilState::default(),
+                        bias: wgpu::DepthBiasState::default(),
+                    }),
+                    multisample: wgpu::MultisampleState::default(),
+                    cache: None,
+                    multiview_mask: None,
+                })
+            };
+            (
+                Some(make_normal("chunk-normal-pipeline", "fs_normal")),
+                Some(make_normal("chunk-normal-cutout-pipeline", "fs_normal_cutout")),
+            )
+        } else {
+            (None, None)
         };
 
         // The GUI block-icon cube pass reuses the cutout shader but must NOT
@@ -3402,6 +3653,52 @@ impl Renderer {
             multiview_mask: None,
         });
 
+        // Ray-traced volumetric variant (RT only): same raymarch, but sun visibility is
+        // a TLAS ray-query instead of a shadow-map lookup. Bound with the vol layout
+        // (group 0) + the RayTracer's TLAS bind group (group 1).
+        let vol_rt_pipeline = match rt_layout.as_ref() {
+            Some(rt_layout) => {
+                let vol_rt_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("volumetric-rt-shader"),
+                    source: wgpu::ShaderSource::Wgsl(
+                        include_str!("../shader/volumetric_rt.wgsl").into(),
+                    ),
+                });
+                let vol_rt_pipeline_layout =
+                    device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                        label: Some("volumetric-rt-pipeline-layout"),
+                        bind_group_layouts: &[Some(&vol_layout), Some(rt_layout)],
+                        immediate_size: 0,
+                    });
+                Some(device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("volumetric-rt-pipeline"),
+                    layout: Some(&vol_rt_pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &vol_rt_shader,
+                        entry_point: Some("vs_main"),
+                        compilation_options: Default::default(),
+                        buffers: &[],
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &vol_rt_shader,
+                        entry_point: Some("fs_main"),
+                        compilation_options: Default::default(),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: HDR_FORMAT,
+                            blend: None,
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                    }),
+                    primitive: wgpu::PrimitiveState::default(),
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState::default(),
+                    cache: None,
+                    multiview_mask: None,
+                }))
+            }
+            None => None,
+        };
+
         // Motion-vector pass: world depth (unfilterable float, binding 0) + the
         // shared post-camera uniform (binding 1) -> RG16F screen-space velocity.
         let mv_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -3983,6 +4280,7 @@ impl Renderer {
             lum_bind_group: None,
             volumetric_enabled: false,
             vol_pipeline,
+            vol_rt_pipeline,
             vol_layout,
             vol_uniform_buffer,
             vol_tex: None,
@@ -4040,6 +4338,24 @@ impl Renderer {
             rt_solid_pipeline,
             rt_cutout_pipeline,
             ray_tracer: None,
+            rtao_pipeline,
+            rtao_aux_layout,
+            rtao_aux_bind_group: None,
+            rtao_denoise_pipeline,
+            rtao_denoise_layout,
+            rtao_denoise_bind_group: None,
+            rtao_apply_pipeline,
+            rtao_apply_layout,
+            rtao_apply_bind_group: None,
+            rtao_sampler,
+            rtao_raw_tex: None,
+            rtao_raw_view: None,
+            rtao_denoised_tex: None,
+            rtao_denoised_view: None,
+            normal_solid_pipeline,
+            normal_cutout_pipeline,
+            normal_gbuffer_tex: None,
+            normal_gbuffer_view: None,
             rt_frame: 0,
             dlss_enabled: false,
             #[cfg(feature = "dlss")]
@@ -4808,6 +5124,102 @@ impl Renderer {
         }));
         self.mv_tex = Some(mv);
         self.mv_view = Some(mv_view);
+
+        // Screen-space RTAO targets + bind groups (only when RT is supported). R8 AO at
+        // render resolution; rebuilt here because they and their depth/camera bindings
+        // track the render size.
+        if self.rtao_pipeline.is_some() {
+            let make_r8 = |label: &str, device: &wgpu::Device| {
+                let t = device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some(label),
+                    size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::R8Unorm,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                });
+                let v = t.create_view(&wgpu::TextureViewDescriptor::default());
+                (t, v)
+            };
+            let (raw_tex, raw_view) = make_r8("rtao-raw", &self.device);
+            let (den_tex, den_view) = make_r8("rtao-denoised", &self.device);
+            let normal_gbuffer = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("rtao-normal-gbuffer"),
+                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            let normal_view = normal_gbuffer.create_view(&wgpu::TextureViewDescriptor::default());
+            self.rtao_aux_bind_group =
+                Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("rtao-aux-bind-group"),
+                    layout: self.rtao_aux_layout.as_ref().unwrap(),
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(&self.depth_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: self.post_camera_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::TextureView(&normal_view),
+                        },
+                    ],
+                }));
+            self.rtao_denoise_bind_group =
+                Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("rtao-denoise-bind-group"),
+                    layout: self.rtao_denoise_layout.as_ref().unwrap(),
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(&raw_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(&self.depth_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: self.post_camera_buffer.as_entire_binding(),
+                        },
+                    ],
+                }));
+            self.rtao_apply_bind_group =
+                Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("rtao-apply-bind-group"),
+                    layout: self.rtao_apply_layout.as_ref().unwrap(),
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(&den_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Sampler(
+                                self.rtao_sampler.as_ref().unwrap(),
+                            ),
+                        },
+                    ],
+                }));
+            self.rtao_raw_tex = Some(raw_tex);
+            self.rtao_raw_view = Some(raw_view);
+            self.rtao_denoised_tex = Some(den_tex);
+            self.rtao_denoised_view = Some(den_view);
+            self.normal_gbuffer_tex = Some(normal_gbuffer);
+            self.normal_gbuffer_view = Some(normal_view);
+        }
+
         self.bloom_a_tex = Some(bloom_a);
         self.bloom_a_view = Some(bloom_a_view);
         self.bloom_b_tex = Some(bloom_b);
@@ -6544,15 +6956,16 @@ impl Renderer {
         // TAA, so High pairs best with TAA on.
         if let Some(rt) = self.ray_tracer.as_mut() {
             self.rt_frame = self.rt_frame.wrapping_add(1);
-            // Sample counts per quality. Higher = much less noise (the RTX can afford
-            // it), since the per-frame stochastic noise leans on TAA/DLSS to resolve —
-            // and the residual is worst under motion. Low is noise-free (hard shadow,
-            // no AO); Med adds well-sampled RTAO over hard shadows; High adds soft sun
-            // shadows. AO uses a short 3-block contact radius (less variance).
+            // Sample counts per quality. RTAO is now a denoised screen-space pass, so a
+            // handful of samples per frame suffices (the bilateral filter resolves it).
+            // Low is noise-free (hard shadow, no AO); Med adds RTAO over hard shadows;
+            // High adds soft sun shadows. AO strength is gentler than the old inline
+            // value because it now multiplies the whole scene (not just ambient).
+            // AO uses a short 3-block contact radius (less variance).
             let (shadow_samples, ao_samples, sun_radius, ao_strength) = match self.rt_quality {
                 0 => (1.0, 0.0, 0.0, 0.0),
-                1 => (1.0, 12.0, 0.0, 0.85),
-                _ => (8.0, 20.0, 0.02, 0.9),
+                1 => (1.0, 6.0, 0.0, 0.5),
+                _ => (8.0, 8.0, 0.02, 0.6),
             };
             self.queue.write_buffer(
                 rt.params_buffer(),
@@ -6674,6 +7087,15 @@ impl Renderer {
             );
         }
 
+        // Opaque chunk batches hoisted out of the main-pass block so the RTAO normal
+        // pass (which runs AFTER the main pass, where these would be out of scope) can
+        // re-draw them. Only populated when the AO normal G-buffer is needed.
+        let want_normal_gbuffer = self.rt_quality >= 1
+            && self.ray_tracer.is_some()
+            && self.normal_solid_pipeline.is_some();
+        let mut normal_solid_batches: Vec<PageBatch> = Vec::new();
+        let mut normal_cutout_batches: Vec<PageBatch> = Vec::new();
+
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main-render-pass"),
@@ -6770,6 +7192,10 @@ impl Renderer {
                     collect_layer_batches(&self.chunk_solid, &visible, &mut chunk_indices);
                 let cutout_batches =
                     collect_layer_batches(&self.chunk_cutout, &visible, &mut chunk_indices);
+                if want_normal_gbuffer {
+                    normal_solid_batches = solid_batches.clone();
+                    normal_cutout_batches = cutout_batches.clone();
+                }
                 let trans_batches =
                     collect_layer_batches(&self.chunk_transparent, &visible_far, &mut chunk_indices);
                 // Water is drawn in its own later pass (SSR), not via the shared
@@ -7243,6 +7669,132 @@ impl Renderer {
             } // else (non-panorama sky + world content)
         }
 
+        // Screen-space RTAO: cast occlusion rays into rtao_raw, bilaterally denoise into
+        // rtao_denoised, then multiply onto the opaque offscreen scene — before water +
+        // the temporal upscale, so the AO noise never reaches TAA/DLSS. Only when RT is
+        // on with AO samples (Med/High).
+        if self.rt_quality >= 1 {
+            if let (
+                Some(rt),
+                Some(ao_pipe),
+                Some(aux_bg),
+                Some(raw_view),
+                Some(den_pipe),
+                Some(den_bg),
+                Some(den_view),
+                Some(apply_pipe),
+                Some(apply_bg),
+                Some(nsolid),
+                Some(ncutout),
+                Some(ngbuf),
+            ) = (
+                self.ray_tracer.as_ref(),
+                self.rtao_pipeline.as_ref(),
+                self.rtao_aux_bind_group.as_ref(),
+                self.rtao_raw_view.as_ref(),
+                self.rtao_denoise_pipeline.as_ref(),
+                self.rtao_denoise_bind_group.as_ref(),
+                self.rtao_denoised_view.as_ref(),
+                self.rtao_apply_pipeline.as_ref(),
+                self.rtao_apply_bind_group.as_ref(),
+                self.normal_solid_pipeline.as_ref(),
+                self.normal_cutout_pipeline.as_ref(),
+                self.normal_gbuffer_view.as_ref(),
+            ) {
+                // 0. Normal G-buffer: re-draw opaque chunks (depth-tested, no write) with
+                //    fs_normal so the AO pass reads an exact, stable per-pixel normal.
+                {
+                    let mut np = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("normal-gbuffer-pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: ngbuf,
+                            resolve_target: None,
+                            depth_slice: None,
+                            ops: wgpu::Operations {
+                                // Clear to encoded zero-normal so unwritten pixels (sky /
+                                // entities) get no AO.
+                                load: wgpu::LoadOp::Clear(wgpu::Color {
+                                    r: 0.5,
+                                    g: 0.5,
+                                    b: 0.5,
+                                    a: 1.0,
+                                }),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                            view: &self.depth_view,
+                            depth_ops: Some(wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            }),
+                            stencil_ops: None,
+                        }),
+                        occlusion_query_set: None,
+                        timestamp_writes: None,
+                        multiview_mask: None,
+                    });
+                    np.set_bind_group(0, &self.camera_bind_group, &[]);
+                    np.set_bind_group(1, &self.texture_bind_groups[self.mipmap_levels as usize], &[]);
+                    np.set_bind_group(2, &self.lighting_bind_group, &[]);
+                    let mut draw_layer = |pipe: &wgpu::RenderPipeline,
+                                          batches: &[PageBatch],
+                                          layer: &ChunkLayer| {
+                        np.set_pipeline(pipe);
+                        for batch in batches {
+                            let page = &layer.pages[batch.page];
+                            np.set_vertex_buffer(0, page.vertex_buf.slice(..));
+                            np.set_index_buffer(page.index_buf.slice(..), wgpu::IndexFormat::Uint16);
+                            for c in &batch.cmds {
+                                np.draw_indexed(
+                                    c.first_index..c.first_index + c.index_count,
+                                    c.base_vertex,
+                                    0..1,
+                                );
+                            }
+                        }
+                    };
+                    draw_layer(nsolid, &normal_solid_batches, &self.chunk_solid);
+                    draw_layer(ncutout, &normal_cutout_batches, &self.chunk_cutout);
+                }
+                let fs_pass =
+                    |encoder: &mut wgpu::CommandEncoder,
+                     label: &str,
+                     target: &wgpu::TextureView,
+                     load: wgpu::LoadOp<wgpu::Color>,
+                     pipeline: &wgpu::RenderPipeline,
+                     bind0: &wgpu::BindGroup,
+                     bind1: Option<&wgpu::BindGroup>| {
+                        let mut p = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some(label),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: target,
+                                resolve_target: None,
+                                depth_slice: None,
+                                ops: wgpu::Operations { load, store: wgpu::StoreOp::Store },
+                            })],
+                            depth_stencil_attachment: None,
+                            occlusion_query_set: None,
+                            timestamp_writes: None,
+                            multiview_mask: None,
+                        });
+                        p.set_pipeline(pipeline);
+                        p.set_bind_group(0, bind0, &[]);
+                        if let Some(b1) = bind1 {
+                            p.set_bind_group(1, b1, &[]);
+                        }
+                        p.draw(0..3, 0..1);
+                    };
+                let clear = wgpu::LoadOp::Clear(wgpu::Color::WHITE);
+                // 1. AO rays -> rtao_raw (group 0 = TLAS+params, group 1 = depth+camera).
+                fs_pass(&mut encoder, "rtao-pass", raw_view, clear, ao_pipe, rt.bind_group(), Some(aux_bg));
+                // 2. Bilateral denoise -> rtao_denoised.
+                fs_pass(&mut encoder, "rtao-denoise-pass", den_view, clear, den_pipe, den_bg, None);
+                // 3. Multiply the denoised AO onto the offscreen scene (multiply blend).
+                fs_pass(&mut encoder, "rtao-apply-pass", view, wgpu::LoadOp::Load, apply_pipe, apply_bg, None);
+            }
+        }
+
         // SSR water pass: only with shaders + Fancy. Copy the opaque scene and
         // depth so the water shader can sample them for screen-space reflection,
         // then draw water with depth testing (no depth write). The depth is copied
@@ -7353,8 +7905,21 @@ impl Renderer {
                     timestamp_writes: None,
                     multiview_mask: None,
                 });
-                vp.set_pipeline(&self.vol_pipeline);
-                vp.set_bind_group(0, vb, &[]);
+                // Ray-traced shafts when RT is on: cast sun rays at the TLAS each step
+                // (group 1) instead of sampling the shadow map. Falls back to the
+                // shadow-map pipeline otherwise.
+                let rt_vol = self
+                    .ray_tracer
+                    .as_ref()
+                    .zip(self.vol_rt_pipeline.as_ref());
+                if let Some((rt, vol_rt_pipeline)) = rt_vol {
+                    vp.set_pipeline(vol_rt_pipeline);
+                    vp.set_bind_group(0, vb, &[]);
+                    vp.set_bind_group(1, rt.bind_group(), &[]);
+                } else {
+                    vp.set_pipeline(&self.vol_pipeline);
+                    vp.set_bind_group(0, vb, &[]);
+                }
                 vp.draw(0..3, 0..1);
             }
         }
