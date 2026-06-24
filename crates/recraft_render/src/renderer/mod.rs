@@ -5498,16 +5498,18 @@ impl Renderer {
         // q: exposure, saturation, contrast, bloom-enabled
         // r: vignette amount, chromatic amount, dof strength, motion-blur strength
         // s: auto-exposure enabled, (reserved), (reserved), (reserved)
-        // Neutral grade (sat/contrast 1.0) + slightly-under exposure so sunlit
-        // blocks keep texture detail instead of blowing out.
+        // Filmic grade: a slightly lower bloom threshold + stronger intensity (with the
+        // soft-knee bright-pass) for a cinematic highlight glow, plus a touch of extra
+        // saturation + contrast. Exposure stays slightly under so sunlit blocks keep
+        // texture detail (under-exposure + blooming highlights reads as drama).
         let params = [
-            1.0f32,
-            0.6,
+            0.9f32,
+            0.72,
             1.0 / w as f32,
             1.0 / h as f32,
             0.85,
-            1.0,
-            1.0,
+            1.07,
+            1.1,
             on(self.bloom_enabled, 1.0),
             on(self.vignette_enabled, 0.45),
             on(self.chromatic_enabled, 0.004),
@@ -7094,7 +7096,9 @@ impl Renderer {
                 sun_dir: [sun_dir.x, sun_dir.y, sun_dir.z, 0.0],
                 sun_color: [1.0 * sb, 0.96 * sb, 0.88 * sb, 0.0],
                 camera_pos: [cam.x, cam.y, cam.z, sb],
-                params: [0.04, 110.0, 0.72, 0.5],
+                // density, max march dist, HG forward-scatter g, intensity. Denser +
+                // brighter + more forward-scattering so the shafts read clearly.
+                params: [0.075, 110.0, 0.78, 1.1],
             }),
         );
 

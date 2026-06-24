@@ -240,6 +240,19 @@ fn apply_lighting(albedo: vec3<f32>, in: VertexOutput) -> vec3<f32> {
             + albedo * light_curve(ambient * ao + torch, gamma);
         let env_spec = f0 * smoothness * smoothness * ambient * ao * sky * 0.5;
         lit = lit + env_spec;
+        // Hardware ray-traced reflection (a == 0 in non-RT builds → no change). Reflect
+        // the view off the surface and weight by reflectivity: f0 tints metals by their
+        // albedo, smoothness sharpens/strengthens it. Adds real mirror-like reflections
+        // to polished / metallic blocks. Skipped for near-matte surfaces (no ray cost).
+        let reflectivity = max(max(f0.r, f0.g), f0.b) * smoothness;
+        if (reflectivity > 0.04) {
+            let refl_dir = reflect(-view_dir, n);
+            let rt_refl = rt_reflect(in.world_pos + n * 0.05, refl_dir);
+            // Fresnel-weighted, and toned down — a full f0×smoothness reflection reads as
+            // a too-strong mirror on metals.
+            let fres = 0.4 + 0.6 * pow(1.0 - max(dot(n, view_dir), 0.0), 5.0);
+            lit = lit + rt_refl.rgb * f0 * smoothness * fres * rt_refl.a * 0.5;
+        }
         lit = lit + albedo * emissive * 3.0;
         return lit;
     }
@@ -257,17 +270,35 @@ fn apply_lighting(albedo: vec3<f32>, in: VertexOutput) -> vec3<f32> {
 
 // Distance fog toward the sky horizon colour. Independent of the master shader
 // toggle so it can be used on its own.
+// Sky radiance in a view direction, for aerial perspective: horizon (fog colour) up to
+// a cooler/bluer zenith, warmed toward the sun. Distant terrain fades into THIS rather
+// than a flat fog colour, so the haze takes on the sky's direction-dependent tint
+// (warm toward the sun, cool away) — the cue that reads as atmospheric depth + scale.
+fn aerial_sky(dir: vec3<f32>) -> vec3<f32> {
+    let horizon = lighting.fog_color.rgb;
+    let zenith = horizon * 0.55 + vec3<f32>(0.10, 0.20, 0.42) * camera.sky_brightness;
+    var col = mix(horizon, zenith, smoothstep(0.0, 0.5, dir.y));
+    let toward = max(dot(dir, lighting.sun_dir.xyz), 0.0);
+    let warm = lighting.sun_color.rgb * 0.8 + horizon * 0.4;
+    col = mix(col, warm, pow(toward, 3.0) * 0.45 * camera.sky_brightness);
+    return col;
+}
+
 fn apply_fog(color: vec3<f32>, world_pos: vec3<f32>) -> vec3<f32> {
     if (lighting.fog_params.z < 0.5) {
         return color;
     }
-    let dist = length(world_pos - lighting.camera_pos.xyz);
-    let f = clamp(
+    let to = world_pos - lighting.camera_pos.xyz;
+    let dist = length(to);
+    let dir = to / max(dist, 1e-4);
+    // Softer curve (haze eases in earlier in the mid-range) toward the directional sky.
+    let lin = clamp(
         (dist - lighting.fog_params.x) / max(lighting.fog_params.y - lighting.fog_params.x, 0.001),
         0.0,
         1.0,
     );
-    return mix(color, lighting.fog_color.rgb, f);
+    let f = pow(lin, 0.75);
+    return mix(color, aerial_sky(dir), f);
 }
 
 @fragment
