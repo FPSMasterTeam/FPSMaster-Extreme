@@ -1025,6 +1025,7 @@ pub struct Renderer {
     /// Ray-traced clones of the solid / cutout colour pipelines (group 3 bound).
     rt_solid_pipeline: Option<wgpu::RenderPipeline>,
     rt_cutout_pipeline: Option<wgpu::RenderPipeline>,
+    rt_glass_glow_pipeline: Option<wgpu::RenderPipeline>,
     /// The acceleration structures + bind group; `Some` only while ray tracing is on.
     ray_tracer: Option<RayTracer>,
     /// Atlas pixels for sampling per-triangle surface colour at section upload (GI).
@@ -1044,6 +1045,15 @@ pub struct Renderer {
     rtao_apply_layout: Option<wgpu::BindGroupLayout>,
     rtao_apply_bind_group: Option<wgpu::BindGroup>,
     rtao_sampler: Option<wgpu::Sampler>,
+    // Full path tracer ("Path Traced" mode). Renders into a persistent accumulation
+    // target with a constant blend factor (running average), reset whenever the view
+    // changes; the converged result is copied into the offscreen scene for post.
+    pt_pipeline: Option<wgpu::RenderPipeline>,
+    pt_group1_bind_group: Option<wgpu::BindGroup>,
+    pt_accum_tex: Option<wgpu::Texture>,
+    pt_accum_view: Option<wgpu::TextureView>,
+    pt_sample_count: u32,
+    pt_prev_view_proj: [[f32; 4]; 4],
     rtao_raw_tex: Option<wgpu::Texture>,
     rtao_raw_view: Option<wgpu::TextureView>,
     rtao_denoised_tex: Option<wgpu::Texture>,
@@ -2050,6 +2060,66 @@ impl Renderer {
                 (Some(solid), Some(cutout))
             }
             _ => (None, None),
+        };
+
+        // Stained-glass glow pass (RT only): after the multiply filter draw, additively
+        // re-draw the glass lit (two-sided) by the point lights × the glass colour, so a
+        // backlit pane glows that colour like a real stained-glass window.
+        let rt_glass_glow_pipeline = match (&rt_shader, &rt_lit_pipeline_layout) {
+            (Some(rt_shader), Some(rt_layout)) => {
+                Some(device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("chunk-glass-glow-pipeline-rt"),
+                    layout: Some(rt_layout),
+                    vertex: wgpu::VertexState {
+                        module: rt_shader,
+                        entry_point: Some("vs_main"),
+                        compilation_options: Default::default(),
+                        buffers: &[ChunkVertex::layout()],
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: rt_shader,
+                        entry_point: Some("fs_glass_glow"),
+                        compilation_options: Default::default(),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format,
+                            // Additive: the glow adds onto the multiply-filtered glass.
+                            blend: Some(wgpu::BlendState {
+                                color: wgpu::BlendComponent {
+                                    src_factor: wgpu::BlendFactor::One,
+                                    dst_factor: wgpu::BlendFactor::One,
+                                    operation: wgpu::BlendOperation::Add,
+                                },
+                                alpha: wgpu::BlendComponent {
+                                    src_factor: wgpu::BlendFactor::Zero,
+                                    dst_factor: wgpu::BlendFactor::One,
+                                    operation: wgpu::BlendOperation::Add,
+                                },
+                            }),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                    }),
+                    primitive: wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::TriangleList,
+                        strip_index_format: None,
+                        front_face: wgpu::FrontFace::Ccw,
+                        cull_mode: Some(wgpu::Face::Back),
+                        polygon_mode: wgpu::PolygonMode::Fill,
+                        unclipped_depth: false,
+                        conservative: false,
+                    },
+                    depth_stencil: Some(wgpu::DepthStencilState {
+                        format: DEPTH_FORMAT,
+                        depth_write_enabled: Some(false),
+                        depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                        stencil: wgpu::StencilState::default(),
+                        bias: wgpu::DepthBiasState::default(),
+                    }),
+                    multisample: wgpu::MultisampleState::default(),
+                    cache: None,
+                    multiview_mask: None,
+                }))
+            }
+            _ => None,
         };
 
         // Screen-space RTAO + denoiser pipelines (only when RT is supported). The AO
@@ -3470,6 +3540,117 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        // Path tracer pipeline: group 0 = RT data (TLAS/params/colours/lights/normals),
+        // group 1 = camera (primary rays) + sky. Constant-blend into the accumulation
+        // target for a temporal running average.
+        let (pt_pipeline, pt_group1_bind_group) = match rt_layout.as_ref() {
+            Some(rt_layout) => {
+                let uni = |binding| wgpu::BindGroupLayoutEntry {
+                    binding,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                };
+                let pt_g1_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("pt-group1-layout"),
+                    entries: &[
+                        uni(0),
+                        uni(1),
+                        // binding 2: block atlas; binding 3: a nearest sampler — so the
+                        // path tracer samples the real (pixel-art) texture at the hit UV.
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 3,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                            count: None,
+                        },
+                    ],
+                });
+                let pt_atlas_view =
+                    block_atlas_texture.create_view(&wgpu::TextureViewDescriptor::default());
+                let pt_atlas_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+                    label: Some("pt-atlas-sampler"),
+                    mag_filter: wgpu::FilterMode::Nearest,
+                    min_filter: wgpu::FilterMode::Nearest,
+                    ..Default::default()
+                });
+                let pt_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("pathtrace-shader"),
+                    source: wgpu::ShaderSource::Wgsl(include_str!("../shader/pathtrace.wgsl").into()),
+                });
+                let pt_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("pt-pipeline-layout"),
+                    bind_group_layouts: &[Some(rt_layout), Some(&pt_g1_layout)],
+                    immediate_size: 0,
+                });
+                let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("pt-pipeline"),
+                    layout: Some(&pt_layout),
+                    vertex: wgpu::VertexState {
+                        module: &pt_shader,
+                        entry_point: Some("vs_main"),
+                        compilation_options: Default::default(),
+                        buffers: &[],
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &pt_shader,
+                        entry_point: Some("fs_main"),
+                        compilation_options: Default::default(),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: HDR_FORMAT,
+                            // Fresh per-frame trace (REPLACE); the temporal denoising is
+                            // done by the existing TAA/DLSS resolve (like the RT effects),
+                            // not a separate PT accumulation — avoids double temporal.
+                            blend: Some(wgpu::BlendState::REPLACE),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                    }),
+                    primitive: wgpu::PrimitiveState::default(),
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState::default(),
+                    cache: None,
+                    multiview_mask: None,
+                });
+                let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("pt-group1-bind-group"),
+                    layout: &pt_g1_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: post_camera_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: sky_uniform_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::TextureView(&pt_atlas_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::Sampler(&pt_atlas_sampler),
+                        },
+                    ],
+                });
+                (Some(pipeline), Some(bg))
+            }
+            None => (None, None),
+        };
         let post_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("post-pipeline-layout"),
             bind_group_layouts: &[Some(&post_layout)],
@@ -4442,6 +4623,7 @@ impl Renderer {
             rt_layout,
             rt_solid_pipeline,
             rt_cutout_pipeline,
+            rt_glass_glow_pipeline,
             ray_tracer: None,
             rt_atlas,
             rtao_pipeline,
@@ -4454,6 +4636,12 @@ impl Renderer {
             rtao_apply_layout,
             rtao_apply_bind_group: None,
             rtao_sampler,
+            pt_pipeline,
+            pt_group1_bind_group,
+            pt_accum_tex: None,
+            pt_accum_view: None,
+            pt_sample_count: 0,
+            pt_prev_view_proj: [[0.0; 4]; 4],
             rtao_raw_tex: None,
             rtao_raw_view: None,
             rtao_denoised_tex: None,
@@ -4527,7 +4715,15 @@ impl Renderer {
     /// and push it to the mesh worker. Returns true if it flipped, so the caller
     /// can re-mesh the loaded world (the vertex format + draw pipeline change).
     fn refresh_flat_meshing(&mut self) -> bool {
-        let flat = !self.smooth_lighting && !self.shaders_enabled;
+        // Only the full PATH TRACER (rt_quality 3 / RECRAFT_PT) forces smooth (non-greedy)
+        // meshing: it reads the per-triangle BLAS pools (normal/uv), and the greedy format
+        // repurposes those vertex slots (tile origin + repeat-uv). Plain RT (1/2) keeps the
+        // user's meshing — forcing it there flipped them into the RT-lit smooth path and
+        // its warm GI ambient unexpectedly. The PT overwrites the raster, so its lighting
+        // doesn't matter there.
+        let pt_env = std::env::var("RECRAFT_PT").map(|v| v == "1").unwrap_or(false);
+        let path_traced = self.rt_quality >= 3 || pt_env;
+        let flat = !self.smooth_lighting && !self.shaders_enabled && !path_traced;
         if flat == self.flat_meshing {
             return false;
         }
@@ -4689,7 +4885,18 @@ impl Renderer {
     /// Ray-tracing quality preset 0..=2 (Low: hard shadows / Medium: + RTAO / High:
     /// soft shadows + more RTAO). Cheap — only changes the per-frame sample counts.
     pub fn set_rt_quality(&mut self, quality: u32) {
-        self.rt_quality = quality.min(2);
+        // 0 off, 1 RT med, 2 RT high, 3 = full Path Traced.
+        self.rt_quality = quality.min(3);
+        // RT forces non-greedy meshing (see refresh_flat_meshing); the caller re-meshes
+        // if `flat_meshing()` flipped.
+        self.refresh_flat_meshing();
+    }
+
+    /// True while the experimental full path tracer is the active mode. `RECRAFT_PT=1`
+    /// forces it on regardless of the quality setting (debug / quick toggle).
+    fn path_tracing(&self) -> bool {
+        let forced = std::env::var("RECRAFT_PT").map(|v| v == "1").unwrap_or(false);
+        (self.rt_quality >= 3 || forced) && self.ray_tracer.is_some() && self.pt_pipeline.is_some()
     }
 
     /// Toggle DLSS upscaling. The temporal upscaler only runs in builds compiled with
@@ -4911,10 +5118,26 @@ impl Renderer {
             format: HDR_FORMAT,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                 | wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::COPY_SRC,
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
         let view = color.create_view(&wgpu::TextureViewDescriptor::default());
+        // Path-tracer temporal accumulation target (persists across frames; blended into
+        // via a constant blend factor, then copied into the offscreen scene for post).
+        let pt_accum = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("pt-accum-hdr"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: HDR_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        self.pt_accum_view = Some(pt_accum.create_view(&wgpu::TextureViewDescriptor::default()));
+        self.pt_accum_tex = Some(pt_accum);
+        self.pt_sample_count = 0; // resized → restart accumulation
         // Temporal AA targets (only allocated when TAA is on): `taa_resolved` is
         // written by the resolve pass and read by bloom / auto-exposure / post in
         // place of the raw scene; `taa_history` holds the previous resolved frame
@@ -4981,10 +5204,14 @@ impl Renderer {
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: HDR_FORMAT,
+                // DLSS writes this externally, so wgpu zero-initialises it before the first
+                // sample via vkCmdClearColorImage — which needs COPY_DST (TRANSFER_DST).
+                // Without it the validation layer flags the clear + a write-after-write.
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                     | wgpu::TextureUsages::TEXTURE_BINDING
                     | wgpu::TextureUsages::STORAGE_BINDING
-                    | wgpu::TextureUsages::COPY_SRC,
+                    | wgpu::TextureUsages::COPY_SRC
+                    | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             });
             let v = t.create_view(&wgpu::TextureViewDescriptor::default());
@@ -5631,7 +5858,16 @@ impl Renderer {
         // Rebuild this section's ray-tracing BLAS from its opaque (solid+cutout)
         // geometry when ray tracing is on; lifecycle stays in lockstep with the mesh.
         if let Some(rt) = self.ray_tracer.as_mut() {
-            rt.upload_section(device, queue, pos, &mesh.solid, &mesh.cutout);
+            rt.upload_section(
+                device,
+                queue,
+                pos,
+                &mesh.solid,
+                &mesh.cutout,
+                &mesh.transparent,
+                &mesh.water,
+                &mesh.lights,
+            );
         }
     }
 
@@ -7132,7 +7368,7 @@ impl Renderer {
                     quality: [shadow_samples, ao_samples, ao_strength, gi_debug],
                 }),
             );
-            rt.build(&mut encoder, origin_i);
+            rt.build(&mut encoder, &self.queue, origin_i);
         }
 
         // Sun shadow pass: render chunk-section depth from the light's view,
@@ -7568,6 +7804,29 @@ impl Renderer {
                         }
                     }
                     cmd_offset += count as u64 * cmd_stride;
+                }
+
+                // Stained-glass glow: additively re-draw the glass lit by the point
+                // lights × its colour, so a backlit pane glows like a stained window
+                // (RT + fancy only). Uses direct draws (no indirect offset replay).
+                if let (Some(glow), Some(rt)) =
+                    (self.rt_glass_glow_pipeline.as_ref(), self.ray_tracer.as_ref())
+                {
+                    pass.set_pipeline(glow);
+                    pass.set_bind_group(3, rt.bind_group(), &[]);
+                    for batch in &trans_batches {
+                        let page = &self.chunk_transparent.pages[batch.page];
+                        pass.set_vertex_buffer(0, page.vertex_buf.slice(..));
+                        pass.set_index_buffer(page.index_buf.slice(..), wgpu::IndexFormat::Uint16);
+                        for c in &batch.cmds {
+                            draw_calls += 1;
+                            pass.draw_indexed(
+                                c.first_index..c.first_index + c.index_count,
+                                c.base_vertex,
+                                0..1,
+                            );
+                        }
+                    }
                 }
             }
 
@@ -8186,6 +8445,34 @@ impl Renderer {
                 ep.set_index_buffer(model.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 ep.draw_indexed(0..model.index_count, 0, 0..1);
             }
+        }
+
+        // Path tracer ("Path Traced" mode): trace primary rays + diffuse bounces with
+        // next-event estimation, overwriting the rasterized world in the offscreen scene
+        // (REPLACE). A fresh, noisy trace each frame — the existing TAA/DLSS resolve below
+        // does the temporal denoising (like the RT effects), so there is NO separate PT
+        // accumulation (which double-counted temporally and sheared under motion).
+        if self.path_tracing() {
+            let mut pp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("path-trace-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+                multiview_mask: None,
+            });
+            pp.set_pipeline(self.pt_pipeline.as_ref().unwrap());
+            pp.set_bind_group(0, self.ray_tracer.as_ref().unwrap().bind_group(), &[]);
+            pp.set_bind_group(1, self.pt_group1_bind_group.as_ref().unwrap(), &[]);
+            pp.draw(0..3, 0..1);
         }
 
         // Temporal AA resolve: blend the current jittered scene with the

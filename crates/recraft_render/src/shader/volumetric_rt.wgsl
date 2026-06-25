@@ -70,7 +70,7 @@ fn sun_lit(p: vec3<f32>) -> f32 {
     rayQueryInitialize(
         &rq,
         rt_tlas,
-        RayDesc(0x04u, 0xFFu, 0.05, 160.0, p, vol.sun_dir.xyz),
+        RayDesc(0x04u, 0x01u, 0.05, 160.0, p, vol.sun_dir.xyz),
     );
     rayQueryProceed(&rq);
     return select(1.0, 0.0, rayQueryGetCommittedIntersection(&rq).kind != 0u);

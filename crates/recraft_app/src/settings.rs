@@ -130,8 +130,9 @@ pub const RENDER_DIST_MIN: u32 = 2;
 pub const RENDER_DIST_MAX: u32 = 32;
 /// Highest selectable mipmap level (16px tiles → mips 0..4).
 pub const MIPMAP_MAX: u32 = 4;
-/// Highest ray-tracing quality preset index (Low = 0, Medium = 1, High = 2).
-pub const RT_QUALITY_MAX: u32 = 2;
+/// Highest ray-tracing quality preset index (Low = 0, Medium = 1, High = 2,
+/// Path Traced = 3, the experimental full path tracer).
+pub const RT_QUALITY_MAX: u32 = 3;
 // Brightness is a gamma knob (0 = darkest shadows, 1 = neutral), not a flat
 // multiplier — it pulls the dark/low-light end down while leaving fully-lit
 // surfaces alone.

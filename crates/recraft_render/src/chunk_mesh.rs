@@ -93,6 +93,9 @@ impl ChunkVertex {
 pub struct ChunkMeshBuffers {
     pub vertices: Vec<ChunkVertex>,
     pub indices: Vec<u16>,
+    /// Transient meshing state: set before emitting an emissive block's faces so each
+    /// pushed vertex is flagged (bit 16 of pos_light.w). Not real output data.
+    emissive: bool,
 }
 
 impl ChunkMeshBuffers {
@@ -139,7 +142,7 @@ impl ChunkMeshBuffers {
             corners.into_iter().zip(uvs).zip(colors).zip(lights)
         {
             self.vertices
-                .push(encode_chunk_vertex(position, color, uv, light, normal));
+                .push(encode_chunk_vertex(position, color, uv, light, normal, self.emissive));
         }
         self.indices
             .extend_from_slice(&[start, start + 1, start + 2, start, start + 2, start + 3]);
@@ -172,6 +175,7 @@ fn encode_chunk_vertex(
     uv: [f32; 2],
     light: [f32; 2],
     normal: [f32; 3],
+    emissive: bool,
 ) -> ChunkVertex {
     let snorm = |x: f32| (x.clamp(-1.0, 1.0) * 127.0).round() as i8;
     let px = (position[0] * 64.0).round() as i32;
@@ -179,7 +183,8 @@ fn encode_chunk_vertex(
     let pz = (position[2] * 64.0).round() as i32;
     let sky_u8 = (light[0] * 255.0 + 0.5) as u8;
     let block_u8 = (light[1] * 255.0 + 0.5) as u8;
-    let w = ((sky_u8 as i32) << 8) | (block_u8 as i32);
+    // bit 16 = self-emissive block flag (read by the shader for the HDR bloom).
+    let w = ((emissive as i32) << 16) | ((sky_u8 as i32) << 8) | (block_u8 as i32);
     ChunkVertex {
         pos_light: [px, py, pz, w],
         color: [
@@ -314,6 +319,16 @@ pub struct MeshBuffers {
 /// A chunk's geometry split by render pass: opaque, alpha-tested cutout
 /// (leaves/plants/glass — keeps the texture's transparent gaps), and
 /// alpha-blended translucent (water/ice/stained glass).
+/// An emissive block recorded during meshing, used as a ray-traced point light.
+/// Position is SECTION-LOCAL (block-centre, 0..16) so it rides the same camera-relative
+/// transform as the section's BLAS geometry; radius is in blocks (~the light level).
+#[derive(Debug, Clone, Copy)]
+pub struct EmissiveLight {
+    pub local_pos: [f32; 3],
+    pub color: [f32; 3],
+    pub radius: f32,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct ChunkMesh {
     pub solid: ChunkMeshBuffers,
@@ -322,6 +337,8 @@ pub struct ChunkMesh {
     /// Water surfaces, split out from `transparent` so they can be drawn with a
     /// dedicated water shader (waves + reflection).
     pub water: ChunkMeshBuffers,
+    /// Emissive blocks in this section, for ray-traced point lighting.
+    pub lights: Vec<EmissiveLight>,
 }
 
 impl ChunkMesh {
@@ -521,6 +538,15 @@ fn append_section_mesh<S: BlockSource>(
                 if block.is_air() {
                     continue;
                 }
+                // Emissive blocks become ray-traced point lights (section-local centre).
+                let lum = block.luminance();
+                if lum > 0 {
+                    mesh.lights.push(EmissiveLight {
+                        local_pos: [x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5],
+                        color: block.light_color(),
+                        radius: lum as f32,
+                    });
+                }
                 // Cubes are handled by greedy_cube_mesh in flat mode.
                 if flat && block.render_shape() == RenderShape::Cube {
                     continue;
@@ -571,6 +597,14 @@ fn append_block<S: BlockSource>(
     z: i32,
     block: BlockState,
 ) {
+    // Flag this block's faces as emissive (a real light source) so the shader glows only
+    // the emitter, not the warm neighbours its block-light reaches. Set on every buffer
+    // since the block routes to one of them.
+    let e = block.luminance() > 0;
+    mesh.solid.emissive = e;
+    mesh.cutout.emissive = e;
+    mesh.transparent.emissive = e;
+    mesh.water.emissive = e;
     match block.render_shape() {
         RenderShape::None => {}
         RenderShape::Cube => append_cube(mesh, ctx, x, y, z, block),

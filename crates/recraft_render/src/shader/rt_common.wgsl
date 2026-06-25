@@ -28,6 +28,14 @@ struct RtParams {
 // instance_custom_data (section base) + primitive_index — for ray-traced reflections.
 @group(3) @binding(2) var<storage, read> rt_tri_colors: array<u32>;
 
+// Emissive point lights (the nearest in-range emitters, camera-relative). The chunk
+// fragment loops over these for ray-traced point lighting with hard shadows.
+struct RtLight {
+    pos_radius: vec4<f32>, // xyz: camera-relative position, w: radius (blocks)
+    color: vec4<f32>,      // rgb: colour, w: intensity (0 = empty slot)
+};
+@group(3) @binding(3) var<storage, read> rt_lights: array<RtLight>;
+
 // Ray flag: stop at the first hit. All BLAS geometry is OPAQUE, so any committed
 // hit means the point is occluded — no need to find the closest one.
 const RT_TERMINATE_ON_FIRST_HIT: u32 = 0x04u;
@@ -73,7 +81,7 @@ fn rt_basis(n: vec3<f32>) -> mat3x3<f32> {
 fn rt_occluded(origin: vec3<f32>, dir: vec3<f32>, tmax: f32) -> bool {
     var rq: ray_query;
     rayQueryInitialize(&rq, rt_tlas,
-        RayDesc(RT_TERMINATE_ON_FIRST_HIT, 0xFFu, 0.02, tmax, origin, dir));
+        RayDesc(RT_TERMINATE_ON_FIRST_HIT, 0x01u, 0.02, tmax, origin, dir));
     // Opaque-only geometry: traversal commits hits itself, so just drain it.
     loop {
         if (!rayQueryProceed(&rq)) { break; }
@@ -166,7 +174,7 @@ fn rt_sky(dir: vec3<f32>) -> vec3<f32> {
 // surface's reflectivity). The no-op stub returns a==0.
 fn rt_reflect(origin: vec3<f32>, dir: vec3<f32>) -> vec4<f32> {
     var rq: ray_query;
-    rayQueryInitialize(&rq, rt_tlas, RayDesc(0u, 0xFFu, 0.05, 160.0, origin, dir));
+    rayQueryInitialize(&rq, rt_tlas, RayDesc(0u, 0x01u, 0.05, 160.0, origin, dir));
     rayQueryProceed(&rq);
     let it = rayQueryGetCommittedIntersection(&rq);
     if (it.kind == 0u) {
@@ -182,12 +190,119 @@ fn rt_reflect(origin: vec3<f32>, dir: vec3<f32>) -> vec4<f32> {
     let sun = lighting.sun_dir.xyz;
     var lit = lighting.ambient.rgb * 0.6;
     var srq: ray_query;
-    rayQueryInitialize(&srq, rt_tlas, RayDesc(RT_TERMINATE_ON_FIRST_HIT, 0xFFu, 0.05, 160.0, hit + sun * 0.05, sun));
+    rayQueryInitialize(&srq, rt_tlas, RayDesc(RT_TERMINATE_ON_FIRST_HIT, 0x01u, 0.05, 160.0, hit + sun * 0.05, sun));
     rayQueryProceed(&srq);
     if (rayQueryGetCommittedIntersection(&srq).kind == 0u) {
         lit = lit + lighting.sun_color.rgb * 0.9;
     }
     return vec4<f32>(albedo * lit, 1.0);
+}
+
+// Voxel block-light scale: with RT point lights active, dial the smooth voxel torch
+// light down (the RT lights supply the sharp, shadowed, coloured point lighting) but
+// keep a base so emitters beyond the light buffer still tint nearby surfaces.
+fn torch_voxel_scale() -> f32 {
+    return 0.45;
+}
+
+// Ray-traced point lighting from emissive blocks: for each in-range light, distance
+// attenuation × N·L × a hard shadow ray (occluded → no contribution). The 128-slot loop
+// early-skips empty / out-of-range / back-facing lights, so only a few nearby emitters
+// actually cast a ray. Returns the coloured light to add to the block-light term.
+fn block_lights(world_pos: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
+    var accum = vec3<f32>(0.0);
+    let count = arrayLength(&rt_lights);
+    let origin = world_pos + n * 0.04;
+    for (var i = 0u; i < count; i = i + 1u) {
+        let L = rt_lights[i];
+        if (L.color.w <= 0.0) {
+            continue;
+        }
+        let to = L.pos_radius.xyz - world_pos;
+        let dist = length(to);
+        if (dist >= L.pos_radius.w) {
+            continue;
+        }
+        let dir = to / max(dist, 1e-4);
+        let ndotl = max(dot(n, dir), 0.0);
+        if (ndotl <= 0.0) {
+            continue;
+        }
+        let r = dist / L.pos_radius.w;
+        // Inverse-square falloff with a smooth radius window: a bright core fading off
+        // gradually (a natural halo) rather than a flat, hard-edged disc.
+        let window = clamp(1.0 - r * r * r * r, 0.0, 1.0);
+        let atten = window / (1.0 + dist * dist * 0.2);
+        // Solid occlusion (mask 0x01): a wall between the surface and the light blocks it.
+        var rq: ray_query;
+        rayQueryInitialize(&rq, rt_tlas, RayDesc(RT_TERMINATE_ON_FIRST_HIT, 0x01u, 0.04, dist - 0.7, origin, dir));
+        rayQueryProceed(&rq);
+        if (rayQueryGetCommittedIntersection(&rq).kind != 0u) {
+            continue;
+        }
+        // Stained glass in the path (mask 0x02) tints the light by the glass colour —
+        // coloured light through coloured glass. The closest pane's pool colour multiplies
+        // the contribution (one glass layer; good enough for a glass box round a light).
+        var light_color = L.color.rgb;
+        var gq: ray_query;
+        rayQueryInitialize(&gq, rt_tlas, RayDesc(0u, 0x02u, 0.04, dist - 0.7, origin, dir));
+        // Closest-hit traversal: drain the query so it commits the nearest glass pane
+        // (a single proceed may not finish the BVH walk → no hit → light not tinted).
+        loop {
+            if (!rayQueryProceed(&gq)) { break; }
+        }
+        let git = rayQueryGetCommittedIntersection(&gq);
+        if (git.kind != 0u) {
+            let packed = rt_tri_colors[git.instance_custom_data + git.primitive_index];
+            let gc = vec3<f32>(
+                f32((packed >> 16u) & 0xFFu),
+                f32((packed >> 8u) & 0xFFu),
+                f32(packed & 0xFFu),
+            ) * (1.0 / 255.0);
+            // The glass FILTERS the light to its own colour. Replace the source hue (not
+            // multiply) and saturate to the brightest channel, so red glass → clean red
+            // light and blue → clean blue — distinct per colour, not the muddied source.
+            let mc = max(gc.r, max(gc.g, gc.b));
+            light_color = gc / max(mc, 0.04);
+        }
+        accum = accum + light_color * (L.color.w * atten * ndotl);
+    }
+    return accum;
+}
+
+// Two-sided raw point light for lighting the stained-glass SURFACE itself (so a light
+// behind the pane makes the whole pane glow): abs(N·L) lights both faces, solid-only
+// occlusion (the glass pane, mask 0x02, doesn't occlude), no glass tint (the caller
+// multiplies by the glass colour). Returns the light reaching the surface.
+fn block_lights_raw(world_pos: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
+    var accum = vec3<f32>(0.0);
+    let count = arrayLength(&rt_lights);
+    for (var i = 0u; i < count; i = i + 1u) {
+        let L = rt_lights[i];
+        if (L.color.w <= 0.0) {
+            continue;
+        }
+        let to = L.pos_radius.xyz - world_pos;
+        let dist = length(to);
+        if (dist >= L.pos_radius.w) {
+            continue;
+        }
+        let dir = to / max(dist, 1e-4);
+        let nl = abs(dot(n, dir));
+        let r = dist / L.pos_radius.w;
+        // Inverse-square falloff with a smooth radius window: a bright core fading off
+        // gradually (a natural halo) rather than a flat, hard-edged disc.
+        let window = clamp(1.0 - r * r * r * r, 0.0, 1.0);
+        let atten = window / (1.0 + dist * dist * 0.2);
+        var rq: ray_query;
+        rayQueryInitialize(&rq, rt_tlas, RayDesc(RT_TERMINATE_ON_FIRST_HIT, 0x01u, 0.04, dist - 0.7, world_pos + dir * 0.05, dir));
+        rayQueryProceed(&rq);
+        if (rayQueryGetCommittedIntersection(&rq).kind != 0u) {
+            continue;
+        }
+        accum = accum + L.color.rgb * (L.color.w * atten * nl);
+    }
+    return accum;
 }
 
 // Flat sky-ambient scale. When the screen-space sky GI is active (AO samples > 0) it
