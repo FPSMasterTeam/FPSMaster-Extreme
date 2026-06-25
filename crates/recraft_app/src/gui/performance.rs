@@ -36,13 +36,18 @@ fn fsr_label(scale: f32) -> String {
 
 /// Ray-tracing quality presets (placeholder — no RT path yet). Indices match
 /// `Settings::rt_quality` (Low/Medium/High).
-const RT_QUALITY_KEYS: [&str; 3] = [
+const RT_QUALITY_KEYS: [&str; 4] = [
     "recraft.perf.rt.low",
     "recraft.perf.rt.medium",
     "recraft.perf.rt.high",
+    "recraft.perf.rt.pathtraced",
 ];
 
 fn rt_quality_label(q: u32) -> String {
+    // Level 3 is the experimental full path tracer — not localised (advanced control).
+    if q >= 3 {
+        return "Path Traced".to_string();
+    }
     tr(RT_QUALITY_KEYS[(q as usize).min(RT_QUALITY_KEYS.len() - 1)])
 }
 

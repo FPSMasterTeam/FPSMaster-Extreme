@@ -63,6 +63,23 @@ impl BlockState {
         }
     }
 
+    /// The colour an emissive block radiates as a point light (linear RGB, ~unit
+    /// brightness). Most emitters are warm (lava/torch/glowstone/fire); a few are
+    /// distinctly coloured (redstone red, sea lantern / beacon cool white).
+    pub fn light_color(self) -> [f32; 3] {
+        match self.id {
+            10 | 11 => [1.0, 0.45, 0.12], // lava — deep orange
+            51 => [1.0, 0.55, 0.18],      // fire — orange
+            50 | 91 => [1.0, 0.72, 0.40],  // torch / jack o'lantern — warm
+            74 | 76 => [1.0, 0.12, 0.05], // redstone ore / torch — red
+            124 => [1.0, 0.50, 0.22],     // redstone lamp — warm amber
+            89 => [1.0, 0.85, 0.62],      // glowstone — warm white
+            169 | 138 => [0.7, 0.92, 1.0], // sea lantern / beacon — cool white
+            90 | 119 => [0.65, 0.35, 1.0], // nether / end portal — violet
+            _ => [1.0, 0.78, 0.5],         // default warm
+        }
+    }
+
     fn shape(self) -> Shape {
         blocks::def(self.id)
             .map_or(Shape::Cube, |def| def.shape)

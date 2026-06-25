@@ -67,6 +67,10 @@ struct VertexOutput {
     @location(2) light: vec2<f32>,
     @location(3) world_pos: vec3<f32>,
     @location(4) normal: vec3<f32>,
+    // 1.0 for surfaces of a self-emissive block (lava/glowstone/fire/…), packed in
+    // bit 16 of pos_light.w by the mesher — the only reliable emitter marker (the
+    // voxel block-light is also high on lit NEIGHBOURS, which caused glow rings).
+    @location(5) emissive: f32,
 };
 
 @vertex
@@ -81,6 +85,7 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     out.uv = input.uv;
     let w_bits = u32(input.pos_light.w) & 0xFFFFu;
     out.light = vec2<f32>(f32((w_bits >> 8u) & 0xFFu) / 255.0, f32(w_bits & 0xFFu) / 255.0);
+    out.emissive = f32((u32(input.pos_light.w) >> 16u) & 1u);
     out.world_pos = world_pos;
     out.normal = input.normal.xyz;
     return out;
@@ -215,7 +220,11 @@ fn apply_lighting(albedo: vec3<f32>, in: VertexOutput) -> vec3<f32> {
     // is active (it adds the directional sky lighting additively afterward); a small
     // base is always kept. With RT off, gi_ambient_scale() = 1 (unchanged).
     let ambient = lighting.ambient.rgb * (0.08 + 0.92 * sky * day * gi_ambient_scale());
-    let torch = vec3<f32>(1.0, 0.82, 0.55) * block;
+    // Block (torch/lava) light: the smooth voxel block-light, scaled down when RT point
+    // lights are active, PLUS the ray-traced point lights (sharp, shadowed, coloured).
+    // In the non-RT build torch_voxel_scale()=1 and block_lights()=0 (unchanged look).
+    let torch = vec3<f32>(1.0, 0.82, 0.55) * block * torch_voxel_scale()
+        + block_lights(in.world_pos, geo_n);
 
     if (pbr_on) {
         let view_dir = normalize(lighting.camera_pos.xyz - in.world_pos);
@@ -265,14 +274,15 @@ fn apply_lighting(albedo: vec3<f32>, in: VertexOutput) -> vec3<f32> {
         let spec = pow(max(dot(n, half_dir), 0.0), 48.0);
         lit = lit + lighting.sun_color.rgb * (spec * shadow * sky * 0.25);
     }
-    // Self-emissive glow: a bright, WARM surface at full block-light is a light source
-    // (lava, glowstone, fire, magma) — push it to HDR so it overflows into bloom and
-    // reads as actually emitting. The warmth + block-light gates exclude sunlit-bright
-    // or cool-bright blocks (snow/white wool) that aren't emitters.
-    let e_bright = dot(albedo, vec3<f32>(0.3, 0.5, 0.2));
-    let e_warm = clamp(albedo.r - albedo.b * 0.7, 0.0, 1.0);
-    let emit = smoothstep(0.32, 0.65, e_bright) * smoothstep(0.3, 0.6, e_warm) * smoothstep(0.6, 0.9, block);
-    lit = lit + albedo * emit * 3.5;
+    // Self-emissive glow: surfaces of an actual emitter block (per-block flag from the
+    // mesher) are pushed to HDR so they overflow into bloom. Using the flag — not a
+    // brightness/block-light heuristic — means only the emitter glows, not the warm
+    // neighbours its block-light reaches (which produced spurious glow rings).
+    if (in.emissive > 0.5) {
+        // Modest HDR lift so the emitter blooms but keeps its own colour (a big lift
+        // oversaturates the bright core to white — the "wrong colour" look).
+        lit = lit + albedo * 0.8;
+    }
     return lit;
 }
 
@@ -362,6 +372,22 @@ fn fs_glass(input: VertexOutput) -> @location(0) vec4<f32> {
     let half_dir = normalize(lighting.sun_dir.xyz + view_dir);
     let glint = pow(max(dot(geo_n, half_dir), 0.0), 120.0) * max(camera.sky_brightness, 0.0);
     return vec4<f32>(clamp(tinted + glint * 0.4, vec3<f32>(0.0), vec3<f32>(2.0)), 1.0);
+}
+
+// Additive glow pass for stained glass: the pane is lit (two-sided) by the ray-traced
+// point lights and tinted by the glass colour, so a light behind it makes the WHOLE
+// pane glow that colour — a backlit stained-glass window. Drawn additively after the
+// multiply filter pass. Only built on the RT path (block_lights_raw is the live one).
+@fragment
+fn fs_glass_glow(input: VertexOutput) -> @location(0) vec4<f32> {
+    let texel = textureSample(block_atlas, block_sampler, input.uv);
+    let glass = texel.rgb * input.color.rgb;
+    let n = normalize(input.normal);
+    let lit = block_lights_raw(input.world_pos, n);
+    // Gentle, clamped glow: enough that a backlit pane reads as lit, but capped so a
+    // bright light behind doesn't blow it into a big bloom disc or wash out the glass.
+    let glow = min(lit * glass * 0.35, vec3<f32>(0.6));
+    return vec4<f32>(glow, 1.0);
 }
 
 // G-buffer for the screen-space RT sky-lighting pass: location 0 = geometric normal

@@ -105,7 +105,7 @@ fn basis(n: vec3<f32>) -> mat3x3<f32> {
 fn occluded(origin: vec3<f32>, dir: vec3<f32>, tmax: f32) -> bool {
     var rq: ray_query;
     // flags 0x04 = terminate on first hit (any-hit is enough for occlusion).
-    rayQueryInitialize(&rq, tlas, RayDesc(0x04u, 0xFFu, 0.02, tmax, origin, dir));
+    rayQueryInitialize(&rq, tlas, RayDesc(0x04u, 0x01u, 0.02, tmax, origin, dir));
     rayQueryProceed(&rq);
     return rayQueryGetCommittedIntersection(&rq).kind != 0u;
 }
@@ -164,7 +164,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         let dir = bn * local;
         var rq: ray_query;
         // No terminate flag -> closest hit (opaque BLAS commits the nearest).
-        rayQueryInitialize(&rq, tlas, RayDesc(0x00u, 0xFFu, 0.02, tmax, origin, dir));
+        rayQueryInitialize(&rq, tlas, RayDesc(0x00u, 0x01u, 0.02, tmax, origin, dir));
         rayQueryProceed(&rq);
         let it = rayQueryGetCommittedIntersection(&rq);
         if (it.kind == 0u) {
@@ -180,8 +180,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                     f32((packed >> 8u) & 0xFFu),
                     f32(packed & 0xFFu),
                 ) * (1.0 / 255.0);
-                // rt.quality.w is the debug exaggeration (0 in normal play).
-                irradiance = irradiance + sun_color * hit_albedo * (1.6 + rt.quality.w);
+                irradiance = irradiance + sun_color * hit_albedo * 1.6;
             }
         }
     }

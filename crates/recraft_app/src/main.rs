@@ -1278,7 +1278,16 @@ fn handle_actions(
                 // acceleration structures; the meshing budget spreads it over frames.
                 app.game.mark_all_sections_dirty();
             }
-            GuiAction::SetRtQuality(q) => renderer.set_rt_quality(q),
+            GuiAction::SetRtQuality(q) => {
+                // RT forces non-greedy meshing; if that flips the mesh format, re-mesh the
+                // world so the RT BLAS gets real normals/UVs (not the greedy repurposed
+                // slots).
+                let was_flat = renderer.flat_meshing();
+                renderer.set_rt_quality(q);
+                if renderer.flat_meshing() != was_flat {
+                    app.game.mark_all_sections_dirty();
+                }
+            }
             GuiAction::SetDlss(on) => renderer.set_dlss(on),
             GuiAction::SetDlssQuality(q) => renderer.set_dlss_quality(q),
             GuiAction::SetFancyGraphics(on) => {

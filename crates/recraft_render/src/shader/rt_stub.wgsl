@@ -34,3 +34,14 @@ fn gi_ambient_scale() -> f32 {
 fn rt_reflect(origin: vec3<f32>, dir: vec3<f32>) -> vec4<f32> {
     return vec4<f32>(0.0);
 }
+
+// No RT point lights: keep the full voxel block-light, add nothing.
+fn torch_voxel_scale() -> f32 {
+    return 1.0;
+}
+fn block_lights(world_pos: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
+    return vec3<f32>(0.0);
+}
+fn block_lights_raw(world_pos: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
+    return vec3<f32>(0.0);
+}
