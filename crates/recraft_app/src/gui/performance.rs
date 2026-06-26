@@ -3,11 +3,12 @@
 //! (sun shadows + RTAO) drive the renderer. DLSS drives it too when built with the
 //! `dlss` feature; otherwise the toggle persists and falls back to FSR/TAA.
 
+use recraft_render::UiRect;
 use winit::event::{ElementState, KeyEvent};
 use winit::keyboard::{KeyCode, PhysicalKey};
 
-use super::options::GuiVideoSettings;
-use super::widgets::GuiButton;
+use super::options::{draw_slider, slider_fraction, GuiVideoSettings};
+use super::widgets::{GuiButton, BUTTON_HEIGHT};
 use super::{draw_centered_text, draw_default_background, DrawCtx, GuiAction, GuiScreen, ScreenCtx};
 use crate::i18n::tr;
 
@@ -51,13 +52,15 @@ fn rt_quality_label(q: u32) -> String {
     tr(RT_QUALITY_KEYS[(q as usize).min(RT_QUALITY_KEYS.len() - 1)])
 }
 
-/// DLSS quality presets (index = `Settings::dlss_quality`). Higher render resolution
-/// (Quality/DLAA) = less RT noise; lower (Performance) = more FPS. Not localised — an
+/// DLSS quality slider stops (index = `Settings::dlss_quality`), labelled by the
+/// pixel-area upscale factor and the DLSS mode each maps to. 9x (UltraPerformance) is
+/// DLSS's hardware ceiling — it can't render below 1/3 linear res. Not localised — an
 /// advanced/NVIDIA-specific control.
-const DLSS_QUALITY_LABELS: [&str; 5] = ["Auto", "Quality", "Balanced", "Performance", "DLAA"];
+const DLSS_QUALITY_STOPS: [&str; 4] =
+    ["1x (DLAA)", "2x (Quality)", "4x (Performance)", "9x (UltraPerf)"];
 
 fn dlss_quality_label(q: u32) -> &'static str {
-    DLSS_QUALITY_LABELS[(q as usize).min(DLSS_QUALITY_LABELS.len() - 1)]
+    DLSS_QUALITY_STOPS[(q as usize).min(DLSS_QUALITY_STOPS.len() - 1)]
 }
 
 #[derive(Default)]
@@ -65,10 +68,11 @@ pub struct GuiPerformance {
     taa: Option<GuiButton>,
     fsr: Option<GuiButton>,
     dlss: Option<GuiButton>,
-    dlss_quality: Option<GuiButton>,
+    dlss_quality_rect: UiRect,
     rt: Option<GuiButton>,
     rt_quality: Option<GuiButton>,
     done: Option<GuiButton>,
+    dragging_dlss_quality: bool,
     from_main_menu: bool,
 }
 
@@ -95,7 +99,7 @@ impl GuiPerformance {
         self.fsr = Some(GuiButton::at_px(x, row(1), cw, s, ""));
         // DLSS toggle + quality (renderer path gated behind the `dlss` build feature).
         self.dlss = Some(GuiButton::at_px(x, row(2), cw, s, ""));
-        self.dlss_quality = Some(GuiButton::at_px(x, row(3), cw, s, ""));
+        self.dlss_quality_rect = UiRect::new(x, row(3), cw, BUTTON_HEIGHT * s);
         self.rt = Some(GuiButton::at_px(x, row(4), cw, s, ""));
         self.rt_quality = Some(GuiButton::at_px(x, row(5), cw, s, ""));
         self.done = Some(GuiButton::at_px(x, row(6) + 12 * s, cw, s, tr("gui.done")));
@@ -108,18 +112,18 @@ fn on_off(b: bool) -> String {
 
 impl GuiScreen for GuiPerformance {
     fn clicks_button(&self, x: f64, y: f64) -> bool {
-        [
-            self.taa.as_ref(),
-            self.fsr.as_ref(),
-            self.dlss.as_ref(),
-            self.dlss_quality.as_ref(),
-            self.rt.as_ref(),
-            self.rt_quality.as_ref(),
-            self.done.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        .any(|b| b.clicked(x, y))
+        self.dlss_quality_rect.contains(x, y)
+            || [
+                self.taa.as_ref(),
+                self.fsr.as_ref(),
+                self.dlss.as_ref(),
+                self.rt.as_ref(),
+                self.rt_quality.as_ref(),
+                self.done.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|b| b.clicked(x, y))
     }
 
     fn draw(&mut self, ui: &mut recraft_render::UiFrame, ctx: &DrawCtx) {
@@ -151,14 +155,18 @@ impl GuiScreen for GuiPerformance {
             "--features dlss".to_string()
         };
         draw(&mut self.dlss, format!("{}: {}", tr("recraft.perf.dlss"), dlss_value));
-        draw(
-            &mut self.dlss_quality,
-            format!("DLSS {}: {}", tr("recraft.perf.rt.quality"), dlss_quality_label(st.dlss_quality)),
-        );
         draw(&mut self.rt, format!("{}: {}", tr("recraft.perf.rt"), on_off(st.ray_tracing)));
         draw(
             &mut self.rt_quality,
             format!("{}: {}", tr("recraft.perf.rt.quality"), rt_quality_label(st.rt_quality)),
+        );
+        // The closure above mutably borrows `ui`; draw the slider after its last use.
+        draw_slider(
+            ui,
+            self.dlss_quality_rect,
+            s,
+            st.clone().dlss_quality_fraction(),
+            &format!("DLSS {}: {}", tr("recraft.perf.rt.quality"), dlss_quality_label(st.dlss_quality)),
         );
         if let Some(b) = &self.done {
             b.draw(ui, s, ctx.mouse, ctx.mouse_down);
@@ -213,18 +221,16 @@ impl GuiScreen for GuiPerformance {
             actions.push(GuiAction::SaveSettings);
             return actions;
         }
-        // DLSS quality: cycle Auto/Quality/Balanced/Performance/DLAA. Higher render res
-        // = less RT noise. Inert without the dlss build.
-        if self.dlss_quality.as_ref().is_some_and(|b| b.clicked(x, y)) {
+        // DLSS quality slider (1x DLAA … 9x UltraPerformance). Inert without the dlss
+        // build. Like render scale, the renderer rebuild happens on release, not per tick.
+        if self.dlss_quality_rect.contains(x, y) {
             if !cfg!(feature = "dlss") {
                 return Vec::new();
             }
-            ctx.settings.dlss_quality =
-                (ctx.settings.dlss_quality + 1) % DLSS_QUALITY_LABELS.len() as u32;
-            return vec![
-                GuiAction::SetDlssQuality(ctx.settings.dlss_quality),
-                GuiAction::SaveSettings,
-            ];
+            self.dragging_dlss_quality = true;
+            ctx.settings
+                .set_dlss_quality_from01(slider_fraction(self.dlss_quality_rect, x));
+            return Vec::new();
         }
         // Ray tracing (shadows + RTAO) is orthogonal to the upscalers — it can run
         // alongside TAA, which also denoises the soft-shadow / RTAO samples.
@@ -246,6 +252,31 @@ impl GuiScreen for GuiPerformance {
             return vec![GuiAction::SaveSettings, GuiAction::SetScreen(self.back_screen())];
         }
         Vec::new()
+    }
+
+    fn mouse_dragged(&mut self, x: f64, _y: f64, ctx: &mut ScreenCtx) {
+        if self.dragging_dlss_quality {
+            ctx.settings
+                .set_dlss_quality_from01(slider_fraction(self.dlss_quality_rect, x));
+        }
+    }
+
+    fn mouse_released(
+        &mut self,
+        _x: f64,
+        _y: f64,
+        _right: bool,
+        ctx: &mut ScreenCtx,
+    ) -> Vec<GuiAction> {
+        if !self.dragging_dlss_quality {
+            return Vec::new();
+        }
+        // Applying drops + rebuilds the DLSS context, so commit once on release.
+        self.dragging_dlss_quality = false;
+        vec![
+            GuiAction::SetDlssQuality(ctx.settings.dlss_quality),
+            GuiAction::SaveSettings,
+        ]
     }
 
     fn key_pressed(&mut self, event: &KeyEvent, _ctx: &mut ScreenCtx) -> Vec<GuiAction> {

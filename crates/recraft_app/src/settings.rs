@@ -48,8 +48,10 @@ pub struct Settings {
     /// DLSS upscaler master toggle (NVIDIA RTX + Vulkan; only active in the `dlss`
     /// build). Replaces FSR/TAA when on.
     pub dlss: bool,
-    /// DLSS quality preset: 0 Auto / 1 Quality / 2 Balanced / 3 Performance / 4 DLAA.
-    /// Higher = higher render resolution = less RT noise (but smaller FPS gain).
+    /// DLSS quality, as a pixel-area upscale factor (slider index `0..=DLSS_QUALITY_MAX`):
+    /// 0 = 1x (DLAA, native) / 1 = 2x (Quality) / 2 = 4x (Performance) / 3 = 9x
+    /// (UltraPerformance, DLSS's hardware ceiling). Higher = lower render resolution =
+    /// more FPS but more RT noise.
     pub dlss_quality: u32,
     /// Fancy graphics: sky gradient + see-through (alpha-blended) water. Off =
     /// flat horizon sky + opaque water, skipping the heaviest per-pixel work.
@@ -123,7 +125,10 @@ pub const RESOLUTION_PRESETS: [Option<(u32, u32)>; 6] = [
 const FPS_MIN: u32 = 30;
 const FPS_MAX: u32 = 260;
 const FPS_STEP: u32 = 10;
-pub const RENDER_SCALE_MIN: f32 = 0.5;
+pub const RENDER_SCALE_MIN: f32 = 0.1;
+/// DLSS quality slider top index (4 stops: 1x DLAA / 2x Quality / 4x Performance /
+/// 9x UltraPerformance — the achievable DLSS modes).
+pub const DLSS_QUALITY_MAX: u32 = 3;
 /// Render-distance bounds in chunks (vanilla spans 2..32; we cap lower to keep
 /// the square cull cheap and the default modest for weak hardware).
 pub const RENDER_DIST_MIN: u32 = 2;
@@ -397,6 +402,7 @@ impl Settings {
         s.render_distance = s.render_distance.clamp(RENDER_DIST_MIN, RENDER_DIST_MAX);
         s.mipmap_levels = s.mipmap_levels.min(MIPMAP_MAX);
         s.rt_quality = s.rt_quality.min(RT_QUALITY_MAX);
+        s.dlss_quality = s.dlss_quality.min(DLSS_QUALITY_MAX);
         s.brightness = s.brightness.clamp(BRIGHTNESS_MIN, BRIGHTNESS_MAX);
         s.resolution = if res_w > 0 && res_h > 0 {
             Some((res_w, res_h))
@@ -519,8 +525,17 @@ impl Settings {
 
     pub fn set_render_scale_from01(&mut self, value: f32) {
         let raw = RENDER_SCALE_MIN + value.clamp(0.0, 1.0) * (1.0 - RENDER_SCALE_MIN);
-        // Snap to 5% steps for clean labels (50%, 55%, … 100%).
+        // Snap to 5% steps for clean labels (10%, 15%, … 100%).
         self.render_scale = ((raw * 20.0).round() / 20.0).clamp(RENDER_SCALE_MIN, 1.0);
+    }
+
+    /// DLSS-quality slider fill fraction in 0..=1 (knob snaps to the 4 stops).
+    pub fn dlss_quality_fraction(self) -> f32 {
+        self.dlss_quality.min(DLSS_QUALITY_MAX) as f32 / DLSS_QUALITY_MAX as f32
+    }
+
+    pub fn set_dlss_quality_from01(&mut self, value: f32) {
+        self.dlss_quality = (value.clamp(0.0, 1.0) * DLSS_QUALITY_MAX as f32).round() as u32;
     }
 
     /// Render-distance slider fill fraction in 0..=1.
