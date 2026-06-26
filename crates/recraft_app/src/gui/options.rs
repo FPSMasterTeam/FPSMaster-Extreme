@@ -30,7 +30,7 @@ fn root_screen(from_main_menu: bool) -> Box<dyn GuiScreen> {
 }
 
 /// Fraction (0..1) of `rect` that `x` falls at, for slider dragging.
-fn slider_fraction(rect: UiRect, x: f64) -> f32 {
+pub(crate) fn slider_fraction(rect: UiRect, x: f64) -> f32 {
     if rect.width <= 0 {
         return 0.0;
     }
@@ -39,7 +39,7 @@ fn slider_fraction(rect: UiRect, x: f64) -> f32 {
 
 /// Draw a vanilla slider: disabled-button track plus an 8px-wide knob from
 /// the idle button texture, with a centered label.
-fn draw_slider(ui: &mut UiFrame, rect: UiRect, scale: i32, fraction: f32, label: &str) {
+pub(crate) fn draw_slider(ui: &mut UiFrame, rect: UiRect, scale: i32, fraction: f32, label: &str) {
     ui.rect(rect, UiColor::rgba(50, 50, 50, 220));
     let width_gui = (rect.width / scale).clamp(2, 200);
     let half = width_gui / 2;

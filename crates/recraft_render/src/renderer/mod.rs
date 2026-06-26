@@ -4938,12 +4938,13 @@ impl Renderer {
     pub fn set_dlss_quality(&mut self, quality: u32) {
         #[cfg(feature = "dlss")]
         {
+            // Slider index → DLSS mode, by pixel-area upscale factor:
+            // 0 = 1x (DLAA) / 1 = 2x (Quality) / 2 = 4x (Performance) / 3 = 9x (UltraPerformance).
             let mode = match quality {
-                0 => dlss_wgpu::DlssPerfQualityMode::Auto,
+                0 => dlss_wgpu::DlssPerfQualityMode::Dlaa,
                 1 => dlss_wgpu::DlssPerfQualityMode::Quality,
-                2 => dlss_wgpu::DlssPerfQualityMode::Balanced,
-                3 => dlss_wgpu::DlssPerfQualityMode::Performance,
-                _ => dlss_wgpu::DlssPerfQualityMode::Dlaa,
+                2 => dlss_wgpu::DlssPerfQualityMode::Performance,
+                _ => dlss_wgpu::DlssPerfQualityMode::UltraPerformance,
             };
             self.dlss_quality_mode = mode;
             self.dlss = None;
