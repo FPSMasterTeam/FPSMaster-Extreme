@@ -5860,9 +5860,16 @@ impl Renderer {
         }
     }
 
-    /// Upload up to `max` finished background meshes to the GPU. Results for
-    /// sections unloaded since they were queued are discarded.
+    /// Upload finished background meshes to the GPU, bounded by BOTH `max` (a hard
+    /// safety cap) and a per-frame wall-clock budget. A dense section's geometry
+    /// costs far more to `write_buffer` than a sparse one, so a fixed count let a
+    /// burst of freshly-meshed sections stall a frame for tens of ms (the dominant
+    /// chunk-load spike); the time budget caps that and spreads the rest over later
+    /// frames. Removals (unloaded sections) are cheap and never throttled. Results
+    /// for sections unloaded since they were queued are discarded.
     pub fn process_ready_meshes(&mut self, world: &World, max: usize) -> usize {
+        let budget = std::time::Duration::from_millis(4);
+        let start = std::time::Instant::now();
         let mut processed = 0;
         let mut uploaded = 0;
         while processed < max {
@@ -5878,6 +5885,11 @@ impl Renderer {
             } else {
                 self.upload_chunk_mesh(pos, &mesh);
                 uploaded += 1;
+                // Stop once this frame's upload budget is spent (after at least one
+                // upload). The rest stay queued in the worker channel for next frame.
+                if start.elapsed() >= budget {
+                    break;
+                }
             }
         }
         uploaded
