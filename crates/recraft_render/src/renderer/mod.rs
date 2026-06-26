@@ -1108,6 +1108,36 @@ fn dlss_project_id() -> uuid::Uuid {
     uuid::Uuid::from_u128(0x9a1d_5f00_7c3e_4b21_8f6a_2e9c_0d4b_1a37)
 }
 
+/// Build the wgpu instance, window surface and a hardware adapter (with a software
+/// fallback) via the normal multi-backend path. Used by the default build, and by the
+/// dlss build whenever the Vulkan/NGX path isn't available.
+fn request_standard_adapter(
+    instance_descriptor: wgpu::InstanceDescriptor,
+    window: Arc<Window>,
+) -> Result<(wgpu::Instance, wgpu::Surface<'static>, wgpu::Adapter), RendererError> {
+    let instance = wgpu::Instance::new(instance_descriptor);
+    let surface = instance
+        .create_surface(window)
+        .map_err(|err| RendererError::Surface(err.to_string()))?;
+    let adapter = match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        compatible_surface: Some(&surface),
+        force_fallback_adapter: false,
+    })) {
+        Ok(adapter) => adapter,
+        Err(_) => {
+            log::warn!("no hardware GPU adapter found, falling back to software rendering");
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::LowPower,
+                compatible_surface: Some(&surface),
+                force_fallback_adapter: true,
+            }))
+            .map_err(|_| RendererError::NoAdapter)?
+        }
+    };
+    Ok((instance, surface, adapter))
+}
+
 impl Renderer {
     pub fn new(window: Arc<Window>) -> Result<Self, RendererError> {
         let size = window.inner_size();
@@ -1115,39 +1145,48 @@ impl Renderer {
         // from the environment (e.g. WGPU_BACKEND=dx12 for per-backend testing).
         let instance_descriptor =
             wgpu::InstanceDescriptor::new_without_display_handle_from_env();
-        // DLSS builds create the instance + device through `dlss_wgpu` so the Vulkan
-        // instance/device carry the NGX extensions DLSS needs (it forces Vulkan
-        // internally). The default build uses the normal wgpu path on any backend.
-        // Both share all the rest of init below.
+        // DLSS needs a Vulkan instance/device carrying NGX extensions, but Vulkan may be
+        // absent (or the GPU non-NVIDIA). So the dlss build tries the DLSS/Vulkan path
+        // first and falls back to the normal multi-backend wgpu path — DLSS disabled —
+        // when Vulkan or a Vulkan adapter isn't available. `dlss_support` is `Some` only
+        // on the Vulkan path. The default build always uses the normal path.
         #[cfg(feature = "dlss")]
-        let mut dlss_support = dlss_wgpu::FeatureSupport::default();
-        #[cfg(feature = "dlss")]
-        let instance =
-            dlss_wgpu::create_instance(dlss_project_id(), &instance_descriptor, &mut dlss_support)
-                .map_err(|e| RendererError::RequestDevice(format!("DLSS create_instance: {e:?}")))?;
-        #[cfg(not(feature = "dlss"))]
-        let instance = wgpu::Instance::new(instance_descriptor);
-        let surface = instance.create_surface(window)
-            .map_err(|err| RendererError::Surface(err.to_string()))?;
-        let adapter = match pollster::block_on(instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
-            }))
-        {
-            Ok(adapter) => adapter,
-            Err(_) => {
-                log::warn!("no hardware GPU adapter found, falling back to software rendering");
-                pollster::block_on(instance
-                    .request_adapter(&wgpu::RequestAdapterOptions {
-                        power_preference: wgpu::PowerPreference::LowPower,
+        let (_instance, surface, adapter, mut dlss_support) = {
+            let mut support = dlss_wgpu::FeatureSupport::default();
+            // `create_instance` only errors when Vulkan itself is unavailable; a
+            // non-NVIDIA Vulkan box succeeds with `super_resolution_supported = false`.
+            let vulkan = dlss_wgpu::create_instance(
+                dlss_project_id(),
+                &instance_descriptor,
+                &mut support,
+            )
+            .ok()
+            .and_then(|instance| {
+                let surface = instance.create_surface(window.clone()).ok()?;
+                let adapter = pollster::block_on(instance.request_adapter(
+                    &wgpu::RequestAdapterOptions {
+                        power_preference: wgpu::PowerPreference::HighPerformance,
                         compatible_surface: Some(&surface),
-                        force_fallback_adapter: true,
-                    }))
-                    .map_err(|_| RendererError::NoAdapter)?
+                        force_fallback_adapter: false,
+                    },
+                ))
+                .ok()?;
+                Some((instance, surface, adapter))
+            });
+            match vulkan {
+                Some((instance, surface, adapter)) => (instance, surface, adapter, Some(support)),
+                None => {
+                    log::warn!(
+                        "DLSS build: Vulkan/NGX path unavailable; using the standard wgpu backend (DLSS disabled)"
+                    );
+                    let (instance, surface, adapter) =
+                        request_standard_adapter(instance_descriptor, window)?;
+                    (instance, surface, adapter, None)
+                }
             }
         };
+        #[cfg(not(feature = "dlss"))]
+        let (_instance, surface, adapter) = request_standard_adapter(instance_descriptor, window)?;
 
         let info = adapter.get_info();
         log::info!(
@@ -1190,17 +1229,23 @@ impl Renderer {
                 wgpu::ExperimentalFeatures::disabled()
             },
         };
-        // DLSS build: create the device through `dlss_wgpu` so it carries the NGX
-        // device extensions (and still our ray-query feature). Default build: normal.
+        // On the Vulkan/DLSS path create the device through `dlss_wgpu` so it carries the
+        // NGX device extensions (and still our ray-query feature). When we fell back to
+        // the standard backend (or in the default build) use the normal wgpu device —
+        // `dlss_wgpu::request_device` would reject a non-Vulkan adapter.
         #[cfg(feature = "dlss")]
-        let (device, queue) = dlss_wgpu::request_device(
-            dlss_project_id(),
-            &adapter,
-            &device_descriptor,
-            &mut dlss_support,
-            None,
-        )
-        .map_err(|e| RendererError::RequestDevice(format!("DLSS request_device: {e:?}")))?;
+        let (device, queue) = match dlss_support.as_mut() {
+            Some(support) => dlss_wgpu::request_device(
+                dlss_project_id(),
+                &adapter,
+                &device_descriptor,
+                support,
+                None,
+            )
+            .map_err(|e| RendererError::RequestDevice(format!("DLSS request_device: {e:?}")))?,
+            None => pollster::block_on(adapter.request_device(&device_descriptor))
+                .map_err(|err| RendererError::RequestDevice(err.to_string()))?,
+        };
         #[cfg(not(feature = "dlss"))]
         let (device, queue) = pollster::block_on(adapter.request_device(&device_descriptor))
             .map_err(|err| RendererError::RequestDevice(err.to_string()))?;
@@ -1254,7 +1299,7 @@ impl Renderer {
         #[cfg(feature = "dlss")]
         let dlss: Option<crate::dlss::Dlss> = None;
         #[cfg(feature = "dlss")]
-        if !dlss_support.super_resolution_supported {
+        if !dlss_support.as_ref().is_some_and(|s| s.super_resolution_supported) {
             log::warn!("DLSS not supported on this device/driver; using FSR/TAA");
         }
 
@@ -4659,7 +4704,9 @@ impl Renderer {
             #[cfg(feature = "dlss")]
             adapter,
             #[cfg(feature = "dlss")]
-            dlss_supported: dlss_support.super_resolution_supported,
+            dlss_supported: dlss_support
+                .as_ref()
+                .is_some_and(|s| s.super_resolution_supported),
             #[cfg(feature = "dlss")]
             dlss_quality_mode: dlss_wgpu::DlssPerfQualityMode::Quality,
             #[cfg(feature = "dlss")]
