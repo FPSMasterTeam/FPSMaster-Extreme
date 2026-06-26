@@ -2,6 +2,7 @@ mod auth;
 mod chat;
 mod container;
 mod ext_bridge;
+mod frame_profiler;
 mod game;
 mod gui;
 mod item_renderer;
@@ -89,6 +90,10 @@ struct LaunchConfig {
     /// Force the window's physical-pixel inner size (`--window WxH`).
     window_size: Option<(u32, u32)>,
     demo_kind: game::DemoKind,
+    /// Enable the per-frame CPU phase profiler (`--profile-frames`): logs a
+    /// once-a-second phase breakdown + per-spike detail on the `frame_profile`
+    /// target. See [`frame_profiler`].
+    profile_frames: bool,
 }
 
 /// All mutable application state the screens and actions operate on (the
@@ -282,6 +287,9 @@ struct WinitApp {
     scripted_smoke_done: bool,
     smoke_profile: Option<SmokeProfile>,
     pass_bench: Option<PassBench>,
+    /// Per-frame CPU phase profiler (active only with `--profile-frames` /
+    /// `RUST_LOG=frame_profile=debug`).
+    profiler: frame_profiler::FrameProfiler,
     window_shown: bool,
     /// The window is fully hidden/occluded (backgrounded, minimized, covered).
     /// While set, rendering is skipped — see the note in `about_to_wait`.
@@ -337,6 +345,7 @@ impl WinitApp {
             scripted_smoke_done: false,
             smoke_profile,
             pass_bench,
+            profiler: frame_profiler::FrameProfiler::new(now),
             window_shown: false,
             occluded: false,
         }
@@ -748,7 +757,9 @@ impl ApplicationHandler for WinitApp {
         // transactions into one 50 ms burst, which collapsed AAC's transaction-
         // timed fastplace to 0.000. The flying packet stays per-tick (vanilla
         // `onUpdateWalkingPlayer`).
+        let net_start = Instant::now();
         pump_network(app, window, &mut self.cursor_captured);
+        self.profiler.record("net", net_start.elapsed());
         apply_ext_commands(app);
 
         if app.game.take_window_open() {
@@ -986,6 +997,7 @@ impl ApplicationHandler for WinitApp {
             self.mouse_down_left,
             self.f3_debug,
             self.smoke_profile.is_some() || self.pass_bench.is_some(),
+            &mut self.profiler,
         );
         if let Some(profile) = self.smoke_profile.as_mut() {
             profile.record(renderer.last_stats(), Instant::now());
@@ -1073,8 +1085,16 @@ impl ApplicationHandler for WinitApp {
 }
 
 fn main() -> anyhow::Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let config = LaunchConfig::from_args();
+    // `--profile-frames` turns on the per-frame profiler's `frame_profile` target
+    // at debug without touching the default `info` level for everything else
+    // (equivalent to RUST_LOG=frame_profile=debug). RUST_LOG still overrides.
+    let mut log_builder =
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
+    if config.profile_frames {
+        log_builder.filter(Some("frame_profile"), log::LevelFilter::Debug);
+    }
+    log_builder.init();
     if let Some(path) = &config.assets {
         env::set_var("RECRAFT_ASSET_PATH", path);
     }
@@ -2364,6 +2384,7 @@ fn render_frame(
     mouse_down: bool,
     f3_debug: bool,
     smoke_active: bool,
+    profiler: &mut frame_profiler::FrameProfiler,
 ) {
     let now = Instant::now();
     let frame_dt = (now - *last_frame).as_secs_f32().min(0.1);
@@ -2378,14 +2399,17 @@ fn render_frame(
     // out of view (keeping their block data) so resident VRAM stays bounded even
     // on servers that never send ChunkUnload. Runs only on a chunk-boundary
     // crossing; any re-mesh it needs is queued through the dirty budget below.
+    let evict_start = Instant::now();
     let evicted = app.game.enforce_render_distance(app.settings.render_distance);
     if !evicted.is_empty() {
         renderer.drop_chunk_sections(&evicted);
     }
+    profiler.record("evict", evict_start.elapsed());
 
     // Local block prediction gets submitted to the background mesher first, but
     // never rebuilt on the render thread; placing/breaking must not stall a
     // frame.
+    let submit_start = Instant::now();
     let urgent_chunks = app.game.take_urgent_remesh();
     if !urgent_chunks.is_empty() {
         renderer.queue_chunk_meshes(&app.game.world, urgent_chunks.iter().copied());
@@ -2395,7 +2419,10 @@ fn render_frame(
     if !dirty_chunks.is_empty() {
         renderer.queue_chunk_meshes(&app.game.world, dirty_chunks);
     }
+    profiler.record("mesh_submit", submit_start.elapsed());
+    let upload_start = Instant::now();
     renderer.process_ready_meshes(&app.game.world, MESH_UPLOADS_PER_FRAME);
+    profiler.record("mesh_upload", upload_start.elapsed());
 
     let hud_visible = app.in_world
         && app
@@ -2434,6 +2461,7 @@ fn render_frame(
         // (the dominant entity cost) and upload in crowded-but-idle scenes.
         // Cull mobs shorter than terrain (capped at ENTITY_RENDER_CHUNKS) so weak
         // machines skip the distant crowd's per-frame articulated build.
+        let entity_start = Instant::now();
         let entity_chunks = app.settings.render_distance.min(ENTITY_RENDER_CHUNKS);
         let entity_max_dist_sq = (entity_chunks as f64 * 16.0).powi(2);
         let entity_key = app.game.entity_render_fingerprint(
@@ -2531,6 +2559,7 @@ fn render_frame(
             // against them for per-entity motion vectors.
             app.game.snapshot_entity_render_pos(tick_alpha);
         }
+        profiler.record("entity", entity_start.elapsed());
         // Dropped items, projectile sprites and falling-block cubes all share
         // the world-item pass (it binds the block/item atlas). Projectiles reuse
         // the dropped-item sprite path mapped to an item id.
@@ -2707,6 +2736,7 @@ fn render_frame(
     // Drive the day/night sky and lightmap from the world clock (interpolated
     // for smooth motion between ticks).
     renderer.set_world_time(app.game.world_time(tick_alpha));
+    let render_start = Instant::now();
     if has_panorama {
         // Vanilla increments panoramaTimer once per tick (20 Hz).
         app.panorama_timer += frame_dt * 20.0;
@@ -2716,6 +2746,8 @@ fn render_frame(
     } else if let Err(err) = renderer.render_with_ui(&app.game.camera, &ui) {
         log::error!("render error: {err}");
     }
+    profiler.record("render", render_start.elapsed());
+    profiler.end_frame(now, std::time::Duration::from_secs_f32(frame_dt));
 }
 
 /// Start a network connection, choosing premium or offline mode based on the
@@ -2757,6 +2789,7 @@ impl LaunchConfig {
         let mut bench_passes_seconds = None;
         let mut window_size = None;
         let mut demo_kind = game::DemoKind::Landscape;
+        let mut profile_frames = false;
         let mut args = env::args().skip(1);
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -2808,6 +2841,7 @@ impl LaunchConfig {
                         };
                     }
                 }
+                "--profile-frames" => profile_frames = true,
                 _ => {}
             }
         }
@@ -2821,6 +2855,7 @@ impl LaunchConfig {
             bench_passes_seconds,
             window_size,
             demo_kind,
+            profile_frames,
         }
     }
 }
