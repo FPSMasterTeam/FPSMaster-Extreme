@@ -53,6 +53,10 @@ struct Sky {
 // cloud layer as the raster sky — visible in reflections, water and the sky itself.
 @group(1) @binding(7) var noise_tex: texture_3d<f32>;
 @group(1) @binding(8) var noise_samp: sampler;
+// Blue-noise dither, sampled per pixel to Cranley-Patterson-rotate the first-bounce sample
+// so the per-frame error is spatially high-frequency (the denoiser/TAA clean it far better
+// than white noise). Animated per frame by the golden ratio.
+@group(1) @binding(9) var blue_noise: texture_2d<f32>;
 
 fn unpack_uv(p: u32) -> vec2<f32> {
     return vec2<f32>(f32(p & 0xFFFFu), f32((p >> 16u) & 0xFFFFu)) * (1.0 / 65535.0);
@@ -134,9 +138,19 @@ fn rand(state: ptr<function, u32>) -> f32 {
 }
 
 // Cosine-weighted hemisphere sample around n (BRDF importance sampling for diffuse).
-fn cosine_dir(n: vec3<f32>, seed: ptr<function, u32>) -> vec3<f32> {
-    let r1 = rand(seed);
-    let r2 = rand(seed);
+// Per-pixel blue-noise rotation offset (2D, animated per frame), for Cranley-Patterson
+// rotation of a sample. Two decorrelated taps from the tiled blue-noise texture.
+fn blue_noise_rot(px: vec2<i32>) -> vec2<f32> {
+    let dim = vec2<i32>(textureDimensions(blue_noise));
+    let p0 = vec2<i32>(px.x % dim.x, px.y % dim.y);
+    let p1 = vec2<i32>((px.x + 37) % dim.x, (px.y + 17) % dim.y);
+    let b = vec2<f32>(textureLoad(blue_noise, p0, 0).r, textureLoad(blue_noise, p1, 0).r);
+    return fract(b + f32(u32(rt.config.z)) * vec2<f32>(0.618034, 0.324718));
+}
+
+fn cosine_dir(n: vec3<f32>, rot: vec2<f32>, seed: ptr<function, u32>) -> vec3<f32> {
+    let r1 = fract(rand(seed) + rot.x);
+    let r2 = fract(rand(seed) + rot.y);
     let phi = 6.2831853 * r1;
     let st = sqrt(r2);
     let x = cos(phi) * st;
@@ -213,10 +227,10 @@ fn brdf_eval(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, albedo: vec3<f32>, f0: ve
     return kd * albedo + spec;
 }
 // Importance-sample a GGX half-vector around n and reflect the view → bounce direction.
-fn sample_ggx_dir(n: vec3<f32>, v: vec3<f32>, rough: f32, seed: ptr<function, u32>) -> vec3<f32> {
+fn sample_ggx_dir(n: vec3<f32>, v: vec3<f32>, rough: f32, rot: vec2<f32>, seed: ptr<function, u32>) -> vec3<f32> {
     let a = rough * rough;
-    let r1 = rand(seed);
-    let r2 = rand(seed);
+    let r1 = fract(rand(seed) + rot.x);
+    let r2 = fract(rand(seed) + rot.y);
     let phi = 6.2831853 * r1;
     let cos_t = sqrt((1.0 - r2) / (1.0 + (a * a - 1.0) * r2));
     let sin_t = sqrt(max(0.0, 1.0 - cos_t * cos_t));
@@ -249,7 +263,7 @@ struct PtResult {
     transparent: f32,
 };
 
-fn trace_path(ro: vec3<f32>, rd: vec3<f32>, seed: ptr<function, u32>) -> PtResult {
+fn trace_path(ro: vec3<f32>, rd: vec3<f32>, bn: vec2<f32>, seed: ptr<function, u32>) -> PtResult {
     var origin = ro;
     var dir = rd;
     var throughput = vec3<f32>(1.0);
@@ -457,11 +471,14 @@ fn trace_path(ro: vec3<f32>, rd: vec3<f32>, seed: ptr<function, u32>) -> PtResul
         // denoiser cleans it up. ──
         if (bounces >= MAX_BOUNCES) { break; }
         bounces = bounces + 1;
+        // Blue-noise rotate only the first (dominant) bounce's DIRECTION sample; deeper
+        // bounces use plain white noise. The lobe-selection draw stays independent.
+        let rot = select(vec2<f32>(0.0), bn, bounces == 1);
         let fres_v = fresnel_schlick(max(dot(sn, v), 0.0), f0);
         // Lower floor so rough dielectrics don't over-sample (and over-brighten) specular.
         let p_spec = clamp(max(fres_v.r, max(fres_v.g, fres_v.b)), 0.03, 0.9);
         if (rand(seed) < p_spec) {
-            let l = sample_ggx_dir(sn, v, roughness, seed);
+            let l = sample_ggx_dir(sn, v, roughness, rot, seed);
             if (dot(l, geo_n) <= 0.0) { break; } // sampled below the surface
             let h = normalize(v + l);
             let ndotv = max(dot(sn, v), 1e-3);
@@ -478,7 +495,7 @@ fn trace_path(ro: vec3<f32>, rd: vec3<f32>, seed: ptr<function, u32>) -> PtResul
             dir = l;
         } else {
             throughput = throughput * diff_albedo / (1.0 - p_spec);
-            dir = cosine_dir(sn, seed);
+            dir = cosine_dir(sn, rot, seed);
         }
         origin = surf;
         if (max(throughput.r, max(throughput.g, throughput.b)) < 0.02) { break; }
@@ -497,13 +514,14 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     var seed = (u32(in.pos.x) * 1973u) ^ (u32(in.pos.y) * 9277u) ^ (u32(rt.config.z) * 26699u);
     seed = seed | 1u;
 
+    let bn = blue_noise_rot(vec2<i32>(in.pos.xy));
     let SPP = 2;
     var radiance = vec3<f32>(0.0);
     var transparent = 0.0;
     for (var s = 0; s < SPP; s = s + 1) {
         // Clamp each sample to tame fireflies (rare very-bright paths that otherwise leave
         // sparkles the temporal average is slow to remove).
-        let r = trace_path(ro, rd, &seed);
+        let r = trace_path(ro, rd, bn, &seed);
         radiance = radiance + min(r.radiance, vec3<f32>(16.0));
         transparent = r.transparent; // deterministic across samples (primary hit is fixed)
     }
