@@ -373,7 +373,10 @@ fn trace_path(ro: vec3<f32>, rd: vec3<f32>, seed: ptr<function, u32>) -> PtResul
         for (var i = 0u; i < lcount; i = i + 1u) {
             let L = pt_lights[i];
             if (L.color.w <= 0.0) { continue; }
-            let to = L.pos_radius.xyz - pos;
+            // Cube area light: sample a random point in the emitter's 1-block cube, not its
+            // centre — a soft spread pool + penumbra instead of a point's circular hot-spot.
+            let jit = vec3<f32>(rand(seed), rand(seed), rand(seed)) - 0.5;
+            let to = (L.pos_radius.xyz + jit) - pos;
             let ld = length(to);
             if (ld >= L.pos_radius.w) { continue; }
             let ldir = to / max(ld, 1e-4);

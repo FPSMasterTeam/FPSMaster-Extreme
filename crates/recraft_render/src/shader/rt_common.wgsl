@@ -264,16 +264,21 @@ fn torch_voxel_scale() -> f32 {
 // attenuation × N·L × a hard shadow ray (occluded → no contribution). The 128-slot loop
 // early-skips empty / out-of-range / back-facing lights, so only a few nearby emitters
 // actually cast a ray. Returns the coloured light to add to the block-light term.
-fn block_lights(world_pos: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
+fn block_lights(world_pos: vec3<f32>, n: vec3<f32>, pixel: vec2<f32>) -> vec3<f32> {
     var accum = vec3<f32>(0.0);
     let count = arrayLength(&rt_lights);
     let origin = world_pos + n * 0.04;
+    var seed = rt_seed(pixel, 0x2c1b3e9du);
     for (var i = 0u; i < count; i = i + 1u) {
         let L = rt_lights[i];
         if (L.color.w <= 0.0) {
             continue;
         }
-        let to = L.pos_radius.xyz - world_pos;
+        // Sample a random point in the emitter's 1-block CUBE (area light) rather than its
+        // centre: a cube light casts a soft, spread pool with penumbra shadows instead of a
+        // point's tight circular hot-spot. One sample/pixel/frame; TAA averages it smooth.
+        let jitter = vec3<f32>(rt_rand(&seed), rt_rand(&seed), rt_rand(&seed)) - 0.5;
+        let to = (L.pos_radius.xyz + jitter) - world_pos;
         let dist = length(to);
         if (dist >= L.pos_radius.w) {
             continue;
