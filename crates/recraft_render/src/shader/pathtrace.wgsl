@@ -197,11 +197,20 @@ fn occluded(origin: vec3<f32>, dir: vec3<f32>, tmax: f32) -> bool {
 
 const MAX_BOUNCES: i32 = 3;
 
-fn trace_path(ro: vec3<f32>, rd: vec3<f32>, seed: ptr<function, u32>) -> vec3<f32> {
+struct PtResult {
+    radiance: vec3<f32>,
+    // 1.0 if the primary ray's first hit is a transparent surface (water/glass), else 0.
+    // The denoiser uses it to composite: keep the PT result for water/glass, but keep the
+    // rasterized entities/hand (which the PT can't trace) where it's 0 yet there's no chunk.
+    transparent: f32,
+};
+
+fn trace_path(ro: vec3<f32>, rd: vec3<f32>, seed: ptr<function, u32>) -> PtResult {
     var origin = ro;
     var dir = rd;
     var throughput = vec3<f32>(1.0);
     var radiance = vec3<f32>(0.0);
+    var transparent = 0.0;
     let sun = sky.sun_dir.xyz;
     let day = max(sky.cloud_params.w, 0.0);
     // Match the raster sun_color scale (~1.0, see LightingUniform.sun_color) so the
@@ -224,12 +233,21 @@ fn trace_path(ro: vec3<f32>, rd: vec3<f32>, seed: ptr<function, u32>) -> vec3<f3
         }
         let idx = it.instance_custom_data + it.primitive_index;
         let packed = tri_colors[idx];
-        var n = unpack_normal(tri_normals[idx]);
-        if (dot(n, dir) > 0.0) { n = -n; }
+        let n_geo = unpack_normal(tri_normals[idx]);
+        // Front face = the ray hit the outward-facing side. For water/glass (outward
+        // normals) this is the air→medium entry; a back-face hit is the medium→air exit.
+        let front_face = dot(dir, n_geo) < 0.0;
+        var n = n_geo;
+        if (!front_face) { n = -n; } // flip to face the ray
         let pos = origin + dir * it.t;
         let is_glass = ((packed >> 25u) & 1u) == 1u;
         let is_water = ((packed >> 26u) & 1u) == 1u;
         let coverage = f32((packed >> 27u) & 0x1Fu) / 31.0;
+        // Mark this pixel as transparent if the FIRST surface the primary ray hits is
+        // water/glass (so the denoiser keeps the PT result here, not the rasterized scene).
+        if (iter == 0 && (is_glass || is_water)) {
+            transparent = 1.0;
+        }
         // Barycentric-interpolated hit UV (the rasterizer-equivalent: exact, handles every
         // face orientation automatically). Now that RT forces non-greedy meshing, the
         // vertex UVs are the real atlas UVs, so this maps the texture exactly.
@@ -285,7 +303,11 @@ fn trace_path(ro: vec3<f32>, rd: vec3<f32>, seed: ptr<function, u32>) -> vec3<f3
         // clear where it's transparent. Handles stained/clear glass, ice, etc. uniformly;
         // no bend. Not a bounce.
         if (is_glass) {
-            throughput = throughput * mix(vec3<f32>(1.0), albedo, texel.a);
+            // Tint on entry only — a glass block is two faces (front + back), so tinting
+            // both would square the colour (too dark when looking through glass).
+            if (front_face) {
+                throughput = throughput * mix(vec3<f32>(1.0), albedo, texel.a);
+            }
             origin = pos + dir * 0.002;
             continue;
         }
@@ -293,18 +315,26 @@ fn trace_path(ro: vec3<f32>, rd: vec3<f32>, seed: ptr<function, u32>) -> vec3<f3
         // water IOR) and tint by the water colour so the body is visibly coloured. More
         // water crossed = more tint (Beer-Lambert-like). Neither counts as a bounce.
         if (is_water) {
+            // IOR by side: entering air→water (η 0.75), exiting water→air (η 1.333, which
+            // total-internal-reflects at grazing — the silvery underside of the surface).
+            // Using a fixed 0.75 for every face was the bug: exits bent wrong and the tint
+            // stacked. Tint only on ENTRY so a ray crossing several water faces (enter +
+            // exit, or adjacent volumes) doesn't over-darken.
+            let eta = select(1.333, 0.75, front_face);
             let fres = 0.02 + 0.98 * pow(1.0 - abs(dot(n, dir)), 5.0);
             if (rand(seed) < fres) {
                 dir = reflect(dir, n);
                 origin = pos + n * 0.02;
             } else {
-                let refr = refract(dir, n, 0.75); // air->water (1 / 1.33)
+                let refr = refract(dir, n, eta);
                 if (dot(refr, refr) < 1e-6) {
                     dir = reflect(dir, n); // total internal reflection
                     origin = pos + n * 0.02;
                 } else {
                     dir = normalize(refr);
-                    throughput = throughput * vec3<f32>(0.35, 0.62, 0.78);
+                    if (front_face) {
+                        throughput = throughput * vec3<f32>(0.35, 0.62, 0.78);
+                    }
                     origin = pos + dir * 0.01;
                 }
             }
@@ -399,7 +429,7 @@ fn trace_path(ro: vec3<f32>, rd: vec3<f32>, seed: ptr<function, u32>) -> vec3<f3
         origin = surf;
         if (max(throughput.r, max(throughput.g, throughput.b)) < 0.02) { break; }
     }
-    return radiance;
+    return PtResult(radiance, transparent);
 }
 
 @fragment
@@ -415,10 +445,14 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
     let SPP = 2;
     var radiance = vec3<f32>(0.0);
+    var transparent = 0.0;
     for (var s = 0; s < SPP; s = s + 1) {
         // Clamp each sample to tame fireflies (rare very-bright paths that otherwise leave
         // sparkles the temporal average is slow to remove).
-        radiance = radiance + min(trace_path(ro, rd, &seed), vec3<f32>(16.0));
+        let r = trace_path(ro, rd, &seed);
+        radiance = radiance + min(r.radiance, vec3<f32>(16.0));
+        transparent = r.transparent; // deterministic across samples (primary hit is fixed)
     }
-    return vec4<f32>(radiance / f32(SPP), 1.0);
+    // a = the transparent (water/glass) flag, consumed by the denoiser's compositing.
+    return vec4<f32>(radiance / f32(SPP), transparent);
 }
