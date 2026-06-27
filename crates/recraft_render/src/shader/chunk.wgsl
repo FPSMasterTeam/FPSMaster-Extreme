@@ -256,7 +256,7 @@ fn apply_lighting(albedo: vec3<f32>, in: VertexOutput) -> vec3<f32> {
         let reflectivity = max(max(f0.r, f0.g), f0.b) * smoothness;
         if (reflectivity > 0.04) {
             let refl_dir = reflect(-view_dir, n);
-            let rt_refl = rt_reflect(in.world_pos + n * 0.05, refl_dir);
+            let rt_refl = rt_reflect(in.world_pos + n * 0.05, refl_dir, in.clip_position.xy);
             // Schlick fresnel from f0: a smooth metal reflects ~its own albedo (f0) head-on,
             // rising to 1 at grazing, scaled by smoothness (a single sharp RT ray fakes
             // roughness by weakening rather than blurring). The old f0×smoothness×0.5 left

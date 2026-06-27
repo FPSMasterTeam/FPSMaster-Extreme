@@ -187,7 +187,7 @@ fn rt_sky(dir: vec3<f32>) -> vec3<f32> {
 // hit -> the reflected surface's real colour (per-triangle pool) relit by ambient + a
 // sun shadow ray. Returns the reflected radiance; a==1 (the caller weights it by the
 // surface's reflectivity). The no-op stub returns a==0.
-fn rt_reflect(origin: vec3<f32>, dir: vec3<f32>) -> vec4<f32> {
+fn rt_reflect(origin: vec3<f32>, dir: vec3<f32>, pixel: vec2<f32>) -> vec4<f32> {
     var ro = origin;
     // A few iterations so the reflection ray passes THROUGH cutout holes (grass/flowers/
     // leaves) instead of stopping on their transparent texels and reflecting a solid quad.
@@ -253,7 +253,11 @@ fn rt_reflect(origin: vec3<f32>, dir: vec3<f32>) -> vec4<f32> {
         let hn = rt_unpack_normal(rt_tri_normals[idx]);
         let sun = lighting.sun_dir.xyz;
         let ndl = max(dot(hn, sun), 0.0);
-        var lit = lighting.ambient.rgb * 0.6;
+        // Re-light the reflected hit with the SAME RT lighting as the main view: ambient
+        // darkened by ray-traced AO (contact shadows / corner darkening) + direct sun with a
+        // shadow ray. Gives the reflection real light-and-shadow, not a flat unlit fill.
+        let ao = rt_ao_factor(hit, hn, pixel);
+        var lit = lighting.ambient.rgb * 0.5 * ao;
         if (ndl > 0.0 && !rt_occluded(hit + hn * 0.03, sun, 160.0)) {
             lit = lit + lighting.sun_color.rgb * ndl;
         }
