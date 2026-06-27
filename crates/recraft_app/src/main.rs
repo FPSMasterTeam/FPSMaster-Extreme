@@ -131,6 +131,11 @@ struct App {
     /// + hand + nametags. When the next frame's fingerprint matches, the rebuild
     /// and GPU upload are skipped (the renderer keeps the previous mesh).
     last_entity_key: Option<u64>,
+    /// Tracked local-player body yaw (degrees) for the RT shadow/reflection body — follows
+    /// MOVEMENT and freezes while standing still, so it doesn't spin when you only look
+    /// around. Paired with the previous feet position for the movement check.
+    player_body_yaw: f32,
+    prev_player_feet: glam::Vec3,
     /// Audio backend: resolves `sounds.json` events and plays positioned/UI
     /// sounds queued by the game. Silent if no output device is available.
     sound: sound::SoundManager,
@@ -450,6 +455,8 @@ impl ApplicationHandler for WinitApp {
             entity_model: recraft_render::ModelMesh::new(),
             entity_glint: recraft_render::ModelMesh::new(),
             last_entity_key: None,
+            player_body_yaw: 0.0,
+            prev_player_feet: glam::Vec3::ZERO,
             sound: sound::SoundManager::new(),
             pending_window_packets: Vec::new(),
             walking_packets: WalkingPacketState::default(),
@@ -2746,12 +2753,25 @@ fn render_frame(
     // first person). Built from the camera each frame so it works in both the game and the
     // render demo: feet ≈ the eye minus the standing eye height. Skipped on the menu.
     if !has_panorama {
-        let cam = &app.game.camera;
-        let mut feet = cam.position;
+        let look_yaw = app.game.camera.yaw;
+        let mut feet = app.game.camera.position;
         feet.y -= 1.62;
+        // Body yaw follows MOVEMENT (snaps to the look direction while walking) and freezes
+        // when standing still, so the reflected/shadowed body doesn't spin as you look around.
+        let moved = (feet - app.prev_player_feet) * glam::Vec3::new(1.0, 0.0, 1.0);
+        if moved.length() > 0.01 {
+            app.player_body_yaw = look_yaw;
+        }
+        app.prev_player_feet = feet;
         let mut player_body = recraft_render::ModelMesh::new();
-        app.game
-            .build_player_body_at(&mut player_body, feet, cam.yaw, tick_alpha, app.settings.brightness);
+        app.game.build_player_body_at(
+            &mut player_body,
+            feet,
+            app.player_body_yaw,
+            look_yaw,
+            tick_alpha,
+            app.settings.brightness,
+        );
         renderer.upload_rt_player_body(&player_body);
     }
     if has_panorama {
