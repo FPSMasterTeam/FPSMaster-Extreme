@@ -253,6 +253,10 @@ fn occluded(origin: vec3<f32>, dir: vec3<f32>, tmax: f32) -> bool {
 
 const MAX_BOUNCES: i32 = 4;
 
+// Entity triangles live in a fixed top region of the shared pools; a hit with
+// instance_custom_data >= this is an entity (keep in sync with raytrace.rs ENTITY_TRI_BASE).
+const ENTITY_TRI_BASE: u32 = 4128768u;
+
 // Per-channel water absorption (Beer-Lambert, per block travelled). Red is absorbed fastest
 // so deep water turns blue-green and darkens with depth — replaces the old flat entry tint.
 const WATER_ABSORB: vec3<f32> = vec3<f32>(0.45, 0.15, 0.09);
@@ -285,7 +289,11 @@ fn trace_path(ro: vec3<f32>, rd: vec3<f32>, bn: vec2<f32>, seed: ptr<function, u
     for (var iter = 0; iter < 24; iter = iter + 1) {
         var rq: ray_query;
         // Trace solid (0x01) + glass (0x02) + water (0x04).
-        rayQueryInitialize(&rq, tlas, RayDesc(0u, 0x07u, 0.001, 1000.0, origin, dir));
+        // Primary ray (iter 0): solid+glass+water (0x07), NO entities — they stay
+        // rasterized. Bounce / reflection rays also include entities (0x08 → 0x0F) so
+        // entities appear in reflections and on water.
+        let trace_mask = select(0x0Fu, 0x07u, iter == 0);
+        rayQueryInitialize(&rq, tlas, RayDesc(0u, trace_mask, 0.001, 1000.0, origin, dir));
         loop { if (!rayQueryProceed(&rq)) { break; } }
         let it = rayQueryGetCommittedIntersection(&rq);
         if (it.kind == 0u) {
@@ -306,6 +314,30 @@ fn trace_path(ro: vec3<f32>, rd: vec3<f32>, bn: vec2<f32>, seed: ptr<function, u
         var n = n_geo;
         if (!front_face) { n = -n; } // flip to face the ray
         let pos = origin + dir * it.t;
+        // Entity hit (only bounce / reflection rays reach entities): flat-shade the per-tri
+        // colour as a diffuse surface, so entities show up in reflections / water.
+        if (it.instance_custom_data >= ENTITY_TRI_BASE) {
+            let ealb = vec3<f32>(
+                f32((packed >> 16u) & 0xFFu),
+                f32((packed >> 8u) & 0xFFu),
+                f32(packed & 0xFFu),
+            ) / 255.0;
+            let esurf = pos + n * 0.02;
+            let endl = max(dot(n, sun), 0.0);
+            if (endl > 0.0 && !occluded(esurf, sun, 200.0)) {
+                radiance = radiance + throughput * ealb * sun_color * endl;
+            }
+            let ebright = 0.4 + 1.2 * sky.sunset.w;
+            let eamb = (vec3<f32>(0.09, 0.1, 0.13) + sky_color(n) * 0.16) * ebright;
+            radiance = radiance + throughput * ealb * eamb;
+            if (bounces >= MAX_BOUNCES) { break; }
+            bounces = bounces + 1;
+            throughput = throughput * ealb;
+            if (max(throughput.r, max(throughput.g, throughput.b)) < 0.02) { break; }
+            dir = cosine_dir(n, vec2<f32>(0.0), seed);
+            origin = esurf;
+            continue;
+        }
         let is_glass = ((packed >> 25u) & 1u) == 1u;
         let is_water = ((packed >> 26u) & 1u) == 1u;
         let coverage = f32((packed >> 27u) & 0x1Fu) / 31.0;

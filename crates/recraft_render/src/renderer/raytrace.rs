@@ -117,6 +117,13 @@ struct RtSection {
 /// 24-bit instance-custom-data ceiling; well above the in-range triangle count.
 const TRI_POOL_CAPACITY: u32 = 1 << 22; // 4M triangles (the position pool is 9 floats each)
 
+/// Entity triangles get a FIXED reserved region at the top of the shared pools (sections
+/// bump-allocate from 0 and never reach this far), rewritten each frame. The path tracer
+/// detects an entity hit by `instance_custom_data >= ENTITY_TRI_BASE` (keep this in sync
+/// with the same constant in pathtrace.wgsl).
+pub const MAX_ENTITY_TRIS: u32 = 1 << 16; // 64K entity triangles
+pub const ENTITY_TRI_BASE: u32 = TRI_POOL_CAPACITY - MAX_ENTITY_TRIS;
+
 pub struct RayTracer {
     sections: HashMap<SectionPos, RtSection>,
     /// Sections whose BLAS still needs building (newly uploaded since the last build).
@@ -700,6 +707,8 @@ impl RayTracer {
         camera_origin: IVec3,
         entity_positions: &[[f32; 3]],
         entity_indices: &[u32],
+        entity_colors: &[u32],
+        entity_normals: &[u32],
     ) {
         let range2 = RT_RANGE_BLOCKS * RT_RANGE_BLOCKS;
         // 0. Gather the nearest in-range emissive lights into the point-light buffer
@@ -761,6 +770,25 @@ impl RayTracer {
                 mapped_at_creation: false,
             });
             queue.write_buffer(&index_buf, 0, bytemuck::cast_slice(entity_indices));
+            // Write the entity per-triangle colour + geometric normal into the fixed entity
+            // region of the shared pools, so a reflection / bounce ray that hits an entity
+            // can shade it (the PT detects entities by tri_base >= ENTITY_TRI_BASE).
+            let tris = (entity_indices.len() / 3)
+                .min(entity_colors.len())
+                .min(entity_normals.len())
+                .min(MAX_ENTITY_TRIS as usize);
+            if tris > 0 {
+                queue.write_buffer(
+                    &self.tri_color_pool,
+                    ENTITY_TRI_BASE as u64 * 4,
+                    bytemuck::cast_slice(&entity_colors[..tris]),
+                );
+                queue.write_buffer(
+                    &self.tri_normal_pool,
+                    ENTITY_TRI_BASE as u64 * 4,
+                    bytemuck::cast_slice(&entity_normals[..tris]),
+                );
+            }
             let size = wgpu::BlasTriangleGeometrySizeDescriptor {
                 vertex_format: wgpu::VertexFormat::Float32x3,
                 vertex_count: positions.len() as u32,
@@ -834,7 +862,8 @@ impl RayTracer {
                     0.0, 1.0, 0.0, 0.0, //
                     0.0, 0.0, 1.0, 0.0, //
                 ];
-                self.tlas[count as usize] = Some(wgpu::TlasInstance::new(&e.blas, id, 0, 0x08));
+                self.tlas[count as usize] =
+                    Some(wgpu::TlasInstance::new(&e.blas, id, ENTITY_TRI_BASE, 0x08));
                 count += 1;
             }
         }
