@@ -224,7 +224,7 @@ fn apply_lighting(albedo: vec3<f32>, in: VertexOutput) -> vec3<f32> {
     // lights are active, PLUS the ray-traced point lights (sharp, shadowed, coloured).
     // In the non-RT build torch_voxel_scale()=1 and block_lights()=0 (unchanged look).
     let torch = vec3<f32>(1.0, 0.82, 0.55) * block * torch_voxel_scale()
-        + block_lights(in.world_pos, geo_n);
+        + block_lights(in.world_pos, geo_n, in.clip_position.xy);
 
     if (pbr_on) {
         let view_dir = normalize(lighting.camera_pos.xyz - in.world_pos);
