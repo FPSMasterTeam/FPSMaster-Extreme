@@ -81,6 +81,17 @@ struct BlasGeom {
     tri_positions: Vec<f32>,
 }
 
+/// The entity geometry's BLAS, rebuilt each frame from the dynamic model mesh (in
+/// camera-relative space). Ray-masked 0x08: shadow / occlusion rays include it so entities
+/// cast shadows, but the primary trace (0x07) doesn't, so entities stay rasterized. No
+/// per-triangle pools — occlusion rays only need hit / no-hit.
+struct EntityBlas {
+    blas: wgpu::Blas,
+    vertex_buf: wgpu::Buffer,
+    index_buf: wgpu::Buffer,
+    size: wgpu::BlasTriangleGeometrySizeDescriptor,
+}
+
 /// One section's ray-tracing geometry. A section is kept if it has solid/cutout geometry
 /// (the opaque BLAS, ray-masked 0x01) OR stained glass (a separate BLAS, ray-masked 0x02)
 /// — the latter alone matters for a glass box around a light, whose walls may live in a
@@ -114,6 +125,8 @@ pub struct RayTracer {
     max_instances: u32,
     /// Instances written last frame, so the unused tail can be cleared to None.
     prev_instance_count: u32,
+    /// Entity geometry BLAS, rebuilt each frame for the (dynamic) model mesh. Masked 0x08.
+    entity: Option<EntityBlas>,
     params_buffer: wgpu::Buffer,
     /// Shared per-triangle colour pool (storage buffer, one packed RGB per triangle of
     /// every section), bump-allocated; re-packed compactly when it would overflow.
@@ -316,6 +329,7 @@ impl RayTracer {
             tlas,
             max_instances,
             prev_instance_count: 0,
+            entity: None,
             params_buffer,
             tri_color_pool,
             tri_normal_pool,
@@ -681,8 +695,11 @@ impl RayTracer {
     pub fn build(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
+        device: &wgpu::Device,
         queue: &wgpu::Queue,
         camera_origin: IVec3,
+        entity_positions: &[[f32; 3]],
+        entity_indices: &[u32],
     ) {
         let range2 = RT_RANGE_BLOCKS * RT_RANGE_BLOCKS;
         // 0. Gather the nearest in-range emissive lights into the point-light buffer
@@ -720,6 +737,49 @@ impl RayTracer {
             gpu[i] = *l;
         }
         queue.write_buffer(&self.light_buffer, 0, bytemuck::cast_slice(&gpu));
+
+        // Entity BLAS: rebuild each frame from the dynamic model mesh (positions are
+        // absolute world → make them camera-relative to match the section geometry, so the
+        // instance can use an identity transform). Masked 0x08 (shadow rays only).
+        self.entity = None;
+        if entity_indices.len() >= 3 && !entity_positions.is_empty() {
+            let positions: Vec<[f32; 3]> = entity_positions
+                .iter()
+                .map(|p| [p[0] - cam_f.x, p[1] - cam_f.y, p[2] - cam_f.z])
+                .collect();
+            let vertex_buf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("rt-entity"),
+                size: (positions.len() * std::mem::size_of::<[f32; 3]>()) as u64,
+                usage: wgpu::BufferUsages::BLAS_INPUT | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            queue.write_buffer(&vertex_buf, 0, bytemuck::cast_slice(&positions));
+            let index_buf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("rt-entity"),
+                size: (entity_indices.len() * std::mem::size_of::<u32>()) as u64,
+                usage: wgpu::BufferUsages::BLAS_INPUT | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            queue.write_buffer(&index_buf, 0, bytemuck::cast_slice(entity_indices));
+            let size = wgpu::BlasTriangleGeometrySizeDescriptor {
+                vertex_format: wgpu::VertexFormat::Float32x3,
+                vertex_count: positions.len() as u32,
+                index_format: Some(wgpu::IndexFormat::Uint32),
+                index_count: Some(entity_indices.len() as u32),
+                flags: wgpu::AccelerationStructureGeometryFlags::OPAQUE,
+            };
+            let blas = device.create_blas(
+                &wgpu::CreateBlasDescriptor {
+                    label: Some("rt-entity"),
+                    flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE,
+                    update_mode: wgpu::AccelerationStructureUpdateMode::Build,
+                },
+                wgpu::BlasGeometrySizeDescriptors::Triangles {
+                    descriptors: vec![size.clone()],
+                },
+            );
+            self.entity = Some(EntityBlas { blas, vertex_buf, index_buf, size });
+        }
 
         // 1. Place in-range sections into the TLAS as translated instances.
         let mut count = 0u32;
@@ -764,6 +824,20 @@ impl RayTracer {
                 }
             }
         }
+        // Entity instance: identity transform (geometry is already camera-relative), masked
+        // 0x08 so only shadow / occlusion rays see it (entities cast shadows but stay
+        // rasterized in the primary view).
+        if let Some(e) = &self.entity {
+            if count < self.max_instances {
+                let id = [
+                    1.0, 0.0, 0.0, 0.0, //
+                    0.0, 1.0, 0.0, 0.0, //
+                    0.0, 0.0, 1.0, 0.0, //
+                ];
+                self.tlas[count as usize] = Some(wgpu::TlasInstance::new(&e.blas, id, 0, 0x08));
+                count += 1;
+            }
+        }
         // Clear instance slots used last frame but not this one.
         for i in count..self.prev_instance_count {
             self.tlas[i as usize] = None;
@@ -787,7 +861,7 @@ impl RayTracer {
                 },
             ]),
         };
-        let entries: Vec<wgpu::BlasBuildEntry> = self
+        let mut entries: Vec<wgpu::BlasBuildEntry> = self
             .dirty
             .iter()
             .filter_map(|pos| self.sections.get(pos))
@@ -805,6 +879,10 @@ impl RayTracer {
                 v
             })
             .collect();
+        // The entity BLAS is rebuilt every frame (dynamic mesh), so always (re)build it.
+        if let Some(e) = &self.entity {
+            entries.push(geom_entry(&e.blas, &e.size, &e.vertex_buf, &e.index_buf));
+        }
         encoder.build_acceleration_structures(entries.iter(), std::iter::once(&self.tlas));
         drop(entries);
         self.dirty.clear();

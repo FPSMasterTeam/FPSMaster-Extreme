@@ -662,6 +662,11 @@ pub struct Renderer {
     /// `model_pipeline`; the arm range is drawn on top with
     /// `first_person_arm_pipeline`. `None` when no arm is present this frame.
     arm_index_start: Option<u32>,
+    /// Entity geometry stashed for the ray tracer (entities cast PT/RT shadows): absolute
+    /// world vertex positions + indices of `model_mesh`. The first-person arm (indices past
+    /// `arm_index_start`) is excluded at build time. Rebuilt into a camera-relative BLAS.
+    entity_rt_positions: Vec<[f32; 3]>,
+    entity_rt_indices: Vec<u32>,
     /// Native render-hook custom geometry (model-pass format), drawn in the world
     /// pass right after entities. `None`/empty when no native mod submits any.
     extension_mesh: Option<DynamicMesh>,
@@ -4776,6 +4781,8 @@ impl Renderer {
             first_person_arm_pipeline,
             model_mesh: None,
             arm_index_start: None,
+            entity_rt_positions: Vec::new(),
+            entity_rt_indices: Vec::new(),
             extension_mesh: None,
             geometry_texture: None,
             nametag_scale: 1.0,
@@ -6402,6 +6409,15 @@ impl Renderer {
             mesh.indices.len() as u32,
             "model",
         );
+        // Stash the entity geometry for the ray tracer (entities cast shadows in PT/RT).
+        // Only when RT is active; otherwise drop any stale copy.
+        if self.ray_tracer.is_some() {
+            self.entity_rt_positions = mesh.vertices.iter().map(|v| v.position).collect();
+            self.entity_rt_indices = mesh.indices.clone();
+        } else if !self.entity_rt_indices.is_empty() {
+            self.entity_rt_positions = Vec::new();
+            self.entity_rt_indices = Vec::new();
+        }
         // Per-vertex motion attribute for the entity motion-vector pass, in
         // lockstep with the model vertices. Only uploaded when motion vectors are
         // produced; the build pads `motion` to the vertex count.
@@ -7939,7 +7955,21 @@ impl Renderer {
                     quality: [shadow_samples, ao_samples, ao_strength, gi_debug],
                 }),
             );
-            rt.build(&mut encoder, &self.queue, origin_i);
+            // Entity geometry for shadow casting, excluding the first-person arm (the
+            // indices at/after `arm_index_start`).
+            let arm = self
+                .arm_index_start
+                .map(|s| s as usize)
+                .unwrap_or(self.entity_rt_indices.len())
+                .min(self.entity_rt_indices.len());
+            rt.build(
+                &mut encoder,
+                &self.device,
+                &self.queue,
+                origin_i,
+                &self.entity_rt_positions,
+                &self.entity_rt_indices[..arm],
+            );
         }
 
         // Sun shadow pass: render chunk-section depth from the light's view,

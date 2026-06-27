@@ -95,8 +95,10 @@ fn rt_basis(n: vec3<f32>) -> mat3x3<f32> {
 // True if a ray from `origin` along `dir` hits any opaque geometry within `tmax`.
 fn rt_occluded(origin: vec3<f32>, dir: vec3<f32>, tmax: f32) -> bool {
     var rq: ray_query;
+    // Mask 0x09 = solid (0x01) + entities (0x08), so entities cast sun / AO / reflection
+    // shadows in the rasterized RT path too.
     rayQueryInitialize(&rq, rt_tlas,
-        RayDesc(RT_TERMINATE_ON_FIRST_HIT, 0x01u, 0.02, tmax, origin, dir));
+        RayDesc(RT_TERMINATE_ON_FIRST_HIT, 0x09u, 0.02, tmax, origin, dir));
     // Opaque-only geometry: traversal commits hits itself, so just drain it.
     loop {
         if (!rayQueryProceed(&rq)) { break; }
