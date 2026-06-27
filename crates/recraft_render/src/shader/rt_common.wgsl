@@ -261,7 +261,11 @@ fn rt_reflect(origin: vec3<f32>, dir: vec3<f32>, pixel: vec2<f32>) -> vec4<f32> 
         if (ndl > 0.0 && !rt_occluded(hit + hn * 0.03, sun, 160.0)) {
             lit = lit + lighting.sun_color.rgb * ndl;
         }
-        return vec4<f32>(albedo * lit, 1.0);
+        // Emissive blocks (lava / glowstone) must GLOW in the reflection too — add their
+        // self-emission from the labPBR specular atlas's emissive channel (as the main shader
+        // does), so reflected light sources read as bright, not dim lit surfaces.
+        let emissive = textureSampleLevel(specular_atlas, pbr_sampler, uv, 0.0).b;
+        return vec4<f32>(albedo * lit + albedo * emissive * 3.0, 1.0);
     }
     return vec4<f32>(rt_sky(dir), 1.0);
 }
