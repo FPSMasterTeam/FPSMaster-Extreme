@@ -665,6 +665,14 @@ impl RayTracer {
         self.dirty.retain(|&p| p != pos);
     }
 
+    /// Swap the CPU atlas used for per-triangle colour/coverage sampling, after a
+    /// resource-pack reload. Existing sections keep their old colours until they are
+    /// re-meshed and re-uploaded (the renderer clears the chunk meshes on reload, so
+    /// every loaded section rebuilds through `upload_section` with the new atlas).
+    pub fn set_atlas(&mut self, atlas: Option<std::sync::Arc<image::RgbaImage>>) {
+        self.atlas = atlas;
+    }
+
     /// Record this frame's acceleration-structure build into `encoder`: refresh the
     /// TLAS instances (camera-relative transforms for in-range sections) and build
     /// any sections whose BLAS is still pending. Must run before the world pass that
