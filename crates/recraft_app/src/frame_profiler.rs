@@ -1,10 +1,10 @@
 //! Lightweight per-frame CPU phase timing, to pin down frame-time spikes (e.g.
-//! while chunks stream in and the camera turns). Inert unless the `frame_profile`
-//! log target is enabled at debug — pass `--profile-frames`, or set
-//! `RUST_LOG=frame_profile=debug`. When inert, `record`/`end_frame` are near
-//! no-ops, so the timing calls can stay on the hot path.
+//! while chunks stream in and the camera turns). Measurement always runs (it's
+//! near-free) so the F3 overlay can read [`FrameProfiler::latest`] live; only the
+//! *log* output is gated on the `frame_profile` target — pass `--profile-frames`,
+//! or set `RUST_LOG=frame_profile=debug`.
 //!
-//! Output: a once-a-second summary (per-phase avg/max ms over the window) at
+//! Log output: a once-a-second summary (per-phase avg/max ms over the window) at
 //! debug, plus a one-line breakdown at warn for any single frame whose CPU work
 //! spikes well above the running average. To profile a new phase, time it with
 //! `Instant::now()` and call `profiler.record("name", t.elapsed())`.
@@ -12,8 +12,18 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
+/// A snapshot of the most recent ~1s window, for live display (the F3 overlay).
+#[derive(Debug, Clone, Default)]
+pub struct PhaseSummary {
+    pub frames: u32,
+    pub cpu_avg_ms: f32,
+    pub cpu_max_ms: f32,
+    /// `(phase, avg ms, max ms)` over the window, sorted by phase name.
+    pub phases: Vec<(&'static str, f32, f32)>,
+}
+
 pub struct FrameProfiler {
-    /// Whether the `frame_profile` target is enabled (refreshed each frame).
+    /// Whether the `frame_profile` log target is enabled (controls logging only).
     on: bool,
     /// This frame's per-phase durations (one entry per phase, overwritten).
     cur: BTreeMap<&'static str, Duration>,
@@ -26,6 +36,8 @@ pub struct FrameProfiler {
     last_flush: Instant,
     /// Smoothed CPU frame time (ms), for relative spike detection.
     ema_ms: f32,
+    /// Last completed window summary, served to the F3 overlay.
+    latest: PhaseSummary,
 }
 
 impl FrameProfiler {
@@ -40,28 +52,28 @@ impl FrameProfiler {
             frame_max: Duration::ZERO,
             last_flush: now,
             ema_ms: 0.0,
+            latest: PhaseSummary::default(),
         }
+    }
+
+    /// The most recent ~1s window summary (updated once a second), for the F3
+    /// overlay. Empty until the first window completes.
+    pub fn latest(&self) -> &PhaseSummary {
+        &self.latest
     }
 
     /// Record one phase's duration for the current frame. Overwrites, so each
-    /// phase is logged at most once per frame. Cheap no-op while disabled.
+    /// phase is recorded at most once per frame. Always accumulated (cheap) so the
+    /// F3 readout works even without the log flag.
     pub fn record(&mut self, phase: &'static str, dur: Duration) {
-        if self.on {
-            self.cur.insert(phase, dur);
-        }
+        self.cur.insert(phase, dur);
     }
 
-    /// Close out the current frame: roll the phase timings into the window,
-    /// report a spike if this frame's CPU work ran long, and flush a summary
-    /// about once a second. `frame_dt` is the wall-clock frame interval (it
-    /// carries any vsync wait, so it is only logged, not used for spikes).
+    /// Close out the current frame: roll the phase timings into the window, refresh
+    /// the live summary every second, and (when the log target is on) report a spike
+    /// if this frame's CPU work ran long. `frame_dt` is the wall-clock frame interval.
     pub fn end_frame(&mut self, now: Instant, frame_dt: Duration) {
-        // Refresh on/off once per frame (a cheap atomic load + filter check).
         self.on = log::log_enabled!(target: "frame_profile", log::Level::Debug);
-        if !self.on {
-            self.cur.clear();
-            return;
-        }
 
         // CPU total = sum of the measured phases (excludes the vsync sleep that
         // frame_dt carries), so the spike test keys off real work.
@@ -69,7 +81,7 @@ impl FrameProfiler {
         let cpu_ms = cpu.as_secs_f32() * 1000.0;
         let avg = if self.ema_ms > 0.0 { self.ema_ms } else { cpu_ms };
 
-        if cpu_ms > avg * 2.0 && cpu_ms > 6.0 {
+        if self.on && cpu_ms > avg * 2.0 && cpu_ms > 6.0 {
             log::warn!(
                 target: "frame_profile",
                 "SPIKE {cpu_ms:.1}ms cpu (avg {avg:.1}ms, frame {:.1}ms):{}",
@@ -95,18 +107,36 @@ impl FrameProfiler {
 
         if now.duration_since(self.last_flush) >= Duration::from_secs(1) {
             let n = self.frames.max(1);
-            let avg_ms = self.frame_sum.as_secs_f32() * 1000.0 / n as f32;
-            let max_ms = self.frame_max.as_secs_f32() * 1000.0;
-            let mut phases = String::new();
-            for (k, total) in &self.sum {
-                let a = total.as_secs_f32() * 1000.0 / n as f32;
-                let mx = self.max.get(k).copied().unwrap_or_default().as_secs_f32() * 1000.0;
-                phases.push_str(&format!(" {k} {a:.2}/{mx:.2}"));
+            let phases: Vec<(&'static str, f32, f32)> = self
+                .sum
+                .iter()
+                .map(|(k, total)| {
+                    (
+                        *k,
+                        total.as_secs_f32() * 1000.0 / n as f32,
+                        self.max.get(k).copied().unwrap_or_default().as_secs_f32() * 1000.0,
+                    )
+                })
+                .collect();
+            self.latest = PhaseSummary {
+                frames: self.frames,
+                cpu_avg_ms: self.frame_sum.as_secs_f32() * 1000.0 / n as f32,
+                cpu_max_ms: self.frame_max.as_secs_f32() * 1000.0,
+                phases,
+            };
+            if self.on {
+                let mut s = String::new();
+                for (k, a, mx) in &self.latest.phases {
+                    s.push_str(&format!(" {k} {a:.2}/{mx:.2}"));
+                }
+                log::debug!(
+                    target: "frame_profile",
+                    "{} frames | cpu avg/max {:.2}/{:.2}ms | phases avg/max ms:{s}",
+                    self.latest.frames,
+                    self.latest.cpu_avg_ms,
+                    self.latest.cpu_max_ms,
+                );
             }
-            log::debug!(
-                target: "frame_profile",
-                "{n} frames | cpu avg/max {avg_ms:.2}/{max_ms:.2}ms | phases avg/max ms:{phases}",
-            );
             self.sum.clear();
             self.max.clear();
             self.frames = 0;
