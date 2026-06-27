@@ -2178,24 +2178,29 @@ impl GameState {
         &self,
         mesh: &mut ModelMesh,
         feet: Vec3,
-        yaw: f32,
+        body_yaw: f32,
+        look_yaw: f32,
         tick_alpha: f32,
         brightness: f32,
     ) {
         mesh.clear();
         let sun_b = recraft_render::sky::sun_brightness(self.world_time(tick_alpha));
+        // Real walk/swing/sneak pose from the local player's state; the head turns toward
+        // the look direction relative to the (movement-following) body yaw.
+        let (limb_swing, limb_swing_amount) = self.player.render_limb_swing(tick_alpha);
+        let net_head_yaw = wrap_degrees(look_yaw - body_yaw).clamp(-75.0, 75.0);
         let anim = EntityAnim {
-            limb_swing: 0.0,
-            limb_swing_amount: 0.0,
-            net_head_yaw: 0.0,
-            head_pitch: 0.0,
-            swing_progress: 0.0,
-            sneaking: false,
+            limb_swing,
+            limb_swing_amount,
+            net_head_yaw,
+            head_pitch: self.player.render_pitch(tick_alpha),
+            swing_progress: self.player.render_swing(tick_alpha),
+            sneaking: self.player.sneaking,
             held_item_right: 0,
             old_animations: false,
             death_roll: 0.0,
         };
-        mesh.push_entity(EntityKind::RemotePlayer, feet, yaw, &anim, None);
+        mesh.push_entity(EntityKind::RemotePlayer, feet, body_yaw, &anim, None);
         let center = Vec3::new(feet.x, feet.y + 0.9, feet.z);
         let factor = entity_light(&self.world, center, sun_b, brightness);
         for v in &mut mesh.vertices {
