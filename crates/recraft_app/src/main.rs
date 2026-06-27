@@ -2558,16 +2558,6 @@ fn render_frame(
             // with `vertices` for the velocity pass.
             app.entity_model.fill_motion([0.0, 0.0, 0.0, 0.0]);
             renderer.upload_model(&app.entity_model);
-            // Local player body for ray-traced shadows + reflections (RT-only, never drawn
-            // in first person). Built into a separate mesh fed only to the entity BLAS.
-            let mut player_body = recraft_render::ModelMesh::new();
-            app.game.build_local_player_model(
-                &mut player_body,
-                tick_alpha,
-                app.settings.brightness,
-                app.settings.old_animations,
-            );
-            renderer.upload_rt_player_body(&player_body);
             renderer.set_entity_glint(&app.entity_glint);
             // Record this frame's positions so the next frame's rebuild can diff
             // against them for per-entity motion vectors.
@@ -2613,7 +2603,6 @@ fn render_frame(
     } else {
         app.last_entity_key = None;
         renderer.upload_model(&recraft_render::ModelMesh::new());
-        renderer.upload_rt_player_body(&recraft_render::ModelMesh::new());
         renderer.set_arm_index_start(None);
         renderer.set_entity_glint(&recraft_render::ModelMesh::new());
         renderer.set_first_person_item(&[], &[]);
@@ -2753,6 +2742,18 @@ fn render_frame(
     // for smooth motion between ticks).
     renderer.set_world_time(app.game.world_time(tick_alpha));
     let render_start = Instant::now();
+    // Local-player body for ray-traced shadows + reflections (RT-only — never rasterized in
+    // first person). Built from the camera each frame so it works in both the game and the
+    // render demo: feet ≈ the eye minus the standing eye height. Skipped on the menu.
+    if !has_panorama {
+        let cam = &app.game.camera;
+        let mut feet = cam.position;
+        feet.y -= 1.62;
+        let mut player_body = recraft_render::ModelMesh::new();
+        app.game
+            .build_player_body_at(&mut player_body, feet, cam.yaw, tick_alpha, app.settings.brightness);
+        renderer.upload_rt_player_body(&player_body);
+    }
     if has_panorama {
         // Vanilla increments panoramaTimer once per tick (20 Hz).
         app.panorama_timer += frame_dt * 20.0;
