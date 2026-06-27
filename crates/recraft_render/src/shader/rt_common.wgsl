@@ -55,6 +55,10 @@ fn rt_unpack_normal(p: u32) -> vec3<f32> {
 // hit means the point is occluded — no need to find the closest one.
 const RT_TERMINATE_ON_FIRST_HIT: u32 = 0x04u;
 
+// Entity/player triangles live in a fixed top region of the shared pools (keep in sync with
+// raytrace.rs ENTITY_TRI_BASE); a hit with instance_custom_data >= this is an entity.
+const ENTITY_TRI_BASE: u32 = 4128768u;
+
 // PCG hash (u32 -> u32): high-quality avalanche, the basis for a per-pixel stateful
 // RNG. Seeding from the SCREEN pixel coordinate (not world position) gives the
 // high-frequency white noise a temporal resolve (TAA) can average — a position-based
@@ -195,7 +199,8 @@ fn rt_reflect(origin: vec3<f32>, dir: vec3<f32>, pixel: vec2<f32>) -> vec4<f32> 
     // leaves) instead of stopping on their transparent texels and reflecting a solid quad.
     for (var iter = 0; iter < 4; iter = iter + 1) {
         var rq: ray_query;
-        rayQueryInitialize(&rq, rt_tlas, RayDesc(0u, 0x01u, 0.02, 160.0, ro, dir));
+        // Mask 0x09 = solid (0x01) + entities/player (0x08), so they show up in reflections.
+        rayQueryInitialize(&rq, rt_tlas, RayDesc(0u, 0x09u, 0.02, 160.0, ro, dir));
         loop { if (!rayQueryProceed(&rq)) { break; } }
         let it = rayQueryGetCommittedIntersection(&rq);
         if (it.kind == 0u) {
@@ -205,6 +210,24 @@ fn rt_reflect(origin: vec3<f32>, dir: vec3<f32>, pixel: vec2<f32>) -> vec4<f32> 
         let packed = rt_tri_colors[idx];
         let coverage = f32((packed >> 27u) & 0x1Fu) / 31.0;
         let hit = ro + dir * it.t;
+        // Entity / player hit: the entity pool region has no per-tri UVs / positions, so
+        // flat-shade the per-tri colour (sun N·L + ambient) and return.
+        if (it.instance_custom_data >= ENTITY_TRI_BASE) {
+            let ealb = vec3<f32>(
+                f32((packed >> 16u) & 0xFFu),
+                f32((packed >> 8u) & 0xFFu),
+                f32(packed & 0xFFu),
+            ) * (1.0 / 255.0);
+            var hn = rt_unpack_normal(rt_tri_normals[idx]);
+            if (dot(hn, dir) > 0.0) { hn = -hn; } // face the reflected face toward the ray
+            let sun = lighting.sun_dir.xyz;
+            let endl = max(dot(hn, sun), 0.0);
+            var elit = lighting.ambient.rgb * 0.6;
+            if (endl > 0.0 && !rt_occluded(hit + hn * 0.03, sun, 160.0)) {
+                elit = elit + lighting.sun_color.rgb * endl;
+            }
+            return vec4<f32>(ealb * elit, 1.0);
+        }
         // Reconstruct the hit UV from the triangle's section-local positions (the RT hit
         // gives no UV) — same barycentric trick as the path tracer.
         let pbase = idx * 9u;
