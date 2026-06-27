@@ -195,7 +195,11 @@ fn occluded(origin: vec3<f32>, dir: vec3<f32>, tmax: f32) -> bool {
     return rayQueryGetCommittedIntersection(&rq).kind != 0u;
 }
 
-const MAX_BOUNCES: i32 = 3;
+const MAX_BOUNCES: i32 = 4;
+
+// Per-channel water absorption (Beer-Lambert, per block travelled). Red is absorbed fastest
+// so deep water turns blue-green and darkens with depth — replaces the old flat entry tint.
+const WATER_ABSORB: vec3<f32> = vec3<f32>(0.45, 0.15, 0.09);
 
 struct PtResult {
     radiance: vec3<f32>,
@@ -211,6 +215,7 @@ fn trace_path(ro: vec3<f32>, rd: vec3<f32>, seed: ptr<function, u32>) -> PtResul
     var throughput = vec3<f32>(1.0);
     var radiance = vec3<f32>(0.0);
     var transparent = 0.0;
+    var in_water = false; // true while the ray is travelling inside a water volume
     let sun = sky.sun_dir.xyz;
     let day = max(sky.cloud_params.w, 0.0);
     // Match the raster sun_color scale (~1.0, see LightingUniform.sun_color) so the
@@ -230,6 +235,11 @@ fn trace_path(ro: vec3<f32>, rd: vec3<f32>, seed: ptr<function, u32>) -> PtResul
         if (it.kind == 0u) {
             radiance = radiance + throughput * sky_color(dir);
             break;
+        }
+        // Beer-Lambert: if the segment just travelled was inside water, absorb along it
+        // (depth-dependent darkening/tint) before shading this hit.
+        if (in_water) {
+            throughput = throughput * exp(-WATER_ABSORB * it.t);
         }
         let idx = it.instance_custom_data + it.primitive_index;
         let packed = tri_colors[idx];
@@ -332,9 +342,10 @@ fn trace_path(ro: vec3<f32>, rd: vec3<f32>, seed: ptr<function, u32>) -> PtResul
                     origin = pos + n * 0.02;
                 } else {
                     dir = normalize(refr);
-                    if (front_face) {
-                        throughput = throughput * vec3<f32>(0.35, 0.62, 0.78);
-                    }
+                    // Entering → now inside water (the next segment gets Beer-Lambert
+                    // absorption above); exiting → back in air. Surface / internal
+                    // reflections don't cross the interface, so they leave in_water as-is.
+                    in_water = front_face;
                     origin = pos + dir * 0.01;
                 }
             }
@@ -422,7 +433,7 @@ fn trace_path(ro: vec3<f32>, rd: vec3<f32>, seed: ptr<function, u32>) -> PtResul
             // term explodes at grazing angles (block silhouettes) → bright fireflies the
             // denoiser then smears into a halo ring. The 0.5 tones the mirror down to match
             // the raster's damped reflections (a full reflection reads as too strong).
-            let w = min(f * g * vdoth / (ndotv * ndoth), vec3<f32>(4.0)) * 0.5;
+            let w = min(f * g * vdoth / (ndotv * ndoth), vec3<f32>(5.0)) * 0.75;
             throughput = throughput * w / p_spec;
             dir = l;
         } else {
