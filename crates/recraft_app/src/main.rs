@@ -1352,6 +1352,10 @@ fn handle_actions(
             GuiAction::ReloadResourcePack(path) => {
                 log::info!("resource pack reload requested: {:?}", path);
                 *atlas_uv = renderer.reload_atlas(path);
+                // reload_atlas drops every GPU chunk mesh; re-mesh the whole loaded
+                // world against the new atlas, or it renders empty/wrong until the
+                // player walks far enough to reload chunks naturally.
+                app.game.mark_all_sections_dirty();
             }
             GuiAction::ReloadMods => {
                 let loaded = app.ext.reload_mods(std::path::Path::new("mods"));

@@ -1050,6 +1050,9 @@ pub struct Renderer {
     // changes; the converged result is copied into the offscreen scene for post.
     pt_pipeline: Option<wgpu::RenderPipeline>,
     pt_group1_bind_group: Option<wgpu::BindGroup>,
+    /// Retained pt group(1) bind-group layout, so the bind group can be rebuilt with
+    /// the new atlas view after a resource-pack reload.
+    pt_group1_layout: Option<wgpu::BindGroupLayout>,
     pt_accum_tex: Option<wgpu::Texture>,
     pt_accum_view: Option<wgpu::TextureView>,
     pt_sample_count: u32,
@@ -3588,7 +3591,7 @@ impl Renderer {
         // Path tracer pipeline: group 0 = RT data (TLAS/params/colours/lights/normals),
         // group 1 = camera (primary rays) + sky. Constant-blend into the accumulation
         // target for a temporal running average.
-        let (pt_pipeline, pt_group1_bind_group) = match rt_layout.as_ref() {
+        let (pt_pipeline, pt_group1_bind_group, pt_group1_layout) = match rt_layout.as_ref() {
             Some(rt_layout) => {
                 let uni = |binding| wgpu::BindGroupLayoutEntry {
                     binding,
@@ -3692,9 +3695,9 @@ impl Renderer {
                         },
                     ],
                 });
-                (Some(pipeline), Some(bg))
+                (Some(pipeline), Some(bg), Some(pt_g1_layout))
             }
-            None => (None, None),
+            None => (None, None, None),
         };
         let post_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("post-pipeline-layout"),
@@ -4683,6 +4686,7 @@ impl Renderer {
             rtao_sampler,
             pt_pipeline,
             pt_group1_bind_group,
+            pt_group1_layout,
             pt_accum_tex: None,
             pt_accum_view: None,
             pt_sample_count: 0,
@@ -6306,6 +6310,44 @@ impl Renderer {
         &self.atlas_uv
     }
 
+    /// (Re)build the path tracer's group(1) bind group against the current block atlas
+    /// texture. Returns None when the GPU has no ray tracing (no PT layout). Called on
+    /// startup and after an atlas reload so the PT samples the live atlas.
+    fn build_pt_group1_bind_group(&self) -> Option<wgpu::BindGroup> {
+        let layout = self.pt_group1_layout.as_ref()?;
+        let view = self
+            .block_atlas_texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("pt-atlas-sampler"),
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+        Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("pt-group1-bind-group"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.post_camera_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.sky_uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+            ],
+        }))
+    }
+
     /// Rebuild the block atlas from a resource pack (or default when `None`),
     /// uploading new GPU textures and recreating the mesh worker pool.
     /// Returns the new `AtlasUv` so the caller can update its own copy.
@@ -6457,6 +6499,20 @@ impl Renderer {
         );
 
         let block_image = image::RgbaImage::from_raw(atlas.width, atlas.height, atlas.pixels);
+        // Refresh the path tracer's atlas, or a runtime resource-pack swap leaves it
+        // sampling the OLD atlas → misaligned block textures under path tracing:
+        //  - `rt_atlas`/`ray_tracer` = the CPU atlas for per-triangle colour/coverage;
+        //  - `pt_group1_bind_group` = the GPU atlas the PT shader samples at a hit.
+        // Sections re-mesh below (meshes cleared), recomputing colours with the new atlas.
+        self.rt_atlas = block_image
+            .as_ref()
+            .map(|img| std::sync::Arc::new(img.clone()));
+        if let Some(rt) = self.ray_tracer.as_mut() {
+            rt.set_atlas(self.rt_atlas.clone());
+        }
+        if self.pt_group1_layout.is_some() {
+            self.pt_group1_bind_group = self.build_pt_group1_bind_group();
+        }
         self.gui_atlas = GuiAtlas::load(block_image, atlas_uv.clone());
         self.biome_colors = biome_colors;
         self.atlas_uv = atlas_uv.clone();
