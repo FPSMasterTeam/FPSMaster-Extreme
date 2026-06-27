@@ -388,9 +388,15 @@ impl RayTracer {
         // Opaque (solid + cutout, mask 0x01), stained glass (0x02) and water (0x04) each
         // get their own BLAS so the path tracer can mask + handle them differently. Keep
         // the section if it has ANY of them.
-        let solid_geom = self.build_blas_geom(device, queue, origin, &[solid, cutout], "rt-section", 0);
-        let glass_geom = self.build_blas_geom(device, queue, origin, &[transparent], "rt-glass", 1);
-        let water_geom = self.build_blas_geom(device, queue, origin, &[water], "rt-water", 2);
+        // Solid layer first, then cutout — triangles at or past `solid` count are the
+        // alpha-tested cutout layer (grass/flowers/leaves), never forced opaque.
+        let solid_tris = solid.indices.len() / 3;
+        let solid_geom =
+            self.build_blas_geom(device, queue, origin, &[solid, cutout], "rt-section", 0, solid_tris);
+        let glass_geom =
+            self.build_blas_geom(device, queue, origin, &[transparent], "rt-glass", 1, usize::MAX);
+        let water_geom =
+            self.build_blas_geom(device, queue, origin, &[water], "rt-water", 2, usize::MAX);
         if solid_geom.is_none() && glass_geom.is_none() && water_geom.is_none() {
             self.remove_section(pos);
             return;
@@ -458,6 +464,10 @@ impl RayTracer {
         // 0 = solid/cutout, 1 = glass, 2 = water. Packed into the tri-colour flags so the
         // path tracer knows how to handle a hit (alpha test / tint pass-through / Fresnel).
         material: u32,
+        // Triangle index (within this BLAS) at which the alpha-tested cutout layer begins;
+        // `usize::MAX` = none. Cutout triangles never take the opaque-centroid shortcut, so
+        // grass/flowers/leaves get per-texel holes instead of rendering as solid quads.
+        cutout_start_tri: usize,
     ) -> Option<BlasGeom> {
         let vertex_count: usize = bufs.iter().map(|b| b.vertices.len()).sum();
         let index_count: usize = bufs.iter().map(|b| b.indices.len()).sum();
@@ -501,6 +511,7 @@ impl RayTracer {
                 // (colour, coverage 0..31): opaque centroid → full coverage; a cutout hole
                 // → the alpha-weighted average colour + the average alpha as coverage, so
                 // the path tracer can stochastically alpha-test the holes.
+                let is_cutout = t >= cutout_start_tri;
                 let (tex, cov): ([u8; 4], u32) = match atlas {
                     Some(a) => {
                         let to_px = |u: u32, vv: u32| -> [u8; 4] {
@@ -513,7 +524,10 @@ impl RayTracer {
                         let cu = (v0.uv[0] as u32 + v1.uv[0] as u32 + v2.uv[0] as u32) / 3;
                         let cv = (v0.uv[1] as u32 + v1.uv[1] as u32 + v2.uv[1] as u32) / 3;
                         let c = to_px(cu, cv);
-                        if c[3] >= 128 {
+                        // Solid-layer opaque centroid → full coverage (never holed). Cutout
+                        // triangles always take the per-texel path so the texture's
+                        // transparent parts become holes, even when the centroid is opaque.
+                        if c[3] >= 128 && !is_cutout {
                             (c, 31) // opaque centroid (the common solid-block case)
                         } else {
                             let umin = v0.uv[0].min(v1.uv[0]).min(v2.uv[0]) as u32;
