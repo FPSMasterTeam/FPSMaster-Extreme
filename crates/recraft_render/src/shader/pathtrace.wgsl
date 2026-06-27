@@ -244,7 +244,9 @@ fn sample_ggx_dir(n: vec3<f32>, v: vec3<f32>, rough: f32, rot: vec2<f32>, seed: 
 
 fn occluded(origin: vec3<f32>, dir: vec3<f32>, tmax: f32) -> bool {
     var rq: ray_query;
-    rayQueryInitialize(&rq, tlas, RayDesc(0x04u, 0x01u, 0.02, tmax, origin, dir));
+    // Mask 0x09 = solid (0x01) + entities (0x08): entities cast shadows. (Primary rays use
+    // 0x07 = solid+glass+water and DON'T see entities, so entities stay rasterized.)
+    rayQueryInitialize(&rq, tlas, RayDesc(0x04u, 0x09u, 0.02, tmax, origin, dir));
     rayQueryProceed(&rq);
     return rayQueryGetCommittedIntersection(&rq).kind != 0u;
 }
