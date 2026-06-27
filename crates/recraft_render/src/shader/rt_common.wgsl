@@ -35,6 +35,16 @@ struct RtLight {
     color: vec4<f32>,      // rgb: colour, w: intensity (0 = empty slot)
 };
 @group(3) @binding(3) var<storage, read> rt_lights: array<RtLight>;
+// Per-triangle atlas UVs (3 packed Unorm16x2 per triangle) + section-local vertex
+// positions (9 f32 per triangle). Reflections use them to reconstruct the hit UV and
+// sample the REAL texture (the flat per-triangle colour has no texture detail) and to
+// alpha-test cutout holes (grass/flowers/leaves) instead of reflecting them as solid.
+@group(3) @binding(5) var<storage, read> rt_tri_uvs: array<u32>;
+@group(3) @binding(6) var<storage, read> rt_tri_positions: array<f32>;
+
+fn rt_unpack_uv(p: u32) -> vec2<f32> {
+    return vec2<f32>(f32(p & 0xFFFFu), f32((p >> 16u) & 0xFFFFu)) * (1.0 / 65535.0);
+}
 
 // Ray flag: stop at the first hit. All BLAS geometry is OPAQUE, so any committed
 // hit means the point is occluded — no need to find the closest one.
@@ -173,29 +183,74 @@ fn rt_sky(dir: vec3<f32>) -> vec3<f32> {
 // sun shadow ray. Returns the reflected radiance; a==1 (the caller weights it by the
 // surface's reflectivity). The no-op stub returns a==0.
 fn rt_reflect(origin: vec3<f32>, dir: vec3<f32>) -> vec4<f32> {
-    var rq: ray_query;
-    rayQueryInitialize(&rq, rt_tlas, RayDesc(0u, 0x01u, 0.05, 160.0, origin, dir));
-    rayQueryProceed(&rq);
-    let it = rayQueryGetCommittedIntersection(&rq);
-    if (it.kind == 0u) {
-        return vec4<f32>(rt_sky(dir), 1.0);
+    var ro = origin;
+    // A few iterations so the reflection ray passes THROUGH cutout holes (grass/flowers/
+    // leaves) instead of stopping on their transparent texels and reflecting a solid quad.
+    for (var iter = 0; iter < 4; iter = iter + 1) {
+        var rq: ray_query;
+        rayQueryInitialize(&rq, rt_tlas, RayDesc(0u, 0x01u, 0.02, 160.0, ro, dir));
+        loop { if (!rayQueryProceed(&rq)) { break; } }
+        let it = rayQueryGetCommittedIntersection(&rq);
+        if (it.kind == 0u) {
+            return vec4<f32>(rt_sky(dir), 1.0);
+        }
+        let idx = it.instance_custom_data + it.primitive_index;
+        let packed = rt_tri_colors[idx];
+        let coverage = f32((packed >> 27u) & 0x1Fu) / 31.0;
+        let hit = ro + dir * it.t;
+        // Reconstruct the hit UV from the triangle's section-local positions (the RT hit
+        // gives no UV) — same barycentric trick as the path tracer.
+        let pbase = idx * 9u;
+        let p0 = vec3<f32>(rt_tri_positions[pbase], rt_tri_positions[pbase + 1u], rt_tri_positions[pbase + 2u]);
+        let p1 = vec3<f32>(rt_tri_positions[pbase + 3u], rt_tri_positions[pbase + 4u], rt_tri_positions[pbase + 5u]);
+        let p2 = vec3<f32>(rt_tri_positions[pbase + 6u], rt_tri_positions[pbase + 7u], rt_tri_positions[pbase + 8u]);
+        let hp = hit - it.object_to_world[3];
+        let e1 = p1 - p0;
+        let e2 = p2 - p0;
+        let ph = hp - p0;
+        let d00 = dot(e1, e1);
+        let d01 = dot(e1, e2);
+        let d11 = dot(e2, e2);
+        let d20 = dot(ph, e1);
+        let d21 = dot(ph, e2);
+        let denom = max(d00 * d11 - d01 * d01, 1e-8);
+        let b1 = (d11 * d20 - d01 * d21) / denom;
+        let b2 = (d00 * d21 - d01 * d20) / denom;
+        let b0 = 1.0 - b1 - b2;
+        let uvbase = idx * 3u;
+        let t0 = rt_unpack_uv(rt_tri_uvs[uvbase]);
+        let t1 = rt_unpack_uv(rt_tri_uvs[uvbase + 1u]);
+        let t2 = rt_unpack_uv(rt_tri_uvs[uvbase + 2u]);
+        var uv = t0 * b0 + t1 * b1 + t2 * b2;
+        let tmn = min(t0, min(t1, t2));
+        let tmx = max(t0, max(t1, t2));
+        let inset = (tmx - tmn) * 0.001;
+        uv = clamp(uv, tmn + inset, tmx - inset);
+        let texel = textureSampleLevel(block_atlas, block_sampler, uv, 0.0);
+        // Cutout hole → see through it.
+        if (coverage < 0.99 && texel.a < 0.5) {
+            ro = hit + dir * 0.002;
+            continue;
+        }
+        // Biome tint for greyscale texels (grass/leaves), like the main shader.
+        let avg = vec3<f32>(
+            f32((packed >> 16u) & 0xFFu),
+            f32((packed >> 8u) & 0xFFu),
+            f32(packed & 0xFFu),
+        ) * (1.0 / 255.0);
+        let tint = avg / max(max(avg.r, max(avg.g, avg.b)), 0.001);
+        let sat = max(texel.r, max(texel.g, texel.b)) - min(texel.r, min(texel.g, texel.b));
+        let greyness = clamp(1.0 - sat * 3.0, 0.0, 1.0);
+        let albedo = texel.rgb * mix(vec3<f32>(1.0), tint, greyness);
+        // Relight: flat ambient + a hard sun shadow ray.
+        let sun = lighting.sun_dir.xyz;
+        var lit = lighting.ambient.rgb * 0.6;
+        if (!rt_occluded(hit + sun * 0.05, sun, 160.0)) {
+            lit = lit + lighting.sun_color.rgb * 0.9;
+        }
+        return vec4<f32>(albedo * lit, 1.0);
     }
-    let packed = rt_tri_colors[it.instance_custom_data + it.primitive_index];
-    let albedo = vec3<f32>(
-        f32((packed >> 16u) & 0xFFu),
-        f32((packed >> 8u) & 0xFFu),
-        f32(packed & 0xFFu),
-    ) * (1.0 / 255.0);
-    let hit = origin + dir * it.t;
-    let sun = lighting.sun_dir.xyz;
-    var lit = lighting.ambient.rgb * 0.6;
-    var srq: ray_query;
-    rayQueryInitialize(&srq, rt_tlas, RayDesc(RT_TERMINATE_ON_FIRST_HIT, 0x01u, 0.05, 160.0, hit + sun * 0.05, sun));
-    rayQueryProceed(&srq);
-    if (rayQueryGetCommittedIntersection(&srq).kind == 0u) {
-        lit = lit + lighting.sun_color.rgb * 0.9;
-    }
-    return vec4<f32>(albedo * lit, 1.0);
+    return vec4<f32>(rt_sky(dir), 1.0);
 }
 
 // Voxel block-light scale: with RT point lights active, dial the smooth voxel torch
