@@ -52,17 +52,23 @@ fn world_at(px: vec2<i32>, dims: vec2<i32>, depth: f32) -> vec3<f32> {
     return w.xyz / w.w;
 }
 
+// Demodulated irradiance: chunks divide by their albedo (so texture stays sharp); pixels
+// with no opaque-chunk albedo (water / glass, mostly specular) are denoised in radiance
+// space directly (ca = 1, no demodulation).
 fn irradiance_at(p: vec2<i32>) -> vec3<f32> {
-    let a = max(textureLoad(albedo_tex, p, 0).rgb, vec3<f32>(0.04));
-    return textureLoad(color_tex, p, 0).rgb / a;
+    let a = textureLoad(albedo_tex, p, 0);
+    let ca = select(vec3<f32>(1.0), max(a.rgb, vec3<f32>(0.04)), a.a >= 0.5);
+    return textureLoad(color_tex, p, 0).rgb / ca;
 }
 
 @fragment
 fn fs_main(in: VsOut) -> Out {
     let dims = vec2<i32>(textureDimensions(color_tex));
     let c = vec2<i32>(clamp(in.uv * vec2<f32>(dims), vec2<f32>(0.0), vec2<f32>(dims) - vec2<f32>(1.0)));
+    let pt = textureLoad(color_tex, c, 0);
+    let center_color = pt.rgb;
+    let transparent = pt.a; // 1 = the primary PT ray hit water/glass at this pixel
     let cd = textureLoad(depth_tex, c, 0).r;
-    let center_color = textureLoad(color_tex, c, 0).rgb;
     var o: Out;
     if (cd >= 1.0) {
         o.view = vec4<f32>(center_color, 1.0); // sky — PT result, no surface
@@ -70,10 +76,14 @@ fn fs_main(in: VsOut) -> Out {
         return o;
     }
     let albedo4 = textureLoad(albedo_tex, c, 0);
-    if (albedo4.a < 0.5) {
-        discard; // entity / hand → keep the rasterized `view`; history left stale
+    // No opaque chunk here AND the PT didn't hit a transparent surface → a rasterized
+    // entity / hand the PT can't trace: discard, keep the rasterized `view`. Water/glass
+    // (transparent set) and chunks keep the PT result.
+    if (albedo4.a < 0.5 && transparent < 0.5) {
+        discard;
     }
-    let ca = max(albedo4.rgb, vec3<f32>(0.04));
+    // Chunks demodulate by albedo; water/glass denoise in radiance space (ca = 1).
+    let ca = select(vec3<f32>(1.0), max(albedo4.rgb, vec3<f32>(0.04)), albedo4.a >= 0.5);
     let ci = center_color / ca;
     let cl = dot(ci, vec3<f32>(0.299, 0.587, 0.114));
     let cp = world_at(c, dims, cd);
@@ -112,7 +122,10 @@ fn fs_main(in: VsOut) -> Out {
             }
         }
     }
-    let cur = select(ci, sum / wsum, wsum > 0.0);
+    // Water/glass reflections are sharp — skip the spatial blur (it softens them) and let
+    // the temporal accumulation below do the cleaning. Chunks get the full spatial filter.
+    let spatial = select(ci, sum / wsum, wsum > 0.0);
+    let cur = select(spatial, ci, albedo4.a < 0.5);
 
     // ── Temporal: reproject + neighbourhood-clamp + accumulate. ──
     var acc = cur;
