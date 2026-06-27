@@ -2180,14 +2180,15 @@ impl GameState {
         feet: Vec3,
         body_yaw: f32,
         look_yaw: f32,
+        limb_swing: f32,
+        limb_swing_amount: f32,
         tick_alpha: f32,
         brightness: f32,
     ) {
         mesh.clear();
         let sun_b = recraft_render::sky::sun_brightness(self.world_time(tick_alpha));
-        // Real walk/swing/sneak pose from the local player's state; the head turns toward
-        // the look direction relative to the (movement-following) body yaw.
-        let (limb_swing, limb_swing_amount) = self.player.render_limb_swing(tick_alpha);
+        // Walk cycle (limb_swing) is driven by the caller from movement; swing/sneak come
+        // from the player state; the head turns toward the look relative to the body yaw.
         let net_head_yaw = wrap_degrees(look_yaw - body_yaw).clamp(-75.0, 75.0);
         let anim = EntityAnim {
             limb_swing,

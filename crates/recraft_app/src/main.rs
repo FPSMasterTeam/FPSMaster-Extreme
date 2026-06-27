@@ -136,6 +136,11 @@ struct App {
     /// around. Paired with the previous feet position for the movement check.
     player_body_yaw: f32,
     prev_player_feet: glam::Vec3,
+    /// Walk-cycle phase + magnitude for the RT player body, driven from the player's
+    /// per-frame horizontal movement (the local player's own limb-swing isn't tracked since
+    /// the body is never normally drawn).
+    player_limb_swing: f32,
+    player_limb_swing_amount: f32,
     /// Audio backend: resolves `sounds.json` events and plays positioned/UI
     /// sounds queued by the game. Silent if no output device is available.
     sound: sound::SoundManager,
@@ -457,6 +462,8 @@ impl ApplicationHandler for WinitApp {
             last_entity_key: None,
             player_body_yaw: 0.0,
             prev_player_feet: glam::Vec3::ZERO,
+            player_limb_swing: 0.0,
+            player_limb_swing_amount: 0.0,
             sound: sound::SoundManager::new(),
             pending_window_packets: Vec::new(),
             walking_packets: WalkingPacketState::default(),
@@ -2759,9 +2766,16 @@ fn render_frame(
         // Body yaw follows MOVEMENT (snaps to the look direction while walking) and freezes
         // when standing still, so the reflected/shadowed body doesn't spin as you look around.
         let moved = (feet - app.prev_player_feet) * glam::Vec3::new(1.0, 0.0, 1.0);
-        if moved.length() > 0.01 {
+        let moved_dist = moved.length();
+        if moved_dist > 0.01 {
             app.player_body_yaw = look_yaw;
         }
+        // Drive the walk cycle from horizontal speed (normalized to ~walk speed); advance the
+        // phase per tick-equivalent so the legs swing while moving and settle when still.
+        let speed = moved_dist / frame_dt.max(1e-4);
+        let target = (speed * 0.22).min(1.0);
+        app.player_limb_swing_amount += (target - app.player_limb_swing_amount) * 0.2;
+        app.player_limb_swing += app.player_limb_swing_amount * frame_dt * 20.0;
         app.prev_player_feet = feet;
         let mut player_body = recraft_render::ModelMesh::new();
         app.game.build_player_body_at(
@@ -2769,6 +2783,8 @@ fn render_frame(
             feet,
             app.player_body_yaw,
             look_yaw,
+            app.player_limb_swing,
+            app.player_limb_swing_amount,
             tick_alpha,
             app.settings.brightness,
         );
