@@ -570,7 +570,7 @@ pub(super) mod sky_geometry {
 
     const STAR_COUNT: usize = 1500;
     const STAR_DIST: f32 = 100.0;
-    const STAR_SIZE: f32 = 0.65;
+    const STAR_SIZE: f32 = 0.35;
 
     /// Deterministic star field in the celestial-local frame: `STAR_COUNT`
     /// small quads scattered over the sphere, each billboarded around its
