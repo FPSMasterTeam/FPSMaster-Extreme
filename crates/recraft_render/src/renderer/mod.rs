@@ -1053,6 +1053,21 @@ pub struct Renderer {
     /// Retained pt group(1) bind-group layout, so the bind group can be rebuilt with
     /// the new atlas view after a resource-pack reload.
     pt_group1_layout: Option<wgpu::BindGroupLayout>,
+    /// Path-tracer denoiser: a demodulated edge-aware spatial filter (pt_denoise.wgsl)
+    /// run on the PT scene before the temporal resolve. Built when RT is supported.
+    pt_denoise_pipeline: Option<wgpu::RenderPipeline>,
+    pt_denoise_layout: Option<wgpu::BindGroupLayout>,
+    /// Ping-pong temporal denoiser bind groups: `bg_a` reads history A (that frame writes
+    /// history B), `bg_b` reads B (writes A). Selected by frame parity.
+    pt_denoise_bg_a: Option<wgpu::BindGroup>,
+    pt_denoise_bg_b: Option<wgpu::BindGroup>,
+    /// Ping-pong history textures (accumulated demodulated irradiance) + a linear sampler
+    /// for motion-vector reprojection.
+    pt_hist_a_tex: Option<wgpu::Texture>,
+    pt_hist_a_view: Option<wgpu::TextureView>,
+    pt_hist_b_tex: Option<wgpu::Texture>,
+    pt_hist_b_view: Option<wgpu::TextureView>,
+    pt_hist_sampler: wgpu::Sampler,
     pt_accum_tex: Option<wgpu::Texture>,
     pt_accum_view: Option<wgpu::TextureView>,
     pt_sample_count: u32,
@@ -3626,6 +3641,34 @@ impl Renderer {
                             ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                             count: None,
                         },
+                        // binding 4: PBR normal atlas; 5: PBR specular atlas; 6: linear PBR
+                        // sampler — so the path tracer reads labPBR materials at the hit.
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 4,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 5,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 6,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                            count: None,
+                        },
                     ],
                 });
                 let pt_atlas_view =
@@ -3693,12 +3736,127 @@ impl Renderer {
                             binding: 3,
                             resource: wgpu::BindingResource::Sampler(&pt_atlas_sampler),
                         },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: wgpu::BindingResource::TextureView(&pbr_normal_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 5,
+                            resource: wgpu::BindingResource::TextureView(&pbr_specular_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 6,
+                            resource: wgpu::BindingResource::Sampler(&pbr_sampler),
+                        },
                     ],
                 });
                 (Some(pipeline), Some(bg), Some(pt_g1_layout))
             }
             None => (None, None, None),
         };
+        // Path-tracer denoiser pipeline (see shader/pt_denoise.wgsl): demodulate the noisy
+        // PT radiance by the albedo G-buffer, à-trous bilateral, remodulate. Built when RT
+        // is supported; its bind group is (re)built in `rebuild_scaled_targets`.
+        let (pt_denoise_pipeline, pt_denoise_layout) = match rt_layout.as_ref() {
+            Some(_) => {
+                let frag = wgpu::ShaderStages::FRAGMENT;
+                let entry = |binding, ty| wgpu::BindGroupLayoutEntry {
+                    binding,
+                    visibility: frag,
+                    ty,
+                    count: None,
+                };
+                let unf = wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                };
+                let uniform = wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                };
+                let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("pt-denoise-layout"),
+                    // 0 color, 1 albedo G-buffer, 2 depth, 3 post-camera, 4 motion vectors,
+                    // 5 history (sampled, for reprojection), 6 history sampler.
+                    entries: &[
+                        entry(0, unf),
+                        entry(1, unf),
+                        entry(2, unf),
+                        entry(3, uniform),
+                        entry(4, unf),
+                        entry(
+                            5,
+                            wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                        ),
+                        entry(6, wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering)),
+                    ],
+                });
+                let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("pt-denoise-shader"),
+                    source: wgpu::ShaderSource::Wgsl(
+                        include_str!("../shader/pt_denoise.wgsl").into(),
+                    ),
+                });
+                let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("pt-denoise-pipeline-layout"),
+                    bind_group_layouts: &[Some(&layout)],
+                    immediate_size: 0,
+                });
+                let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("pt-denoise-pipeline"),
+                    layout: Some(&pl),
+                    vertex: wgpu::VertexState {
+                        module: &shader,
+                        entry_point: Some("vs_main"),
+                        compilation_options: Default::default(),
+                        buffers: &[],
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &shader,
+                        entry_point: Some("fs_main"),
+                        compilation_options: Default::default(),
+                        // @0 = displayed colour (offscreen view), @1 = accumulated irradiance
+                        // (next frame's history).
+                        targets: &[
+                            Some(wgpu::ColorTargetState {
+                                format: HDR_FORMAT,
+                                blend: Some(wgpu::BlendState::REPLACE),
+                                write_mask: wgpu::ColorWrites::ALL,
+                            }),
+                            Some(wgpu::ColorTargetState {
+                                format: HDR_FORMAT,
+                                blend: Some(wgpu::BlendState::REPLACE),
+                                write_mask: wgpu::ColorWrites::ALL,
+                            }),
+                        ],
+                    }),
+                    primitive: wgpu::PrimitiveState::default(),
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState::default(),
+                    cache: None,
+                    multiview_mask: None,
+                });
+                (Some(pipeline), Some(layout))
+            }
+            None => (None, None),
+        };
+        // Linear clamp sampler for reprojecting the PT denoiser's history (bilinear fetch
+        // at the motion-vector-displaced previous-frame position).
+        let pt_hist_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("pt-hist-sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
         let post_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("post-pipeline-layout"),
             bind_group_layouts: &[Some(&post_layout)],
@@ -4687,6 +4845,15 @@ impl Renderer {
             pt_pipeline,
             pt_group1_bind_group,
             pt_group1_layout,
+            pt_denoise_pipeline,
+            pt_denoise_layout,
+            pt_denoise_bg_a: None,
+            pt_denoise_bg_b: None,
+            pt_hist_a_tex: None,
+            pt_hist_a_view: None,
+            pt_hist_b_tex: None,
+            pt_hist_b_view: None,
+            pt_hist_sampler,
             pt_accum_tex: None,
             pt_accum_view: None,
             pt_sample_count: 0,
@@ -5184,7 +5351,10 @@ impl Renderer {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: HDR_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            // The path tracer renders here; the denoiser samples it (TEXTURE_BINDING).
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
         self.pt_accum_view = Some(pt_accum.create_view(&wgpu::TextureViewDescriptor::default()));
@@ -5623,6 +5793,63 @@ impl Renderer {
                         },
                     ],
                 }));
+            // Path-tracer denoiser: two ping-pong history textures (accumulated demodulated
+            // irradiance) + the two bind groups (bg_a reads history A, bg_b reads B).
+            let make_hist = |label: &str, device: &wgpu::Device| {
+                let t = device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some(label),
+                    size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: HDR_FORMAT,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                });
+                let v = t.create_view(&wgpu::TextureViewDescriptor::default());
+                (t, v)
+            };
+            let (hist_a_tex, hist_a_view) = make_hist("pt-hist-a", &self.device);
+            let (hist_b_tex, hist_b_view) = make_hist("pt-hist-b", &self.device);
+            if let (Some(layout), Some(pt_accum_view), Some(mv_view)) = (
+                self.pt_denoise_layout.as_ref(),
+                self.pt_accum_view.as_ref(),
+                self.mv_view.as_ref(),
+            ) {
+                let common = [
+                    wgpu::BindingResource::TextureView(pt_accum_view),
+                    wgpu::BindingResource::TextureView(&albedo_view),
+                    wgpu::BindingResource::TextureView(&self.depth_view),
+                    self.post_camera_buffer.as_entire_binding(),
+                    wgpu::BindingResource::TextureView(mv_view),
+                    wgpu::BindingResource::Sampler(&self.pt_hist_sampler),
+                ];
+                let make = |label, hist_read| {
+                    self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some(label),
+                        layout,
+                        entries: &[
+                            wgpu::BindGroupEntry { binding: 0, resource: common[0].clone() },
+                            wgpu::BindGroupEntry { binding: 1, resource: common[1].clone() },
+                            wgpu::BindGroupEntry { binding: 2, resource: common[2].clone() },
+                            wgpu::BindGroupEntry { binding: 3, resource: common[3].clone() },
+                            wgpu::BindGroupEntry { binding: 4, resource: common[4].clone() },
+                            wgpu::BindGroupEntry {
+                                binding: 5,
+                                resource: wgpu::BindingResource::TextureView(hist_read),
+                            },
+                            wgpu::BindGroupEntry { binding: 6, resource: common[5].clone() },
+                        ],
+                    })
+                };
+                self.pt_denoise_bg_a = Some(make("pt-denoise-bg-a", &hist_a_view));
+                self.pt_denoise_bg_b = Some(make("pt-denoise-bg-b", &hist_b_view));
+            }
+            self.pt_hist_a_tex = Some(hist_a_tex);
+            self.pt_hist_a_view = Some(hist_a_view);
+            self.pt_hist_b_tex = Some(hist_b_tex);
+            self.pt_hist_b_view = Some(hist_b_view);
             self.rtao_raw_tex = Some(raw_tex);
             self.rtao_raw_view = Some(raw_view);
             self.rtao_denoised_tex = Some(den_tex);
@@ -6344,6 +6571,18 @@ impl Renderer {
                     binding: 3,
                     resource: wgpu::BindingResource::Sampler(&sampler),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(&self.pbr_normal_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(&self.pbr_specular_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::Sampler(&self.pbr_sampler),
+                },
             ],
         }))
     }
@@ -6677,7 +6916,10 @@ impl Renderer {
                 horizon: [sky.horizon[0], sky.horizon[1], sky.horizon[2], 1.0],
                 zenith: [sky.zenith[0], sky.zenith[1], sky.zenith[2], 1.0],
                 sun_dir: [sun_dir.x, sun_dir.y, sun_dir.z, sky.sunset[3]],
-                sunset: sky.sunset,
+                // rgb = sunset glow colour; w carries the user Brightness slider (the glow
+                // STRENGTH already lives in sun_dir.w), read by the path tracer to scale
+                // its ambient fill so dark-area brightness is dial-able.
+                sunset: [sky.sunset[0], sky.sunset[1], sky.sunset[2], self.brightness],
                 camera_pos: [
                     camera.position.x,
                     camera.position.y,
@@ -8287,8 +8529,17 @@ impl Renderer {
                                 resolve_target: None,
                                 depth_slice: None,
                                 ops: wgpu::Operations {
-                                    // Clear albedo to black → no GI added on unwritten px.
-                                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                    // Clear albedo to transparent black: rgb 0 → no GI added
+                                    // on unwritten px (RTAO apply uses rgb only), and ALPHA 0
+                                    // marks "no opaque chunk here" so the path-trace denoiser
+                                    // can keep the rasterized entities/hand at those pixels
+                                    // (Color::BLACK has alpha 1, which broke that mask).
+                                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                                        r: 0.0,
+                                        g: 0.0,
+                                        b: 0.0,
+                                        a: 0.0,
+                                    }),
                                     store: wgpu::StoreOp::Store,
                                 },
                             }),
@@ -8563,32 +8814,92 @@ impl Renderer {
             }
         }
 
-        // Path tracer ("Path Traced" mode): trace primary rays + diffuse bounces with
-        // next-event estimation, overwriting the rasterized world in the offscreen scene
-        // (REPLACE). A fresh, noisy trace each frame — the existing TAA/DLSS resolve below
-        // does the temporal denoising (like the RT effects), so there is NO separate PT
-        // accumulation (which double-counted temporally and sheared under motion).
+        // Path tracer ("Path Traced" mode): trace primary rays + diffuse/specular bounces
+        // with next-event estimation. The raw trace is noisy, so a demodulated edge-aware
+        // SPATIAL denoiser (pt_denoise) cleans the lighting before the temporal TAA/DLSS
+        // resolve converges the rest. With the denoiser: PT renders into `pt_accum`, the
+        // denoiser writes the cleaned result into the offscreen `view`. Without it (denoiser
+        // unbuilt): PT overwrites `view` directly, as before.
         if self.path_tracing() {
-            let mut pp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("path-trace-pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                occlusion_query_set: None,
-                timestamp_writes: None,
-                multiview_mask: None,
-            });
-            pp.set_pipeline(self.pt_pipeline.as_ref().unwrap());
-            pp.set_bind_group(0, self.ray_tracer.as_ref().unwrap().bind_group(), &[]);
-            pp.set_bind_group(1, self.pt_group1_bind_group.as_ref().unwrap(), &[]);
-            pp.draw(0..3, 0..1);
+            let denoise = self.pt_denoise_pipeline.is_some()
+                && self.pt_denoise_bg_a.is_some()
+                && self.pt_denoise_bg_b.is_some()
+                && self.pt_accum_view.is_some()
+                && self.pt_hist_a_view.is_some()
+                && self.pt_hist_b_view.is_some();
+            let pt_target = if denoise {
+                self.pt_accum_view.as_ref().unwrap()
+            } else {
+                view
+            };
+            {
+                let mut pp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("path-trace-pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: pt_target,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    occlusion_query_set: None,
+                    timestamp_writes: None,
+                    multiview_mask: None,
+                });
+                pp.set_pipeline(self.pt_pipeline.as_ref().unwrap());
+                pp.set_bind_group(0, self.ray_tracer.as_ref().unwrap().bind_group(), &[]);
+                pp.set_bind_group(1, self.pt_group1_bind_group.as_ref().unwrap(), &[]);
+                pp.draw(0..3, 0..1);
+            }
+            if denoise {
+                // Temporal ping-pong: even frames read history A + write B; odd read B +
+                // write A. @0 = displayed colour (view), @1 = accumulated irradiance (hist).
+                let even = self.rt_frame & 1 == 0;
+                let (bg, hist_write) = if even {
+                    (
+                        self.pt_denoise_bg_a.as_ref().unwrap(),
+                        self.pt_hist_b_view.as_ref().unwrap(),
+                    )
+                } else {
+                    (
+                        self.pt_denoise_bg_b.as_ref().unwrap(),
+                        self.pt_hist_a_view.as_ref().unwrap(),
+                    )
+                };
+                let mut dp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("pt-denoise-pass"),
+                    color_attachments: &[
+                        Some(wgpu::RenderPassColorAttachment {
+                            view,
+                            resolve_target: None,
+                            depth_slice: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            },
+                        }),
+                        Some(wgpu::RenderPassColorAttachment {
+                            view: hist_write,
+                            resolve_target: None,
+                            depth_slice: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            },
+                        }),
+                    ],
+                    depth_stencil_attachment: None,
+                    occlusion_query_set: None,
+                    timestamp_writes: None,
+                    multiview_mask: None,
+                });
+                dp.set_pipeline(self.pt_denoise_pipeline.as_ref().unwrap());
+                dp.set_bind_group(0, bg, &[]);
+                dp.draw(0..3, 0..1);
+            }
         }
 
         // Temporal AA resolve: blend the current jittered scene with the

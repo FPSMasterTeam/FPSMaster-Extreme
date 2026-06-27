@@ -43,6 +43,12 @@ struct Sky {
 @group(1) @binding(1) var<uniform> sky: Sky;
 @group(1) @binding(2) var atlas: texture_2d<f32>;
 @group(1) @binding(3) var atlas_samp: sampler;
+// PBR (labPBR) atlases: normal (RGB tangent-space normal) + specular
+// (R smoothness, G metallic, B emissive). Default 1×1 textures when no PBR pack, so
+// the tracer degrades to plain diffuse. Sampled with the linear PBR sampler.
+@group(1) @binding(4) var normal_atlas: texture_2d<f32>;
+@group(1) @binding(5) var specular_atlas: texture_2d<f32>;
+@group(1) @binding(6) var pbr_samp: sampler;
 
 fn unpack_uv(p: u32) -> vec2<f32> {
     return vec2<f32>(f32(p & 0xFFFFu), f32((p >> 16u) & 0xFFFFu)) * (1.0 / 65535.0);
@@ -110,6 +116,76 @@ fn unpack_rgb(p: u32) -> vec3<f32> {
 fn unpack_normal(p: u32) -> vec3<f32> {
     let b = vec3<f32>(f32((p >> 16u) & 0xFFu), f32((p >> 8u) & 0xFFu), f32(p & 0xFFu));
     return normalize((b - 128.0) / 127.0);
+}
+
+// ── PBR (labPBR) material + GGX BRDF, mirroring the raster chunk shader ──
+fn ggx_distribution(ndoth: f32, rough: f32) -> f32 {
+    let a = rough * rough;
+    let a2 = a * a;
+    let d = ndoth * ndoth * (a2 - 1.0) + 1.0;
+    return a2 / max(3.14159265 * d * d, 1e-7);
+}
+fn smith_ggx(ndotv: f32, ndotl: f32, rough: f32) -> f32 {
+    let r = rough + 1.0;
+    let k = (r * r) / 8.0;
+    let gv = ndotv / (ndotv * (1.0 - k) + k);
+    let gl = ndotl / (ndotl * (1.0 - k) + k);
+    return gv * gl;
+}
+fn fresnel_schlick(cos_theta: f32, f0: vec3<f32>) -> vec3<f32> {
+    return f0 + (vec3<f32>(1.0) - f0) * pow(1.0 - cos_theta, 5.0);
+}
+// labPBR tangent-space normal → world, TBN from the axis-aligned face normal (mirrors
+// the raster `sample_pbr_normal`).
+fn pbr_normal(uv: vec2<f32>, geo_n: vec3<f32>) -> vec3<f32> {
+    let n_tex = textureSampleLevel(normal_atlas, pbr_samp, uv, 0.0);
+    var ts = n_tex.rgb * 2.0 - vec3<f32>(1.0);
+    ts.x = ts.x * 1.5;
+    ts.y = ts.y * 1.5;
+    let abs_n = abs(geo_n);
+    var tangent: vec3<f32>;
+    var bitangent: vec3<f32>;
+    if (abs_n.y > 0.9) {
+        tangent = vec3<f32>(1.0, 0.0, 0.0);
+        bitangent = vec3<f32>(0.0, 0.0, sign(geo_n.y));
+    } else if (abs_n.x > 0.9) {
+        tangent = vec3<f32>(0.0, 0.0, -sign(geo_n.x));
+        bitangent = vec3<f32>(0.0, 1.0, 0.0);
+    } else {
+        tangent = vec3<f32>(sign(geo_n.z), 0.0, 0.0);
+        bitangent = vec3<f32>(0.0, 1.0, 0.0);
+    }
+    return normalize(tangent * ts.x + bitangent * ts.y + geo_n * ts.z);
+}
+// Combined diffuse + GGX specular BRDF (no cosine; caller multiplies by N·L). Matches
+// the raster: kd*albedo + D*G*F/(4 N·V N·L), kd = (1-F)(1-metallic).
+fn brdf_eval(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, albedo: vec3<f32>, f0: vec3<f32>, rough: f32, metallic: f32) -> vec3<f32> {
+    let h = normalize(v + l);
+    let ndotv = max(dot(n, v), 0.001);
+    let ndotl = max(dot(n, l), 0.0);
+    let ndoth = max(dot(n, h), 0.0);
+    let vdoth = max(dot(v, h), 0.0);
+    let dterm = ggx_distribution(ndoth, rough);
+    let gterm = smith_ggx(ndotv, ndotl, rough);
+    let fterm = fresnel_schlick(vdoth, f0);
+    let spec = (dterm * gterm * fterm) / max(4.0 * ndotv * ndotl, 0.001);
+    let kd = (vec3<f32>(1.0) - fterm) * (1.0 - metallic);
+    return kd * albedo + spec;
+}
+// Importance-sample a GGX half-vector around n and reflect the view → bounce direction.
+fn sample_ggx_dir(n: vec3<f32>, v: vec3<f32>, rough: f32, seed: ptr<function, u32>) -> vec3<f32> {
+    let a = rough * rough;
+    let r1 = rand(seed);
+    let r2 = rand(seed);
+    let phi = 6.2831853 * r1;
+    let cos_t = sqrt((1.0 - r2) / (1.0 + (a * a - 1.0) * r2));
+    let sin_t = sqrt(max(0.0, 1.0 - cos_t * cos_t));
+    var up = vec3<f32>(0.0, 1.0, 0.0);
+    if (abs(n.y) > 0.99) { up = vec3<f32>(1.0, 0.0, 0.0); }
+    let tx = normalize(cross(up, n));
+    let ty = cross(n, tx);
+    let h = normalize(tx * (sin_t * cos(phi)) + ty * (sin_t * sin(phi)) + n * cos_t);
+    return reflect(-v, h);
 }
 
 fn occluded(origin: vec3<f32>, dir: vec3<f32>, tmax: f32) -> bool {
@@ -235,18 +311,34 @@ fn trace_path(ro: vec3<f32>, rd: vec3<f32>, seed: ptr<function, u32>) -> vec3<f3
             continue;
         }
 
-        // Opaque surface. Emission seen on the first opaque hit (indirect emitter light is
-        // the point-light NEE, so don't double-count on later bounces).
-        if (((packed >> 24u) & 1u) == 1u && bounces == 0) {
-            radiance = radiance + throughput * albedo * 3.0;
+        // ── Opaque PBR surface ──
+        // `n` is the geometric face normal (flipped to face the ray); use it for the TBN
+        // and the ray offset. The shading normal comes from the labPBR normal map.
+        let geo_n = n;
+        var sn = pbr_normal(uv, geo_n);
+        if (dot(sn, dir) > 0.0) { sn = geo_n; } // keep the shading normal facing the ray
+        let spec_tex = textureSampleLevel(specular_atlas, pbr_samp, uv, 0.0);
+        let smoothness = spec_tex.r;
+        let metallic = spec_tex.g;
+        let roughness = max((1.0 - smoothness) * (1.0 - smoothness), 0.04);
+        let f0 = mix(vec3<f32>(0.04), albedo, metallic);
+        let diff_albedo = albedo * (1.0 - metallic); // metals have no diffuse term
+        let v = -dir;                                 // view (toward the incoming ray)
+        let surf = pos + geo_n * 0.02;
+
+        // Emission: the full-emissive block flag (glowstone/lava) OR the labPBR emissive
+        // (specular B). First opaque hit only — indirect emitter light is the point-light NEE.
+        let emit = select(spec_tex.b, 1.0, ((packed >> 24u) & 1u) == 1u);
+        if (bounces == 0 && emit > 0.01) {
+            radiance = radiance + throughput * albedo * emit * 3.0;
         }
-        let surf = pos + n * 0.02;
-        // NEE: sun.
-        let ndl = max(dot(n, sun), 0.0);
+        // NEE: sun, full BRDF (diffuse + GGX specular highlight).
+        let ndl = max(dot(sn, sun), 0.0);
         if (ndl > 0.0 && day > 0.0 && !occluded(surf, sun, 1000.0)) {
-            radiance = radiance + throughput * albedo * sun_color * ndl;
+            let b = brdf_eval(sn, v, sun, albedo, f0, roughness, metallic);
+            radiance = radiance + throughput * b * sun_color * ndl;
         }
-        // NEE: emissive-block point lights.
+        // NEE: emissive-block point lights, full BRDF.
         let lcount = arrayLength(&pt_lights);
         for (var i = 0u; i < lcount; i = i + 1u) {
             let L = pt_lights[i];
@@ -255,27 +347,57 @@ fn trace_path(ro: vec3<f32>, rd: vec3<f32>, seed: ptr<function, u32>) -> vec3<f3
             let ld = length(to);
             if (ld >= L.pos_radius.w) { continue; }
             let ldir = to / max(ld, 1e-4);
-            let lndl = max(dot(n, ldir), 0.0);
+            let lndl = max(dot(sn, ldir), 0.0);
             if (lndl <= 0.0) { continue; }
             let r = ld / L.pos_radius.w;
             let win = clamp(1.0 - r * r * r * r, 0.0, 1.0);
             let atten = win / (1.0 + ld * ld * 0.2);
             if (!occluded(surf, ldir, ld - 0.7)) {
-                radiance = radiance + throughput * albedo * L.color.rgb * (L.color.w * atten * lndl);
+                let b = brdf_eval(sn, v, ldir, albedo, f0, roughness, metallic);
+                radiance = radiance + throughput * b * L.color.rgb * (L.color.w * atten * lndl);
             }
         }
-        // Sky-ambient floor: the colour the face's hemisphere sees, so occluded/back-lit
-        // faces aren't pure black (the bounce GI refines it). Without this, 3 bounces in
-        // deep terrain leave shadowed sides black — the harsh "black stripe" look.
-        radiance = radiance + throughput * albedo * sky_color(n) * 0.35;
+        // Diffuse ambient = a sky-independent floor + a sky-visibility term (metals get
+        // none — their fill is the spec bounce). The FLOOR lifts deep shadow / occluded
+        // faces (it barely touches already-bright surfaces, which ACES compresses); the SKY
+        // term is the open-area fill. The user Brightness slider (sky.sunset.w, 0..1, default
+        // 0.5) scales the whole ambient 0.4..1.6× so "how dark the dark parts get" is
+        // dial-able in-game.
+        let bright = 0.4 + 1.2 * sky.sunset.w;
+        let ambient = (vec3<f32>(0.09, 0.1, 0.13) + sky_color(sn) * 0.16) * bright;
+        radiance = radiance + throughput * diff_albedo * ambient;
 
-        // Diffuse bounce (cosine importance sampling → throughput *= albedo).
+        // ── Bounce: stochastically pick the diffuse or the GGX specular lobe. The specular
+        // lobe IS the reflection — sharp for smooth/metallic, blurry for rough — so polished
+        // and metal blocks reflect the scene. One sample → noisy; the temporal resolve /
+        // denoiser cleans it up. ──
         if (bounces >= MAX_BOUNCES) { break; }
         bounces = bounces + 1;
-        throughput = throughput * albedo;
-        if (max(throughput.r, max(throughput.g, throughput.b)) < 0.02) { break; }
-        dir = cosine_dir(n, seed);
+        let fres_v = fresnel_schlick(max(dot(sn, v), 0.0), f0);
+        // Lower floor so rough dielectrics don't over-sample (and over-brighten) specular.
+        let p_spec = clamp(max(fres_v.r, max(fres_v.g, fres_v.b)), 0.03, 0.9);
+        if (rand(seed) < p_spec) {
+            let l = sample_ggx_dir(sn, v, roughness, seed);
+            if (dot(l, geo_n) <= 0.0) { break; } // sampled below the surface
+            let h = normalize(v + l);
+            let ndotv = max(dot(sn, v), 1e-3);
+            let ndoth = max(dot(sn, h), 1e-3);
+            let vdoth = max(dot(v, h), 1e-3);
+            let g = smith_ggx(ndotv, max(dot(sn, l), 1e-3), roughness);
+            let f = fresnel_schlick(vdoth, f0);
+            // BRDF·cos / pdf — D and N·H cancel in the GGX estimator. CLAMP it: the 1/N·V
+            // term explodes at grazing angles (block silhouettes) → bright fireflies the
+            // denoiser then smears into a halo ring. The 0.5 tones the mirror down to match
+            // the raster's damped reflections (a full reflection reads as too strong).
+            let w = min(f * g * vdoth / (ndotv * ndoth), vec3<f32>(4.0)) * 0.5;
+            throughput = throughput * w / p_spec;
+            dir = l;
+        } else {
+            throughput = throughput * diff_albedo / (1.0 - p_spec);
+            dir = cosine_dir(sn, seed);
+        }
         origin = surf;
+        if (max(throughput.r, max(throughput.g, throughput.b)) < 0.02) { break; }
     }
     return radiance;
 }
