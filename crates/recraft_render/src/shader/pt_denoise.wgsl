@@ -76,13 +76,9 @@ fn fs_main(in: VsOut) -> Out {
         return o;
     }
     let albedo4 = textureLoad(albedo_tex, c, 0);
-    // No opaque chunk here AND the PT didn't hit a transparent surface → a rasterized
-    // entity / hand the PT can't trace: discard, keep the rasterized `view`. Water/glass
-    // (transparent set) and chunks keep the PT result.
-    if (albedo4.a < 0.5 && transparent < 0.5) {
-        discard;
-    }
-    // Chunks demodulate by albedo; water/glass denoise in radiance space (ca = 1).
+    // Chunks demodulate by albedo; water/glass denoise in radiance space (ca = 1). Entity/
+    // hand pixels are NOT discarded here — the second à-trous pass composites them, so the
+    // transparent flag is written (in .a) for every pixel below.
     let ca = select(vec3<f32>(1.0), max(albedo4.rgb, vec3<f32>(0.04)), albedo4.a >= 0.5);
     let ci = center_color / ca;
     let cl = dot(ci, vec3<f32>(0.299, 0.587, 0.114));
@@ -160,6 +156,8 @@ fn fs_main(in: VsOut) -> Out {
     }
 
     o.hist = vec4<f32>(acc, age);
-    o.view = vec4<f32>(acc * ca, 1.0); // remodulate with THIS pixel's sharp albedo
+    // Pass 1 emits the DEMODULATED irradiance (+ transparent flag in .a) to an intermediate;
+    // the second à-trous pass widens the filter, remodulates by albedo and composites.
+    o.view = vec4<f32>(acc, transparent);
     return o;
 }

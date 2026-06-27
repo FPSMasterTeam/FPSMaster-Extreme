@@ -1072,6 +1072,13 @@ pub struct Renderer {
     pt_hist_b_tex: Option<wgpu::Texture>,
     pt_hist_b_view: Option<wgpu::TextureView>,
     pt_hist_sampler: wgpu::Sampler,
+    /// Second à-trous pass: pass-1 demodulated irradiance → wider filter, remodulate +
+    /// composite. `pt_filtered` is the intermediate pass 1 writes (instead of the view).
+    pt_filtered_tex: Option<wgpu::Texture>,
+    pt_filtered_view: Option<wgpu::TextureView>,
+    pt_atrous2_pipeline: Option<wgpu::RenderPipeline>,
+    pt_atrous2_layout: Option<wgpu::BindGroupLayout>,
+    pt_atrous2_bind_group: Option<wgpu::BindGroup>,
     pt_accum_tex: Option<wgpu::Texture>,
     pt_accum_view: Option<wgpu::TextureView>,
     pt_sample_count: u32,
@@ -3875,6 +3882,71 @@ impl Renderer {
             }
             None => (None, None),
         };
+        // Second à-trous pass (pt_atrous2.wgsl): widens the filter on the pass-1 irradiance,
+        // then remodulates + composites. 4 bindings: filtered irradiance, albedo, depth, cam.
+        let (pt_atrous2_pipeline, pt_atrous2_layout) = match rt_layout.as_ref() {
+            Some(_) => {
+                let frag = wgpu::ShaderStages::FRAGMENT;
+                let entry = |binding, ty| wgpu::BindGroupLayoutEntry {
+                    binding,
+                    visibility: frag,
+                    ty,
+                    count: None,
+                };
+                let unf = wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                };
+                let uniform = wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                };
+                let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("pt-atrous2-layout"),
+                    entries: &[entry(0, unf), entry(1, unf), entry(2, unf), entry(3, uniform)],
+                });
+                let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("pt-atrous2-shader"),
+                    source: wgpu::ShaderSource::Wgsl(
+                        include_str!("../shader/pt_atrous2.wgsl").into(),
+                    ),
+                });
+                let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("pt-atrous2-pipeline-layout"),
+                    bind_group_layouts: &[Some(&layout)],
+                    immediate_size: 0,
+                });
+                let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("pt-atrous2-pipeline"),
+                    layout: Some(&pl),
+                    vertex: wgpu::VertexState {
+                        module: &shader,
+                        entry_point: Some("vs_main"),
+                        compilation_options: Default::default(),
+                        buffers: &[],
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &shader,
+                        entry_point: Some("fs_main"),
+                        compilation_options: Default::default(),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: HDR_FORMAT,
+                            blend: Some(wgpu::BlendState::REPLACE),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                    }),
+                    primitive: wgpu::PrimitiveState::default(),
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState::default(),
+                    cache: None,
+                    multiview_mask: None,
+                });
+                (Some(pipeline), Some(layout))
+            }
+            None => (None, None),
+        };
         // Linear clamp sampler for reprojecting the PT denoiser's history (bilinear fetch
         // at the motion-vector-displaced previous-frame position).
         let pt_hist_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -4885,6 +4957,11 @@ impl Renderer {
             pt_hist_b_tex: None,
             pt_hist_b_view: None,
             pt_hist_sampler,
+            pt_filtered_tex: None,
+            pt_filtered_view: None,
+            pt_atrous2_pipeline,
+            pt_atrous2_layout,
+            pt_atrous2_bind_group: None,
             pt_accum_tex: None,
             pt_accum_view: None,
             pt_sample_count: 0,
@@ -5881,6 +5958,47 @@ impl Renderer {
             self.pt_hist_a_view = Some(hist_a_view);
             self.pt_hist_b_tex = Some(hist_b_tex);
             self.pt_hist_b_view = Some(hist_b_view);
+
+            // Pass-1 intermediate (demodulated irradiance) + the second à-trous bind group.
+            let filtered = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("pt-filtered"),
+                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: HDR_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            let filtered_view = filtered.create_view(&wgpu::TextureViewDescriptor::default());
+            if let Some(layout) = self.pt_atrous2_layout.as_ref() {
+                self.pt_atrous2_bind_group =
+                    Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("pt-atrous2-bind-group"),
+                        layout,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::TextureView(&filtered_view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::TextureView(&albedo_view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: wgpu::BindingResource::TextureView(&self.depth_view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 3,
+                                resource: self.post_camera_buffer.as_entire_binding(),
+                            },
+                        ],
+                    }));
+            }
+            self.pt_filtered_tex = Some(filtered);
+            self.pt_filtered_view = Some(filtered_view);
             self.rtao_raw_tex = Some(raw_tex);
             self.rtao_raw_view = Some(raw_view);
             self.rtao_denoised_tex = Some(den_tex);
@@ -8865,7 +8983,10 @@ impl Renderer {
                 && self.pt_denoise_bg_b.is_some()
                 && self.pt_accum_view.is_some()
                 && self.pt_hist_a_view.is_some()
-                && self.pt_hist_b_view.is_some();
+                && self.pt_hist_b_view.is_some()
+                && self.pt_filtered_view.is_some()
+                && self.pt_atrous2_pipeline.is_some()
+                && self.pt_atrous2_bind_group.is_some();
             let pt_target = if denoise {
                 self.pt_accum_view.as_ref().unwrap()
             } else {
@@ -8908,11 +9029,13 @@ impl Renderer {
                         self.pt_hist_a_view.as_ref().unwrap(),
                     )
                 };
+                // Pass 1 writes the demodulated irradiance to the intermediate `pt_filtered`
+                // (@0) + the history (@1); the second à-trous pass below turns it into `view`.
                 let mut dp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("pt-denoise-pass"),
                     color_attachments: &[
                         Some(wgpu::RenderPassColorAttachment {
-                            view,
+                            view: self.pt_filtered_view.as_ref().unwrap(),
                             resolve_target: None,
                             depth_slice: None,
                             ops: wgpu::Operations {
@@ -8938,6 +9061,28 @@ impl Renderer {
                 dp.set_pipeline(self.pt_denoise_pipeline.as_ref().unwrap());
                 dp.set_bind_group(0, bg, &[]);
                 dp.draw(0..3, 0..1);
+                drop(dp);
+
+                // Pass 2: wider à-trous on `pt_filtered`, remodulate + composite → `view`.
+                let mut ap = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("pt-atrous2-pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    occlusion_query_set: None,
+                    timestamp_writes: None,
+                    multiview_mask: None,
+                });
+                ap.set_pipeline(self.pt_atrous2_pipeline.as_ref().unwrap());
+                ap.set_bind_group(0, self.pt_atrous2_bind_group.as_ref().unwrap(), &[]);
+                ap.draw(0..3, 0..1);
             }
         }
 
