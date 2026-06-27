@@ -2170,52 +2170,33 @@ impl GameState {
         }
     }
 
-    /// Build the LOCAL player's body at its world position, for ray tracing only (so the
-    /// player casts a shadow + shows in reflections / water). It is NEVER rasterized — the
-    /// first-person view doesn't draw your own body — so it goes into a separate mesh that
-    /// is fed only to the entity BLAS, not the model pass.
-    pub fn build_local_player_model(
+    /// Build a player biped at `feet` / `yaw` for ray tracing ONLY (so the local player
+    /// casts a shadow + shows in reflections / water). Never rasterized — fed only to the
+    /// entity BLAS. Default pose (a shadow doesn't need limb-swing detail). Built from the
+    /// camera each frame so it works in both the game and the render demo.
+    pub fn build_player_body_at(
         &self,
         mesh: &mut ModelMesh,
+        feet: Vec3,
+        yaw: f32,
         tick_alpha: f32,
         brightness: f32,
-        old_animations: bool,
     ) {
         mesh.clear();
         let sun_b = recraft_render::sky::sun_brightness(self.world_time(tick_alpha));
-        let feet = match self
-            .vehicles
-            .get(&self.player.id)
-            .and_then(|vehicle_id| self.world.entity(*vehicle_id))
-        {
-            Some(vehicle) => {
-                let (_, vehicle_height) = vehicle.size();
-                to_render_vec3(
-                    vehicle.render_position(tick_alpha as f64)
-                        + DVec3::new(0.0, vehicle_height * 0.75, 0.0),
-                )
-            }
-            None => to_render_vec3(self.player.render_position(tick_alpha as f64)),
-        };
-        let body_yaw = self.player.render_yaw(tick_alpha);
-        let (limb_swing, limb_swing_amount) = self.player.render_limb_swing(tick_alpha);
-        let net_head_yaw =
-            wrap_degrees(self.player.render_head_yaw(tick_alpha) - body_yaw).clamp(-75.0, 75.0);
         let anim = EntityAnim {
-            limb_swing,
-            limb_swing_amount,
-            net_head_yaw,
-            head_pitch: self.player.render_pitch(tick_alpha),
-            swing_progress: self.player.render_swing(tick_alpha),
-            sneaking: self.player.sneaking,
+            limb_swing: 0.0,
+            limb_swing_amount: 0.0,
+            net_head_yaw: 0.0,
+            head_pitch: 0.0,
+            swing_progress: 0.0,
+            sneaking: false,
             held_item_right: 0,
-            old_animations,
-            death_roll: death_roll_radians(self.player.death_time, tick_alpha),
+            old_animations: false,
+            death_roll: 0.0,
         };
-        // A player biped with the default player skin slot (skin_row None).
-        mesh.push_entity(EntityKind::RemotePlayer, feet, body_yaw, &anim, None);
-        let (_, height) = self.player.size();
-        let center = Vec3::new(feet.x, feet.y + height as f32 * 0.5, feet.z);
+        mesh.push_entity(EntityKind::RemotePlayer, feet, yaw, &anim, None);
+        let center = Vec3::new(feet.x, feet.y + 0.9, feet.z);
         let factor = entity_light(&self.world, center, sun_b, brightness);
         for v in &mut mesh.vertices {
             v.color[0] *= factor;
