@@ -734,6 +734,10 @@ pub struct Renderer {
     /// to draw a flat lit cloud layer — no raymarch pass, no half-res buffer.
     _cloud_noise_texture: wgpu::Texture,
     cloud_noise_bind_group: wgpu::BindGroup,
+    /// Cloud noise view + sampler, also bound to the path tracer (group 1) so its sky
+    /// renders the same clouds — visible in PT reflections / water / the sky.
+    cloud_noise_view: wgpu::TextureView,
+    cloud_noise_sampler: wgpu::Sampler,
     /// Sun/moon/stars pass: textured quads at infinity drawn after the gradient.
     celestial_pipeline: wgpu::RenderPipeline,
     celestial_uniform_buffer: wgpu::Buffer,
@@ -3669,6 +3673,23 @@ impl Renderer {
                             ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                             count: None,
                         },
+                        // binding 7: 3D cloud noise; 8: its sampler — for the PT sky's clouds.
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 7,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                                view_dimension: wgpu::TextureViewDimension::D3,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 8,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                            count: None,
+                        },
                     ],
                 });
                 let pt_atlas_view =
@@ -3747,6 +3768,14 @@ impl Renderer {
                         wgpu::BindGroupEntry {
                             binding: 6,
                             resource: wgpu::BindingResource::Sampler(&pbr_sampler),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 7,
+                            resource: wgpu::BindingResource::TextureView(&noise_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 8,
+                            resource: wgpu::BindingResource::Sampler(&noise_sampler),
                         },
                     ],
                 });
@@ -4660,6 +4689,8 @@ impl Renderer {
             sky_bind_group,
             _cloud_noise_texture: noise_texture,
             cloud_noise_bind_group: noise_bind_group,
+            cloud_noise_view: noise_view,
+            cloud_noise_sampler: noise_sampler,
             celestial_pipeline,
             celestial_uniform_buffer,
             celestial_uniform_bind_group,
@@ -6582,6 +6613,14 @@ impl Renderer {
                 wgpu::BindGroupEntry {
                     binding: 6,
                     resource: wgpu::BindingResource::Sampler(&self.pbr_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::TextureView(&self.cloud_noise_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: wgpu::BindingResource::Sampler(&self.cloud_noise_sampler),
                 },
             ],
         }))
