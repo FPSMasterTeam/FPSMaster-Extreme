@@ -667,6 +667,12 @@ pub struct Renderer {
     /// `arm_index_start`) is excluded at build time. Rebuilt into a camera-relative BLAS.
     entity_rt_positions: Vec<[f32; 3]>,
     entity_rt_indices: Vec<u32>,
+    /// Per-entity-triangle packed colour (entity-atlas texel × tint) + geometric normal,
+    /// so PT reflection / bounce rays can shade entity hits. CPU entity atlas for the
+    /// texel lookup.
+    entity_rt_colors: Vec<u32>,
+    entity_rt_normals: Vec<u32>,
+    entity_atlas: crate::texture::EntityAtlasImage,
     /// Native render-hook custom geometry (model-pass format), drawn in the world
     /// pass right after entities. `None`/empty when no native mod submits any.
     extension_mesh: Option<DynamicMesh>,
@@ -4783,6 +4789,9 @@ impl Renderer {
             arm_index_start: None,
             entity_rt_positions: Vec::new(),
             entity_rt_indices: Vec::new(),
+            entity_rt_colors: Vec::new(),
+            entity_rt_normals: Vec::new(),
+            entity_atlas: crate::texture::EntityAtlasImage::load_default(),
             extension_mesh: None,
             geometry_texture: None,
             nametag_scale: 1.0,
@@ -6409,14 +6418,54 @@ impl Renderer {
             mesh.indices.len() as u32,
             "model",
         );
-        // Stash the entity geometry for the ray tracer (entities cast shadows in PT/RT).
-        // Only when RT is active; otherwise drop any stale copy.
+        // Stash the entity geometry for the ray tracer (entities cast shadows + appear in
+        // PT reflections / water). Only when RT is active; otherwise drop any stale copy.
         if self.ray_tracer.is_some() {
             self.entity_rt_positions = mesh.vertices.iter().map(|v| v.position).collect();
             self.entity_rt_indices = mesh.indices.clone();
+            // Per-triangle colour (atlas texel at the UV centroid × the vertex tint) +
+            // geometric normal, for shading entity hits in reflections / water.
+            let atlas = &self.entity_atlas;
+            let (aw, ah) = (atlas.width as usize, atlas.height as usize);
+            let ntri = mesh.indices.len() / 3;
+            let mut colors = Vec::with_capacity(ntri);
+            let mut normals = Vec::with_capacity(ntri);
+            for t in 0..ntri {
+                let v0 = &mesh.vertices[mesh.indices[t * 3] as usize];
+                let v1 = &mesh.vertices[mesh.indices[t * 3 + 1] as usize];
+                let v2 = &mesh.vertices[mesh.indices[t * 3 + 2] as usize];
+                let cu = (v0.uv[0] + v1.uv[0] + v2.uv[0]) / 3.0;
+                let cv = (v0.uv[1] + v1.uv[1] + v2.uv[1]) / 3.0;
+                let px = ((cu * aw as f32) as i32).clamp(0, aw as i32 - 1) as usize;
+                let py = ((cv * ah as f32) as i32).clamp(0, ah as i32 - 1) as usize;
+                let pi = (py * aw + px) * 4;
+                let tint = |c: f32, idx: usize| {
+                    let texel = atlas.pixels[pi + idx] as f32 / 255.0;
+                    ((texel * c).clamp(0.0, 1.0) * 255.0) as u32
+                };
+                let r = tint((v0.color[0] + v1.color[0] + v2.color[0]) / 3.0, 0);
+                let g = tint((v0.color[1] + v1.color[1] + v2.color[1]) / 3.0, 1);
+                let b = tint((v0.color[2] + v1.color[2] + v2.color[2]) / 3.0, 2);
+                colors.push((r << 16) | (g << 8) | b);
+                let (p0, p1, p2) = (v0.position, v1.position, v2.position);
+                let e1 = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]];
+                let e2 = [p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]];
+                let n = [
+                    e1[1] * e2[2] - e1[2] * e2[1],
+                    e1[2] * e2[0] - e1[0] * e2[2],
+                    e1[0] * e2[1] - e1[1] * e2[0],
+                ];
+                let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt().max(1e-6);
+                let nb = |x: f32| (((x / len * 127.0).round() as i32 + 128).clamp(0, 255)) as u32;
+                normals.push((nb(n[0]) << 16) | (nb(n[1]) << 8) | nb(n[2]));
+            }
+            self.entity_rt_colors = colors;
+            self.entity_rt_normals = normals;
         } else if !self.entity_rt_indices.is_empty() {
             self.entity_rt_positions = Vec::new();
             self.entity_rt_indices = Vec::new();
+            self.entity_rt_colors = Vec::new();
+            self.entity_rt_normals = Vec::new();
         }
         // Per-vertex motion attribute for the entity motion-vector pass, in
         // lockstep with the model vertices. Only uploaded when motion vectors are
@@ -7969,6 +8018,8 @@ impl Renderer {
                 origin_i,
                 &self.entity_rt_positions,
                 &self.entity_rt_indices[..arm],
+                &self.entity_rt_colors,
+                &self.entity_rt_normals,
             );
         }
 
