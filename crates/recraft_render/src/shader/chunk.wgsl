@@ -257,10 +257,12 @@ fn apply_lighting(albedo: vec3<f32>, in: VertexOutput) -> vec3<f32> {
         if (reflectivity > 0.04) {
             let refl_dir = reflect(-view_dir, n);
             let rt_refl = rt_reflect(in.world_pos + n * 0.05, refl_dir);
-            // Fresnel-weighted, and toned down — a full f0×smoothness reflection reads as
-            // a too-strong mirror on metals.
-            let fres = 0.4 + 0.6 * pow(1.0 - max(dot(n, view_dir), 0.0), 5.0);
-            lit = lit + rt_refl.rgb * f0 * smoothness * fres * rt_refl.a * 0.5;
+            // Schlick fresnel from f0: a smooth metal reflects ~its own albedo (f0) head-on,
+            // rising to 1 at grazing, scaled by smoothness (a single sharp RT ray fakes
+            // roughness by weakening rather than blurring). The old f0×smoothness×0.5 left
+            // iron/gold barely reflective; this makes them read as real metal.
+            let fres = fresnel_schlick(max(dot(n, view_dir), 0.0), f0);
+            lit = lit + rt_refl.rgb * fres * smoothness * rt_refl.a;
         }
         lit = lit + albedo * emissive * 3.0;
         return lit;
