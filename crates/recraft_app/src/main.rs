@@ -2685,6 +2685,7 @@ fn render_frame(
             yaw: game.camera.yaw,
             pitch: game.camera.pitch,
             stats: renderer.last_stats(),
+            phases: profiler.latest().clone(),
         });
         let chat_input = screen.as_mut().and_then(|screen| screen.chat_input_mut());
         GuiIngame::render(

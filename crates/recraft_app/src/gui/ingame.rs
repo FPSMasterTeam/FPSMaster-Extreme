@@ -82,7 +82,7 @@ pub struct HudVitals {
 
 /// Data for the F3 debug overlay: the player feet position (world coords),
 /// look angles and the previous frame's render-pass timings/draw scale.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct DebugInfo {
     /// Player feet position in world coordinates (vanilla posX/posY/posZ).
     pub pos: [f64; 3],
@@ -90,6 +90,8 @@ pub struct DebugInfo {
     pub yaw: f32,
     pub pitch: f32,
     pub stats: RenderStats,
+    /// Per-phase CPU frame timing from the frame profiler (last ~1s window).
+    pub phases: crate::frame_profiler::PhaseSummary,
 }
 
 // gui/widgets.png hotbar source metrics (pixels).
@@ -241,7 +243,7 @@ fn draw_debug_overlay(
     } else {
         "gpu: n/a".to_owned()
     };
-    let right = [
+    let mut right = vec![
         format!("frame: {frame_ms:.2} ms ({fps:.0} fps)"),
         gpu,
         format!("cpu prepare {}us  encode {}us", s.prepare_us, s.encode_us),
@@ -249,6 +251,20 @@ fn draw_debug_overlay(
         format!("draws {}  visible {}", s.draw_calls, s.visible_chunks),
         format!("tris {}", s.chunk_indices / 3),
     ];
+    // Per-phase CPU frame breakdown (from the frame profiler): which subsystem owns
+    // the frame. `avg/max ms` over the last ~1s. Phases under 0.05ms max are hidden.
+    let p = &info.phases;
+    if p.frames > 0 {
+        right.push(format!(
+            "cpu {:.1}/{:.1} ms (x{})",
+            p.cpu_avg_ms, p.cpu_max_ms, p.frames
+        ));
+        for (name, avg, mx) in &p.phases {
+            if *mx >= 0.05 {
+                right.push(format!("{name} {avg:.1}/{mx:.1}"));
+            }
+        }
+    }
 
     for (i, text) in left.iter().enumerate() {
         let y = margin + i as i32 * line;
