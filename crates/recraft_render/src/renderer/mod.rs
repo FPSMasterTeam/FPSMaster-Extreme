@@ -672,6 +672,9 @@ pub struct Renderer {
     /// texel lookup.
     entity_rt_colors: Vec<u32>,
     entity_rt_normals: Vec<u32>,
+    /// Per-entity-triangle atlas UVs (3 packed u16x2 per triangle), so reflection/bounce
+    /// rays sample the real entity texture instead of a flat per-triangle colour.
+    entity_rt_uvs: Vec<u32>,
     entity_atlas: crate::texture::EntityAtlasImage,
     /// RT-only local-player body (built each frame but NOT rasterized in first person), so
     /// the player casts a shadow + shows in reflections / water. Concatenated onto the
@@ -680,6 +683,7 @@ pub struct Renderer {
     player_rt_indices: Vec<u32>,
     player_rt_colors: Vec<u32>,
     player_rt_normals: Vec<u32>,
+    player_rt_uvs: Vec<u32>,
     /// Native render-hook custom geometry (model-pass format), drawn in the world
     /// pass right after entities. `None`/empty when no native mod submits any.
     extension_mesh: Option<DynamicMesh>,
@@ -756,6 +760,9 @@ pub struct Renderer {
     /// renders the same clouds — visible in PT reflections / water / the sky.
     cloud_noise_view: wgpu::TextureView,
     cloud_noise_sampler: wgpu::Sampler,
+    /// Entity-atlas view, also bound to the path tracer (group 1) so reflection/bounce rays
+    /// sample the real entity texture at an entity hit.
+    entity_atlas_view: wgpu::TextureView,
     /// Blue-noise dither, bound to the path tracer (group 1, binding 9) for spatially
     /// decorrelated sampling. Texture kept alive by the field; view bound.
     _blue_noise_texture: wgpu::Texture,
@@ -1423,6 +1430,7 @@ impl Renderer {
         let animated_last_frame = vec![usize::MAX; animated_tiles.len()];
         let (entity_texture_layout, entity_bind_group, entity_texture) =
             create_entity_texture_bind_group(&device, &queue);
+        let entity_atlas_view = entity_texture.create_view(&wgpu::TextureViewDescriptor::default());
         // The UI reuses the block atlas (and its name→tile map) for item icons.
         let gui_atlas = GuiAtlas::load(block_image, atlas_uv.clone());
         // Background chunk-meshing pool (built from the shared atlas/biome data).
@@ -3761,6 +3769,17 @@ impl Renderer {
                             },
                             count: None,
                         },
+                        // binding 10: entity atlas (sampled with atlas_samp for entity hits).
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 10,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
                     ],
                 });
                 let pt_atlas_view =
@@ -3851,6 +3870,10 @@ impl Renderer {
                         wgpu::BindGroupEntry {
                             binding: 9,
                             resource: wgpu::BindingResource::TextureView(&blue_noise_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 10,
+                            resource: wgpu::BindingResource::TextureView(&entity_atlas_view),
                         },
                     ],
                 });
@@ -4798,11 +4821,13 @@ impl Renderer {
             entity_rt_indices: Vec::new(),
             entity_rt_colors: Vec::new(),
             entity_rt_normals: Vec::new(),
+            entity_rt_uvs: Vec::new(),
             entity_atlas: crate::texture::EntityAtlasImage::load_default(),
             player_rt_positions: Vec::new(),
             player_rt_indices: Vec::new(),
             player_rt_colors: Vec::new(),
             player_rt_normals: Vec::new(),
+            player_rt_uvs: Vec::new(),
             extension_mesh: None,
             geometry_texture: None,
             nametag_scale: 1.0,
@@ -4840,6 +4865,7 @@ impl Renderer {
             cloud_noise_bind_group: noise_bind_group,
             cloud_noise_view: noise_view,
             cloud_noise_sampler: noise_sampler,
+            entity_atlas_view,
             _blue_noise_texture: blue_noise_texture,
             blue_noise_view,
             celestial_pipeline,
@@ -6441,10 +6467,18 @@ impl Renderer {
             let ntri = mesh.indices.len() / 3;
             let mut colors = Vec::with_capacity(ntri);
             let mut normals = Vec::with_capacity(ntri);
+            let mut uvs = Vec::with_capacity(ntri * 3);
+            let pack_uv = |uv: [f32; 2]| {
+                ((uv[0].clamp(0.0, 1.0) * 65535.0) as u32)
+                    | (((uv[1].clamp(0.0, 1.0) * 65535.0) as u32) << 16)
+            };
             for t in 0..ntri {
                 let v0 = &mesh.vertices[mesh.indices[t * 3] as usize];
                 let v1 = &mesh.vertices[mesh.indices[t * 3 + 1] as usize];
                 let v2 = &mesh.vertices[mesh.indices[t * 3 + 2] as usize];
+                uvs.push(pack_uv(v0.uv));
+                uvs.push(pack_uv(v1.uv));
+                uvs.push(pack_uv(v2.uv));
                 let cu = (v0.uv[0] + v1.uv[0] + v2.uv[0]) / 3.0;
                 let cv = (v0.uv[1] + v1.uv[1] + v2.uv[1]) / 3.0;
                 let px = ((cu * aw as f32) as i32).clamp(0, aw as i32 - 1) as usize;
@@ -6472,11 +6506,13 @@ impl Renderer {
             }
             self.entity_rt_colors = colors;
             self.entity_rt_normals = normals;
+            self.entity_rt_uvs = uvs;
         } else if !self.entity_rt_indices.is_empty() {
             self.entity_rt_positions = Vec::new();
             self.entity_rt_indices = Vec::new();
             self.entity_rt_colors = Vec::new();
             self.entity_rt_normals = Vec::new();
+            self.entity_rt_uvs = Vec::new();
         }
         // Per-vertex motion attribute for the entity motion-vector pass, in
         // lockstep with the model vertices. Only uploaded when motion vectors are
@@ -6505,6 +6541,7 @@ impl Renderer {
             self.player_rt_indices = Vec::new();
             self.player_rt_colors = Vec::new();
             self.player_rt_normals = Vec::new();
+            self.player_rt_uvs = Vec::new();
             return;
         }
         self.player_rt_positions = mesh.vertices.iter().map(|v| v.position).collect();
@@ -6514,10 +6551,18 @@ impl Renderer {
         let ntri = mesh.indices.len() / 3;
         let mut colors = Vec::with_capacity(ntri);
         let mut normals = Vec::with_capacity(ntri);
+        let mut uvs = Vec::with_capacity(ntri * 3);
+        let pack_uv = |uv: [f32; 2]| {
+            ((uv[0].clamp(0.0, 1.0) * 65535.0) as u32)
+                | (((uv[1].clamp(0.0, 1.0) * 65535.0) as u32) << 16)
+        };
         for t in 0..ntri {
             let v0 = &mesh.vertices[mesh.indices[t * 3] as usize];
             let v1 = &mesh.vertices[mesh.indices[t * 3 + 1] as usize];
             let v2 = &mesh.vertices[mesh.indices[t * 3 + 2] as usize];
+            uvs.push(pack_uv(v0.uv));
+            uvs.push(pack_uv(v1.uv));
+            uvs.push(pack_uv(v2.uv));
             let cu = (v0.uv[0] + v1.uv[0] + v2.uv[0]) / 3.0;
             let cv = (v0.uv[1] + v1.uv[1] + v2.uv[1]) / 3.0;
             let px = ((cu * aw as f32) as i32).clamp(0, aw as i32 - 1) as usize;
@@ -6545,6 +6590,7 @@ impl Renderer {
         }
         self.player_rt_colors = colors;
         self.player_rt_normals = normals;
+        self.player_rt_uvs = uvs;
     }
 
     /// Mark where the first-person arm begins in the uploaded model mesh (the arm
@@ -6921,6 +6967,10 @@ impl Renderer {
                 wgpu::BindGroupEntry {
                     binding: 9,
                     resource: wgpu::BindingResource::TextureView(&self.blue_noise_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: wgpu::BindingResource::TextureView(&self.entity_atlas_view),
                 },
             ],
         }))
@@ -8078,12 +8128,14 @@ impl Renderer {
             let mut indices = self.entity_rt_indices[..arm].to_vec();
             let mut colors = self.entity_rt_colors[..etris].to_vec();
             let mut normals = self.entity_rt_normals[..etris].to_vec();
+            let mut uvs = self.entity_rt_uvs[..(etris * 3).min(self.entity_rt_uvs.len())].to_vec();
             if !self.player_rt_indices.is_empty() {
                 let off = positions.len() as u32;
                 positions.extend_from_slice(&self.player_rt_positions);
                 indices.extend(self.player_rt_indices.iter().map(|&i| i + off));
                 colors.extend_from_slice(&self.player_rt_colors);
                 normals.extend_from_slice(&self.player_rt_normals);
+                uvs.extend_from_slice(&self.player_rt_uvs);
             }
             rt.build(
                 &mut encoder,
@@ -8094,6 +8146,7 @@ impl Renderer {
                 &indices,
                 &colors,
                 &normals,
+                &uvs,
             );
         }
 

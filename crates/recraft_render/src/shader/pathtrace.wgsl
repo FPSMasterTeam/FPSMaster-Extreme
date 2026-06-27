@@ -57,6 +57,9 @@ struct Sky {
 // so the per-frame error is spatially high-frequency (the denoiser/TAA clean it far better
 // than white noise). Animated per frame by the golden ratio.
 @group(1) @binding(9) var blue_noise: texture_2d<f32>;
+// Entity atlas (mobs/players), sampled at an entity hit so reflections show the real
+// texture rather than a flat per-triangle colour.
+@group(1) @binding(10) var entity_atlas: texture_2d<f32>;
 
 fn unpack_uv(p: u32) -> vec2<f32> {
     return vec2<f32>(f32(p & 0xFFFFu), f32((p >> 16u) & 0xFFFFu)) * (1.0 / 65535.0);
@@ -314,14 +317,32 @@ fn trace_path(ro: vec3<f32>, rd: vec3<f32>, bn: vec2<f32>, seed: ptr<function, u
         var n = n_geo;
         if (!front_face) { n = -n; } // flip to face the ray
         let pos = origin + dir * it.t;
-        // Entity hit (only bounce / reflection rays reach entities): flat-shade the per-tri
-        // colour as a diffuse surface, so entities show up in reflections / water.
+        // Entity hit (only bounce / reflection rays reach entities): sample the real entity
+        // texture via barycentrics (the entity pool region carries UVs + camera-relative
+        // positions), then diffuse-shade — so entities show their texture in reflections.
         if (it.instance_custom_data >= ENTITY_TRI_BASE) {
-            let ealb = vec3<f32>(
-                f32((packed >> 16u) & 0xFFu),
-                f32((packed >> 8u) & 0xFFu),
-                f32(packed & 0xFFu),
-            ) / 255.0;
+            let epb = idx * 9u;
+            let ep0 = vec3<f32>(tri_positions[epb], tri_positions[epb + 1u], tri_positions[epb + 2u]);
+            let ep1 = vec3<f32>(tri_positions[epb + 3u], tri_positions[epb + 4u], tri_positions[epb + 5u]);
+            let ep2 = vec3<f32>(tri_positions[epb + 6u], tri_positions[epb + 7u], tri_positions[epb + 8u]);
+            let ehp = pos - it.object_to_world[3];
+            let ee1 = ep1 - ep0;
+            let ee2 = ep2 - ep0;
+            let eph = ehp - ep0;
+            let ed00 = dot(ee1, ee1);
+            let ed01 = dot(ee1, ee2);
+            let ed11 = dot(ee2, ee2);
+            let ed20 = dot(eph, ee1);
+            let ed21 = dot(eph, ee2);
+            let edenom = max(ed00 * ed11 - ed01 * ed01, 1e-8);
+            let eb1 = (ed11 * ed20 - ed01 * ed21) / edenom;
+            let eb2 = (ed00 * ed21 - ed01 * ed20) / edenom;
+            let eb0 = 1.0 - eb1 - eb2;
+            let eub = idx * 3u;
+            let euv = unpack_uv(tri_uvs[eub]) * eb0
+                + unpack_uv(tri_uvs[eub + 1u]) * eb1
+                + unpack_uv(tri_uvs[eub + 2u]) * eb2;
+            let ealb = textureSampleLevel(entity_atlas, atlas_samp, euv, 0.0).rgb;
             let esurf = pos + n * 0.02;
             let endl = max(dot(n, sun), 0.0);
             if (endl > 0.0 && !occluded(esurf, sun, 200.0)) {

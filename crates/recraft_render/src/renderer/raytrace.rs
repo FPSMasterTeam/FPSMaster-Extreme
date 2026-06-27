@@ -709,6 +709,7 @@ impl RayTracer {
         entity_indices: &[u32],
         entity_colors: &[u32],
         entity_normals: &[u32],
+        entity_uvs: &[u32],
     ) {
         let range2 = RT_RANGE_BLOCKS * RT_RANGE_BLOCKS;
         // 0. Gather the nearest in-range emissive lights into the point-light buffer
@@ -776,6 +777,7 @@ impl RayTracer {
             let tris = (entity_indices.len() / 3)
                 .min(entity_colors.len())
                 .min(entity_normals.len())
+                .min(entity_uvs.len() / 3)
                 .min(MAX_ENTITY_TRIS as usize);
             if tris > 0 {
                 queue.write_buffer(
@@ -787,6 +789,25 @@ impl RayTracer {
                     &self.tri_normal_pool,
                     ENTITY_TRI_BASE as u64 * 4,
                     bytemuck::cast_slice(&entity_normals[..tris]),
+                );
+                queue.write_buffer(
+                    &self.tri_uv_pool,
+                    ENTITY_TRI_BASE as u64 * 3 * 4,
+                    bytemuck::cast_slice(&entity_uvs[..tris * 3]),
+                );
+                // Per-triangle vertex positions (camera-relative, from the BLAS positions),
+                // so the path tracer can compute the hit barycentrics for the entity texture.
+                let mut tri_pos: Vec<f32> = Vec::with_capacity(tris * 9);
+                for t in 0..tris {
+                    for k in 0..3 {
+                        let p = positions[entity_indices[t * 3 + k] as usize];
+                        tri_pos.extend_from_slice(&[p[0], p[1], p[2]]);
+                    }
+                }
+                queue.write_buffer(
+                    &self.tri_pos_pool,
+                    ENTITY_TRI_BASE as u64 * 9 * 4,
+                    bytemuck::cast_slice(&tri_pos),
                 );
             }
             let size = wgpu::BlasTriangleGeometrySizeDescriptor {
