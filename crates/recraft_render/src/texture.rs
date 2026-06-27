@@ -917,6 +917,117 @@ pub fn generate_cloud_noise() -> Vec<u8> {
     data
 }
 
+/// Edge length of the tileable blue-noise dither texture.
+pub const BLUE_NOISE_DIM: u32 = 64;
+
+/// Splat the Gaussian energy kernel of a toggled point into the (toroidal) energy field.
+/// `add` deposits energy (a 1 was placed), otherwise removes it.
+fn bn_deposit(energy: &mut [f32], size: i32, sigma: f32, radius: i32, x: i32, y: i32, add: bool) {
+    let s = if add { 1.0 } else { -1.0 };
+    let inv = -1.0 / (2.0 * sigma * sigma);
+    for dy in -radius..=radius {
+        let yy = (y + dy).rem_euclid(size);
+        for dx in -radius..=radius {
+            let xx = (x + dx).rem_euclid(size);
+            let w = (((dx * dx + dy * dy) as f32) * inv).exp();
+            energy[(yy * size + xx) as usize] += s * w;
+        }
+    }
+}
+
+/// Generate a tileable blue-noise texture (R8) via Ulichney's void-and-cluster: every
+/// 8-bit value 0..255 appears in a spatially well-distributed (high-frequency) pattern,
+/// so used as a per-pixel dither it pushes the path tracer's sampling error into the high
+/// frequencies the spatial denoiser + TAA remove cleanly (white noise leaves low-frequency
+/// clumps that survive). Deterministic (fixed seed) so every run is identical.
+pub fn generate_blue_noise() -> Vec<u8> {
+    let size = BLUE_NOISE_DIM as i32;
+    let n = (size * size) as usize;
+    let sigma = 1.9_f32;
+    let radius = (3.0 * sigma).ceil() as i32;
+    let mut energy = vec![0f32; n];
+
+    // Prototype: a tenth of the pixels placed, then relaxed (remove the tightest cluster,
+    // fill the largest void) until it converges to an even blue-noise distribution.
+    let mut state = 0x1234_5678u32;
+    let mut rng = || {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        state
+    };
+    let mut ones = vec![false; n];
+    let target = n / 10;
+    let mut placed = 0;
+    while placed < target {
+        let i = (rng() as usize) % n;
+        if !ones[i] {
+            ones[i] = true;
+            bn_deposit(&mut energy, size, sigma, radius, (i as i32) % size, (i as i32) / size, true);
+            placed += 1;
+        }
+    }
+    let tightest = |energy: &[f32], ones: &[bool]| {
+        let mut bi = 0usize;
+        let mut bv = f32::NEG_INFINITY;
+        for i in 0..n {
+            if ones[i] && energy[i] > bv {
+                bv = energy[i];
+                bi = i;
+            }
+        }
+        bi
+    };
+    let largest = |energy: &[f32], ones: &[bool]| {
+        let mut bi = 0usize;
+        let mut bv = f32::INFINITY;
+        for i in 0..n {
+            if !ones[i] && energy[i] < bv {
+                bv = energy[i];
+                bi = i;
+            }
+        }
+        bi
+    };
+    for _ in 0..(10 * n) {
+        let c = tightest(&energy, &ones);
+        ones[c] = false;
+        bn_deposit(&mut energy, size, sigma, radius, (c as i32) % size, (c as i32) / size, false);
+        let v = largest(&energy, &ones);
+        ones[v] = true;
+        bn_deposit(&mut energy, size, sigma, radius, (v as i32) % size, (v as i32) / size, true);
+        if v == c {
+            break; // the void we filled is the cluster we cleared → stable
+        }
+    }
+
+    let proto_energy = energy.clone();
+    let proto_ones = ones.clone();
+    let k = proto_ones.iter().filter(|&&b| b).count();
+    let mut rank = vec![0u32; n];
+
+    // Phase 1: rank the prototype's ones (k-1 .. 0) by removing tightest clusters.
+    let mut e = proto_energy.clone();
+    let mut o = proto_ones.clone();
+    for r in (0..k).rev() {
+        let c = tightest(&e, &o);
+        rank[c] = r as u32;
+        o[c] = false;
+        bn_deposit(&mut e, size, sigma, radius, (c as i32) % size, (c as i32) / size, false);
+    }
+    // Phase 2: rank the rest (k .. n-1) by filling largest voids.
+    let mut e = proto_energy;
+    let mut o = proto_ones;
+    for r in k..n {
+        let v = largest(&e, &o);
+        rank[v] = r as u32;
+        o[v] = true;
+        bn_deposit(&mut e, size, sigma, radius, (v as i32) % size, (v as i32) / size, true);
+    }
+
+    rank.iter()
+        .map(|&r| (r as f32 / (n as f32 - 1.0) * 255.0).round() as u8)
+        .collect()
+}
+
 /// Deterministic 0..1 hash of an integer lattice point, wrapped to `period` so the
 /// noise tiles seamlessly over the texture domain.
 fn noise_hash3(xi: i32, yi: i32, zi: i32, period: i32) -> f32 {

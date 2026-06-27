@@ -738,6 +738,10 @@ pub struct Renderer {
     /// renders the same clouds — visible in PT reflections / water / the sky.
     cloud_noise_view: wgpu::TextureView,
     cloud_noise_sampler: wgpu::Sampler,
+    /// Blue-noise dither, bound to the path tracer (group 1, binding 9) for spatially
+    /// decorrelated sampling. Texture kept alive by the field; view bound.
+    _blue_noise_texture: wgpu::Texture,
+    blue_noise_view: wgpu::TextureView,
     /// Sun/moon/stars pass: textured quads at infinity drawn after the gradient.
     celestial_pipeline: wgpu::RenderPipeline,
     celestial_uniform_buffer: wgpu::Buffer,
@@ -1531,6 +1535,37 @@ impl Renderer {
             },
         );
         let noise_view = noise_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // Blue-noise dither (R8), bound to the path tracer to spatially decorrelate its
+        // per-pixel sampling — high-frequency error the denoiser / TAA remove cleanly.
+        let bnd = crate::texture::BLUE_NOISE_DIM;
+        let blue_noise_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("blue-noise-2d"),
+            size: wgpu::Extent3d { width: bnd, height: bnd, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &blue_noise_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &crate::texture::generate_blue_noise(),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(bnd),
+                rows_per_image: Some(bnd),
+            },
+            wgpu::Extent3d { width: bnd, height: bnd, depth_or_array_layers: 1 },
+        );
+        let blue_noise_view =
+            blue_noise_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let noise_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("cloud-noise-sampler"),
             address_mode_u: wgpu::AddressMode::Repeat,
@@ -3697,6 +3732,17 @@ impl Renderer {
                             ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                             count: None,
                         },
+                        // binding 9: blue-noise dither (textureLoad, no sampler).
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 9,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
                     ],
                 });
                 let pt_atlas_view =
@@ -3783,6 +3829,10 @@ impl Renderer {
                         wgpu::BindGroupEntry {
                             binding: 8,
                             resource: wgpu::BindingResource::Sampler(&noise_sampler),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 9,
+                            resource: wgpu::BindingResource::TextureView(&blue_noise_view),
                         },
                     ],
                 });
@@ -4763,6 +4813,8 @@ impl Renderer {
             cloud_noise_bind_group: noise_bind_group,
             cloud_noise_view: noise_view,
             cloud_noise_sampler: noise_sampler,
+            _blue_noise_texture: blue_noise_texture,
+            blue_noise_view,
             celestial_pipeline,
             celestial_uniform_buffer,
             celestial_uniform_bind_group,
@@ -6739,6 +6791,10 @@ impl Renderer {
                 wgpu::BindGroupEntry {
                     binding: 8,
                     resource: wgpu::BindingResource::Sampler(&self.cloud_noise_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: wgpu::BindingResource::TextureView(&self.blue_noise_view),
                 },
             ],
         }))
