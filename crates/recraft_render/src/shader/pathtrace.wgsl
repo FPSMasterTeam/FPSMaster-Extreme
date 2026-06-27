@@ -49,6 +49,10 @@ struct Sky {
 @group(1) @binding(4) var normal_atlas: texture_2d<f32>;
 @group(1) @binding(5) var specular_atlas: texture_2d<f32>;
 @group(1) @binding(6) var pbr_samp: sampler;
+// 3D cloud noise (R base shape, G detail) + sampler, so the PT sky renders the same flat
+// cloud layer as the raster sky — visible in reflections, water and the sky itself.
+@group(1) @binding(7) var noise_tex: texture_3d<f32>;
+@group(1) @binding(8) var noise_samp: sampler;
 
 fn unpack_uv(p: u32) -> vec2<f32> {
     return vec2<f32>(f32(p & 0xFFFFu), f32((p >> 16u) & 0xFFFFu)) * (1.0 / 65535.0);
@@ -69,6 +73,37 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
     return out;
 }
 
+// Flat procedural cloud layer (ported from sky.wgsl), so the path-traced sky matches the
+// raster sky — clouds appear in reflections and on water.
+fn cloud_density(uv: vec2<f32>) -> f32 {
+    let base = textureSampleLevel(noise_tex, noise_samp, vec3<f32>(uv, 0.25), 0.0).r;
+    let cov = sky.cloud_params.y;
+    var d = smoothstep(1.0 - cov - 0.18, 1.0 - cov + 0.12, base);
+    let det = textureSampleLevel(noise_tex, noise_samp, vec3<f32>(uv * 3.0, 0.6), 0.0).g;
+    d = clamp(d - (1.0 - det) * 0.45, 0.0, 1.0);
+    return d * sky.cloud_params.z;
+}
+
+fn clouds(dir: vec3<f32>) -> vec4<f32> {
+    let fade = smoothstep(0.04, 0.22, dir.y);
+    if (fade <= 0.0) { return vec4<f32>(0.0); }
+    let height = 220.0;
+    let t = height / max(dir.y, 0.04);
+    let wxz = sky.camera_pos.xz + dir.xz * t;
+    let wind = vec2<f32>(sky.camera_pos.w * 1.5, sky.camera_pos.w * 0.5);
+    let uv = (wxz + wind) * 0.0016;
+    let d = cloud_density(uv);
+    if (d <= 0.001) { return vec4<f32>(0.0); }
+    let sun_xz = normalize(sky.sun_dir.xz + vec2<f32>(1e-4, 0.0));
+    let relief = d - cloud_density(uv + sun_xz * 0.025);
+    let day = max(sky.cloud_params.w, 0.0);
+    let shadow_col = mix(vec3<f32>(0.34, 0.36, 0.42), vec3<f32>(0.60, 0.63, 0.70), day);
+    let lit_col = mix(vec3<f32>(0.5, 0.5, 0.55), vec3<f32>(1.0, 0.98, 0.93), day);
+    var col = mix(shadow_col, lit_col, smoothstep(-0.15, 0.25, relief));
+    col = col + vec3<f32>(1.0, 0.95, 0.82) * max(relief, 0.0) * 1.3 * day;
+    return vec4<f32>(col, d * fade);
+}
+
 fn sky_color(dir: vec3<f32>) -> vec3<f32> {
     let t = smoothstep(0.0, 0.55, clamp(dir.y, 0.0, 1.0));
     var color = mix(sky.horizon.rgb, sky.zenith.rgb, t);
@@ -82,6 +117,11 @@ fn sky_color(dir: vec3<f32>) -> vec3<f32> {
     // A bright sun disc so it can light the scene + show in reflections.
     let to_sun = max(dot(dir, sky.sun_dir.xyz), 0.0);
     color += vec3<f32>(1.0, 0.96, 0.86) * pow(to_sun, 350.0) * 8.0 * max(sky.cloud_params.w, 0.0);
+    // Flat cloud layer (matches the raster sky), so reflections / water show clouds.
+    if (sky.cloud_params.x > 0.5) {
+        let c = clouds(dir);
+        color = mix(color, c.rgb, c.a);
+    }
     return color;
 }
 
