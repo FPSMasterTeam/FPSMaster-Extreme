@@ -385,7 +385,7 @@ fn fs_glass_glow(input: VertexOutput) -> @location(0) vec4<f32> {
     let texel = textureSample(block_atlas, block_sampler, input.uv);
     let glass = texel.rgb * input.color.rgb;
     let n = normalize(input.normal);
-    let lit = block_lights_raw(input.world_pos, n);
+    let lit = block_lights_raw(input.world_pos, n, input.clip_position.xy);
     // Gentle, clamped glow: enough that a backlit pane reads as lit, but capped so a
     // bright light behind doesn't blow it into a big bloom disc or wash out the glass.
     let glow = min(lit * glass * 0.35, vec3<f32>(0.6));

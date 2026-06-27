@@ -39,11 +39,16 @@ struct RtLight {
 // positions (9 f32 per triangle). Reflections use them to reconstruct the hit UV and
 // sample the REAL texture (the flat per-triangle colour has no texture detail) and to
 // alpha-test cutout holes (grass/flowers/leaves) instead of reflecting them as solid.
+@group(3) @binding(4) var<storage, read> rt_tri_normals: array<u32>;
 @group(3) @binding(5) var<storage, read> rt_tri_uvs: array<u32>;
 @group(3) @binding(6) var<storage, read> rt_tri_positions: array<f32>;
 
 fn rt_unpack_uv(p: u32) -> vec2<f32> {
     return vec2<f32>(f32(p & 0xFFFFu), f32((p >> 16u) & 0xFFFFu)) * (1.0 / 65535.0);
+}
+fn rt_unpack_normal(p: u32) -> vec3<f32> {
+    let b = vec3<f32>(f32((p >> 16u) & 0xFFu), f32((p >> 8u) & 0xFFu), f32(p & 0xFFu));
+    return normalize((b - 128.0) / 127.0);
 }
 
 // Ray flag: stop at the first hit. All BLAS geometry is OPAQUE, so any committed
@@ -242,11 +247,15 @@ fn rt_reflect(origin: vec3<f32>, dir: vec3<f32>) -> vec4<f32> {
         let sat = max(texel.r, max(texel.g, texel.b)) - min(texel.r, min(texel.g, texel.b));
         let greyness = clamp(1.0 - sat * 3.0, 0.0, 1.0);
         let albedo = texel.rgb * mix(vec3<f32>(1.0), tint, greyness);
-        // Relight: flat ambient + a hard sun shadow ray.
+        // Relight with the hit's OWN normal: ambient + sun × N·L × shadow. Without the N·L
+        // term every reflected face came out at the same brightness — a flat, unlit-looking
+        // mirror; this restores the scene's directional shading inside the reflection.
+        let hn = rt_unpack_normal(rt_tri_normals[idx]);
         let sun = lighting.sun_dir.xyz;
+        let ndl = max(dot(hn, sun), 0.0);
         var lit = lighting.ambient.rgb * 0.6;
-        if (!rt_occluded(hit + sun * 0.05, sun, 160.0)) {
-            lit = lit + lighting.sun_color.rgb * 0.9;
+        if (ndl > 0.0 && !rt_occluded(hit + hn * 0.03, sun, 160.0)) {
+            lit = lit + lighting.sun_color.rgb * ndl;
         }
         return vec4<f32>(albedo * lit, 1.0);
     }
@@ -334,15 +343,19 @@ fn block_lights(world_pos: vec3<f32>, n: vec3<f32>, pixel: vec2<f32>) -> vec3<f3
 // behind the pane makes the whole pane glow): abs(N·L) lights both faces, solid-only
 // occlusion (the glass pane, mask 0x02, doesn't occlude), no glass tint (the caller
 // multiplies by the glass colour). Returns the light reaching the surface.
-fn block_lights_raw(world_pos: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
+fn block_lights_raw(world_pos: vec3<f32>, n: vec3<f32>, pixel: vec2<f32>) -> vec3<f32> {
     var accum = vec3<f32>(0.0);
     let count = arrayLength(&rt_lights);
+    var seed = rt_seed(pixel, 0x6b1e57a3u);
     for (var i = 0u; i < count; i = i + 1u) {
         let L = rt_lights[i];
         if (L.color.w <= 0.0) {
             continue;
         }
-        let to = L.pos_radius.xyz - world_pos;
+        // Same cube area-light sampling as block_lights, so a backlit glass pane is lit by
+        // the emitter's whole cube (soft) — not a point that paints a circular hot-spot.
+        let jitter = vec3<f32>(rt_rand(&seed), rt_rand(&seed), rt_rand(&seed)) - 0.5;
+        let to = (L.pos_radius.xyz + jitter) - world_pos;
         let dist = length(to);
         if (dist >= L.pos_radius.w) {
             continue;
