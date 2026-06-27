@@ -88,6 +88,22 @@ fn fs_main(in: VsOut) -> Out {
     let cl = dot(ci, vec3<f32>(0.299, 0.587, 0.114));
     let cp = world_at(c, dims, cd);
 
+    // ── Temporal reprojection FIRST, so the spatial filter can lean on the history length
+    // (SVGF-style variable history). A freshly disoccluded pixel (age≈1) has no clean
+    // history → it leans on a WIDER spatial blur; a long-accumulated pixel (age→32) is
+    // already clean → the spatial filter tightens to preserve detail. ──
+    let mv = textureLoad(mv_tex, c, 0).rg;
+    let prev_uv = in.uv - mv;
+    var hist_irr = ci;
+    var age = 1.0;
+    let valid = all(prev_uv >= vec2<f32>(0.0)) && all(prev_uv <= vec2<f32>(1.0));
+    if (valid) {
+        let h = textureSampleLevel(hist_tex, hist_samp, prev_uv, 0.0);
+        hist_irr = h.rgb;
+        age = min(h.a + 1.0, 32.0);
+    }
+    let tol = mix(2.5, 0.5, clamp((age - 1.0) / 8.0, 0.0, 1.0));
+
     // ── Spatial: à-trous bilateral on the current frame's irradiance, and a tight 3×3
     // min/max box of the raw irradiance for the temporal clamp. ──
     var sum = vec3<f32>(0.0);
@@ -109,7 +125,7 @@ fn fs_main(in: VsOut) -> Out {
             let sw = exp(-r2 * 0.15);
             let ip = irradiance_at(p);
             let il = dot(ip, vec3<f32>(0.299, 0.587, 0.114));
-            let lw = exp(-abs(il - cl) / (cl * 0.6 + 0.1));
+            let lw = exp(-abs(il - cl) / (cl * tol + 0.1));
             let w = dw * sw * lw;
             sum = sum + ip * w;
             wsum = wsum + w;
@@ -127,19 +143,23 @@ fn fs_main(in: VsOut) -> Out {
     let spatial = select(ci, sum / wsum, wsum > 0.0);
     let cur = select(spatial, ci, albedo4.a < 0.5);
 
-    // ── Temporal: reproject + neighbourhood-clamp + accumulate. ──
+    // ── Temporal accumulate: clamp the reprojected history to the current neighbourhood
+    // (reject ghosting), then blend by history length — age 1 = all current, age N = an
+    // N-frame running average (fast convergence, then very clean once stable). ──
     var acc = cur;
-    let mv = textureLoad(mv_tex, c, 0).rg;
-    let prev_uv = in.uv - mv;
-    if (all(prev_uv >= vec2<f32>(0.0)) && all(prev_uv <= vec2<f32>(1.0))) {
-        let hist = textureSampleLevel(hist_tex, hist_samp, prev_uv, 0.0).rgb;
-        // Clamp the (smooth) history into the current raw neighbourhood — rejects ghosting
-        // and disocclusion (the box shifts when a new surface is reprojected in).
-        let clamped = clamp(hist, bmin, bmax);
-        acc = mix(cur, clamped, 0.85); // ~7-frame accumulation
+    if (valid) {
+        let clamped = clamp(hist_irr, bmin, bmax);
+        // A large clamp means the history was stale (disocclusion the box caught) — drop the
+        // age so we re-converge from the current frame instead of trusting it.
+        let hl = dot(hist_irr, vec3<f32>(0.299, 0.587, 0.114));
+        let cll = dot(clamped, vec3<f32>(0.299, 0.587, 0.114));
+        if (abs(hl - cll) > cll * 0.5 + 0.1) {
+            age = 1.0;
+        }
+        acc = mix(cur, clamped, (age - 1.0) / age);
     }
 
-    o.hist = vec4<f32>(acc, 1.0);
+    o.hist = vec4<f32>(acc, age);
     o.view = vec4<f32>(acc * ca, 1.0); // remodulate with THIS pixel's sharp albedo
     return o;
 }
