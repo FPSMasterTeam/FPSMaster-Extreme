@@ -673,6 +673,13 @@ pub struct Renderer {
     entity_rt_colors: Vec<u32>,
     entity_rt_normals: Vec<u32>,
     entity_atlas: crate::texture::EntityAtlasImage,
+    /// RT-only local-player body (built each frame but NOT rasterized in first person), so
+    /// the player casts a shadow + shows in reflections / water. Concatenated onto the
+    /// entity geometry for the entity BLAS.
+    player_rt_positions: Vec<[f32; 3]>,
+    player_rt_indices: Vec<u32>,
+    player_rt_colors: Vec<u32>,
+    player_rt_normals: Vec<u32>,
     /// Native render-hook custom geometry (model-pass format), drawn in the world
     /// pass right after entities. `None`/empty when no native mod submits any.
     extension_mesh: Option<DynamicMesh>,
@@ -4792,6 +4799,10 @@ impl Renderer {
             entity_rt_colors: Vec::new(),
             entity_rt_normals: Vec::new(),
             entity_atlas: crate::texture::EntityAtlasImage::load_default(),
+            player_rt_positions: Vec::new(),
+            player_rt_indices: Vec::new(),
+            player_rt_colors: Vec::new(),
+            player_rt_normals: Vec::new(),
             extension_mesh: None,
             geometry_texture: None,
             nametag_scale: 1.0,
@@ -6486,6 +6497,56 @@ impl Renderer {
         }
     }
 
+    /// Stash the local-player body (RT-only, never rasterized) for the entity BLAS, so the
+    /// player casts a shadow + shows in reflections / water. Empty mesh / RT off clears it.
+    pub fn upload_rt_player_body(&mut self, mesh: &ModelMesh) {
+        if self.ray_tracer.is_none() || mesh.indices.len() < 3 {
+            self.player_rt_positions = Vec::new();
+            self.player_rt_indices = Vec::new();
+            self.player_rt_colors = Vec::new();
+            self.player_rt_normals = Vec::new();
+            return;
+        }
+        self.player_rt_positions = mesh.vertices.iter().map(|v| v.position).collect();
+        self.player_rt_indices = mesh.indices.clone();
+        let atlas = &self.entity_atlas;
+        let (aw, ah) = (atlas.width as usize, atlas.height as usize);
+        let ntri = mesh.indices.len() / 3;
+        let mut colors = Vec::with_capacity(ntri);
+        let mut normals = Vec::with_capacity(ntri);
+        for t in 0..ntri {
+            let v0 = &mesh.vertices[mesh.indices[t * 3] as usize];
+            let v1 = &mesh.vertices[mesh.indices[t * 3 + 1] as usize];
+            let v2 = &mesh.vertices[mesh.indices[t * 3 + 2] as usize];
+            let cu = (v0.uv[0] + v1.uv[0] + v2.uv[0]) / 3.0;
+            let cv = (v0.uv[1] + v1.uv[1] + v2.uv[1]) / 3.0;
+            let px = ((cu * aw as f32) as i32).clamp(0, aw as i32 - 1) as usize;
+            let py = ((cv * ah as f32) as i32).clamp(0, ah as i32 - 1) as usize;
+            let pi = (py * aw + px) * 4;
+            let tint = |c: f32, idx: usize| {
+                let texel = atlas.pixels[pi + idx] as f32 / 255.0;
+                ((texel * c).clamp(0.0, 1.0) * 255.0) as u32
+            };
+            let r = tint((v0.color[0] + v1.color[0] + v2.color[0]) / 3.0, 0);
+            let g = tint((v0.color[1] + v1.color[1] + v2.color[1]) / 3.0, 1);
+            let b = tint((v0.color[2] + v1.color[2] + v2.color[2]) / 3.0, 2);
+            colors.push((r << 16) | (g << 8) | b);
+            let (p0, p1, p2) = (v0.position, v1.position, v2.position);
+            let e1 = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]];
+            let e2 = [p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]];
+            let n = [
+                e1[1] * e2[2] - e1[2] * e2[1],
+                e1[2] * e2[0] - e1[0] * e2[2],
+                e1[0] * e2[1] - e1[1] * e2[0],
+            ];
+            let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt().max(1e-6);
+            let nb = |x: f32| (((x / len * 127.0).round() as i32 + 128).clamp(0, 255)) as u32;
+            normals.push((nb(n[0]) << 16) | (nb(n[1]) << 8) | nb(n[2]));
+        }
+        self.player_rt_colors = colors;
+        self.player_rt_normals = normals;
+    }
+
     /// Mark where the first-person arm begins in the uploaded model mesh (the arm
     /// is appended last). That trailing range is drawn over the world so it isn't
     /// occluded by nearby blocks; the range before it draws depth-tested as usual.
@@ -8004,22 +8065,35 @@ impl Renderer {
                     quality: [shadow_samples, ao_samples, ao_strength, gi_debug],
                 }),
             );
-            // Entity geometry for shadow casting, excluding the first-person arm (the
-            // indices at/after `arm_index_start`).
+            // Entity geometry for shadows + reflections, excluding the first-person arm (the
+            // indices at/after `arm_index_start`), CONCATENATED with the RT-only local-player
+            // body so the player casts a shadow + shows in reflections too.
             let arm = self
                 .arm_index_start
                 .map(|s| s as usize)
                 .unwrap_or(self.entity_rt_indices.len())
                 .min(self.entity_rt_indices.len());
+            let etris = (arm / 3).min(self.entity_rt_colors.len());
+            let mut positions = self.entity_rt_positions.clone();
+            let mut indices = self.entity_rt_indices[..arm].to_vec();
+            let mut colors = self.entity_rt_colors[..etris].to_vec();
+            let mut normals = self.entity_rt_normals[..etris].to_vec();
+            if !self.player_rt_indices.is_empty() {
+                let off = positions.len() as u32;
+                positions.extend_from_slice(&self.player_rt_positions);
+                indices.extend(self.player_rt_indices.iter().map(|&i| i + off));
+                colors.extend_from_slice(&self.player_rt_colors);
+                normals.extend_from_slice(&self.player_rt_normals);
+            }
             rt.build(
                 &mut encoder,
                 &self.device,
                 &self.queue,
                 origin_i,
-                &self.entity_rt_positions,
-                &self.entity_rt_indices[..arm],
-                &self.entity_rt_colors,
-                &self.entity_rt_normals,
+                &positions,
+                &indices,
+                &colors,
+                &normals,
             );
         }
 
