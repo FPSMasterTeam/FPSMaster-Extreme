@@ -128,7 +128,10 @@ fn trace_path(ro: vec3<f32>, rd: vec3<f32>, seed: ptr<function, u32>) -> vec3<f3
     var radiance = vec3<f32>(0.0);
     let sun = sky.sun_dir.xyz;
     let day = max(sky.cloud_params.w, 0.0);
-    let sun_color = vec3<f32>(1.0, 0.95, 0.85) * 3.2 * day;
+    // Match the raster sun_color scale (~1.0, see LightingUniform.sun_color) so the
+    // path-traced world isn't over-exposed through the shared post exposure/ACES
+    // tonemap — the PT was ~3.2x too bright, blowing the whole scene to white.
+    let sun_color = vec3<f32>(1.0, 0.95, 0.85) * day;
     var bounces = 0;
 
     // One loop over ray segments. Opaque hits shade + diffuse-bounce; cutout holes, glass
@@ -201,22 +204,33 @@ fn trace_path(ro: vec3<f32>, rd: vec3<f32>, seed: ptr<function, u32>) -> vec3<f3
             origin = pos + dir * 0.002;
             continue;
         }
-        // Stained glass: tint the path by the glass colour and pass through (no bend).
+        // Semi-transparent (mask 0x02): alpha-blend filter by the REAL texel alpha — the
+        // path picks up the surface colour where the texture is opaque and passes through
+        // clear where it's transparent. Handles stained/clear glass, ice, etc. uniformly;
+        // no bend. Not a bounce.
         if (is_glass) {
-            throughput = throughput * mix(vec3<f32>(1.0), albedo, 0.85);
+            throughput = throughput * mix(vec3<f32>(1.0), albedo, texel.a);
             origin = pos + dir * 0.002;
             continue;
         }
-        // Water: Fresnel — stochastically reflect (the sky/scene) or refract (tinted by
-        // absorption). Neither counts as a diffuse bounce.
+        // Water: Fresnel — stochastically reflect (sky/scene) or REFRACT (bend by the
+        // water IOR) and tint by the water colour so the body is visibly coloured. More
+        // water crossed = more tint (Beer-Lambert-like). Neither counts as a bounce.
         if (is_water) {
             let fres = 0.02 + 0.98 * pow(1.0 - abs(dot(n, dir)), 5.0);
             if (rand(seed) < fres) {
                 dir = reflect(dir, n);
                 origin = pos + n * 0.02;
             } else {
-                throughput = throughput * vec3<f32>(0.55, 0.74, 0.82);
-                origin = pos + dir * 0.002;
+                let refr = refract(dir, n, 0.75); // air->water (1 / 1.33)
+                if (dot(refr, refr) < 1e-6) {
+                    dir = reflect(dir, n); // total internal reflection
+                    origin = pos + n * 0.02;
+                } else {
+                    dir = normalize(refr);
+                    throughput = throughput * vec3<f32>(0.35, 0.62, 0.78);
+                    origin = pos + dir * 0.01;
+                }
             }
             continue;
         }
@@ -224,7 +238,7 @@ fn trace_path(ro: vec3<f32>, rd: vec3<f32>, seed: ptr<function, u32>) -> vec3<f3
         // Opaque surface. Emission seen on the first opaque hit (indirect emitter light is
         // the point-light NEE, so don't double-count on later bounces).
         if (((packed >> 24u) & 1u) == 1u && bounces == 0) {
-            radiance = radiance + throughput * albedo * 6.0;
+            radiance = radiance + throughput * albedo * 3.0;
         }
         let surf = pos + n * 0.02;
         // NEE: sun.
