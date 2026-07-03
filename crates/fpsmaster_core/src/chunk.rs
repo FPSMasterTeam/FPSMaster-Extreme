@@ -202,11 +202,13 @@ impl Chunk {
         section.set_sky_light(x, local_y, z, sky_light);
     }
 
-    /// Vertical sky-light cast for this column: per (x,z), the topmost opaque
-    /// block and everything below it get sky-light 0; open air above keeps the
-    /// default 15. Only touches already-allocated sections (creates none) and
-    /// leaves block-light alone. Used by offline/demo worlds, which otherwise
-    /// ship every cell fully sky-lit so caves and interiors look bright.
+    /// Vertical sky-light cast for this column: per (x,z), the topmost block
+    /// with any light opacity (vanilla heightmap — water and leaves count) and
+    /// everything below it get sky-light 0; open air above keeps the default
+    /// 15. The BFS in `World::propagate_sky_light` then re-lights covered cells
+    /// with the vanilla per-block attenuation. Only touches already-allocated
+    /// sections (creates none) and leaves block-light alone. Used by
+    /// offline/demo worlds, which otherwise ship every cell fully sky-lit.
     pub fn recompute_vertical_skylight(&mut self) {
         let mut present = [false; SECTION_COUNT];
         let mut top = -1i32;
@@ -227,7 +229,7 @@ impl Chunk {
                 let mut y = max_y;
                 while y >= 0 {
                     if present[(y >> 4) as usize] {
-                        if !blocked && self.get_block(x, y, z).is_opaque_cube() {
+                        if !blocked && self.get_block(x, y, z).light_opacity() > 0 {
                             blocked = true;
                         }
                         if blocked {

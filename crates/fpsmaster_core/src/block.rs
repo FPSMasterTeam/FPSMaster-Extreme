@@ -95,6 +95,17 @@ impl BlockState {
         blocks::def(self.id).is_none_or(|def| def.opaque)
     }
 
+    /// Vanilla `lightOpacity` (0..=15): how much sky/block light is absorbed
+    /// entering this block — 0 transparent, water/ice 3, leaves/web 1, 15
+    /// fully blocking. Drives the local relight so it reproduces the same
+    /// attenuated values the server computes.
+    pub fn light_opacity(self) -> u8 {
+        if self.is_air() || self.id == 166 {
+            return 0;
+        }
+        blocks::def(self.id).map_or(15, |def| def.light_opacity)
+    }
+
     /// Render geometry: full cube, crossed plant, or partial boxes.
     pub fn render_shape(self) -> RenderShape {
         if self.id == 166 {

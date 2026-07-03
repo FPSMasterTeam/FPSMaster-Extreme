@@ -123,6 +123,10 @@ pub struct BlockDef {
     pub layer: RenderLayer,
     pub opaque: bool,
     pub alpha: f32,
+    /// Vanilla `lightOpacity` clamped to 0..=15: how much sky/block light is
+    /// absorbed entering this block (0 transparent, water 3, leaves 1, 15
+    /// fully blocking). Defaults to 15 for opaque blocks and 0 otherwise.
+    pub light_opacity: u8,
     tint: TintFaces,
     tex: Faces,
     mask: u8,
@@ -182,6 +186,7 @@ impl BlockDef {
             },
             opaque,
             alpha,
+            light_opacity: if opaque { 15 } else { 0 },
             tint: TintFaces {
                 all: tint,
                 ..Default::default()
@@ -321,6 +326,7 @@ struct RawBlock {
     layer: String,
     opaque: Option<bool>,
     alpha: Option<f32>,
+    light_opacity: Option<u8>,
     tex: Option<TexSpec>,
     tint: Option<TexSpec>,
     #[serde(default = "default_mask")]
@@ -379,6 +385,10 @@ fn resolve(raw: RawBlock) -> BlockDef {
         layer,
         opaque,
         alpha: raw.alpha.unwrap_or(1.0),
+        light_opacity: raw
+            .light_opacity
+            .map(|o| o.min(15))
+            .unwrap_or(if opaque { 15 } else { 0 }),
         tint: raw.tint.map(tint_faces).unwrap_or_default(),
         tex: raw.tex.map(faces_from_spec).unwrap_or_default(),
         mask: raw.mask,
