@@ -1,0 +1,24 @@
+[package]
+name = "fpsmaster_ext"
+version = "0.3.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Host-side extension manager: the single source of truth for the event bus,
+# command queue and read-views. Deliberately decoupled from the rest of the
+# workspace (no fpsmaster_core/protocol/render/app dependency) so it stays the
+# stable projection layer — fpsmaster_app does every projection into/out of these
+# plain types, which is also what makes the same vocabulary cross the native ABI
+# boundary later (fpsmaster_ext_api mirrors these shapes).
+[dependencies]
+log.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+thiserror.workspace = true
+toml = "0.8"
+# JS extension engine: embeds QuickJS (compiled from source via rquickjs-sys).
+rquickjs = { version = "0.9", features = ["rust-alloc"] }
+# Native extension ABI: the stable contract + the dynamic-lib loader.
+fpsmaster_ext_api = { path = "../fpsmaster_ext_api" }
+abi_stable = "0.11"

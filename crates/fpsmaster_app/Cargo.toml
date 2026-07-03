@@ -1,0 +1,31 @@
+[package]
+name = "fpsmaster_app"
+version = "0.3.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+arboard.workspace = true
+env_logger.workspace = true
+glam.workspace = true
+hickory-resolver.workspace = true
+kira.workspace = true
+log.workspace = true
+pollster.workspace = true
+fpsmaster_core = { path = "../fpsmaster_core" }
+fpsmaster_ext = { path = "../fpsmaster_ext" }
+fpsmaster_protocol = { path = "../fpsmaster_protocol" }
+fpsmaster_render = { path = "../fpsmaster_render" }
+winit.workspace = true
+serde_json.workspace = true
+ureq.workspace = true
+base64.workspace = true
+image.workspace = true
+
+[features]
+# Pass-through to the renderer's DLSS upscaler so the whole app can be built with
+# `cargo run -p fpsmaster_app --features dlss` (needs DLSS_SDK + Vulkan SDK + clang on
+# an RTX/Vulkan box — see docs/DLSS.md). Off by default → fully cross-platform.
+dlss = ["fpsmaster_render/dlss"]

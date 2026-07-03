@@ -1,6 +1,6 @@
-# recraft Extension SDK
+# fpsmaster Extension SDK
 
-Everything you need to write **recraft** mods. recraft has a two-layer extension
+Everything you need to write **fpsmaster** mods. fpsmaster has a two-layer extension
 system; both layers share one API surface — modelled on vanilla `mc.player` /
 `mc.world` / `mc.connection` — over different transports (events, commands,
 read-views, HUD, key bindings, a scheduler, per-mod config, preset render toggles).
@@ -25,14 +25,14 @@ sdk/
     examples/          ← coords_hud, chat_alert, block_tint, preset_demo
   native/
     README.md          ← building a native cdylib mod
-    recraft_ext_api/   ← the plugin ABI crate, bundled (no crates.io needed)
+    fpsmaster_ext_api/   ← the plugin ABI crate, bundled (no crates.io needed)
     example/           ← a complete, building native mod
     template/          ← a minimal starter native mod
 ```
 
 ## Quickstart (JS — 30 seconds)
 
-1. Find your recraft `mods/` folder (next to where you launch recraft).
+1. Find your fpsmaster `mods/` folder (next to where you launch fpsmaster).
 2. Create `mods/hello/mod.toml`:
 
    ```toml
@@ -53,7 +53,7 @@ sdk/
    ```
 
 4. Copy `js/mc.d.ts` from this SDK to `mods/mc.d.ts` for autocomplete.
-5. Launch recraft, enter a world, see your HUD. Press **F10** to hot-reload after edits.
+5. Launch fpsmaster, enter a world, see your HUD. Press **F10** to hot-reload after edits.
 
 Then read **[REFERENCE.md](REFERENCE.md)** for the full API, and crib from
 `js/examples/`.
@@ -61,7 +61,7 @@ Then read **[REFERENCE.md](REFERENCE.md)** for the full API, and crib from
 ## Native mods
 
 See **[native/README.md](native/README.md)**. Native mods compile against the
-`recraft_ext_api` crate (bundled here in `native/recraft_ext_api/` — no crates.io
+`fpsmaster_ext_api` crate (bundled here in `native/fpsmaster_ext_api/` — no crates.io
 needed) and `abi_stable`.
 
 ## Capabilities

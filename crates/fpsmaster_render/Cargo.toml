@@ -1,0 +1,40 @@
+[package]
+name = "fpsmaster_render"
+version = "0.3.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+bytemuck.workspace = true
+font8x8.workspace = true
+glam.workspace = true
+image.workspace = true
+log.workspace = true
+pollster.workspace = true
+fpsmaster_core = { path = "../fpsmaster_core" }
+fpsmaster_protocol = { path = "../fpsmaster_protocol" }
+serde_json.workspace = true
+thiserror.workspace = true
+wgpu.workspace = true
+winit.workspace = true
+zip.workspace = true
+# NVIDIA DLSS (temporal upscaling). Optional + off by default: only compiled with
+# `--features dlss`, which requires the NVIDIA DLSS SDK + Vulkan SDK + clang and a
+# Vulkan backend on an RTX GPU (Windows/Linux). The default build (incl. macOS,
+# which has none of these) never touches it. See docs/dlss.md. Targets wgpu 29.
+dlss_wgpu = { version = "4", optional = true }
+# Only used by the dlss module (the NGX project id). Gated with the feature so the
+# default build doesn't pull it. NOTE: the exact project_id type is unverified —
+# adjust if DlssSdk::new wants something other than a uuid (see docs/DLSS.md).
+uuid = { version = "1", optional = true }
+
+[features]
+# Enable the DLSS temporal upscaler. Build with `cargo run --features dlss` on a
+# Windows/Linux machine that has the DLSS SDK set up (DLSS_SDK env var) — see
+# docs/DLSS.md. Leaving it off (the default) keeps the build fully cross-platform.
+dlss = ["dep:dlss_wgpu", "dep:uuid"]
+
+[dev-dependencies]
+pollster = "0.4"
+env_logger.workspace = true

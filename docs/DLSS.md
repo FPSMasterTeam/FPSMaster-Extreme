@@ -26,10 +26,10 @@ DLSS 已**完整接入渲染器并实测产出正确画面**（RTX 5060）：
   一帧拆两次提交保证 NGX 的写在 post 读之前完成；输出贴图先清屏定义布局。
 - **feature flags**：`HighDynamicRange | LowResolutionMotionVectors | AutoExposure` + `Exposure::Automatic`，
   `partial_texture_size = Some([渲染宽,渲染高])`（render_resolution() 是 MIN，≠ MAX）。**不设** InvertedDepth
-  （recraft 是标准深度 0=近，非 reverse-Z）。
+  （fpsmaster 是标准深度 0=近，非 reverse-Z）。
 - **互斥**：DLSS / TAA 在 UI 和渲染器 setter 两层都互斥。
 - **仍需肉眼确认（§4.5）**：运动矢量**符号** —— Bevy 传 `motion_vector_scale = -渲染分辨率`（取负），
-  recraft 现传正值；若放大后走动有**反向拖影**,把它取负即可。`reset`（§6）接传送/维度切换,目前恒 `false`。
+  fpsmaster 现传正值；若放大后走动有**反向拖影**,把它取负即可。`reset`（§6）接传送/维度切换,目前恒 `false`。
 
 运行时需把 `nvngx_dlss.dll`（`$DLSS_SDK\lib\Windows_x86_64\rel\`）放到 exe 同目录。
 
@@ -37,16 +37,16 @@ DLSS 已**完整接入渲染器并实测产出正确画面**（RTX 5060）：
 
 ## 1. 现状（已在仓库里）
 
-- **feature gate**：`recraft_render` 的可选依赖 `dlss_wgpu = { version = "4", optional = true }`
+- **feature gate**：`fpsmaster_render` 的可选依赖 `dlss_wgpu = { version = "4", optional = true }`
   + feature `dlss = ["dep:dlss_wgpu"]`。默认关闭 → 默认构建不编译它，跨平台不受影响。
-- **骨架模块**：[`crates/recraft_render/src/dlss.rs`](../crates/recraft_render/src/dlss.rs)
+- **骨架模块**：[`crates/fpsmaster_render/src/dlss.rs`](../crates/fpsmaster_render/src/dlss.rs)
   （`#[cfg(feature = "dlss")]`），封装 `dlss_wgpu` 4.x：`Dlss::new` / `render_resolution`
   / `suggested_jitter` / `suggested_mip_bias` / `render`。**这个骨架在 macOS 上没法编译
   验证，到 Windows 上预计要修少量签名**（已在代码里用 `VERIFY` 注释标出）。
 - **共享输入**（做 FSR2 时建好的，DLSS 直接复用）：
   - 抖动投影（`renderer/mod.rs` 的 jitter）；
   - 渲染分辨率离屏颜色 + 深度（`render_scale<1` 时低分辨率）；
-  - RG16F 运动矢量（相机 + 实体），见 [`shader/motion_vector.wgsl`](../crates/recraft_render/src/shader/motion_vector.wgsl)、`model_velocity.wgsl`；
+  - RG16F 运动矢量（相机 + 实体），见 [`shader/motion_vector.wgsl`](../crates/fpsmaster_render/src/shader/motion_vector.wgsl)、`model_velocity.wgsl`；
   - 全分辨率输出目标（现在是 TAA 的 `taa_resolved`）。
 - **UI 占位**：Performance 界面已有 `DLSS` 开关，持久化到 `settings.dlss`（目前不接渲染）。
 
@@ -68,10 +68,10 @@ DLSS 已**完整接入渲染器并实测产出正确画面**（RTX 5060）：
 ## 3. 编译运行
 
 ```bash
-cargo run -p recraft_app --features recraft_render/dlss
+cargo run -p fpsmaster_app --features fpsmaster_render/dlss
 ```
 
-（若给 `recraft_app` 也加一个透传 feature 会更顺手，见第 6 节。）
+（若给 `fpsmaster_app` 也加一个透传 feature 会更顺手，见第 6 节。）
 
 ---
 
@@ -184,7 +184,7 @@ NVIDIA 的网络；输入管线完全复用。
 
 ## 6. 坑与注意事项
 
-- **线程安全**：`dlss_wgpu` 用 `Arc<Mutex<DlssSdk>>`。若 recraft 以后做并行帧/录制，注意
+- **线程安全**：`dlss_wgpu` 用 `Arc<Mutex<DlssSdk>>`。若 fpsmaster 以后做并行帧/录制，注意
   DLSS 调用要串行化（SDK 非线程安全）。
 - **DLL 分发**：发布 Windows 构建时随包带 `nvngx_dlss.dll`（及 ray reconstruction 用到的
   额外 DLL）+ DLSS 编程指南 9.5 节的版权/许可文本。`DLSS_SDK` 环境变量**运行时不需要**。
@@ -192,8 +192,8 @@ NVIDIA 的网络；输入管线完全复用。
 - **NGX project id**：`DlssSdk::new` 要一个 NVIDIA NGX 工程 UUID。开发期可用 SDK 示例里的
   占位 id；正式发布要按 NVIDIA 流程申请。
 - **可选**：`dlss_wgpu` 的 `debug_overlay` feature 在设了 `DLSS_SDK` 时链开发版 DLL，方便调试。
-- **`recraft_app` 透传 feature**（可选，省得写长命令）：在 `recraft_app/Cargo.toml` 加
-  `[features] dlss = ["recraft_render/dlss"]`，就能 `cargo run -p recraft_app --features dlss`。
+- **`fpsmaster_app` 透传 feature**（可选，省得写长命令）：在 `fpsmaster_app/Cargo.toml` 加
+  `[features] dlss = ["fpsmaster_render/dlss"]`，就能 `cargo run -p fpsmaster_app --features dlss`。
 
 ---
 

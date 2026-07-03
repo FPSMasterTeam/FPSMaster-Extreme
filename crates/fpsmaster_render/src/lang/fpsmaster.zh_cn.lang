@@ -1,0 +1,113 @@
+# FPSMaster 专有界面文本（原版没有对应键）。叠加在原版 zh_CN 表之上。
+
+# 主菜单 / 暂停菜单
+fpsmaster.menu.accounts=账户
+fpsmaster.menu.mods=模组…
+fpsmaster.menu.demo=试玩世界
+fpsmaster.menu.quitToTitle=退回标题画面
+fpsmaster.account.notSignedIn=未登录
+fpsmaster.account.signedInAs=已登录为
+
+# 账户界面
+fpsmaster.accounts.title=账户
+fpsmaster.accounts.use=使用账户
+fpsmaster.accounts.addMicrosoft=用微软账户添加
+fpsmaster.accounts.addToken=添加令牌
+fpsmaster.accounts.copyToken=复制令牌
+fpsmaster.accounts.empty=还没有账户——在下方添加。
+fpsmaster.accounts.inUse=（使用中）
+fpsmaster.accounts.addTitle=用刷新令牌添加
+fpsmaster.accounts.addInstr=粘贴一个微软刷新令牌（在账户界面按 Cmd/Ctrl+V）：
+fpsmaster.accounts.add=添加账户
+
+# 按键设置界面
+fpsmaster.controls.bindHint=按一个键进行绑定，或按 Esc 取消
+
+# 试玩世界选择
+fpsmaster.demo.title=选择试玩世界
+fpsmaster.demo.landscape=风景地形
+fpsmaster.demo.chunkStress=区块压力测试
+fpsmaster.demo.entityStress=实体压力测试
+
+# 服务器列表 / 编辑服务器
+fpsmaster.server.defaultName=Minecraft 服务器
+fpsmaster.server.add=添加服务器
+fpsmaster.multiplayer.empty=还没有服务器——在下方添加服务器或直接连接。
+fpsmaster.multiplayer.pinging=正在 Ping…
+
+# 模组界面
+fpsmaster.mods.title=模组
+fpsmaster.mods.empty=未安装模组
+fpsmaster.mods.enabledCount=已启用 %1$s/%2$s  -  点击模组以切换
+fpsmaster.mods.on=开
+fpsmaster.mods.off=关
+fpsmaster.mods.help=将模组放入 'mods' 文件夹，然后点击重新加载。
+fpsmaster.mods.reload=重新加载
+fpsmaster.mods.openFolder=打开文件夹
+fpsmaster.mods.builtin=内置
+
+# 视频 / 选项（FPSMaster 专有设置标签）
+fpsmaster.options.renderScale=渲染缩放
+fpsmaster.options.autoRes=自动分辨率
+fpsmaster.options.resolution=分辨率
+fpsmaster.options.showFps=显示 FPS
+fpsmaster.options.oldAnimations=旧版动画
+fpsmaster.options.shaders=光影…
+fpsmaster.options.performance=性能…
+fpsmaster.options.native=原生
+fpsmaster.unit.chunks=区块
+
+# 性能界面
+fpsmaster.perf.title=性能
+fpsmaster.perf.taa=TAA 时间性抗锯齿
+fpsmaster.perf.fsr=FSR 超分辨率
+fpsmaster.perf.fsr.off=关闭
+fpsmaster.perf.fsr.quality=质量
+fpsmaster.perf.fsr.balanced=均衡
+fpsmaster.perf.fsr.performance=性能
+fpsmaster.perf.fsr.custom=自定义
+fpsmaster.perf.dlss=DLSS
+fpsmaster.perf.rt=光线追踪
+fpsmaster.perf.rt.quality=光追质量
+fpsmaster.perf.rt.low=低
+fpsmaster.perf.rt.medium=中
+fpsmaster.perf.rt.high=高
+
+# 光影界面
+fpsmaster.shaders.title=光影
+fpsmaster.shaders.shaders=光影
+fpsmaster.shaders.shadows=阴影
+fpsmaster.shaders.specular=高光
+fpsmaster.shaders.fog=雾
+fpsmaster.shaders.bloom=泛光
+fpsmaster.shaders.volLight=体积光
+fpsmaster.shaders.vignette=暗角
+fpsmaster.shaders.chroma=色散
+fpsmaster.shaders.dof=景深
+fpsmaster.shaders.motion=动态模糊
+fpsmaster.shaders.autoExp=自动曝光
+fpsmaster.shaders.clouds=云
+
+# 进度 / 连接 / 登录界面
+fpsmaster.progress.loadingWorld=正在加载世界…
+fpsmaster.progress.connecting=正在连接服务器…
+fpsmaster.progress.chunksLoaded=已加载 %s 个区块
+fpsmaster.auth.title=微软登录
+fpsmaster.auth.openBrowser=打开浏览器并访问：
+fpsmaster.auth.enterCode=输入代码：
+fpsmaster.auth.waiting=正在等待登录…按 ESC 取消
+fpsmaster.server.startFailed=服务器启动失败
+fpsmaster.server.startTimeout=服务器在 60 秒内未响应
+fpsmaster.server.starting=正在启动本地服务器…
+fpsmaster.server.waiting=正在等待服务器启动
+
+# 资源包界面
+fpsmaster.resourcepack.default=默认（原版 1.8）
+fpsmaster.resourcepack.none=无资源包
+fpsmaster.resourcepack.format=格式：%1$s  %2$s
+
+# 村民交易界面
+fpsmaster.merchant.unavailable=目前无法与村民交易
+
+# 语言界面
+fpsmaster.language.title=选择语言

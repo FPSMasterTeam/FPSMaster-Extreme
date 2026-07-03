@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to the recraft extension API.
+All notable changes to the fpsmaster extension API.
 
 ## 0.3.0
 
@@ -25,9 +25,9 @@ fields (recompile native mods). Declare `api = "^0.3"`.
 
 ## 0.2.0
 
-**Breaking.** The JS global was renamed `recraft` → `mc` and restructured around
+**Breaking.** The JS global was renamed `fpsmaster` → `mc` and restructured around
 vanilla-style objects (`mc.player`, `mc.world`, `mc.connection`). Declare
-`api = "^0.2"`. The native ABI bumps to 0.2.0; `recraft.d.ts` is now `mc.d.ts`.
+`api = "^0.2"`. The native ABI bumps to 0.2.0; `fpsmaster.d.ts` is now `mc.d.ts`.
 
 - **Namespace**: `mc.player` / `mc.world` / `mc.connection`; `mc.log`/`warn`/`error`.
 - **Events**: unified `mc.on(name, cb)` (`tick`, `frame`, `load`, `key`, `chat`,
@@ -60,8 +60,8 @@ Initial release. Two-layer extension system (JS + native), sharing one API.
 - **HUD**: `hud.rect` / `text` / `itemIcon` / `blockItem`.
 - **Preset render**: `setBlockTint`, `fullbright`, `chunkBorders`, `entityBox`,
   `nametagScale`, `particleDensity`. (The targeted-block outline is built in.)
-- **Content (experimental)**: `registerBlock` (recraft-authoritative worlds only).
-- **Native**: `recraft_ext_api` crate — `NativePlugin` trait, `HostApi`
+- **Content (experimental)**: `registerBlock` (fpsmaster-authoritative worlds only).
+- **Native**: `fpsmaster_ext_api` crate — `NativePlugin` trait, `HostApi`
   (`cmd`/`query`/`hud`/`geometry`), plus a render-geometry hook (`submit_geometry`).
 - Per-mod error isolation; **F10** hot reload; capability declarations;
   dependency load order.

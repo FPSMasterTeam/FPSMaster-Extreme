@@ -2,10 +2,10 @@
 
 记录 1.8.9 生物/实体的模型与贴图实现状态。代码位置：
 
-- 模型与骨骼动画：`crates/recraft_render/src/model.rs`
-- 纹理图集（实体槽位）：`crates/recraft_render/src/texture.rs`
-- 插值/行走相位/头部转向等动画状态：`crates/recraft_core/src/entity.rs`
-- App 层装配（把实体状态喂给模型）：`crates/recraft_app/src/game.rs::build_entity_model`
+- 模型与骨骼动画：`crates/fpsmaster_render/src/model.rs`
+- 纹理图集（实体槽位）：`crates/fpsmaster_render/src/texture.rs`
+- 插值/行走相位/头部转向等动画状态：`crates/fpsmaster_core/src/entity.rs`
+- App 层装配（把实体状态喂给模型）：`crates/fpsmaster_app/src/game.rs::build_entity_model`
 
 ## 架构要点
 
@@ -75,9 +75,9 @@
 
 ## 验证
 
-- `cargo test -p recraft_render`：52 passed（含新增 `modeled_mobs_are_well_formed_and_textured`、
+- `cargo test -p fpsmaster_render`：52 passed（含新增 `modeled_mobs_are_well_formed_and_textured`、
   `single_slot_mobs_sample_their_own_slot`、`sheep_layers_body_and_wool`，覆盖每个建模生物的
   网格良构性、UV 落在 [0,1]、各生物只采样自己的图集槽位、羊同时采样身体+羊毛两层）。
-- `cargo test -p recraft_core`：69 passed。
-- `cargo build -p recraft_app`、`cargo clippy -p recraft_render`：通过，无新增告警。
+- `cargo test -p fpsmaster_core`：69 passed。
+- `cargo build -p fpsmaster_app`、`cargo clippy -p fpsmaster_render`：通过，无新增告警。
 - 尚未做应用内的可视化人工验证（运行客户端连服观察实际外观）。

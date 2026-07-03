@@ -14,8 +14,8 @@ param(
     [string]$Fullscreen = "false"
 )
 
-$dir = "C:\Users\Super\MiniCraft"
-$task = "recraft_bench"
+$dir = "C:\Users\Super\FPSMaster-Extreme"
+$task = "fpsmaster_bench"
 
 # Persisted options the game loads on start (scripted-smoke forces vsync off).
 @"
@@ -27,11 +27,11 @@ fancy_graphics=$Graphics
 resolution_w=$ResW
 resolution_h=$ResH
 fullscreen=$Fullscreen
-"@ | Set-Content -Encoding ASCII "$dir\recraft_options.txt"
+"@ | Set-Content -Encoding ASCII "$dir\fpsmaster_options.txt"
 
 # The actual command, in a .bat so the scheduled action stays simple.
 $winArg = if ($Window) { " --window $Window" } else { "" }
-"cd /d $dir`r`n`"$dir\recraft_app.exe`" --demo $Demo --scripted-smoke $Seconds$winArg > `"$dir\prof.txt`" 2>&1" |
+"cd /d $dir`r`n`"$dir\fpsmaster_app.exe`" --demo $Demo --scripted-smoke $Seconds$winArg > `"$dir\prof.txt`" 2>&1" |
     Set-Content -Encoding ASCII "$dir\run_bench.bat"
 
 # (Re)register an interactive task running as the current logged-on user — no

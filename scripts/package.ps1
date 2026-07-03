@@ -1,19 +1,19 @@
 #!/usr/bin/env pwsh
 <#
 .SYNOPSIS
-    Build a distributable ReCraft package: release exe + DLSS dll + assets + local test server.
+    Build a distributable FPSMaster package: release exe + DLSS dll + assets + local test server.
 
 .DESCRIPTION
-    Compiles recraft_app in release mode and assembles a self-contained `dist/` folder:
+    Compiles fpsmaster_app in release mode and assembles a self-contained `dist/` folder:
 
         dist/
-          recraft_app.exe          # the client
+          fpsmaster_app.exe          # the client
           nvngx_dlss.dll           # NVIDIA DLSS Super Resolution (only with -Dlss)
           local_assets/minecraft-1.8.9/...   # vanilla 1.8.9 textures/sounds
           local_server/paper-1.8-protocol47/...   # Paper 1.8 test server (logs stripped)
 
     The exe resolves `local_assets/minecraft-1.8.9` relative to its own directory, so the
-    package runs in-place: launch dist/recraft_app.exe and it finds the bundled assets.
+    package runs in-place: launch dist/fpsmaster_app.exe and it finds the bundled assets.
 
 .PARAMETER Dlss
     Build with the `dlss` feature and copy nvngx_dlss.dll next to the exe. Default: on.
@@ -23,14 +23,14 @@
     only to skip the feature/dll entirely (smaller package, no build toolchain needed).
 
 .PARAMETER Zip
-    Also produce MiniCraft.zip at the repo root from the dist/ contents. Default: off.
+    Also produce FPSMaster-Extreme.zip at the repo root from the dist/ contents. Default: off.
 
 .PARAMETER OutDir
     Output directory (relative to repo root). Default: dist.
 
 .EXAMPLE
     ./scripts/package.ps1                 # release + DLSS dll + assets + server -> dist/
-    ./scripts/package.ps1 -Zip            # ...and zip it to MiniCraft.zip
+    ./scripts/package.ps1 -Zip            # ...and zip it to FPSMaster-Extreme.zip
     ./scripts/package.ps1 -Dlss:$false    # plain build, no DLSS
 #>
 [CmdletBinding()]
@@ -46,7 +46,7 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $Dist = Join-Path $RepoRoot $OutDir
 
-Write-Host "==> ReCraft package (DLSS=$Dlss)" -ForegroundColor Cyan
+Write-Host "==> FPSMaster package (DLSS=$Dlss)" -ForegroundColor Cyan
 
 # --- Preflight: if building DLSS, the toolchain env vars must be present, else the
 #     dlss_wgpu build.rs (bindgen) fails. Catch it here with a clear message. ---
@@ -58,11 +58,11 @@ if ($Dlss) {
 
 # --- 1. Build release ---
 $features = if ($Dlss) { @("--features", "dlss") } else { @() }
-Write-Host "==> cargo build --release -p recraft_app $features" -ForegroundColor Cyan
-& cargo build --release -p recraft_app @features
+Write-Host "==> cargo build --release -p fpsmaster_app $features" -ForegroundColor Cyan
+& cargo build --release -p fpsmaster_app @features
 if ($LASTEXITCODE -ne 0) { throw "cargo build failed (exit $LASTEXITCODE)" }
 
-$ExeSrc = Join-Path $RepoRoot "target\release\recraft_app.exe"
+$ExeSrc = Join-Path $RepoRoot "target\release\fpsmaster_app.exe"
 if (-not (Test-Path $ExeSrc)) { throw "Build succeeded but exe missing: $ExeSrc" }
 
 # --- 2. Fresh dist dir ---
@@ -71,7 +71,7 @@ New-Item -ItemType Directory -Path $Dist | Out-Null
 
 # --- 3. exe ---
 Copy-Item $ExeSrc $Dist
-Write-Host "  + recraft_app.exe"
+Write-Host "  + fpsmaster_app.exe"
 
 # --- 4. DLSS dll (super resolution only; dlssd/dlssg are RR/frame-gen, unused) ---
 if ($Dlss) {
@@ -105,10 +105,10 @@ if (Test-Path $ServerSrc) {
 
 # --- 7. optional zip ---
 if ($Zip) {
-    $ZipPath = Join-Path $RepoRoot "MiniCraft.zip"
+    $ZipPath = Join-Path $RepoRoot "FPSMaster-Extreme.zip"
     if (Test-Path $ZipPath) { Remove-Item -Force $ZipPath }
     Compress-Archive -Path (Join-Path $Dist "*") -DestinationPath $ZipPath
-    Write-Host "  + MiniCraft.zip" -ForegroundColor Green
+    Write-Host "  + FPSMaster-Extreme.zip" -ForegroundColor Green
 }
 
 Write-Host "==> Done. Package at: $Dist" -ForegroundColor Green

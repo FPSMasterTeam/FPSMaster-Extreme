@@ -1,7 +1,7 @@
-//! Minimal recraft native mod. `cargo build --release`, then drop the resulting
-//! cdylib + a `mod.toml` into a recraft `mods/<id>/` folder. See ../README.md.
+//! Minimal fpsmaster native mod. `cargo build --release`, then drop the resulting
+//! cdylib + a `mod.toml` into a fpsmaster `mods/<id>/` folder. See ../README.md.
 
-use recraft_ext_api::prelude::*;
+use fpsmaster_ext_api::prelude::*;
 
 #[derive(Default)]
 struct MyMod {

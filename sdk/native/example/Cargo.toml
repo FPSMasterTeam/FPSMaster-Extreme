@@ -1,16 +1,16 @@
 [package]
-name = "recraft_native_example"
+name = "fpsmaster_native_example"
 version = "1.0.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-description = "Example recraft native (cdylib) extension."
+description = "Example fpsmaster native (cdylib) extension."
 
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
-# Bundled with this SDK (no crates.io needed) — see ../recraft_ext_api/.
-recraft_ext_api = { path = "../recraft_ext_api" }
+# Bundled with this SDK (no crates.io needed) — see ../fpsmaster_ext_api/.
+fpsmaster_ext_api = { path = "../fpsmaster_ext_api" }
 # abi_stable's macros expand to `::abi_stable` paths, so depend on it directly at
-# the same version recraft_ext_api uses.
+# the same version fpsmaster_ext_api uses.
 abi_stable = "0.11"

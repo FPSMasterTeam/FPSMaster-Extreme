@@ -1,13 +1,13 @@
-# recraft Extension SDK
+# fpsmaster Extension SDK
 
-recraft has a two-layer extension system:
+fpsmaster has a two-layer extension system:
 
 | Layer | For | Distribution | Power |
 |---|---|---|---|
 | **JS** (`tier = "js"`) | behaviour / automation / HUD / config | one `.js` file, cross-platform, hot-reloadable | events, commands, read-views, HUD drawing, key bindings, a scheduler, per-mod config, a closed set of preset render toggles |
 | **Native** (`tier = "native"`) | depth / performance / arbitrary native code | a `cdylib` per OS × arch | everything JS can do **plus** unrestricted native code (own threads/state, heavy CPU work, raw render hooks, direct file IO) |
 
-Both layers are bindings over one internal **event bus + command queue** (`recraft_ext`), so they share the exact same event/command semantics; the JS and native APIs are the same surface with different transports.
+Both layers are bindings over one internal **event bus + command queue** (`fpsmaster_ext`), so they share the exact same event/command semantics; the JS and native APIs are the same surface with different transports.
 
 The JS API is modelled on vanilla Minecraft: `mc.player`, `mc.world`, `mc.connection`.
 
@@ -45,7 +45,7 @@ mc.drawHud((ctx) => {
 });
 ```
 
-Launch recraft from the directory that contains `mods/`. Press **F10** to hot-reload all mods after editing. Copy this SDK's `js/mc.d.ts` next to your mods for editor autocomplete/type-checking.
+Launch fpsmaster from the directory that contains `mods/`. Press **F10** to hot-reload all mods after editing. Copy this SDK's `js/mc.d.ts` next to your mods for editor autocomplete/type-checking.
 
 Four worked examples are in `js/examples/`: `coords_hud`, `chat_alert`, `block_tint`, `preset_demo`.
 
@@ -59,7 +59,7 @@ Four worked examples are in `js/examples/`: `coords_hud`, `chat_alert`, `block_t
 | `version` | yes | Mod version. |
 | `tier` | yes | `"js"` or `"native"`. |
 | `api` | yes | Semver requirement against the host API (e.g. `"^0.2"`). The host refuses incompatible mods. |
-| `entry` | yes | `main.js` for JS; the dylib filename (`librecraft_*.dylib` / `.so` / `.dll`) for native. |
+| `entry` | yes | `main.js` for JS; the dylib filename (`libfpsmaster_*.dylib` / `.so` / `.dll`) for native. |
 | `depends` | no | List of mod ids this mod loads after (topologically ordered; cycles are an error). |
 | `capabilities` | no | Declared capabilities (see below). |
 | `name`, `description` | no | Display metadata. |
@@ -224,7 +224,7 @@ mc.world.nametagScale(1.5);
 mc.world.particleDensity(0.5);
 ```
 
-All presets are wired to the renderer: `setBlockTint` (chunk mesher), `fullbright` (forces the world lightmap to full — caves/night fully visible, no washout), `nametagScale` (nametag world size), `particleDensity` (spawn-count multiplier), `chunkBorders` (the player chunk's grid), and `entityBox` (a thick white hitbox wireframe around entities). The targeted-block outline is built into recraft (always drawn, like vanilla), not a preset.
+All presets are wired to the renderer: `setBlockTint` (chunk mesher), `fullbright` (forces the world lightmap to full — caves/night fully visible, no washout), `nametagScale` (nametag world size), `particleDensity` (spawn-count multiplier), `chunkBorders` (the player chunk's grid), and `entityBox` (a thick white hitbox wireframe around entities). The targeted-block outline is built into fpsmaster (always drawn, like vanilla), not a preset.
 
 ### Content blocks (experimental)
 
@@ -239,7 +239,7 @@ mc.on("load", () => mc.world.registerBlock(300, {
 }));
 ```
 
-**Caveat:** this only manifests in a *recraft-authoritative* world. recraft is a client to a vanilla/Paper 1.8 server, which never sends mod block ids, so there is currently no world where a registered mod block can be placed. Per-mod *texture* registration is also not implemented yet.
+**Caveat:** this only manifests in a *fpsmaster-authoritative* world. fpsmaster is a client to a vanilla/Paper 1.8 server, which never sends mod block ids, so there is currently no world where a registered mod block can be placed. Per-mod *texture* registration is also not implemented yet.
 
 ### Key bindings
 
@@ -285,7 +285,7 @@ Each mod runs in its own QuickJS context. A handler that throws is caught and lo
 
 ## 4. Native mods (`abi_stable`)
 
-Native mods compile against the stable **`recraft_ext_api`** crate and export a root module the host loads with `abi_stable`, which checks the type layout + version at load and rejects a mismatch.
+Native mods compile against the stable **`fpsmaster_ext_api`** crate and export a root module the host loads with `abi_stable`, which checks the type layout + version at load and rejects a mismatch.
 
 A native mod talks to the host through the **same JSON protocol** as JS — the host hands it function pointers (`cmd` / `query` / `hud` / `geometry`) bundled in `HostApi`, plus ergonomic Rust helpers that build the JSON for you.
 
@@ -302,17 +302,17 @@ crate-type = ["cdylib"]
 
 [dependencies]
 # Bundled with this SDK — no crates.io needed. (Or a git dep:
-#   recraft_ext_api = { git = "https://github.com/gaoyu06/MiniCraft" }  )
-recraft_ext_api = { path = "../recraft_ext_api" }
+#   fpsmaster_ext_api = { git = "https://github.com/FPSMasterTeam/FPSMaster-Extreme" }  )
+fpsmaster_ext_api = { path = "../fpsmaster_ext_api" }
 # abi_stable's macros expand to `::abi_stable` paths, so depend on it directly
-# at the SAME version recraft_ext_api uses:
+# at the SAME version fpsmaster_ext_api uses:
 abi_stable = "0.11"
 ```
 
 ### Minimal mod
 
 ```rust
-use recraft_ext_api::prelude::*;
+use fpsmaster_ext_api::prelude::*;
 
 #[derive(Default)]
 struct MyMod { ticks: u64 }
@@ -410,11 +410,11 @@ Copy the dylib into `mods/<id>/` and set `entry` in `mod.toml` to its filename. 
 
 ### Obfuscation
 
-Rust has no true obfuscator; the workspace `release` profile uses `strip = "symbols"`. That is safe here because native mods never reference host symbols — they depend only on `recraft_ext_api`'s **layout** (verified at load). A stripped/obfuscated host still loads native mods, and a mod's `cdylib` keeps its root-module export in the *dynamic* symbol table (where the loader resolves it) even when stripped.
+Rust has no true obfuscator; the workspace `release` profile uses `strip = "symbols"`. That is safe here because native mods never reference host symbols — they depend only on `fpsmaster_ext_api`'s **layout** (verified at load). A stripped/obfuscated host still loads native mods, and a mod's `cdylib` keeps its root-module export in the *dynamic* symbol table (where the loader resolves it) even when stripped.
 
 ---
 
 ## 5. Versioning
 
-- `recraft_ext_api` follows semver; native loads are double-checked by `abi_stable`'s runtime layout hash.
-- The JS and native APIs share a single version (currently `0.3.0`); the host refuses a mod whose `api` requirement it doesn't satisfy. **0.3 is a breaking bump from 0.2** — it adds the expanded render API (mod textures, `hud.image`/`line`/`gradient`, textured native geometry, full-screen post effects) and the native `HostApi`/`geometry` ABI gained fields, so recompile native mods and declare `api = "^0.3"`. (0.2 was itself a breaking bump from 0.1: the JS global was renamed `recraft` → `mc` and restructured around `mc.player`/`mc.world`/`mc.connection`.)
+- `fpsmaster_ext_api` follows semver; native loads are double-checked by `abi_stable`'s runtime layout hash.
+- The JS and native APIs share a single version (currently `0.3.0`); the host refuses a mod whose `api` requirement it doesn't satisfy. **0.3 is a breaking bump from 0.2** — it adds the expanded render API (mod textures, `hud.image`/`line`/`gradient`, textured native geometry, full-screen post effects) and the native `HostApi`/`geometry` ABI gained fields, so recompile native mods and declare `api = "^0.3"`. (0.2 was itself a breaking bump from 0.1: the JS global was renamed `fpsmaster` → `mc` and restructured around `mc.player`/`mc.world`/`mc.connection`.)

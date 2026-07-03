@@ -1,11 +1,11 @@
 # 1.8.9 方块渲染对照状态（T4）
 
-记录 1.8.9 全部方块 id（1..=197）的渲染覆盖情况。数据源：`crates/recraft_core/src/blocks.json`（形状/碰撞/贴图分配）+ `block.rs`（每形状几何）。
+记录 1.8.9 全部方块 id（1..=197）的渲染覆盖情况。数据源：`crates/fpsmaster_core/src/blocks.json`（形状/碰撞/贴图分配）+ `block.rs`（每形状几何）。
 
 ## 覆盖结论
 
 - **无任何方块落入 magenta 兜底瓦片**。回归测试
-  `recraft_core::blocks::tests::every_1_8_block_id_has_a_render_def_no_magenta_fallback`
+  `fpsmaster_core::blocks::tests::every_1_8_block_id_has_a_render_def_no_magenta_fallback`
   断言：1..=197 内除两个有意例外的 id 外，每个 id 都有 registry 定义；且每个非 `none`
   形状的方块至少映射一个面贴图。
 - 两个有意例外：

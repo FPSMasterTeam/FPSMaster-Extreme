@@ -2,7 +2,7 @@
 """Download a modern Paper server + Via stack for testing a 1.8.9 client against Grim.
 
 Grim is a modern-server anticheat (api-version 1.13, compiled against paper-api 1.20.6)
-and cannot run on a 1.8.x server. To exercise a protocol-47 (1.8.9) client like ReCraft
+and cannot run on a 1.8.x server. To exercise a protocol-47 (1.8.9) client like FPSMaster
 against Grim we run Paper 1.20.6 with ViaVersion + ViaBackwards + ViaRewind so the old
 client can connect through Via translation -- exactly the "1.8 PvP on a modern server"
 scenario Grim is designed for.
@@ -21,7 +21,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 SERVER_DIR = ROOT / "local_server" / "paper-grim-1.20.6"
 PLUGINS = SERVER_DIR / "plugins"
 PAPER_VERSION = "1.20.6"
-UA = "ReCraft Grim test setup"
+UA = "FPSMaster Grim test setup"
 
 
 def get_json(url: str) -> dict:

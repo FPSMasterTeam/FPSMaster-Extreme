@@ -1,0 +1,16 @@
+[package]
+name = "fpsmaster_native_example"
+version = "1.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Example fpsmaster native (cdylib) extension built on fpsmaster_ext_api."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+fpsmaster_ext_api = { path = "../fpsmaster_ext_api" }
+# Required directly: abi_stable's macros expand to `::abi_stable` paths. Pin the
+# same version fpsmaster_ext_api uses so the layouts match.
+abi_stable = "0.11"

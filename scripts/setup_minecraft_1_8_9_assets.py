@@ -17,7 +17,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 ASSET_DIR = ROOT / "local_assets"
 DEST = ASSET_DIR / "minecraft-1.8.9-client.jar"
 EXTRACTED = ASSET_DIR / "minecraft-1.8.9"
-USER_AGENT = "ReCraft local asset setup"
+USER_AGENT = "FPSMaster local asset setup"
 MANIFEST_URL = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
 
 
@@ -100,7 +100,7 @@ def main() -> None:
     print("Downloading 1.8.9 sound objects (ogg + sounds.json)...")
     sounds = download_sounds(version_meta, EXTRACTED)
     print(f"Sound objects ready: {sounds}")
-    print("Run with: cargo run -p recraft_app")
+    print("Run with: cargo run -p fpsmaster_app")
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
-# recraft mods
+# fpsmaster mods
 
 Drop mods here. Each mod is a subdirectory with a `mod.toml` and an entry file.
-recraft loads everything in this folder at startup (in dependency order); press
+fpsmaster loads everything in this folder at startup (in dependency order); press
 **F10** in-game to hot-reload.
 
 ```
@@ -29,7 +29,7 @@ mc.drawHud(() => hud.text(2, 2, "y=" + mc.player.y.toFixed(1)));
 
 ## Native mod
 
-A native mod is a `cdylib` built against `recraft_ext_api` (see
-`crates/recraft_native_example`). Build it, copy the resulting
-`librecraft_*.{dylib,so,dll}` into a subdirectory here, and point `entry` in its
+A native mod is a `cdylib` built against `fpsmaster_ext_api` (see
+`crates/fpsmaster_native_example`). Build it, copy the resulting
+`libfpsmaster_*.{dylib,so,dll}` into a subdirectory here, and point `entry` in its
 `mod.toml` at the filename. Native mods are per-OS × arch.

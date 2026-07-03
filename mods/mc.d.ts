@@ -1,4 +1,4 @@
-// Type definitions for the recraft JS extension API (`mc.*`).
+// Type definitions for the fpsmaster JS extension API (`mc.*`).
 //
 // Drop this next to your mod and add `/// <reference path="../mc.d.ts" />` at
 // the top of `main.js` (or use a `jsconfig.json`) to get autocomplete and
@@ -121,7 +121,7 @@ interface World {
   /** Statically tint a block id (read by the mesher). `meta` narrows to one meta. */
   setBlockTint(id: number, color: Color, meta?: number): void;
   /** Register a content-mod full-cube block (id > 197). Takes effect only in a
-   *  recraft-authoritative world. `tint` is `[r,g,b]` in 0..1. */
+   *  fpsmaster-authoritative world. `tint` is `[r,g,b]` in 0..1. */
   registerBlock(id: number, opts?: {
     texture?: string; opaque?: boolean; alpha?: number;
     luminance?: number; tint?: [number, number, number];

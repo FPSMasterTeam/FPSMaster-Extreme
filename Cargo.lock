@@ -1027,6 +1027,107 @@ dependencies = [
 ]
 
 [[package]]
+name = "fpsmaster_app"
+version = "0.3.1"
+dependencies = [
+ "anyhow",
+ "arboard",
+ "base64",
+ "env_logger",
+ "fpsmaster_core",
+ "fpsmaster_ext",
+ "fpsmaster_protocol",
+ "fpsmaster_render",
+ "glam 0.27.0",
+ "hickory-resolver",
+ "image",
+ "kira",
+ "log",
+ "pollster",
+ "serde_json",
+ "ureq",
+ "winit",
+]
+
+[[package]]
+name = "fpsmaster_core"
+version = "0.3.1"
+dependencies = [
+ "glam 0.27.0",
+ "log",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "fpsmaster_ext"
+version = "0.3.1"
+dependencies = [
+ "abi_stable",
+ "fpsmaster_ext_api",
+ "log",
+ "rquickjs",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "toml",
+]
+
+[[package]]
+name = "fpsmaster_ext_api"
+version = "0.3.1"
+dependencies = [
+ "abi_stable",
+]
+
+[[package]]
+name = "fpsmaster_native_example"
+version = "1.0.0"
+dependencies = [
+ "abi_stable",
+ "fpsmaster_ext_api",
+]
+
+[[package]]
+name = "fpsmaster_protocol"
+version = "0.3.1"
+dependencies = [
+ "aes",
+ "base64",
+ "cfb8",
+ "flate2",
+ "num-bigint",
+ "rand",
+ "rsa",
+ "serde_json",
+ "sha1",
+ "thiserror 1.0.69",
+ "ureq",
+]
+
+[[package]]
+name = "fpsmaster_render"
+version = "0.3.1"
+dependencies = [
+ "bytemuck",
+ "dlss_wgpu",
+ "env_logger",
+ "font8x8",
+ "fpsmaster_core",
+ "fpsmaster_protocol",
+ "glam 0.27.0",
+ "image",
+ "log",
+ "pollster",
+ "serde_json",
+ "thiserror 1.0.69",
+ "uuid",
+ "wgpu",
+ "winit",
+ "zip",
+]
+
+[[package]]
 name = "futures-channel"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2641,107 +2742,6 @@ dependencies = [
  "objc2-core-foundation",
  "objc2-foundation 0.3.2",
  "objc2-quartz-core 0.3.2",
-]
-
-[[package]]
-name = "recraft_app"
-version = "0.3.1"
-dependencies = [
- "anyhow",
- "arboard",
- "base64",
- "env_logger",
- "glam 0.27.0",
- "hickory-resolver",
- "image",
- "kira",
- "log",
- "pollster",
- "recraft_core",
- "recraft_ext",
- "recraft_protocol",
- "recraft_render",
- "serde_json",
- "ureq",
- "winit",
-]
-
-[[package]]
-name = "recraft_core"
-version = "0.3.1"
-dependencies = [
- "glam 0.27.0",
- "log",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "recraft_ext"
-version = "0.3.1"
-dependencies = [
- "abi_stable",
- "log",
- "recraft_ext_api",
- "rquickjs",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "toml",
-]
-
-[[package]]
-name = "recraft_ext_api"
-version = "0.3.1"
-dependencies = [
- "abi_stable",
-]
-
-[[package]]
-name = "recraft_native_example"
-version = "1.0.0"
-dependencies = [
- "abi_stable",
- "recraft_ext_api",
-]
-
-[[package]]
-name = "recraft_protocol"
-version = "0.3.1"
-dependencies = [
- "aes",
- "base64",
- "cfb8",
- "flate2",
- "num-bigint",
- "rand",
- "rsa",
- "serde_json",
- "sha1",
- "thiserror 1.0.69",
- "ureq",
-]
-
-[[package]]
-name = "recraft_render"
-version = "0.3.1"
-dependencies = [
- "bytemuck",
- "dlss_wgpu",
- "env_logger",
- "font8x8",
- "glam 0.27.0",
- "image",
- "log",
- "pollster",
- "recraft_core",
- "recraft_protocol",
- "serde_json",
- "thiserror 1.0.69",
- "uuid",
- "wgpu",
- "winit",
- "zip",
 ]
 
 [[package]]

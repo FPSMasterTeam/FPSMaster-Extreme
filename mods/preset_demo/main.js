@@ -4,7 +4,7 @@
 //   F7  fullbright          F9  chunk borders
 //   [   entity hitboxes     ]   cycle nametag scale  \  cycle particle density
 //
-// (The targeted-block outline is built into recraft now, like vanilla.)
+// (The targeted-block outline is built into fpsmaster now, like vanilla.)
 
 /// <reference path="../mc.d.ts" />
 
