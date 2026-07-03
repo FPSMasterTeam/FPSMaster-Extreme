@@ -311,17 +311,14 @@ impl GuiScreen for GuiOptions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VideoSlider {
     FpsCap,
-    RenderScale,
     RenderDistance,
 }
 
 #[derive(Default)]
 pub struct GuiVideoSettings {
     fps_rect: UiRect,
-    render_scale_rect: UiRect,
     render_distance_rect: UiRect,
     vsync: Option<GuiButton>,
-    adaptive: Option<GuiButton>,
     graphics: Option<GuiButton>,
     mipmaps: Option<GuiButton>,
     resolution: Option<GuiButton>,
@@ -356,31 +353,33 @@ impl GuiVideoSettings {
     fn layout(&mut self, ctx: &DrawCtx) {
         let s = ctx.scale;
         let x = (ctx.width - 200 * s) / 2;
-        let top = ctx.height / 4 - 40 * s;
-        self.fps_rect = UiRect::new(x, top, 200 * s, BUTTON_HEIGHT * s);
-        self.render_scale_rect = UiRect::new(x, top + 24 * s, 200 * s, BUTTON_HEIGHT * s);
-        self.render_distance_rect = UiRect::new(x, top + 48 * s, 200 * s, BUTTON_HEIGHT * s);
-        self.vsync = Some(GuiButton::at_px(x, top + 72 * s, 98 * s, s, ""));
-        self.adaptive = Some(GuiButton::at_px(x + 102 * s, top + 72 * s, 98 * s, s, ""));
-        self.graphics = Some(GuiButton::at_px(x, top + 96 * s, 98 * s, s, ""));
-        self.mipmaps = Some(GuiButton::at_px(x + 102 * s, top + 96 * s, 98 * s, s, ""));
-        self.resolution = Some(GuiButton::at_px(x, top + 120 * s, 98 * s, s, ""));
-        self.fullscreen = Some(GuiButton::at_px(x + 102 * s, top + 120 * s, 98 * s, s, ""));
+        let right = x + 102 * s;
+        let half = 98 * s;
+        let top = ctx.height / 4 - 24 * s;
+        // Two sliders, then a 2-column grid of toggles, then the two sub-menu
+        // buttons. Render Scale + Auto-Resolution moved to the Performance screen
+        // (they belong with FSR/DLSS/RT), so this screen holds only core video.
+        self.render_distance_rect = UiRect::new(x, top, 200 * s, BUTTON_HEIGHT * s);
+        self.fps_rect = UiRect::new(x, top + 24 * s, 200 * s, BUTTON_HEIGHT * s);
+        self.graphics = Some(GuiButton::at_px(x, top + 48 * s, half, s, ""));
+        self.smooth_light = Some(GuiButton::at_px(right, top + 48 * s, half, s, ""));
+        self.vsync = Some(GuiButton::at_px(x, top + 72 * s, half, s, ""));
+        self.fullscreen = Some(GuiButton::at_px(right, top + 72 * s, half, s, ""));
+        self.resolution = Some(GuiButton::at_px(x, top + 96 * s, half, s, ""));
+        self.mipmaps = Some(GuiButton::at_px(right, top + 96 * s, half, s, ""));
+        self.show_fps = Some(GuiButton::at_px(x, top + 120 * s, half, s, ""));
+        self.old_animations = Some(GuiButton::at_px(right, top + 120 * s, half, s, ""));
         self.shaders_btn =
-            Some(GuiButton::at_px(x, top + 144 * s, 98 * s, s, tr("fpsmaster.options.shaders")));
-        self.smooth_light = Some(GuiButton::at_px(x + 102 * s, top + 144 * s, 98 * s, s, ""));
-        self.show_fps = Some(GuiButton::at_px(x, top + 168 * s, 98 * s, s, ""));
-        self.old_animations =
-            Some(GuiButton::at_px(x + 102 * s, top + 168 * s, 98 * s, s, ""));
+            Some(GuiButton::at_px(x, top + 144 * s, half, s, tr("fpsmaster.options.shaders")));
         self.perf_btn = Some(GuiButton::at_px(
-            x,
-            top + 192 * s,
-            200 * s,
+            right,
+            top + 144 * s,
+            half,
             s,
             tr("fpsmaster.options.performance"),
         ));
         // A gap above Done, echoing vanilla's separated bottom button.
-        self.done = Some(GuiButton::at_px(x, top + 216 * s, 200 * s, s, tr("gui.done")));
+        self.done = Some(GuiButton::at_px(x, top + 180 * s, 200 * s, s, tr("gui.done")));
     }
 
     fn apply_drag(&mut self, x: f64, ctx: &mut ScreenCtx) {
@@ -388,9 +387,6 @@ impl GuiVideoSettings {
             Some(VideoSlider::FpsCap) => ctx
                 .settings
                 .set_fps_from01(slider_fraction(self.fps_rect, x)),
-            Some(VideoSlider::RenderScale) => ctx
-                .settings
-                .set_render_scale_from01(slider_fraction(self.render_scale_rect, x)),
             Some(VideoSlider::RenderDistance) => ctx
                 .settings
                 .set_render_distance_from01(slider_fraction(self.render_distance_rect, x)),
@@ -403,7 +399,6 @@ impl GuiScreen for GuiVideoSettings {
     fn clicks_button(&self, x: f64, y: f64) -> bool {
         [
             self.vsync.as_ref(),
-            self.adaptive.as_ref(),
             self.graphics.as_ref(),
             self.mipmaps.as_ref(),
             self.resolution.as_ref(),
@@ -428,20 +423,6 @@ impl GuiScreen for GuiVideoSettings {
 
         draw_slider(
             ui,
-            self.fps_rect,
-            s,
-            ctx.settings.clone().fps_fraction(),
-            &format!("{}: {}", tr("options.framerateLimit"), ctx.settings.clone().fps_label()),
-        );
-        draw_slider(
-            ui,
-            self.render_scale_rect,
-            s,
-            ctx.settings.clone().render_scale_fraction(),
-            &format!("{}: {}%", tr("fpsmaster.options.renderScale"), ctx.settings.clone().render_scale_percent()),
-        );
-        draw_slider(
-            ui,
             self.render_distance_rect,
             s,
             ctx.settings.clone().render_distance_fraction(),
@@ -452,17 +433,16 @@ impl GuiScreen for GuiVideoSettings {
                 tr("fpsmaster.unit.chunks")
             ),
         );
+        draw_slider(
+            ui,
+            self.fps_rect,
+            s,
+            ctx.settings.clone().fps_fraction(),
+            &format!("{}: {}", tr("options.framerateLimit"), ctx.settings.clone().fps_label()),
+        );
         if let Some(vsync) = &mut self.vsync {
             vsync.label = format!("{}: {}", tr("options.vsync"), on_off(ctx.settings.vsync));
             vsync.draw(ui, s, ctx.mouse, ctx.mouse_down);
-        }
-        if let Some(adaptive) = &mut self.adaptive {
-            adaptive.label = format!(
-                "{}: {}",
-                tr("fpsmaster.options.autoRes"),
-                on_off(ctx.settings.adaptive_resolution)
-            );
-            adaptive.draw(ui, s, ctx.mouse, ctx.mouse_down);
         }
         if let Some(graphics) = &mut self.graphics {
             graphics.label = format!(
@@ -528,11 +508,6 @@ impl GuiScreen for GuiVideoSettings {
             self.apply_drag(x, ctx);
             return Vec::new();
         }
-        if self.render_scale_rect.contains(x, y) {
-            self.dragging = Some(VideoSlider::RenderScale);
-            self.apply_drag(x, ctx);
-            return Vec::new();
-        }
         if self.render_distance_rect.contains(x, y) {
             self.dragging = Some(VideoSlider::RenderDistance);
             self.apply_drag(x, ctx);
@@ -541,10 +516,6 @@ impl GuiScreen for GuiVideoSettings {
         if self.vsync.as_ref().is_some_and(|b| b.clicked(x, y)) {
             ctx.settings.vsync = !ctx.settings.vsync;
             return vec![GuiAction::SetVsync(ctx.settings.vsync)];
-        }
-        if self.adaptive.as_ref().is_some_and(|b| b.clicked(x, y)) {
-            ctx.settings.adaptive_resolution = !ctx.settings.adaptive_resolution;
-            return vec![GuiAction::SetAdaptiveResolution(ctx.settings.adaptive_resolution)];
         }
         if self.graphics.as_ref().is_some_and(|b| b.clicked(x, y)) {
             ctx.settings.fancy_graphics = !ctx.settings.fancy_graphics;
@@ -605,12 +576,9 @@ impl GuiScreen for GuiVideoSettings {
         _right: bool,
         ctx: &mut ScreenCtx,
     ) -> Vec<GuiAction> {
-        // Render scale recreates off-screen targets, so apply it once on release
-        // rather than on every drag tick.
+        // Render distance re-meshes, so apply it once on release rather than on
+        // every drag tick.
         let action = match self.dragging {
-            Some(VideoSlider::RenderScale) => {
-                vec![GuiAction::SetRenderScale(ctx.settings.render_scale)]
-            }
             Some(VideoSlider::RenderDistance) => {
                 vec![GuiAction::SetRenderDistance(ctx.settings.render_distance)]
             }
