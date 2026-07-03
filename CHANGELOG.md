@@ -1,10 +1,10 @@
 # Changelog
 
-All notable changes to recraft are documented here. The format follows
+All notable changes to fpsmaster are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
-[Semantic Versioning](https://semver.org/). The crates (`recraft_app`,
-`recraft_core`, `recraft_protocol`, `recraft_render`, `recraft_ext`,
-`recraft_ext_api`) are versioned in lockstep.
+[Semantic Versioning](https://semver.org/). The crates (`fpsmaster_app`,
+`fpsmaster_core`, `fpsmaster_protocol`, `fpsmaster_render`, `fpsmaster_ext`,
+`fpsmaster_ext_api`) are versioned in lockstep.
 
 ## [0.3.1] - 2026-06-19
 
@@ -20,7 +20,7 @@ All notable changes to recraft are documented here. The format follows
 
 ## [0.3.0] - 2026-06-19
 
-The extension-system milestone. recraft grows a two-layer mod platform — a
+The extension-system milestone. fpsmaster grows a two-layer mod platform — a
 sandbox-friendly JavaScript layer for behaviour/HUD/automation and a native
 (`cdylib`) layer for deep rendering and content — plus the SDK and example mods
 to build against it. Built from the plan in `docs/PLAN_EXTENSION_SYSTEM.md`.
@@ -34,7 +34,7 @@ The extension API is versioned `0.3.0` — a breaking bump from `0.2` (the nativ
 ### Added
 
 #### Extension system — core
-- **Two-layer mod platform** (`recraft_ext`) — a host event bus + command queue
+- **Two-layer mod platform** (`fpsmaster_ext`) — a host event bus + command queue
   threaded through four seams (clientbound packets, input, HUD assembly, tick),
   with all mod code on the main thread and per-mod error isolation. The 6500-line
   `game.rs` packet handler was split into discrete per-packet functions to host
@@ -46,13 +46,13 @@ The extension API is versioned `0.3.0` — a breaking bump from `0.2` (the nativ
 - **`mc.*` JS API** (rquickjs) — `mc.player` / `mc.world` / `mc.connection`
   read-views, event subscriptions, chat/command injection, HUD drawing,
   keybinding + scheduler + config, an `on_serverbound` pre-send hook, and
-  `mc.now()` real-time access. (Replaces the earlier `recraft.*` prototype API.)
+  `mc.now()` real-time access. (Replaces the earlier `fpsmaster.*` prototype API.)
 - **Preset render modifications** — `setBlockTint` (global tint registry +
   re-mesh), fullbright (forced full lightmap), a built-in vanilla block outline,
   and thick white entity hitboxes — all toggleable from JS.
 
 #### Extension system — native layer
-- **Stable native ABI** (`recraft_ext_api`, abi_stable) — `NativePlugin` trait
+- **Stable native ABI** (`fpsmaster_ext_api`, abi_stable) — `NativePlugin` trait
   with a serverbound hook, interaction + rich read-view HostApi helpers, and
   runtime layout/version checking that refuses to load a mismatched mod.
 - **Native render hook** — submit custom world geometry (`ExtVertex` /
@@ -80,14 +80,14 @@ The extension API is versioned `0.3.0` — a breaking bump from `0.2` (the nativ
 #### SDK & examples
 - **Extension SDK** (`sdk/`) — JS TypeScript typings (`mc.d.ts`), a native build
   guide + template + worked example, an API reference, and a bundled
-  `recraft_ext_api` snapshot so the SDK builds without crates.io.
+  `fpsmaster_ext_api` snapshot so the SDK builds without crates.io.
 - **Example mods** in `mods/` — `coords_hud`, `chat_alert`, `block_tint`,
   `preset_demo` (toggles every render preset by key), `scaffold_demo` (a
   vanilla-legit auto-bridge demonstrating the `mc.*` API), and `render_demo`
   (the textures / HUD primitives / post-effect surface).
 - **Mod-management screen** — a `Mods…` button on the title/pause screen to
   list / toggle / reload mods and open the mods folder; disabled state persists
-  to `recraft_options.txt`.
+  to `fpsmaster_options.txt`.
 
 ### Changed
 - **Anti-cheat-legit silent rotation & automation** — the extension tick now
@@ -110,7 +110,7 @@ The extension API is versioned `0.3.0` — a breaking bump from `0.2` (the nativ
   CPU so the large translations cancel there instead of in the shader.
 - **Vanilla packet timing** — incoming packets are processed per-frame (as
   vanilla does), and outgoing acks/commands are handled on the main thread in
-  vanilla per-tick order, instead of recraft's previous ad-hoc scheduling.
+  vanilla per-tick order, instead of fpsmaster's previous ad-hoc scheduling.
 - **macOS GPU-memory leak** — skip rendering entirely while the window is
   occluded (the swapchain was throttled but still accumulating).
 - Scaffold-demo placement now derives from a real ray cast and only places
@@ -212,6 +212,6 @@ Initial 1.8.9 client: world/chunk rendering, terrain meshing and lighting,
 player physics and collision, the 1.8.9 protocol (online and offline mode),
 basic entity rendering, and core GUIs.
 
-[0.3.1]: https://github.com/gaoyu06/MiniCraft/releases/tag/v0.3.1
-[0.3.0]: https://github.com/gaoyu06/MiniCraft/releases/tag/v0.3.0
-[0.2.0]: https://github.com/gaoyu06/MiniCraft/releases/tag/v0.2.0
+[0.3.1]: https://github.com/FPSMasterTeam/FPSMaster-Extreme/releases/tag/v0.3.1
+[0.3.0]: https://github.com/FPSMasterTeam/FPSMaster-Extreme/releases/tag/v0.3.0
+[0.2.0]: https://github.com/FPSMasterTeam/FPSMaster-Extreme/releases/tag/v0.2.0

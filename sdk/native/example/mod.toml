@@ -1,8 +1,8 @@
-# Deploy this alongside the built cdylib in a recraft `mods/<id>/` folder.
+# Deploy this alongside the built cdylib in a fpsmaster `mods/<id>/` folder.
 # `entry` is the actual library filename for your platform.
-id = "recraft.native.example"
+id = "fpsmaster.native.example"
 version = "1.0.0"
 tier = "native"
 api = "^0.3"
-entry = "librecraft_native_example.dylib"   # .so on Linux, .dll on Windows
+entry = "libfpsmaster_native_example.dylib"   # .so on Linux, .dll on Windows
 capabilities = ["hud", "chat", "render"]

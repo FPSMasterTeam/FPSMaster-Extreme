@@ -1,0 +1,17 @@
+[package]
+name = "fpsmaster_ext_api"
+version = "0.3.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Stable plugin ABI for fpsmaster native (cdylib) extensions."
+repository.workspace = true
+readme = "README.md"
+keywords = ["fpsmaster", "minecraft", "plugin", "modding", "abi_stable"]
+categories = ["game-development", "api-bindings"]
+
+# The stable, obfuscation-exempt contract a native mod compiles against. Depends
+# only on abi_stable + a small JSON shim, never on fpsmaster internals, so the host
+# can refactor/obfuscate everything behind it.
+[dependencies]
+abi_stable = "0.11"

@@ -3,7 +3,7 @@
 // (Recoloring the chat text itself is a host-side concern; the JS layer reacts
 // to the event instead — a ping plus a banner that fades after a few seconds.)
 
-const KEYWORDS = ["diamond", "help", "recraft"];
+const KEYWORDS = ["diamond", "help", "fpsmaster"];
 let flashUntil = 0;
 let tick = 0;
 

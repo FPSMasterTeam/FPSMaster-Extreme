@@ -1,23 +1,23 @@
 [workspace]
 members = [
-    "crates/recraft_app",
-    "crates/recraft_core",
-    "crates/recraft_ext",
-    "crates/recraft_ext_api",
-    "crates/recraft_native_example",
-    "crates/recraft_protocol",
-    "crates/recraft_render",
+    "crates/fpsmaster_app",
+    "crates/fpsmaster_core",
+    "crates/fpsmaster_ext",
+    "crates/fpsmaster_ext_api",
+    "crates/fpsmaster_native_example",
+    "crates/fpsmaster_protocol",
+    "crates/fpsmaster_render",
 ]
 # The SDK's standalone template/example packages depend on the published
-# `recraft_ext_api` crate, so they are not part of this workspace.
+# `fpsmaster_ext_api` crate, so they are not part of this workspace.
 exclude = ["sdk"]
 resolver = "2"
 
 # Release "obfuscation" baseline. Rust has no true obfuscator; stripping the
 # symbol table is the closest primitive and is enough here because native mods
-# never reference host symbols — they depend only on `recraft_ext_api`'s checked
+# never reference host symbols — they depend only on `fpsmaster_ext_api`'s checked
 # layout. `strip = "symbols"` drops internal names from the host binary while a
-# mod cdylib keeps its `recraft_ext_mod` root-module export in the *dynamic*
+# mod cdylib keeps its `fpsmaster_ext_mod` root-module export in the *dynamic*
 # symbol table (the loader resolves it there), so stripped release builds still
 # load native mods. That dynamic export is the de-facto symbol whitelist.
 [profile.release]
@@ -28,7 +28,7 @@ lto = "thin"
 edition = "2021"
 rust-version = "1.82"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/gaoyu06/MiniCraft"
+repository = "https://github.com/FPSMasterTeam/FPSMaster-Extreme"
 
 [workspace.dependencies]
 anyhow = "1.0"

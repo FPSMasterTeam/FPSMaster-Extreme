@@ -49,7 +49,7 @@ server-port=25565
 Then run:
 
 ```bash
-cargo run -p recraft_app -- --connect 127.0.0.1:25565 --username ReCraft
+cargo run -p fpsmaster_app -- --connect 127.0.0.1:25565 --username FPSMaster
 ```
 
 ## Missing before completion

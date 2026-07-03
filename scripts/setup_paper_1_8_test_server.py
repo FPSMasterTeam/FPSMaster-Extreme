@@ -16,7 +16,7 @@ PROJECT = "paper"
 VERSION = "1.8.8"
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SERVER_DIR = ROOT / "local_server" / "paper-1.8-protocol47"
-USER_AGENT = "ReCraft local test setup"
+USER_AGENT = "FPSMaster local test setup"
 
 
 def request_json(url: str) -> dict:

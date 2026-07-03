@@ -1,4 +1,4 @@
-# recraft 0.2.0 开发计划
+# fpsmaster 0.2.0 开发计划
 
 > 本文档是一份**自洽的执行说明书**：把当前零散的 28 个目标整理成按范围/大小分组、按依赖排期的开发计划。
 > 执行者（人或 agent）应从「一、执行规范」读起，然后按 wave 顺序推进。
@@ -11,7 +11,7 @@
 2. **分支命名**：遵循 conventional，格式 `<type>/<scope>-<desc>`，例如 `feat/particle-system`、`fix/chest-block-render`。`type ∈ {feat, fix, perf, refactor, chore, docs}`。
 3. **commit message**：遵循 conventional commits：`<type>(<scope>): <subject>`（subject 用英文、祈使句、不超过 ~72 字）。按 harness 规则在 commit 结尾追加：
    `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`
-4. **版本号节奏**：四个 crate（`recraft_app/core/protocol/render`）版本**同步**。起点 `0.1.0`。
+4. **版本号节奏**：四个 crate（`fpsmaster_app/core/protocol/render`）版本**同步**。起点 `0.1.0`。
    - 每个 wave 全部 merge 完成后 bump 一个 patch：`0.1.1 → 0.1.2 → 0.1.3 → 0.1.4`。
    - **所有任务结束后**统一 bump 到 `0.2.0`，commit `chore(release): 0.2.0` 并打 tag `v0.2.0`。
 5. **对照基准（oracle）**：
@@ -33,7 +33,7 @@
 
 ```bash
 # 为一个并行任务建立独立工作区
-git worktree add ../recraft-<branch> -b <branch>
+git worktree add ../fpsmaster-<branch> -b <branch>
 # 在该 worktree 内开发、自测（cargo test/clippy/build）
 
 # wave 收尾：依次合并回 main
@@ -42,20 +42,20 @@ git merge --no-ff <branch>          # 或 rebase 后 ff，按冲突情况选
 # 全部合并后跑全量验证
 cargo build && cargo test && cargo clippy --workspace
 # bump patch 版本，提交，清理
-git worktree remove ../recraft-<branch>
+git worktree remove ../fpsmaster-<branch>
 ```
 
 **热点文件（hot files）** —— 多任务都会动，安排并行时需让同一 wave 内的并行分支**尽量错开**它们，否则串行：
 
 | 文件 | 谁会动 |
 |------|--------|
-| `recraft_render/src/renderer.rs` (6k 行) | 几乎所有渲染任务（新增 pass、绑定） |
-| `recraft_app/src/game.rs` (5k 行) | 几乎所有 app 层任务（事件分发、装配） |
-| `recraft_render/src/chunk_mesh.rs` (2k) | 所有方块渲染任务 |
-| `recraft_render/src/model.rs` (1.6k) | 所有实体/模型任务 |
-| `recraft_render/src/texture.rs` (2k) | 新增贴图槽位的任务 |
-| `recraft_app/src/settings.rs` / `gui/options.rs` | FPS 开关、按键映射、OldAnimations 开关 |
-| `recraft_core/src/{collision,physics,blocks}.rs` | 碰撞、流体、掉落物物理 |
+| `fpsmaster_render/src/renderer.rs` (6k 行) | 几乎所有渲染任务（新增 pass、绑定） |
+| `fpsmaster_app/src/game.rs` (5k 行) | 几乎所有 app 层任务（事件分发、装配） |
+| `fpsmaster_render/src/chunk_mesh.rs` (2k) | 所有方块渲染任务 |
+| `fpsmaster_render/src/model.rs` (1.6k) | 所有实体/模型任务 |
+| `fpsmaster_render/src/texture.rs` (2k) | 新增贴图槽位的任务 |
+| `fpsmaster_app/src/settings.rs` / `gui/options.rs` | FPS 开关、按键映射、OldAnimations 开关 |
+| `fpsmaster_core/src/{collision,physics,blocks}.rs` | 碰撞、流体、掉落物物理 |
 
 > 约定：每个 wave 内，把「重写 `renderer.rs`/`game.rs` 大段」的任务尽量**安排为该文件的单一改动者**，其余并行分支只动各自的新模块/数据文件。冲突小的任务才真正并行。
 
@@ -109,7 +109,7 @@ git worktree remove ../recraft-<branch>
 这三项跨不同 crate，文件域基本不相交，**可三路并行**。是后续多个任务的地基（粒子、音效被 T12/T27 复用；碰撞被 T24/T7 复用），所以放最前。
 
 **T10 粒子渲染系统** `feat/particle-system` · L
-- 触及：新增 `recraft_render/src/particle.rs`；`renderer.rs`（新增一个粒子 pass）；`game.rs`（粒子生成 / tick）；贴图 `assets/minecraft/textures/particle/particles.png`。
+- 触及：新增 `fpsmaster_render/src/particle.rs`；`renderer.rs`（新增一个粒子 pass）；`game.rs`（粒子生成 / tick）；贴图 `assets/minecraft/textures/particle/particles.png`。
 - 步骤：
   1. 对照 MCP-919 `EnumParticleTypes` 列出全部 ~40 种粒子，及各自 `EntityFX` 子类的物理（重力、初速、碰撞、贴图帧/UV、颜色、生命周期）。
   2. 设计**实例化（instanced）billboard 渲染**：一个固定容量的粒子池，每帧只更新实例 buffer（位置/UV/颜色/大小），不重建顶点——这是相对原版 per-particle 的性能优化点。
@@ -118,7 +118,7 @@ git worktree remove ../recraft-<branch>
 - 验证：`cargo test` 覆盖粒子物理数值与 MCP 对齐；本地服触发各类粒子目视 ⚠️；性能上确认万级粒子不重建顶点缓冲。
 
 **T13 音效系统** `feat/sound-system` · L
-- 触及：新增 `recraft_app/src/sound.rs`（或新 crate `recraft_audio`）；`game.rs`/`network.rs`（事件接入）；`Cargo.toml`（新增音频后端依赖）；扩展 `scripts/setup_minecraft_1_8_9_assets.py`。
+- 触及：新增 `fpsmaster_app/src/sound.rs`（或新 crate `fpsmaster_audio`）；`game.rs`/`network.rs`（事件接入）；`Cargo.toml`（新增音频后端依赖）；扩展 `scripts/setup_minecraft_1_8_9_assets.py`。
 - 步骤：
   1. **新增音频依赖**：使用 `kira`（基于 `cpal`，已确认）。用其 spatial 场景做 emitter/listener 定位与距离衰减，mixer 音轨对应原版音效分类，playback rate 做变调（音符盒/随机音高），tween 做音乐淡入淡出；OGG 解码经 symphonia（开 feature）。
   2. **下载缺失的音频资源**：`local_assets` 目前 0 个 `.ogg`。扩展 setup 脚本，按 Mojang **asset index**（`resources.download.minecraft.net`，公开、无需登录）下载 1.8.9 `sounds/` 与 `sounds.json`。
@@ -128,13 +128,13 @@ git worktree remove ../recraft-<branch>
 - 验证：在已知坐标播放已知音效，左右声相/距离衰减随坐标变化正确；连本地服触发游戏音效 ⚠️。
 
 **T19 全碰撞箱对照** `fix/collision-parity` · L
-- 触及：`recraft_core/src/{collision.rs, physics.rs, blocks.rs}`；`entity.rs`（`entity_size`）。
+- 触及：`fpsmaster_core/src/{collision.rs, physics.rs, blocks.rs}`；`entity.rs`（`entity_size`）。
 - 步骤：
   1. 逐方块对照 MCP-919 `Block.setBlockBounds` / 各 `BlockXxx`，校正 `blocks.rs` 中所有非整方块的碰撞盒（楼梯/台阶/栅栏/墙/活板门/床/蛋糕/酿造台/铁砧/漏斗/花盆/火把/拌线钩等）。
   2. 逐实体对照 `Entity`/各 `EntityXxx` 的宽高，修掉 `entity_size()` 对所有 mob 返回固定 `0.3×1.9` 的问题（见 `ENTITY_RENDERING.md` 已知限制）。
   3. 玩家碰撞用 Grim 一致性靶场（见 memory `grim-conformance-test-harness`）回归。
   4. 保持 `f64` 精度路径与原版 `addCoord`/`calculate*Offset` 一致。
-- 验证：单测断言每个方块/实体盒的精确数值取自 MCP 源码；Grim 不再因碰撞误判；`cargo test -p recraft_core`。
+- 验证：单测断言每个方块/实体盒的精确数值取自 MCP 源码；Grim 不再因碰撞误判；`cargo test -p fpsmaster_core`。
 
 ---
 
@@ -207,7 +207,7 @@ git worktree remove ../recraft-<branch>
   3. 核对所有 ⚠️/近似项（牛角/乳房、猪鼻、squid/slime/snowman/bat/silverfish 的 UV、蜘蛛腿角）。
   4. **【已确认】加宽实体图集到 128px，覆盖全部实体**：把当前 64px 槽位的实体图集扩展到 128px 宽，补齐所有未建模生物——铁傀儡/马/女巫（128² 贴图）、恶魂/烈焰人/守卫者/凋灵/末影龙/兔子等，逐一对照 `ModelXxx` 建模并采样自身槽位。目标：**没有任何生物落入彩色占位盒兜底**。
   5. **【已确认】盔甲层 + 第二皮肤层渲染**：给人形实体加盔甲层（头/胸/腿/靴，读装备元数据/`S04 EntityEquipment`，对照 `ModelBiped`/`LayerArmorBase` 的膨胀盒）与第二皮肤层（帽子/外套 overlay）。这同时是 T2「其他玩家盔甲 glint」的前置。
-- 验证：`cargo test -p recraft_render`（well-formed/UV 落 [0,1]/各采样自身槽位，新增 128px 生物与盔甲层用例）；逐生物 + 穿盔甲目视 ⚠️。
+- 验证：`cargo test -p fpsmaster_render`（well-formed/UV 落 [0,1]/各采样自身槽位，新增 128px 生物与盔甲层用例）；逐生物 + 穿盔甲目视 ⚠️。
 - 备注：图集加宽到 128px 是一项较大改造（影响 `texture.rs` 槽位布局与所有现有 UV），作为本任务的第一步先落地，再补未建模生物。
 
 **T5 实体受伤颜色/动画** `feat/entity-hurt-flash` · M

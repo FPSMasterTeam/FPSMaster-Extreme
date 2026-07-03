@@ -1,7 +1,7 @@
 /target/
 /.DS_Store
 *.exe
-/MiniCraft.zip
+/FPSMaster-Extreme.zip
 /dist/
 /references/*
 !/references/README.md
@@ -12,7 +12,7 @@
 CLAUDE.md
 
 # Runtime artifacts
-recraft_options.txt
+fpsmaster_options.txt
 logs/
 
 # Machine-local Claude Code config (settings.local.json, etc.)

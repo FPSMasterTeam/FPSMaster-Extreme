@@ -1,6 +1,6 @@
-# recraft 扩展系统实施计划（两层：JS + Native）
+# fpsmaster 扩展系统实施计划（两层：JS + Native）
 
-> 一份自洽的执行说明书。目标是给 recraft 加一套 **Forge 级深度** 的扩展系统，分两层：
+> 一份自洽的执行说明书。目标是给 fpsmaster 加一套 **Forge 级深度** 的扩展系统，分两层：
 > 轻量 **JS 层**（门槛低、易分发、不碰 3D/世界渲染）+ 深度 **Native 层**（`cdylib`，可深入改渲染与逻辑）。
 > 执行规范（分支命名、commit、验证纪律、worktree 流程、热点文件错峰）沿用 [`PLAN_0_2_0.md`](PLAN_0_2_0.md) 的「一、二」节，不再重复。
 
@@ -12,7 +12,7 @@
 |---|---|
 | 深度目标 | 对标 Forge：可深入改逻辑、网络、渲染、（最终）新增内容 |
 | 安全沙箱 | **不要求**。Native mod 与宿主同进程、全权访问；JS mod 错误可隔离但不防恶意 |
-| 发布形态 | 发布版二进制会**混淆**，因此必须对外暴露一套**稳定插件 API**（`recraft_ext_api` crate + 稳定 JS 全局 API） |
+| 发布形态 | 发布版二进制会**混淆**，因此必须对外暴露一套**稳定插件 API**（`fpsmaster_ext_api` crate + 稳定 JS 全局 API） |
 | 机制 | 运行时动态加载。**Native = `cdylib` + `abi_stable`**；**JS = `rquickjs`（QuickJS）** |
 | 分层职责 | **JS 层不提供 3D/世界渲染**，只提供 HUD 绘制 + 一组**预置渲染修改选项**；**Native 层**可任意深入渲染 |
 | 内容范围 | 分阶段：先做客户端行为/外观 mod（对 vanilla 服务器可用，不动 core）；完整新内容（new blocks/items/entities）作为后期里程碑，需 core id 空间重写，且仅单人/自有世界生效 |
@@ -22,7 +22,7 @@
 1. **深度 = 稳定 API 的广度。** Rust 无 Mixin/字节码注入等价物，混淆后内部符号 mod 够不着。所以本系统主要工作量在「把 hook 点和 API 铺广铺细」，不在选机制。
 2. **Rust 无稳定 ABI。** Native 跨边界只能用 `abi_stable` 的 `RString`/`RVec`/`RBox`/`#[sabi_trait]`，禁止直接传 `String`/`Vec`/裸 trait object。
 3. **Native 非跨平台。** mod 要按 `OS × arch` 出多份二进制；需提供 CI 模板缓解。JS 一份 `.js` 到处跑。
-4. **内容 mod 受协议约束。** recraft 是连 vanilla 1.8.9 服务器的客户端，vanilla 永不下发 mod 内容；新增内容只在 recraft 掌权世界（单人/自有服务器）才成立。
+4. **内容 mod 受协议约束。** fpsmaster 是连 vanilla 1.8.9 服务器的客户端，vanilla 永不下发 mod 内容；新增内容只在 fpsmaster 掌权世界（单人/自有服务器）才成立。
 
 ---
 
@@ -33,17 +33,17 @@
 ```
                          ┌─────────────────────────────┐
    .js mods ──rquickjs──▶│                             │
-                         │   ExtBus  (events out)      │──▶ recraft_app 接缝
+                         │   ExtBus  (events out)      │──▶ fpsmaster_app 接缝
  .dylib mods ─abi_stable▶│   CmdQueue (commands in)    │◀── (packet/tick/frame/input)
                          │   ReadViews (world/entity)  │
                          └─────────────────────────────┘
-                              ▲ 定义于 recraft_ext_api（稳定契约 / 混淆豁免）
+                              ▲ 定义于 fpsmaster_ext_api（稳定契约 / 混淆豁免）
 ```
 
 好处：
 - 机制决策被这一层吸收——先把内部 API 做出来（Phase 0，反正躲不掉），之后绑 JS、绑 Native、还是两者都绑，都是增量。
 - JS 与 Native 共享同一套事件/命令语义，不是两套独立 API，维护成本可控。
-- `recraft_ext_api` 是这层的**稳定投影**，扮演 Forge 里 MCP/SRG 映射层的角色：混淆只动内部，不动这层。
+- `fpsmaster_ext_api` 是这层的**稳定投影**，扮演 Forge 里 MCP/SRG 映射层的角色：混淆只动内部，不动这层。
 
 ---
 
@@ -51,18 +51,18 @@
 
 | crate | 角色 | 是否对外/混淆豁免 |
 |---|---|---|
-| `recraft_ext_api`（新，开源、独立 semver） | 稳定契约：`abi_stable` 事件/命令/handle 类型 + `#[sabi_trait] NativePlugin` + 版本常量 | **是**，发布给 mod 作者，符号白名单不混淆 |
-| `recraft_ext`（新） | 宿主侧扩展管理器：ExtBus + CmdQueue + ReadViews 核心、native loader、JS runtime、manifest/依赖/加载顺序、capability | 否（内部，可混淆） |
-| `recraft_app` | 在四个接缝接出事件、排空命令队列、持有 `recraft_ext` manager | 否 |
-| `recraft_core`（后期） | 内容 mod 的 id 空间重写 | 否 |
+| `fpsmaster_ext_api`（新，开源、独立 semver） | 稳定契约：`abi_stable` 事件/命令/handle 类型 + `#[sabi_trait] NativePlugin` + 版本常量 | **是**，发布给 mod 作者，符号白名单不混淆 |
+| `fpsmaster_ext`（新） | 宿主侧扩展管理器：ExtBus + CmdQueue + ReadViews 核心、native loader、JS runtime、manifest/依赖/加载顺序、capability | 否（内部，可混淆） |
+| `fpsmaster_app` | 在四个接缝接出事件、排空命令队列、持有 `fpsmaster_ext` manager | 否 |
+| `fpsmaster_core`（后期） | 内容 mod 的 id 空间重写 | 否 |
 
-> 依赖方向：`recraft_app → recraft_ext → recraft_ext_api`。`recraft_ext_api` 只依赖 `abi_stable` 与少量纯数据类型，**不依赖** core/render/protocol（避免把内部类型泄进稳定契约——契约里用自己的精简镜像类型）。
+> 依赖方向：`fpsmaster_app → fpsmaster_ext → fpsmaster_ext_api`。`fpsmaster_ext_api` 只依赖 `abi_stable` 与少量纯数据类型，**不依赖** core/render/protocol（避免把内部类型泄进稳定契约——契约里用自己的精简镜像类型）。
 
 ---
 
 ## 四、内部 API 草图（事件 / 命令 / 读视图）
 
-> 下列签名为**示意**，落地时定稿到 `recraft_ext_api`。命令类型尽量复用现有 `NetworkCommand` / `GuiAction` 的形状。
+> 下列签名为**示意**，落地时定稿到 `fpsmaster_ext_api`。命令类型尽量复用现有 `NetworkCommand` / `GuiAction` 的形状。
 
 ### 事件（host → mod，hook 点）
 
@@ -133,13 +133,13 @@ world_time(), dimension(), ...
 
 **定位**：需要深度/性能/任意渲染/（后期）新内容的少数 mod。逃生口。
 
-- 契约：`recraft_ext_api` 用 `#[export_root_module]` + `RootModule`（prefix type，便于向后兼容地加字段）暴露入口；`#[sabi_trait] trait NativePlugin` 定义生命周期 + 全部 hook。
-- 加载：`recraft_ext` 扫描 `mods/*.{dylib,so,dll}`，`abi_stable` **运行时校验类型布局 + 版本**，不匹配直接拒绝加载（挡住混淆/版本错配 UB）。
+- 契约：`fpsmaster_ext_api` 用 `#[export_root_module]` + `RootModule`（prefix type，便于向后兼容地加字段）暴露入口；`#[sabi_trait] trait NativePlugin` 定义生命周期 + 全部 hook。
+- 加载：`fpsmaster_ext` 扫描 `mods/*.{dylib,so,dll}`，`abi_stable` **运行时校验类型布局 + 版本**，不匹配直接拒绝加载（挡住混淆/版本错配 UB）。
 - 能力：JS 能做的全都能做，**外加**：
   - 任意 HUD/世界渲染 hook（拿真实 renderer 资源，自定义几何提交、自定义实体 renderer、TESR 式 block-entity 渲染）；
   - block model / 着色器槽覆盖（超出 JS 预置集）；
   - 直接读真实状态视图（仍走 API，不给 `&mut GameState`，保内部可重构）。
-- **混淆集成**：把 `abi_stable` 的 root-module 导出符号 + `recraft_ext_api` 的 `#[repr(C)]`/`StableAbi` 布局加入混淆白名单，内部其余符号随便混淆。验证：用混淆后的 release 加载一个示例 native mod。
+- **混淆集成**：把 `abi_stable` 的 root-module 导出符号 + `fpsmaster_ext_api` 的 `#[repr(C)]`/`StableAbi` 布局加入混淆白名单，内部其余符号随便混淆。验证：用混淆后的 release 加载一个示例 native mod。
 
 ---
 
@@ -151,7 +151,7 @@ world_time(), dimension(), ...
 id = "coords_hud"
 version = "1.0.0"
 tier = "js"              # "js" | "native"
-api = "^0.1"             # 依赖的 recraft_ext_api / JS API semver
+api = "^0.1"             # 依赖的 fpsmaster_ext_api / JS API semver
 entry = "main.js"        # 或 native: "libcoords.dylib"
 depends = []             # 其它 mod id + 版本范围
 capabilities = ["hud", "read_world"]   # 声明所用能力，安装时给用户确认
@@ -159,7 +159,7 @@ capabilities = ["hud", "read_world"]   # 声明所用能力，安装时给用户
 
 - **加载顺序**：按 `depends` 拓扑排序；环依赖报错。
 - **capability**：虽无沙箱，仍做「声明 + 用户确认」以建立信任分级。敏感能力（`inject_packet`、`read_player_pos`）要显式授权；纯 `hud` mod 默认放行。
-- **版本化**：`recraft_ext_api` 走 semver；JS API 一个全局版本号。host 拒绝 `api` 不兼容的 mod。
+- **版本化**：`fpsmaster_ext_api` 走 semver；JS API 一个全局版本号。host 拒绝 `api` 不兼容的 mod。
 
 ---
 
@@ -169,7 +169,7 @@ capabilities = ["hud", "read_world"]   # 声明所用能力，安装时给用户
 
 ### Phase 0 — 内部事件总线 + 命令队列 + 拆 `game.rs`（无悔基座，不碰 JS/Native）
 
-- 在 `recraft_ext` 建 `ExtBus` / `CmdQueue` / `ReadViews` 核心 + 一个内部 `trait HostHooks`（即未来 `NativePlugin` 的内部原型）。
+- 在 `fpsmaster_ext` 建 `ExtBus` / `CmdQueue` / `ReadViews` 核心 + 一个内部 `trait HostHooks`（即未来 `NativePlugin` 的内部原型）。
 - 在四个接缝接出事件 / 排空命令：
   - 触及：`main.rs`（`NetworkEvent` 出队点接 `on_clientbound_packet`；输入路由接 `on_input`；UiFrame 装配处接 `draw_hud`）。
   - 触及：`game.rs`（`handle_play_packet` 巨型 `match` 内派生 block/chunk/chat/entity 事件；tick 后接 `on_tick`；tick 末排空命令）。顺手把 packet handler 拆成离散函数，**给 6500 行的 `game.rs` 减肥**。
@@ -180,7 +180,7 @@ capabilities = ["hud", "read_world"]   # 声明所用能力，安装时给用户
 
 ### Phase 1 — JS 层（`rquickjs`）：行为 / HUD / 自动化
 
-- `recraft_ext` 接 `rquickjs`，从 `mods/` + `mod.toml` 加载 `.js`。
+- `fpsmaster_ext` 接 `rquickjs`，从 `mods/` + `mod.toml` 加载 `.js`。
 - 暴露 §5 的 JS API（事件订阅、命令、读视图、HUD 绘制、预置渲染选项注册）。错误按 mod 隔离 + 热重载。
 - capability + manifest 解析 + 加载顺序。
 - **验证**：随仓库附 3 个示例 mod 并演示运行时加载 + 热重载：① 坐标/朝向 HUD ② 关键词聊天高亮 ③ `setBlockTint` 预置渲染。`cargo test` 覆盖 manifest 解析与命令排空。
@@ -188,8 +188,8 @@ capabilities = ["hud", "read_world"]   # 声明所用能力，安装时给用户
 
 ### Phase 2 — Native 层（`abi_stable`）+ 稳定 API crate + 混淆集成
 
-- 定稿 `recraft_ext_api`：`#[sabi_trait] NativePlugin` + `abi_stable` 类型 + 版本常量 + root module。
-- `recraft_ext` native loader：扫描 → 布局/版本校验 → 实例化 → 注册到 ExtBus。把内部 `HostHooks` 适配为 `NativePlugin`。
+- 定稿 `fpsmaster_ext_api`：`#[sabi_trait] NativePlugin` + `abi_stable` 类型 + 版本常量 + root module。
+- `fpsmaster_ext` native loader：扫描 → 布局/版本校验 → 实例化 → 注册到 ExtBus。把内部 `HostHooks` 适配为 `NativePlugin`。
 - 暴露完整内部 API（含深度读视图）。
 - **验证**：建一个示例 native mod crate，编译出 `cdylib`，加载进客户端确认能拦包 + 跑 tick 逻辑；构造一个 `api` 版本不匹配的 mod，确认 `abi_stable` **拒绝加载**；用混淆后的 release 加载示例 native mod 成功。
 - 风险：`abi_stable` 类型替换 std 类型的样板量；混淆白名单需与构建脚本对齐。
@@ -197,18 +197,18 @@ capabilities = ["hud", "read_world"]   # 声明所用能力，安装时给用户
 ### Phase 3 — Native 渲染 hook（深度渲染，仅 Native）
 
 - 加 native-only 渲染 hook：自定义 HUD/世界几何提交（拿真实 renderer 资源）、自定义实体 renderer、block model/着色器槽覆盖（超出 JS 预置集）。
-- 触及：`recraft_render`（`renderer.rs` 加 hook 注入点 + 资源出借接口）、`recraft_ext_api`（渲染 hook trait）。
+- 触及：`fpsmaster_render`（`renderer.rs` 加 hook 注入点 + 资源出借接口）、`fpsmaster_ext_api`（渲染 hook trait）。
 - JS 层保持在预置渲染集合，不动。
 - **验证**：示例 native mod 在世界里画自定义 3D 几何 / 覆盖某方块渲染，肉眼确认（标注「待用户目视确认」）。
 - 风险：render 是 present/occlusion-bound 热路径（见 render 笔记），hook 必须批处理、不得逐方块回调。
 
-### Phase 4 — 内容 mod（`recraft_core` id 空间重写，仅自有世界）
+### Phase 4 — 内容 mod（`fpsmaster_core` id 空间重写，仅自有世界）
 
 - 抽象 `BlockState` id 空间（脱离固定 1.8.9 ≤197 范围）、把 `luminance` 等 `match id` 硬编码迁进数据注册表；为 items/entities 建注册表。
 - 仅在单人/自有世界生效；明确与协议边界的关系。
-- 触及：`recraft_core/{block,blocks,...}.rs`、协议边界转换。
+- 触及：`fpsmaster_core/{block,blocks,...}.rs`、协议边界转换。
 - **验证**：mod 在单人世界注册一个新方块并能放置/渲染。
-- 风险：最大工程，独立里程碑，前置是「recraft 掌权世界」能力就绪。
+- 风险：最大工程，独立里程碑，前置是「fpsmaster 掌权世界」能力就绪。
 
 ---
 
@@ -217,7 +217,7 @@ capabilities = ["hud", "read_world"]   # 声明所用能力，安装时给用户
 - **线程模型**：所有 mod 代码只跑在主线程。包拦截在主线程 `NetworkEvent` 出队点做（包本就经 mpsc 流到主线程），避开 `rquickjs`/`abi_stable` 跨线程问题。注入 = push `NetworkCommand`。
 - **性能预算**：HUD/frame hook 每帧一次（μs 级，无压力）；tick hook 20Hz/50ms 预算充裕；packet hook 仅订阅类型；**meshing 逐方块绝不回调 mod**——所有方块级修改走注册表，meshing 原生读合并表。
 - **错误隔离**：JS 异常按 mod 捕获并禁用该 mod；Native 无沙箱，崩溃即宿主崩溃（文档明示，capability 标注高危）。
-- **版本化**：`recraft_ext_api` semver + `abi_stable` 运行时布局校验双保险；JS API 全局版本号。
+- **版本化**：`fpsmaster_ext_api` semver + `abi_stable` 运行时布局校验双保险；JS API 全局版本号。
 
 ---
 

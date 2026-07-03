@@ -1,0 +1,127 @@
+# FPSMaster-specific UI strings (no vanilla equivalent). Layered over the vanilla
+# en_US table. Keys that DO have a vanilla translation are looked up directly
+# (menu.*, gui.*, options.*, selectServer.*, deathScreen.*, …) and are not here.
+
+# Main menu / pause menu additions
+fpsmaster.menu.accounts=Accounts
+fpsmaster.menu.mods=Mods...
+fpsmaster.menu.demo=Demo World
+fpsmaster.menu.quitToTitle=Quit to Title
+fpsmaster.account.notSignedIn=Not signed in
+fpsmaster.account.signedInAs=Signed in as
+
+# Accounts screen
+fpsmaster.accounts.title=Accounts
+fpsmaster.accounts.use=Use Account
+fpsmaster.accounts.addMicrosoft=Add with Microsoft
+fpsmaster.accounts.addToken=Add Token
+fpsmaster.accounts.copyToken=Copy Token
+fpsmaster.accounts.empty=No accounts yet — add one below.
+fpsmaster.accounts.inUse=(in use)
+fpsmaster.accounts.addTitle=Add with Refresh Token
+fpsmaster.accounts.addInstr=Paste a Microsoft refresh token (Cmd/Ctrl+V on the Accounts screen):
+fpsmaster.accounts.add=Add Account
+
+# Controls screen
+fpsmaster.controls.bindHint=Press a key to bind, or Escape to cancel
+
+# Demo world select
+fpsmaster.demo.title=Select Demo World
+fpsmaster.demo.landscape=Landscape
+fpsmaster.demo.chunkStress=Chunk Stress Test
+fpsmaster.demo.entityStress=Entity Stress Test
+
+# Server list / edit server
+fpsmaster.server.defaultName=Minecraft Server
+fpsmaster.server.add=Add Server
+fpsmaster.multiplayer.empty=No servers yet — Add Server or Direct Connect below.
+fpsmaster.multiplayer.pinging=Pinging...
+
+# Mods screen
+fpsmaster.mods.title=Mods
+fpsmaster.mods.empty=No mods installed
+fpsmaster.mods.enabledCount=%1$s/%2$s enabled  -  click a mod to toggle
+fpsmaster.mods.on=ON
+fpsmaster.mods.off=OFF
+fpsmaster.mods.help=Drop mods into the 'mods' folder, then Reload.
+fpsmaster.mods.reload=Reload
+fpsmaster.mods.openFolder=Open Folder
+fpsmaster.mods.builtin=built-in
+
+# Video / options additions (labels for fpsmaster-only settings)
+fpsmaster.options.renderScale=Render Scale
+fpsmaster.options.autoRes=Auto Res
+fpsmaster.options.resolution=Res
+fpsmaster.options.showFps=Show FPS
+fpsmaster.options.oldAnimations=Old Animations
+fpsmaster.options.shaders=Shaders...
+fpsmaster.options.performance=Performance...
+fpsmaster.options.native=Native
+fpsmaster.unit.chunks=chunks
+
+# Performance screen
+fpsmaster.perf.title=Performance
+fpsmaster.perf.taa=TAA
+fpsmaster.perf.fsr=FSR
+fpsmaster.perf.fsr.off=Off
+fpsmaster.perf.fsr.quality=Quality
+fpsmaster.perf.fsr.balanced=Balanced
+fpsmaster.perf.fsr.performance=Performance
+fpsmaster.perf.fsr.custom=Custom
+fpsmaster.perf.dlss=DLSS
+fpsmaster.perf.rt=Ray Tracing
+fpsmaster.perf.rt.quality=RT Quality
+fpsmaster.perf.rt.low=Low
+fpsmaster.perf.rt.medium=Medium
+fpsmaster.perf.rt.high=High
+
+# Shaders screen
+fpsmaster.shaders.title=Shaders
+fpsmaster.shaders.shaders=Shaders
+fpsmaster.shaders.shadows=Shadows
+fpsmaster.shaders.specular=Specular
+fpsmaster.shaders.fog=Fog
+fpsmaster.shaders.bloom=Bloom
+fpsmaster.shaders.volLight=VolLight
+fpsmaster.shaders.vignette=Vignette
+fpsmaster.shaders.chroma=Chroma
+fpsmaster.shaders.dof=DoF
+fpsmaster.shaders.motion=Motion
+fpsmaster.shaders.autoExp=AutoExp
+fpsmaster.shaders.clouds=Clouds
+
+# Progress / connect / auth screens
+fpsmaster.progress.loadingWorld=Loading world...
+fpsmaster.progress.connecting=Connecting to server...
+fpsmaster.progress.chunksLoaded=%s chunks loaded
+fpsmaster.auth.title=Microsoft Login
+fpsmaster.auth.openBrowser=Open your browser and go to:
+fpsmaster.auth.enterCode=Enter code:
+fpsmaster.auth.waiting=Waiting for login... ESC to cancel
+fpsmaster.server.startFailed=Failed to start server
+fpsmaster.server.startTimeout=Server did not respond within 60 seconds
+fpsmaster.server.starting=Starting local server...
+fpsmaster.server.waiting=Waiting for server to start
+
+# Resource pack screen
+fpsmaster.resourcepack.default=Default (Vanilla 1.8)
+fpsmaster.resourcepack.none=No resource pack
+fpsmaster.resourcepack.format=Format: %1$s  %2$s
+
+# Villager trade screen
+fpsmaster.merchant.unavailable=Can't trade with villager at the moment
+
+# Language screen
+fpsmaster.language.title=Select Language
+
+# Server-sent chat translation patterns, embedded so messages still format
+# correctly when the vanilla language tables are unavailable (offline / tests).
+# Identical to vanilla en_US, which overrides these when assets are present.
+chat.type.text=<%s> %s
+chat.type.announcement=[%s] %s
+chat.type.emote=* %s %s
+chat.type.admin=[%s: %s]
+multiplayer.player.joined=%s joined the game
+multiplayer.player.left=%s left the game
+commands.message.display.incoming=%s whispers to you: %s
+commands.message.display.outgoing=You whisper to %s: %s

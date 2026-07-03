@@ -12,7 +12,7 @@ Environment:
 Commands run successfully:
 
 ```bash
-cargo test -p recraft_core -p recraft_protocol -p recraft_render
+cargo test -p fpsmaster_core -p fpsmaster_protocol -p fpsmaster_render
 cargo check
 ```
 
@@ -33,7 +33,7 @@ Done (...)! For help, type "help" or "?"
 Client demo runtime check:
 
 ```bash
-RUST_LOG=warn cargo run -p recraft_app
+RUST_LOG=warn cargo run -p fpsmaster_app
 ```
 
 No wgpu validation error was observed during the short run.
@@ -41,13 +41,13 @@ No wgpu validation error was observed during the short run.
 Client offline-mode server connection check:
 
 ```bash
-RUST_LOG=info cargo run -p recraft_app -- --connect 127.0.0.1:25565 --username ReCraftBot3
+RUST_LOG=info cargo run -p fpsmaster_app -- --connect 127.0.0.1:25565 --username FPSMasterBot3
 ```
 
 Observed client logs:
 
 ```text
-logged in as ReCraftBot3 (...)
+logged in as FPSMasterBot3 (...)
 applied chunk bulk: 10 chunks
 ...
 applied chunk bulk: 9 chunks
@@ -56,7 +56,7 @@ applied chunk bulk: 9 chunks
 Observed server logs:
 
 ```text
-ReCraftBot3[/127.0.0.1:...] logged in with entity id ... at ([world]..., ..., ...)
+FPSMasterBot3[/127.0.0.1:...] logged in with entity id ... at ([world]..., ..., ...)
 ```
 
 Known issue found and fixed during this verification:
@@ -77,8 +77,8 @@ Commands run successfully:
 
 ```bash
 python3 scripts/setup_minecraft_1_8_9_assets.py
-RUST_LOG=info cargo run -p recraft_app -- --assets local_assets/minecraft-1.8.9-client.jar
-cargo test -p recraft_core -p recraft_protocol -p recraft_render
+RUST_LOG=info cargo run -p fpsmaster_app -- --assets local_assets/minecraft-1.8.9-client.jar
+cargo test -p fpsmaster_core -p fpsmaster_protocol -p fpsmaster_render
 cargo check
 ```
 
@@ -96,7 +96,7 @@ Movement direction is now covered by `movement_forward_matches_minecraft_yaw_con
 Commands run successfully:
 
 ```bash
-cargo test -p recraft_core -p recraft_protocol -p recraft_render
+cargo test -p fpsmaster_core -p fpsmaster_protocol -p fpsmaster_render
 cargo check
 ```
 
@@ -114,7 +114,7 @@ This verifies the data path from decoded 1.8 chunk light nibbles into internal c
 Commands run successfully:
 
 ```bash
-cargo test -p recraft_core -p recraft_protocol -p recraft_render
+cargo test -p fpsmaster_core -p fpsmaster_protocol -p fpsmaster_render
 cargo check
 ```
 
@@ -130,7 +130,7 @@ This moves the implementation closer to the 1.8.9 movement order, but it is not 
 Commands run successfully:
 
 ```bash
-cargo test -p recraft_core -p recraft_protocol -p recraft_render
+cargo test -p fpsmaster_core -p fpsmaster_protocol -p fpsmaster_render
 cargo check
 ```
 
@@ -162,8 +162,8 @@ MCP reference availability:
 Commands run successfully:
 
 ```bash
-cargo test -p recraft_core -p recraft_protocol -p recraft_render
-cargo test -p recraft_app
+cargo test -p fpsmaster_core -p fpsmaster_protocol -p fpsmaster_render
+cargo test -p fpsmaster_app
 cargo check
 ```
 
@@ -189,16 +189,16 @@ local_server/paper-1.8-protocol47/run.sh
 Client smoke command:
 
 ```bash
-RUST_LOG=info cargo run -p recraft_app -- \
+RUST_LOG=info cargo run -p fpsmaster_app -- \
   --connect 127.0.0.1:25565 \
-  --username ReCraftVerify \
+  --username FPSMasterVerify \
   --assets local_assets/minecraft-1.8.9-client.jar
 ```
 
 Observed:
 
 ```text
-logged in as ReCraftVerify (...)
+logged in as FPSMasterVerify (...)
 applied chunk bulk: 10 chunks
 ...
 applied chunk bulk: 9 chunks
@@ -209,7 +209,7 @@ Server observed successful login and only logged `Connection reset` after the cl
 Commands run successfully:
 
 ```bash
-cargo test -p recraft_core
+cargo test -p fpsmaster_core
 ```
 
 Coverage added/updated:
@@ -224,9 +224,9 @@ Coverage added/updated:
 Client smoke command:
 
 ```bash
-RUST_LOG=info,recraft_app::network=debug cargo run -p recraft_app -- \
+RUST_LOG=info,fpsmaster_app::network=debug cargo run -p fpsmaster_app -- \
   --connect 127.0.0.1:25565 \
-  --username ReCraftC06 \
+  --username FPSMasterC06 \
   --assets local_assets/minecraft-1.8.9-client.jar \
   --scripted-smoke 20
 ```
@@ -236,7 +236,7 @@ The `--scripted-smoke` mode is a verification-only app entry point. It drives fo
 Observed client logs:
 
 ```text
-logged in as ReCraftC06 (...)
+logged in as FPSMasterC06 (...)
 applied chunk bulk: 10 chunks
 ...
 sending C06 PlayerPositionLook
@@ -247,9 +247,9 @@ scripted smoke complete
 Observed server logs:
 
 ```text
-ReCraftC06[/127.0.0.1:...] logged in with entity id ... at ([world]..., ..., ...)
-ReCraftC06 lost connection: Disconnected
-ReCraftC06 left the game.
+FPSMasterC06[/127.0.0.1:...] logged in with entity id ... at ([world]..., ..., ...)
+FPSMasterC06 lost connection: Disconnected
+FPSMasterC06 left the game.
 ```
 
 No `Bad packet id 6` or protocol exception was observed during the scripted C06 path.
@@ -267,7 +267,7 @@ Observed:
 ```text
 Asset jar ready: .../local_assets/minecraft-1.8.9-client.jar
 Extracted 3085 asset files to: .../local_assets/minecraft-1.8.9
-Run with: cargo run -p recraft_app
+Run with: cargo run -p fpsmaster_app
 ```
 
 The extracted directory preserves the vanilla/resource-pack root layout:
@@ -279,7 +279,7 @@ local_assets/minecraft-1.8.9/assets/minecraft/textures/blocks/...
 Demo smoke command without `--assets`:
 
 ```bash
-RUST_LOG=info cargo run -p recraft_app -- --scripted-smoke 2
+RUST_LOG=info cargo run -p fpsmaster_app -- --scripted-smoke 2
 ```
 
 Observed:
@@ -293,9 +293,9 @@ scripted smoke complete
 Server smoke command without `--assets`:
 
 ```bash
-RUST_LOG=info cargo run -p recraft_app -- \
+RUST_LOG=info cargo run -p fpsmaster_app -- \
   --connect 127.0.0.1:25565 \
-  --username ReCraftAssets \
+  --username FPSMasterAssets \
   --scripted-smoke 8
 ```
 
@@ -304,7 +304,7 @@ Observed client logs:
 ```text
 loaded 7 block atlas tiles from local_assets/minecraft-1.8.9
 loaded Minecraft 1.8.9 block atlas from asset directory local_assets/minecraft-1.8.9
-logged in as ReCraftAssets (...)
+logged in as FPSMasterAssets (...)
 applied chunk bulk: 10 chunks
 ...
 scripted smoke complete
@@ -313,9 +313,9 @@ scripted smoke complete
 Observed server logs:
 
 ```text
-ReCraftAssets[/127.0.0.1:...] logged in with entity id ... at ([world]..., ..., ...)
-ReCraftAssets lost connection: Disconnected
-ReCraftAssets left the game.
+FPSMasterAssets[/127.0.0.1:...] logged in with entity id ... at ([world]..., ..., ...)
+FPSMasterAssets lost connection: Disconnected
+FPSMasterAssets left the game.
 ```
 
 ## 2026-06-11 expanded block atlas coverage
@@ -323,7 +323,7 @@ ReCraftAssets left the game.
 Demo smoke command without `--assets`:
 
 ```bash
-RUST_LOG=info cargo run -p recraft_app -- --scripted-smoke 2
+RUST_LOG=info cargo run -p fpsmaster_app -- --scripted-smoke 2
 ```
 
 Observed:
@@ -337,9 +337,9 @@ scripted smoke complete
 Server smoke command without `--assets`:
 
 ```bash
-RUST_LOG=info cargo run -p recraft_app -- \
+RUST_LOG=info cargo run -p fpsmaster_app -- \
   --connect 127.0.0.1:25565 \
-  --username ReCraftAtlas \
+  --username FPSMasterAtlas \
   --scripted-smoke 8
 ```
 
@@ -348,7 +348,7 @@ Observed client logs:
 ```text
 loaded 129 block atlas tiles from local_assets/minecraft-1.8.9
 loaded Minecraft 1.8.9 block atlas from asset directory local_assets/minecraft-1.8.9
-logged in as ReCraftAtlas (...)
+logged in as FPSMasterAtlas (...)
 applied chunk bulk: 10 chunks
 ...
 scripted smoke complete
@@ -357,9 +357,9 @@ scripted smoke complete
 Observed server logs:
 
 ```text
-ReCraftAtlas[/127.0.0.1:...] logged in with entity id ... at ([world]..., ..., ...)
-ReCraftAtlas lost connection: Disconnected
-ReCraftAtlas left the game.
+FPSMasterAtlas[/127.0.0.1:...] logged in with entity id ... at ([world]..., ..., ...)
+FPSMasterAtlas lost connection: Disconnected
+FPSMasterAtlas left the game.
 ```
 
 Coverage expanded from the initial 7-tile atlas to common 1.8.9 block-id/meta textures. This is still not a full blockstate/model/resource-pack implementation.
@@ -376,9 +376,9 @@ Runtime renderer change:
 Server smoke command without `--assets`:
 
 ```bash
-RUST_LOG=info cargo run -p recraft_app -- \
+RUST_LOG=info cargo run -p fpsmaster_app -- \
   --connect 127.0.0.1:25565 \
-  --username ReCraftMesh \
+  --username FPSMasterMesh \
   --scripted-smoke 8
 ```
 
@@ -387,7 +387,7 @@ Observed client logs:
 ```text
 loaded 129 block atlas tiles from local_assets/minecraft-1.8.9
 loaded Minecraft 1.8.9 block atlas from asset directory local_assets/minecraft-1.8.9
-logged in as ReCraftMesh (...)
+logged in as FPSMasterMesh (...)
 applied chunk bulk: 10 chunks
 ...
 scripted smoke complete
@@ -396,9 +396,9 @@ scripted smoke complete
 Observed server logs:
 
 ```text
-ReCraftMesh[/127.0.0.1:...] logged in with entity id ... at ([world]..., ..., ...)
-ReCraftMesh lost connection: Disconnected
-ReCraftMesh left the game.
+FPSMasterMesh[/127.0.0.1:...] logged in with entity id ... at ([world]..., ..., ...)
+FPSMasterMesh lost connection: Disconnected
+FPSMasterMesh left the game.
 ```
 
 No wgpu validation or protocol error was observed during the scripted smoke run. This is a runtime smoke check, not a visual-performance benchmark.
@@ -411,9 +411,9 @@ Commands run successfully:
 python3 scripts/setup_minecraft_1_8_9_assets.py
 cargo fmt --all
 cargo check
-cargo test -p recraft_core -p recraft_protocol -p recraft_render
-cargo test -p recraft_app
-RUST_LOG=info cargo run -p recraft_app -- --scripted-smoke 2
+cargo test -p fpsmaster_core -p fpsmaster_protocol -p fpsmaster_render
+cargo test -p fpsmaster_app
+RUST_LOG=info cargo run -p fpsmaster_app -- --scripted-smoke 2
 ```
 
 Observed default asset log without `--assets`:
@@ -428,9 +428,9 @@ Local Paper server smoke command without `--assets`:
 
 ```bash
 local_server/paper-1.8-protocol47/run.sh
-RUST_LOG=info cargo run -p recraft_app -- \
+RUST_LOG=info cargo run -p fpsmaster_app -- \
   --connect 127.0.0.1:25565 \
-  --username ReCraftAssets2 \
+  --username FPSMasterAssets2 \
   --scripted-smoke 8
 ```
 
@@ -439,7 +439,7 @@ Observed client logs:
 ```text
 loaded 129 block atlas tiles from local_assets/minecraft-1.8.9
 loaded Minecraft 1.8.9 block atlas from asset directory local_assets/minecraft-1.8.9
-logged in as ReCraftAssets2 (...)
+logged in as FPSMasterAssets2 (...)
 applied chunk bulk: 10 chunks
 ...
 scripted smoke complete
@@ -448,9 +448,9 @@ scripted smoke complete
 Observed server logs:
 
 ```text
-ReCraftAssets2[/127.0.0.1:...] logged in with entity id ... at ([world]144.5, 67.0, 71.5)
-ReCraftAssets2 lost connection: Disconnected
-ReCraftAssets2 left the game.
+FPSMasterAssets2[/127.0.0.1:...] logged in with entity id ... at ([world]144.5, 67.0, 71.5)
+FPSMasterAssets2 lost connection: Disconnected
+FPSMasterAssets2 left the game.
 ```
 
 MCP source checked for chunk unload behavior:
@@ -473,7 +473,7 @@ MCP source checked:
 Commands run successfully:
 
 ```bash
-cargo test -p recraft_protocol
+cargo test -p fpsmaster_protocol
 cargo check
 ```
 
@@ -496,10 +496,10 @@ MCP source checked:
 Commands run successfully:
 
 ```bash
-cargo test -p recraft_protocol
-cargo test -p recraft_app
-cargo test -p recraft_core -p recraft_protocol -p recraft_render
-cargo test -p recraft_app
+cargo test -p fpsmaster_protocol
+cargo test -p fpsmaster_app
+cargo test -p fpsmaster_core -p fpsmaster_protocol -p fpsmaster_render
+cargo test -p fpsmaster_app
 cargo check
 ```
 
@@ -509,9 +509,9 @@ Successful local Paper smoke after the fix:
 
 ```bash
 local_server/paper-1.8-protocol47/run.sh
-RUST_LOG=info,recraft_app::network=debug cargo run -p recraft_app -- \
+RUST_LOG=info,fpsmaster_app::network=debug cargo run -p fpsmaster_app -- \
   --connect 127.0.0.1:25565 \
-  --username ReCraftC0B2 \
+  --username FPSMasterC0B2 \
   --scripted-smoke 6
 ```
 
@@ -519,7 +519,7 @@ Observed client logs:
 
 ```text
 loaded 129 block atlas tiles from local_assets/minecraft-1.8.9
-logged in as ReCraftC0B2 (...)
+logged in as FPSMasterC0B2 (...)
 sending C0B EntityAction START_SPRINTING
 sending C06 PlayerPositionLook
 ...
@@ -530,9 +530,9 @@ scripted smoke complete
 Observed server logs:
 
 ```text
-ReCraftC0B2[/127.0.0.1:...] logged in with entity id ... at ([world]145.5, 67.0, 72.5)
-ReCraftC0B2 lost connection: Disconnected
-ReCraftC0B2 left the game.
+FPSMasterC0B2[/127.0.0.1:...] logged in with entity id ... at ([world]145.5, 67.0, 72.5)
+FPSMasterC0B2 lost connection: Disconnected
+FPSMasterC0B2 left the game.
 ```
 
 No `Bad packet id 11` or other server protocol exception occurred in the successful run.
