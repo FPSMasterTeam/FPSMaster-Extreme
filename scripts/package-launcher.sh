@@ -78,10 +78,15 @@ DEFAULT_URL="https://cdn.fpsmaster.top/extreme/${VERSION}/${STAMP}.tar.gz"
 echo "==> Packaging $STAMP (dlss=$DLSS)"
 
 # --- 1. Build release ---
-FEATURES=()
-if [[ "$DLSS" == "1" ]]; then FEATURES=(--features dlss); fi
-echo "==> cargo build --release -p fpsmaster_app ${FEATURES[*]:-}"
-( cd "$REPO_ROOT" && cargo build --release -p fpsmaster_app "${FEATURES[@]}" )
+# NOTE: don't expand an array here — macOS runners ship bash 3.2, where
+# "${arr[@]}" on an empty array under `set -u` errors with "unbound variable".
+if [[ "$DLSS" == "1" ]]; then
+  echo "==> cargo build --release -p fpsmaster_app --features dlss"
+  ( cd "$REPO_ROOT" && cargo build --release -p fpsmaster_app --features dlss )
+else
+  echo "==> cargo build --release -p fpsmaster_app"
+  ( cd "$REPO_ROOT" && cargo build --release -p fpsmaster_app )
+fi
 
 BIN_SRC="$REPO_ROOT/target/release/$BIN_NAME"
 [[ -f "$BIN_SRC" ]] || { echo "build succeeded but binary missing: $BIN_SRC" >&2; exit 1; }
