@@ -181,9 +181,22 @@ impl World {
         self.propagate_sky_light();
     }
 
+    /// Vanilla propagation cost of light entering the cell at (x,y,z):
+    /// `max(1, lightOpacity)` (air 1, water/ice 3, leaves 1, ...), or None when
+    /// the block is fully light-blocking (opacity 15) and carries no light.
+    fn light_cost(&self, x: i32, y: i32, z: i32) -> Option<u8> {
+        let opacity = self.block_at(x, y, z).light_opacity();
+        if opacity >= 15 {
+            None
+        } else {
+            Some(opacity.max(1))
+        }
+    }
+
     /// BFS-propagate sky light from vertical-cast boundaries into covered
-    /// areas. Decays by 1 per horizontal/upward step; passes straight down
-    /// through transparent blocks with no decay (vanilla rule).
+    /// areas, decaying by the vanilla per-block cost `max(1, lightOpacity)`
+    /// per step (so water columns attenuate 3/block, matching the values
+    /// vanilla servers send).
     fn propagate_sky_light(&mut self) {
         let mut lit_cells: Vec<(i32, i32, i32)> = Vec::new();
         for (cpos, chunk) in &self.chunks {
@@ -214,10 +227,10 @@ impl World {
                 if !(0..256).contains(&ny) || !self.is_block_column_loaded(nx, nz) {
                     return false;
                 }
-                if self.block_at(nx, ny, nz).is_opaque_cube() {
+                let Some(cost) = self.light_cost(nx, ny, nz) else {
                     return false;
-                }
-                let new_level = if ny < wy { sky } else { sky.saturating_sub(1) };
+                };
+                let new_level = sky.saturating_sub(cost);
                 new_level > 0 && new_level > self.light_at(nx, ny, nz).1
             });
             if is_seed {
@@ -234,10 +247,10 @@ impl World {
                 if !(0..256).contains(&ny) || !self.is_block_column_loaded(nx, nz) {
                     continue;
                 }
-                if self.block_at(nx, ny, nz).is_opaque_cube() {
+                let Some(cost) = self.light_cost(nx, ny, nz) else {
                     continue;
-                }
-                let new_level = if ny < cy { level } else { level.saturating_sub(1) };
+                };
+                let new_level = level.saturating_sub(cost);
                 if new_level > 0 && new_level > self.light_at(nx, ny, nz).1 {
                     let bl = self.light_at(nx, ny, nz).0;
                     self.set_light(nx, ny, nz, bl, new_level);
@@ -293,12 +306,13 @@ impl World {
                 if !(0..256).contains(&ny) || !self.is_block_column_loaded(nx, nz) {
                     continue;
                 }
-                if self.block_at(nx, ny, nz).is_opaque_cube() {
+                let Some(cost) = self.light_cost(nx, ny, nz) else {
                     continue;
-                }
+                };
+                let new_level = level.saturating_sub(cost);
                 let nl = self.light_at(nx, ny, nz).0;
-                if level - 1 > nl {
-                    self.set_block_light_tracked(nx, ny, nz, level - 1, &mut changed);
+                if new_level > nl {
+                    self.set_block_light_tracked(nx, ny, nz, new_level, &mut changed);
                     additions.push_back((nx, ny, nz));
                 }
             }
@@ -323,10 +337,12 @@ impl World {
     }
 
     /// Two-phase sky-light update after a block edit: vertical cast for the
-    /// edited column, BFS removal of stale propagated light, then BFS
-    /// re-propagation from remaining bright borders. Decays by 1 per
-    /// horizontal/upward step; passes straight down through transparent blocks
-    /// with no decay (vanilla rule). Returns sections whose sky-light changed.
+    /// edited column (direct sky reaches down to the first block with
+    /// `lightOpacity > 0`, vanilla's heightmap rule), BFS removal of stale
+    /// propagated light, then BFS re-propagation from remaining bright borders
+    /// decaying by the vanilla `max(1, lightOpacity)` per block. Reproduces the
+    /// same values the server computes, so a local relight is idempotent over
+    /// server-sent light. Returns sections whose sky-light changed.
     pub fn update_sky_light(
         &mut self,
         x: i32,
@@ -349,7 +365,11 @@ impl World {
             let mut vy = top * 16 + 15;
             while vy >= 0 {
                 if section_ys.contains(&vy.div_euclid(16)) {
-                    if !blocked && self.block_at(x, vy, z).is_opaque_cube() {
+                    // Vanilla heightmap: direct sky ends at the first block that
+                    // attenuates light at all (water, leaves, ...), not just at
+                    // opaque cubes. Cells below get re-lit by the BFS with the
+                    // proper per-block attenuation.
+                    if !blocked && self.block_at(x, vy, z).light_opacity() > 0 {
                         blocked = true;
                     }
                     let want = if blocked { 0 } else { 15 };
@@ -369,7 +389,7 @@ impl World {
         }
 
         // --- Handle opacity change at the edited position -------------------
-        if old.is_opaque_cube() && !self.block_at(x, y, z).is_opaque_cube() {
+        if old.light_opacity() > self.block_at(x, y, z).light_opacity() {
             for (nx, ny, nz) in neighbors(x, y, z) {
                 if (0..256).contains(&ny)
                     && self.is_block_column_loaded(nx, nz)
@@ -390,9 +410,9 @@ impl World {
                 if nl == 0 {
                     continue;
                 }
-                // Downward: no decay, so the neighbour could be at `level`.
-                let removes = if ny < cy { nl <= level } else { nl < level };
-                if removes {
+                // Every propagation step costs >= 1, so anything we lit is
+                // strictly dimmer; equal-or-brighter borders re-seed instead.
+                if nl < level {
                     self.set_sky_light_tracked(nx, ny, nz, 0, &mut changed);
                     removal.push_back((nx, ny, nz, nl));
                 } else {
@@ -411,10 +431,10 @@ impl World {
                 if !(0..256).contains(&ny) || !self.is_block_column_loaded(nx, nz) {
                     continue;
                 }
-                if self.block_at(nx, ny, nz).is_opaque_cube() {
+                let Some(cost) = self.light_cost(nx, ny, nz) else {
                     continue;
-                }
-                let new_level = if ny < cy { level } else { level.saturating_sub(1) };
+                };
+                let new_level = level.saturating_sub(cost);
                 if new_level > 0 && new_level > self.light_at(nx, ny, nz).1 {
                     self.set_sky_light_tracked(nx, ny, nz, new_level, &mut changed);
                     additions.push_back((nx, ny, nz));
@@ -583,7 +603,7 @@ mod tests {
     }
 
     #[test]
-    fn sky_light_descends_without_decay() {
+    fn sky_light_decays_downward_below_heightmap() {
         let mut world = World::new();
         // Open column at x=0, y=69 is the lowest open-air block.
         // Wall at x=0 from y=68 down blocks horizontal light to x=1.
@@ -605,11 +625,91 @@ mod tests {
 
         assert_eq!(world.light_at(0, 69, 0).1, 15, "open air");
         assert_eq!(world.light_at(1, 69, 0).1, 14, "horizontal from open column");
-        // Below: the only light path is downward from (1,69) — no horizontal
-        // source because of the wall at x=0. Downward has no decay.
-        assert_eq!(world.light_at(1, 68, 0).1, 14, "down without decay");
-        assert_eq!(world.light_at(1, 67, 0).1, 14, "still 14 further down");
-        assert_eq!(world.light_at(1, 66, 0).1, 14, "still 14 at bottom");
+        // Below the heightmap every step costs max(1, opacity) — including
+        // straight down (vanilla getRawLight has no free downward pass; only
+        // the direct-sky column above the heightmap stays 15).
+        assert_eq!(world.light_at(1, 68, 0).1, 13, "downward decays by 1");
+        assert_eq!(world.light_at(1, 67, 0).1, 12);
+        assert_eq!(world.light_at(1, 66, 0).1, 11);
+    }
+
+    #[test]
+    fn water_attenuates_skylight_like_vanilla() {
+        let mut world = World::new();
+        let water = BlockState::new(9, 0);
+        // A walled 1×1 pond: sand floor at y=59, water y=60..=63, stone walls
+        // around so the only light path is straight down from the sky.
+        world.set_block(0, 59, 0, BlockState::new(12, 0));
+        for wy in 60..=63 {
+            world.set_block(0, wy, 0, water);
+            for (wx, wz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                world.set_block(wx, wy, wz, BlockState::STONE);
+            }
+        }
+        // Allocate the section above the surface (worlds always have their
+        // above-surface sections allocated; the BFS seeds only scan allocated
+        // sections).
+        world.set_block(0, 64, 0, BlockState::AIR);
+        world.recompute_vertical_skylight();
+
+        assert_eq!(world.light_at(0, 64, 0).1, 15, "air above the surface");
+        assert_eq!(world.light_at(0, 63, 0).1, 12, "each water block costs 3");
+        assert_eq!(world.light_at(0, 62, 0).1, 9);
+        assert_eq!(world.light_at(0, 61, 0).1, 6);
+        assert_eq!(world.light_at(0, 60, 0).1, 3);
+        assert_eq!(world.light_at(0, 59, 0).1, 0, "floor absorbs the rest");
+    }
+
+    #[test]
+    fn local_relight_reproduces_vanilla_water_values() {
+        // The bug this guards: server-decoded vanilla light was correct, but a
+        // block edit re-ran the (then water-transparent) local relight and
+        // visibly brightened the water column. The relight must reproduce the
+        // exact vanilla attenuation so a "refresh" changes nothing.
+        let mut world = World::new();
+        let water = BlockState::new(9, 0);
+        world.set_block(0, 59, 0, BlockState::new(12, 0));
+        for wy in 60..=63 {
+            world.set_block(0, wy, 0, water);
+            for (wx, wz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                world.set_block(wx, wy, wz, BlockState::STONE);
+            }
+        }
+        world.set_block(0, 64, 0, BlockState::AIR); // allocate the section above
+        world.recompute_vertical_skylight();
+
+        // Roof the pond column, then remove the roof again — both edits re-run
+        // the incremental relight over the whole column.
+        world.set_block(0, 70, 0, BlockState::STONE);
+        world.update_sky_light(0, 70, 0, BlockState::AIR);
+        world.set_block(0, 70, 0, BlockState::AIR);
+        world.update_sky_light(0, 70, 0, BlockState::STONE);
+
+        assert_eq!(world.light_at(0, 64, 0).1, 15);
+        assert_eq!(world.light_at(0, 63, 0).1, 12, "unchanged after relight");
+        assert_eq!(world.light_at(0, 62, 0).1, 9);
+        assert_eq!(world.light_at(0, 61, 0).1, 6);
+        assert_eq!(world.light_at(0, 60, 0).1, 3);
+        assert_eq!(world.light_at(0, 59, 0).1, 0);
+    }
+
+    #[test]
+    fn torch_light_attenuates_through_water() {
+        let mut world = World::new();
+        // Emitter at one end of a walled water corridor: block light should
+        // fall off by 3 per water block (max(1, opacity)), not 1.
+        let water = BlockState::new(9, 0);
+        world.set_block(8, 8, 8, BlockState::AIR); // load the chunk
+        for wx in 9..=12 {
+            world.set_block(wx, 8, 8, water);
+        }
+        let glowstone = BlockState::new(89, 0);
+        world.set_block(8, 8, 8, glowstone);
+        world.update_block_light(8, 8, 8, BlockState::AIR);
+
+        assert_eq!(world.light_at(8, 8, 8).0, 15, "emitter");
+        assert_eq!(world.light_at(9, 8, 8).0, 12, "first water block costs 3");
+        assert_eq!(world.light_at(10, 8, 8).0, 9);
     }
 
     #[test]
