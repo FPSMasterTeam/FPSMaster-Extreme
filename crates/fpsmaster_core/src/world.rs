@@ -336,13 +336,14 @@ impl World {
         insert_section_borders(x, y, z, changed);
     }
 
-    /// Two-phase sky-light update after a block edit: vertical cast for the
-    /// edited column (direct sky reaches down to the first block with
-    /// `lightOpacity > 0`, vanilla's heightmap rule), BFS removal of stale
-    /// propagated light, then BFS re-propagation from remaining bright borders
-    /// decaying by the vanilla `max(1, lightOpacity)` per block. Reproduces the
-    /// same values the server computes, so a local relight is idempotent over
-    /// server-sent light. Returns sections whose sky-light changed.
+    /// Incremental sky-light update after a block edit, vanilla-style and
+    /// LOCAL: only the cells whose direct-sky status flipped (the heightmap
+    /// range that opened/closed) plus the edited cell are invalidated; the
+    /// removal/re-add BFS then relaxes just the affected neighbourhood with the
+    /// vanilla `max(1, lightOpacity)` per-block decay. Server-sent light
+    /// outside the touched region is never rewritten, so a relight is
+    /// idempotent over vanilla values and costs O(light radius), not O(column
+    /// flood). Returns sections whose sky-light changed.
     pub fn update_sky_light(
         &mut self,
         x: i32,
@@ -354,42 +355,79 @@ impl World {
         let mut removal: VecDeque<(i32, i32, i32, u8)> = VecDeque::new();
         let mut additions: VecDeque<(i32, i32, i32)> = VecDeque::new();
 
-        // --- Vertical cast for the edited column ----------------------------
         let cpos = ChunkPos::new(div_floor(x, 16), div_floor(z, 16));
         let section_ys: Vec<i32> = match self.chunks.get(&cpos) {
             Some(chunk) => chunk.sections().map(|s| s.y()).collect(),
             None => return Vec::new(),
         };
-        if let Some(&top) = section_ys.iter().max() {
-            let mut blocked = false;
-            let mut vy = top * 16 + 15;
+        let Some(&top) = section_ys.iter().max() else {
+            return Vec::new();
+        };
+        let top_y = top * 16 + 15;
+
+        // Heightmap (vanilla: the topmost block with any light opacity) after
+        // the edit, and reconstructed as it was before by substituting `old`
+        // at the edited height. -1 means a fully open column.
+        let heightmap = |world: &Self, replace: Option<(i32, BlockState)>| -> i32 {
+            let mut vy = top_y;
             while vy >= 0 {
                 if section_ys.contains(&vy.div_euclid(16)) {
-                    // Vanilla heightmap: direct sky ends at the first block that
-                    // attenuates light at all (water, leaves, ...), not just at
-                    // opaque cubes. Cells below get re-lit by the BFS with the
-                    // proper per-block attenuation.
-                    if !blocked && self.block_at(x, vy, z).light_opacity() > 0 {
-                        blocked = true;
-                    }
-                    let want = if blocked { 0 } else { 15 };
-                    let (block_l, old_sky) = self.light_at(x, vy, z);
-                    if old_sky != want {
-                        self.set_light(x, vy, z, block_l, want);
-                        insert_section_borders(x, vy, z, &mut changed);
-                        if want < old_sky {
-                            removal.push_back((x, vy, z, old_sky));
-                        } else {
-                            additions.push_back((x, vy, z));
-                        }
+                    let block = match replace {
+                        Some((ry, rb)) if ry == vy => rb,
+                        _ => world.block_at(x, vy, z),
+                    };
+                    if block.light_opacity() > 0 {
+                        return vy;
                     }
                 }
                 vy -= 1;
             }
+            -1
+        };
+        let h_new = heightmap(self, None);
+        let h_old = heightmap(self, Some((y, old)));
+
+        // --- Cells whose direct-sky status flipped ---------------------------
+        if h_new < h_old {
+            // Column opened: (h_new, h_old] gains direct sky.
+            for vy in (h_new + 1)..=h_old {
+                if !section_ys.contains(&vy.div_euclid(16)) {
+                    continue;
+                }
+                let (block_l, sky) = self.light_at(x, vy, z);
+                if sky != 15 {
+                    self.set_light(x, vy, z, block_l, 15);
+                    insert_section_borders(x, vy, z, &mut changed);
+                    additions.push_back((x, vy, z));
+                }
+            }
+        } else if h_new > h_old {
+            // Column covered: (h_old, h_new] loses direct sky; the BFS re-lights
+            // it from whatever still reaches it.
+            for vy in (h_old + 1)..=h_new {
+                if !section_ys.contains(&vy.div_euclid(16)) {
+                    continue;
+                }
+                let sky = self.light_at(x, vy, z).1;
+                if sky > 0 {
+                    self.set_sky_light_tracked(x, vy, z, 0, &mut changed);
+                    removal.push_back((x, vy, z, sky));
+                }
+            }
         }
 
-        // --- Handle opacity change at the edited position -------------------
-        if old.light_opacity() > self.block_at(x, y, z).light_opacity() {
+        // --- The edited cell itself ------------------------------------------
+        // Below the heightmap its stored light may be stale for the new opacity
+        // (e.g. water placed or removed under the surface): invalidate it and
+        // let the removal frontier + re-add BFS recompute it from neighbours.
+        if y <= h_new && old.light_opacity() != self.block_at(x, y, z).light_opacity() {
+            let sky = self.light_at(x, y, z).1;
+            if sky > 0 {
+                self.set_sky_light_tracked(x, y, z, 0, &mut changed);
+                removal.push_back((x, y, z, sky));
+            }
+            // A transparency increase can only be re-lit from lit neighbours —
+            // seed them explicitly (the removal frontier may be empty).
             for (nx, ny, nz) in neighbors(x, y, z) {
                 if (0..256).contains(&ny)
                     && self.is_block_column_loaded(nx, nz)
@@ -691,6 +729,38 @@ mod tests {
         assert_eq!(world.light_at(0, 61, 0).1, 6);
         assert_eq!(world.light_at(0, 60, 0).1, 3);
         assert_eq!(world.light_at(0, 59, 0).1, 0);
+    }
+
+    #[test]
+    fn digging_the_pond_floor_stays_local_and_vanilla() {
+        // Digging a block under water must (a) light the new cell with the
+        // vanilla attenuated value and (b) leave the rest of the water column
+        // untouched — no whole-column rewrite.
+        let mut world = World::new();
+        let water = BlockState::new(9, 0);
+        let sand = BlockState::new(12, 0);
+        world.set_block(0, 58, 0, BlockState::STONE);
+        world.set_block(0, 59, 0, sand);
+        for wy in 60..=63 {
+            world.set_block(0, wy, 0, water);
+            for (wx, wz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                world.set_block(wx, 59, wz, BlockState::STONE);
+                world.set_block(wx, wy, wz, BlockState::STONE);
+            }
+        }
+        world.set_block(0, 64, 0, BlockState::AIR); // allocate the section above
+        world.recompute_vertical_skylight();
+        assert_eq!(world.light_at(0, 60, 0).1, 3, "deepest water before dig");
+
+        // Dig the sand floor: the new cavity is lit only through the water.
+        world.set_block(0, 59, 0, BlockState::AIR);
+        world.update_sky_light(0, 59, 0, sand);
+
+        assert_eq!(world.light_at(0, 59, 0).1, 2, "cavity: 3 - max(1, air)");
+        assert_eq!(world.light_at(0, 63, 0).1, 12, "water column unchanged");
+        assert_eq!(world.light_at(0, 62, 0).1, 9);
+        assert_eq!(world.light_at(0, 61, 0).1, 6);
+        assert_eq!(world.light_at(0, 60, 0).1, 3);
     }
 
     #[test]
