@@ -33,13 +33,13 @@ def download(url: str, dest: pathlib.Path) -> None:
 
 def main() -> None:
     SERVER_DIR.mkdir(parents=True, exist_ok=True)
-    version_url = f"https://api.papermc.io/v2/projects/{PROJECT}/versions/{VERSION}"
-    version = request_json(version_url)
-    build = max(version["builds"])
-    build_url = f"{version_url}/builds/{build}"
-    build_meta = request_json(build_url)
-    jar_name = build_meta["downloads"]["application"]["name"]
-    jar_url = f"{build_url}/downloads/{jar_name}"
+    # PaperMC's legacy v2 API was retired (HTTP 410); use the v3 "Fill" API.
+    builds_url = f"https://fill.papermc.io/v3/projects/{PROJECT}/versions/{VERSION}/builds"
+    builds = request_json(builds_url)
+    latest = max(builds, key=lambda b: b["id"])
+    download_meta = latest["downloads"]["server:default"]
+    jar_name = download_meta["name"]
+    jar_url = download_meta["url"]
     jar_path = SERVER_DIR / jar_name
 
     if not jar_path.exists():
