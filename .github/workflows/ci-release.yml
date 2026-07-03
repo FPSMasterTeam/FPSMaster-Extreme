@@ -1,0 +1,229 @@
+name: Extreme CI Release
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - nightly
+      - nightly/**
+      - cannary
+      - cannary/**
+      - beta
+      - beta/**
+      - release
+      - release/**
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  PRODUCT_CODE: extreme
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      should_publish: ${{ steps.channel.outputs.should_publish }}
+      channel: ${{ steps.channel.outputs.channel }}
+      release_tag: ${{ steps.meta.outputs.release_tag }}
+      version_name: ${{ steps.meta.outputs.version_name }}
+      changelog: ${{ steps.meta.outputs.changelog }}
+      commit_hash: ${{ steps.meta.outputs.commit_hash }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve release channel
+        id: channel
+        shell: bash
+        run: |
+          ref="${GITHUB_REF_NAME}"
+          channel=""
+          should_publish="false"
+          case "$ref" in
+            main|release|release/*) channel="release"; should_publish="true" ;;
+            cannary|cannary/*)      channel="cannary"; should_publish="true" ;;
+            beta|beta/*)            channel="beta";    should_publish="true" ;;
+            nightly|nightly/*)      channel="nightly"; should_publish="true" ;;
+          esac
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+          echo "should_publish=$should_publish" >> "$GITHUB_OUTPUT"
+
+      - name: Capture release metadata
+        id: meta
+        shell: bash
+        run: |
+          base_version="$(grep -m1 '^version' crates/fpsmaster_app/Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          commit_hash="$(printf '%s' "$GITHUB_SHA" | tr '[:upper:]' '[:lower:]')"
+          short_sha="${commit_hash:0:8}"
+          channel="${{ steps.channel.outputs.channel }}"
+          if [ "$channel" = "release" ]; then
+            version_name="$base_version"
+          else
+            version_name="$base_version-$channel.$GITHUB_RUN_NUMBER+$short_sha"
+          fi
+          echo "commit_hash=$commit_hash" >> "$GITHUB_OUTPUT"
+          echo "version_name=$version_name" >> "$GITHUB_OUTPUT"
+          echo "release_tag=extreme-$channel-$GITHUB_RUN_NUMBER-$short_sha" >> "$GITHUB_OUTPUT"
+          changelog="$(git log -1 --pretty=format:'%s%n%n%b')"
+          {
+            echo "changelog<<EOF"
+            printf '%s\n' "$changelog"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: resolve
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: windows-x86_64
+            os: windows-latest
+          - target: linux-x86_64
+            os: ubuntu-latest
+          - target: macos-aarch64
+            os: macos-14
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential pkg-config cmake \
+            libasound2-dev \
+            libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+            libwayland-dev libxkbcommon-dev libudev-dev
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust target
+        uses: swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # NOTE: macOS artifacts are NOT code-signed or notarized. The launcher clears the
+      # quarantine attribute on install (xattr -dr com.apple.quarantine); users installing
+      # the tarball manually may need to run that themselves on first launch.
+      - name: Build launcher package
+        shell: bash
+        run: scripts/package-launcher.sh --target ${{ matrix.target }}
+
+      - name: Capture artifact metadata
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          tarball="$(ls dist-launcher/FPSMaster-Extreme-*-${TARGET}.tar.gz)"
+          checksum="$(cut -d' ' -f1 "${tarball}.sha256")"
+          if command -v stat >/dev/null 2>&1 && stat -c%s "$tarball" >/dev/null 2>&1; then
+            size="$(stat -c%s "$tarball")"      # GNU stat (Linux)
+          else
+            size="$(stat -f%z "$tarball")"      # BSD stat (macOS)
+          fi
+          mkdir -p build-meta
+          printf '{"target":"%s","assetName":"%s","checksum":"%s","fileSize":%s}\n' \
+            "$TARGET" "$(basename "$tarball")" "$checksum" "$size" \
+            > "build-meta/${TARGET}.json"
+          cat "build-meta/${TARGET}.json"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: extreme-build-${{ matrix.target }}
+          path: |
+            dist-launcher/FPSMaster-Extreme-*-${{ matrix.target }}.tar.gz
+            dist-launcher/FPSMaster-Extreme-*-${{ matrix.target }}.manifest.json
+            build-meta/${{ matrix.target }}.json
+          if-no-files-found: error
+
+  publish:
+    needs:
+      - resolve
+      - build
+    if: github.event_name != 'pull_request' && needs.resolve.outputs.should_publish == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: extreme-build-*
+          path: dist
+          merge-multiple: true
+
+      - name: Collect release files
+        shell: bash
+        run: |
+          mkdir -p release-dist
+          find dist -type f \( -name '*.tar.gz' -o -name '*.manifest.json' -o -name '*.json' \) \
+            -exec cp '{}' release-dist/ \;
+          find release-dist -maxdepth 1 -type f -print
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.resolve.outputs.release_tag }}
+          target_commitish: ${{ github.sha }}
+          name: Extreme ${{ needs.resolve.outputs.version_name }}
+          body: ${{ needs.resolve.outputs.changelog }}
+          files: |
+            release-dist/*.tar.gz
+            release-dist/*.manifest.json
+          fail_on_unmatched_files: true
+
+      - name: Notify release API
+        shell: bash
+        env:
+          FPSMASTER_CI_API_BASE_URL: ${{ secrets.FPSMASTER_CI_API_BASE_URL }}
+          FPSMASTER_CI_UPLOAD_TOKEN: ${{ secrets.FPSMASTER_CI_UPLOAD_TOKEN }}
+          CHANNEL: ${{ needs.resolve.outputs.channel }}
+          VERSION_NAME: ${{ needs.resolve.outputs.version_name }}
+          COMMIT_HASH: ${{ needs.resolve.outputs.commit_hash }}
+          CHANGELOG: ${{ needs.resolve.outputs.changelog }}
+        run: |
+          if [ -z "$FPSMASTER_CI_API_BASE_URL" ] || [ -z "$FPSMASTER_CI_UPLOAD_TOKEN" ]; then
+            echo "Release API secrets are not configured" >&2
+            exit 1
+          fi
+
+          shopt -s nullglob
+          metadata_files=(release-dist/*.json)
+          # exclude the per-target manifest.json emitted by the package script
+          for metadata_path in "${metadata_files[@]}"; do
+            case "$metadata_path" in *.manifest.json) continue ;; esac
+
+            asset_name="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["assetName"])' "$metadata_path")"
+            target="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["target"])' "$metadata_path")"
+            checksum="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["checksum"])' "$metadata_path")"
+            file_size="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["fileSize"])' "$metadata_path")"
+            artifact_path="release-dist/$asset_name"
+            if [ ! -f "$artifact_path" ]; then
+              echo "Artifact listed by metadata was not found: $artifact_path" >&2
+              exit 1
+            fi
+
+            upload_response="$(curl --fail-with-body --show-error --silent \
+              -X POST \
+              -H "X-CI-Token: ${FPSMASTER_CI_UPLOAD_TOKEN}" \
+              -F "file=@${artifact_path}" \
+              "${FPSMASTER_CI_API_BASE_URL%/}/api/v1/launcher/releases/upload")"
+
+            export UPLOAD_RESPONSE="$upload_response"
+            export TARGET="$target"
+            export CHECKSUM="$checksum"
+            export FILE_SIZE="$file_size"
+            python3 -c 'import json, os; upload = json.loads(os.environ["UPLOAD_RESPONSE"])["data"]; payload = dict(productCode=os.environ["PRODUCT_CODE"], channelCode=os.environ["CHANNEL"], versionName=os.environ["VERSION_NAME"], commitHash=os.environ["COMMIT_HASH"], artifactSourceType="UPLOADED_FILE", downloadUrl=upload["url"], fileBucket=upload.get("bucket") or "", fileKey=upload.get("key") or "", fileSize=int(os.environ["FILE_SIZE"]), checksum=os.environ["CHECKSUM"], recommended=True, target=os.environ["TARGET"], changelog=os.environ["CHANGELOG"]); open("payload.json", "w", encoding="utf-8").write(json.dumps(payload, ensure_ascii=False))'
+
+            curl --fail-with-body --show-error --silent \
+              -X POST \
+              -H "Content-Type: application/json" \
+              -H "X-CI-Token: ${FPSMASTER_CI_UPLOAD_TOKEN}" \
+              --data @payload.json \
+              "${FPSMASTER_CI_API_BASE_URL%/}/api/v1/launcher/releases/ci"
+          done
