@@ -2679,6 +2679,7 @@ fn render_frame(
             chunk_count: game.loaded_chunk_count(),
             in_world: app.in_world,
             has_panorama,
+            rt_supported: renderer.ray_tracing_supported(),
             settings,
             hud: Some(&hud),
             mods: &mod_list,
