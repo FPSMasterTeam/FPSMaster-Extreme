@@ -789,6 +789,16 @@ impl ApplicationHandler for WinitApp {
                     .apply_scripted_smoke_input((now - self.app_start).as_secs_f32(), seconds);
             }
         }
+        if !app.in_world {
+            // No world (title screen): vanilla still runs the MusicTicker, so
+            // advance just the background music at 20 Hz. Its start/stop commands
+            // are drained below (outside the in_world gate).
+            self.tick_accumulator += sim_dt;
+            while self.tick_accumulator >= 0.05 {
+                app.game.tick_menu_music();
+                self.tick_accumulator -= 0.05;
+            }
+        }
         if app.in_world {
             self.tick_accumulator += sim_dt;
             while self.tick_accumulator >= 0.05 {
@@ -2339,6 +2349,20 @@ fn render_frame(
             .as_ref()
             .is_none_or(|screen| screen.draws_over_hud());
     let tick_alpha = (tick_accumulator / 0.05).clamp(0.0, 1.0);
+    // Category + master volumes and background music run whether or not a world
+    // is active: vanilla drives the MusicTicker on the title screen too, and the
+    // volume sliders must take effect from the menu.
+    app.sound.set_volumes(volumes_from_settings(&app.settings));
+    // Background music (vanilla MusicTicker): apply this tick's start/stop
+    // commands, then report the resulting play state back so the ticker can
+    // schedule the next track when the current one finishes.
+    for cmd in app.game.take_music_commands() {
+        match cmd {
+            game::MusicCommand::Play(event) => app.sound.play_music_event(&event),
+            game::MusicCommand::Stop => app.sound.stop_music(),
+        }
+    }
+    app.game.set_music_playing(app.sound.is_music_playing());
     if app.in_world {
         app.game.update_camera(tick_alpha);
         // Anchor the audio listener to the camera and play this frame's queued
@@ -2347,22 +2371,9 @@ fn render_frame(
             position: app.game.camera.position,
             yaw: app.game.camera.yaw,
         });
-        // Push the current per-category + master volumes so category sliders take
-        // effect (vanilla getNormalizedVolume). Cheap: a plain struct copy.
-        app.sound.set_volumes(volumes_from_settings(&app.settings));
         for queued in app.game.take_sounds() {
             app.sound.play(&queued);
         }
-        // Background music (vanilla MusicTicker): apply this tick's start/stop
-        // commands, then report the resulting play state back so the ticker can
-        // schedule the next track when the current one finishes.
-        for cmd in app.game.take_music_commands() {
-            match cmd {
-                game::MusicCommand::Play(event) => app.sound.play_music_event(&event),
-                game::MusicCommand::Stop => app.sound.stop_music(),
-            }
-        }
-        app.game.set_music_playing(app.sound.is_music_playing());
         // Entity-attached moving emitters (minecarts, …): attach / update / stop.
         for cmd in app.game.take_moving_sound_commands() {
             match cmd {
