@@ -1339,7 +1339,13 @@ impl Renderer {
             .copied()
             .unwrap_or(wgpu::CompositeAlphaMode::Auto);
         let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            // COPY_SRC additionally allows the FPSMASTER_DUMP_FRAME debug hook to
+            // read back the post-processed swapchain image.
+            usage: if std::env::var("FPSMASTER_DUMP_FRAME").is_ok() {
+                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC
+            } else {
+                wgpu::TextureUsages::RENDER_ATTACHMENT
+            },
             format: surface_format,
             width: size.width.max(1),
             height: size.height.max(1),
@@ -7656,6 +7662,111 @@ impl Renderer {
         );
     }
 
+    /// Debug: read back the HDR offscreen world target (pre-post, `.world`) and
+    /// the post-processed swapchain image (`.post`) and save them as PNGs. Runs
+    /// every 120th call so a scripted-smoke run leaves a series of steady frames
+    /// on disk. Blocks the device — diagnostic aid only, gated by
+    /// `FPSMASTER_DUMP_FRAME` in `render_inner`.
+    fn debug_dump_frame(&self, path: &str, swapchain: &wgpu::Texture) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static FRAME: AtomicU32 = AtomicU32::new(0);
+        let n = FRAME.fetch_add(1, Ordering::Relaxed);
+        if n % 120 != 60 {
+            return;
+        }
+        // Read one texture back into an RGBA8 image. `f16` picks the source
+        // texel decode: Rgba16Float (8 B/px) vs 8-bit BGRA/RGBA (4 B/px).
+        let readback = |tex: &wgpu::Texture, f16: bool, bgra: bool| -> Option<image::RgbaImage> {
+            let (w, h) = (tex.width(), tex.height());
+            let px_bytes = if f16 { 8 } else { 4 };
+            let bytes_per_row = ((w * px_bytes + 255) / 256) * 256;
+            let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("frame-dump"),
+                size: (bytes_per_row * h) as u64,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let mut enc = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame-dump") });
+            enc.copy_texture_to_buffer(
+                tex.as_image_copy(),
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &buf,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(bytes_per_row),
+                        rows_per_image: Some(h),
+                    },
+                },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            );
+            self.queue.submit(Some(enc.finish()));
+            let slice = buf.slice(..);
+            slice.map_async(wgpu::MapMode::Read, |_| {});
+            self.device.poll(wgpu::PollType::wait_indefinitely()).ok()?;
+            // Half-precision bits -> f32 (enough for a diagnostic dump).
+            fn f16_to_f32(h: u16) -> f32 {
+                let sign = if h >> 15 & 1 == 1 { -1.0f32 } else { 1.0 };
+                let exp = (h >> 10 & 0x1f) as i32;
+                let mant = (h & 0x3ff) as f32;
+                let mag = if exp == 0 {
+                    mant * 2f32.powi(-24)
+                } else if exp == 0x1f {
+                    if mant == 0.0 { f32::INFINITY } else { f32::NAN }
+                } else {
+                    (1.0 + mant / 1024.0) * 2f32.powi(exp - 15)
+                };
+                sign * mag
+            }
+            let data = slice.get_mapped_range();
+            let mut img = image::RgbaImage::new(w, h);
+            for y in 0..h {
+                let base = (y * bytes_per_row) as usize;
+                for x in 0..w {
+                    let o = base + (x * px_bytes) as usize;
+                    let rgb: [u8; 3] = if f16 {
+                        let ch = |i: usize| {
+                            let v =
+                                f16_to_f32(u16::from_le_bytes([data[o + i * 2], data[o + i * 2 + 1]]));
+                            (v.clamp(0.0, 1.0).powf(1.0 / 2.2) * 255.0 + 0.5) as u8
+                        };
+                        [ch(0), ch(1), ch(2)]
+                    } else if bgra {
+                        [data[o + 2], data[o + 1], data[o]]
+                    } else {
+                        [data[o], data[o + 1], data[o + 2]]
+                    };
+                    img.put_pixel(x, y, image::Rgba([rgb[0], rgb[1], rgb[2], 255]));
+                }
+            }
+            Some(img)
+        };
+        // Numbered output (frame index in the name) so a moving smoke run keeps
+        // every sampled frame instead of overwriting with the last one.
+        let numbered = |tag: &str| path.replace(".png", &format!(".{n:05}.{tag}.png"));
+        if let Some(tex) = self.offscreen_tex.as_ref() {
+            if let Some(img) = readback(tex, true, false) {
+                let p = numbered("world");
+                match img.save(&p) {
+                    Ok(()) => log::warn!("[frame-dump] saved {p}"),
+                    Err(err) => log::warn!("[frame-dump] save failed: {err}"),
+                }
+            }
+        }
+        let bgra = matches!(
+            swapchain.format(),
+            wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+        );
+        if let Some(img) = readback(swapchain, false, bgra) {
+            let p = numbered("post");
+            match img.save(&p) {
+                Ok(()) => log::warn!("[frame-dump] saved {p}"),
+                Err(err) => log::warn!("[frame-dump] save failed: {err}"),
+            }
+        }
+    }
+
     pub fn render(&mut self, camera: &Camera) -> Result<(), RendererError> {
         self.render_inner(camera, None, None)
     }
@@ -9817,6 +9928,14 @@ impl Renderer {
         // whole frame.
         self.queue.submit(Some(encoder.finish()));
         let submit_us = t_submit.elapsed().as_micros() as u32;
+
+        // Debug: FPSMASTER_DUMP_FRAME=<path.png> saves the HDR world target
+        // (pre-post, `.world`) and the post-processed swapchain (`.post`) every
+        // 120th frame for offline pixel inspection. Blocks the device;
+        // diagnostic aid only.
+        if let Ok(path) = std::env::var("FPSMASTER_DUMP_FRAME") {
+            self.debug_dump_frame(&path, &frame.texture);
+        }
 
         // Kick off the async readback for the timestamps we just submitted.
         if measure_gpu {
