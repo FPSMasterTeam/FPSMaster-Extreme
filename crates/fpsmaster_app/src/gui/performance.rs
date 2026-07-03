@@ -65,6 +65,8 @@ fn dlss_quality_label(q: u32) -> &'static str {
 
 #[derive(Default)]
 pub struct GuiPerformance {
+    render_scale_rect: UiRect,
+    adaptive: Option<GuiButton>,
     taa: Option<GuiButton>,
     fsr: Option<GuiButton>,
     dlss: Option<GuiButton>,
@@ -72,6 +74,7 @@ pub struct GuiPerformance {
     rt: Option<GuiButton>,
     rt_quality: Option<GuiButton>,
     done: Option<GuiButton>,
+    dragging_render_scale: bool,
     dragging_dlss_quality: bool,
     from_main_menu: bool,
 }
@@ -91,18 +94,24 @@ impl GuiPerformance {
     fn layout(&mut self, ctx: &DrawCtx) {
         let s = ctx.scale;
         let x = (ctx.width - 200 * s) / 2;
+        let right = x + 102 * s;
+        let half = 98 * s;
         let cw = 200 * s;
-        let top = ctx.height / 4;
+        let top = ctx.height / 4 - 12 * s;
         let row = |i: i32| top + i * 24 * s;
-        self.taa = Some(GuiButton::at_px(x, row(0), cw, s, ""));
+        // Grouped: render-scale controls (manual + adaptive), then the temporal
+        // upscalers (TAA / FSR / DLSS + its quality), then ray tracing.
+        self.render_scale_rect = UiRect::new(x, row(0), cw, BUTTON_HEIGHT * s);
+        self.adaptive = Some(GuiButton::at_px(x, row(1), half, s, ""));
+        self.taa = Some(GuiButton::at_px(right, row(1), half, s, ""));
         // FSR = temporal upscaling (render scale preset + the TAA resolve).
-        self.fsr = Some(GuiButton::at_px(x, row(1), cw, s, ""));
-        // DLSS toggle + quality (renderer path gated behind the `dlss` build feature).
-        self.dlss = Some(GuiButton::at_px(x, row(2), cw, s, ""));
+        self.fsr = Some(GuiButton::at_px(x, row(2), half, s, ""));
+        // DLSS toggle (renderer path gated behind the `dlss` build feature).
+        self.dlss = Some(GuiButton::at_px(right, row(2), half, s, ""));
         self.dlss_quality_rect = UiRect::new(x, row(3), cw, BUTTON_HEIGHT * s);
-        self.rt = Some(GuiButton::at_px(x, row(4), cw, s, ""));
-        self.rt_quality = Some(GuiButton::at_px(x, row(5), cw, s, ""));
-        self.done = Some(GuiButton::at_px(x, row(6) + 12 * s, cw, s, tr("gui.done")));
+        self.rt = Some(GuiButton::at_px(x, row(4), half, s, ""));
+        self.rt_quality = Some(GuiButton::at_px(right, row(4), half, s, ""));
+        self.done = Some(GuiButton::at_px(x, row(5) + 12 * s, cw, s, tr("gui.done")));
     }
 }
 
@@ -113,7 +122,9 @@ fn on_off(b: bool) -> String {
 impl GuiScreen for GuiPerformance {
     fn clicks_button(&self, x: f64, y: f64) -> bool {
         self.dlss_quality_rect.contains(x, y)
+            || self.render_scale_rect.contains(x, y)
             || [
+                self.adaptive.as_ref(),
                 self.taa.as_ref(),
                 self.fsr.as_ref(),
                 self.dlss.as_ref(),
@@ -140,6 +151,10 @@ impl GuiScreen for GuiPerformance {
             }
         };
         draw(
+            &mut self.adaptive,
+            format!("{}: {}", tr("fpsmaster.options.autoRes"), on_off(st.adaptive_resolution)),
+        );
+        draw(
             &mut self.taa,
             format!("{}: {}", tr("fpsmaster.perf.taa"), on_off(st.taa)),
         );
@@ -160,7 +175,14 @@ impl GuiScreen for GuiPerformance {
             &mut self.rt_quality,
             format!("{}: {}", tr("fpsmaster.perf.rt.quality"), rt_quality_label(st.rt_quality)),
         );
-        // The closure above mutably borrows `ui`; draw the slider after its last use.
+        // The closure above mutably borrows `ui`; draw the sliders after its last use.
+        draw_slider(
+            ui,
+            self.render_scale_rect,
+            s,
+            st.clone().render_scale_fraction(),
+            &format!("{}: {}%", tr("fpsmaster.options.renderScale"), st.clone().render_scale_percent()),
+        );
         draw_slider(
             ui,
             self.dlss_quality_rect,
@@ -174,6 +196,21 @@ impl GuiScreen for GuiPerformance {
     }
 
     fn mouse_clicked(&mut self, x: f64, y: f64, ctx: &mut ScreenCtx) -> Vec<GuiAction> {
+        // Manual render scale (the raw 0.1..1.0 knob behind the FSR presets). The
+        // renderer rebuild is deferred to release, like the DLSS-quality slider.
+        if self.render_scale_rect.contains(x, y) {
+            self.dragging_render_scale = true;
+            ctx.settings
+                .set_render_scale_from01(slider_fraction(self.render_scale_rect, x));
+            return Vec::new();
+        }
+        if self.adaptive.as_ref().is_some_and(|b| b.clicked(x, y)) {
+            ctx.settings.adaptive_resolution = !ctx.settings.adaptive_resolution;
+            return vec![
+                GuiAction::SetAdaptiveResolution(ctx.settings.adaptive_resolution),
+                GuiAction::SaveSettings,
+            ];
+        }
         if self.taa.as_ref().is_some_and(|b| b.clicked(x, y)) {
             ctx.settings.taa = !ctx.settings.taa;
             return vec![GuiAction::SetTaa(ctx.settings.taa)];
@@ -255,6 +292,10 @@ impl GuiScreen for GuiPerformance {
     }
 
     fn mouse_dragged(&mut self, x: f64, _y: f64, ctx: &mut ScreenCtx) {
+        if self.dragging_render_scale {
+            ctx.settings
+                .set_render_scale_from01(slider_fraction(self.render_scale_rect, x));
+        }
         if self.dragging_dlss_quality {
             ctx.settings
                 .set_dlss_quality_from01(slider_fraction(self.dlss_quality_rect, x));
@@ -268,15 +309,23 @@ impl GuiScreen for GuiPerformance {
         _right: bool,
         ctx: &mut ScreenCtx,
     ) -> Vec<GuiAction> {
-        if !self.dragging_dlss_quality {
-            return Vec::new();
+        // Both sliders recreate off-screen render targets, so commit once on
+        // release rather than on every drag tick.
+        if self.dragging_render_scale {
+            self.dragging_render_scale = false;
+            return vec![
+                GuiAction::SetRenderScale(ctx.settings.render_scale),
+                GuiAction::SaveSettings,
+            ];
         }
-        // Applying drops + rebuilds the DLSS context, so commit once on release.
-        self.dragging_dlss_quality = false;
-        vec![
-            GuiAction::SetDlssQuality(ctx.settings.dlss_quality),
-            GuiAction::SaveSettings,
-        ]
+        if self.dragging_dlss_quality {
+            self.dragging_dlss_quality = false;
+            return vec![
+                GuiAction::SetDlssQuality(ctx.settings.dlss_quality),
+                GuiAction::SaveSettings,
+            ];
+        }
+        Vec::new()
     }
 
     fn key_pressed(&mut self, event: &KeyEvent, _ctx: &mut ScreenCtx) -> Vec<GuiAction> {
