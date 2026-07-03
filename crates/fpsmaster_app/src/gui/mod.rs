@@ -219,6 +219,9 @@ pub struct DrawCtx<'a> {
     pub in_world: bool,
     /// Whether the GPU panorama skybox is being rendered behind this screen.
     pub has_panorama: bool,
+    /// Whether the GPU/backend supports hardware ray tracing (EXPERIMENTAL_RAY_QUERY).
+    /// Drives greying-out the ray-tracing controls on devices that can't run it.
+    pub rt_supported: bool,
     pub settings: &'a Settings,
     /// HUD data when a world session is active (inventory screen, HUD).
     pub hud: Option<&'a HudState<'a>>,

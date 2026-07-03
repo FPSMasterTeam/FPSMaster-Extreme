@@ -99,6 +99,9 @@ impl GuiPerformance {
         let cw = 200 * s;
         let top = ctx.height / 4 - 12 * s;
         let row = |i: i32| top + i * 24 * s;
+        // Ray tracing is greyed out on devices without hardware ray-query support
+        // (e.g. the GL fallback or older GPUs) since the toggle would do nothing.
+        let rt_off = !ctx.rt_supported;
         // Grouped: render-scale controls (manual + adaptive), then the temporal
         // upscalers (TAA / FSR / DLSS + its quality), then ray tracing.
         self.render_scale_rect = UiRect::new(x, row(0), cw, BUTTON_HEIGHT * s);
@@ -106,12 +109,22 @@ impl GuiPerformance {
         self.taa = Some(GuiButton::at_px(right, row(1), half, s, ""));
         // FSR = temporal upscaling (render scale preset + the TAA resolve).
         self.fsr = Some(GuiButton::at_px(x, row(2), half, s, ""));
-        // DLSS toggle (renderer path gated behind the `dlss` build feature).
-        self.dlss = Some(GuiButton::at_px(right, row(2), half, s, ""));
-        self.dlss_quality_rect = UiRect::new(x, row(3), cw, BUTTON_HEIGHT * s);
-        self.rt = Some(GuiButton::at_px(x, row(4), half, s, ""));
-        self.rt_quality = Some(GuiButton::at_px(right, row(4), half, s, ""));
-        self.done = Some(GuiButton::at_px(x, row(5) + 12 * s, cw, s, tr("gui.done")));
+        if cfg!(feature = "dlss") {
+            // DLSS toggle + quality slider — NVIDIA + `--features dlss` builds only.
+            self.dlss = Some(GuiButton::at_px(right, row(2), half, s, ""));
+            self.dlss_quality_rect = UiRect::new(x, row(3), cw, BUTTON_HEIGHT * s);
+            self.rt = Some(GuiButton::at_px(x, row(4), half, s, "").disabled(rt_off));
+            self.rt_quality = Some(GuiButton::at_px(right, row(4), half, s, "").disabled(rt_off));
+            self.done = Some(GuiButton::at_px(x, row(5) + 12 * s, cw, s, tr("gui.done")));
+        } else {
+            // No DLSS on this platform (e.g. macOS/Metal): omit its controls
+            // entirely and pull Ray Tracing up next to FSR.
+            self.dlss = None;
+            self.dlss_quality_rect = UiRect::default();
+            self.rt = Some(GuiButton::at_px(right, row(2), half, s, "").disabled(rt_off));
+            self.rt_quality = Some(GuiButton::at_px(x, row(3), cw, s, "").disabled(rt_off));
+            self.done = Some(GuiButton::at_px(x, row(4) + 12 * s, cw, s, tr("gui.done")));
+        }
     }
 }
 
@@ -162,14 +175,11 @@ impl GuiScreen for GuiPerformance {
             &mut self.fsr,
             format!("{}: {}", tr("fpsmaster.perf.fsr"), fsr_label(st.render_scale)),
         );
-        // In a non-DLSS build the upscaler isn't available, so show the build hint
-        // instead of an on/off the toggle can't honour.
-        let dlss_value = if cfg!(feature = "dlss") {
-            on_off(st.dlss)
-        } else {
-            "--features dlss".to_string()
-        };
-        draw(&mut self.dlss, format!("{}: {}", tr("fpsmaster.perf.dlss"), dlss_value));
+        // DLSS is only present on `--features dlss` builds (it's a no-op on
+        // macOS/Metal), so `self.dlss` is None there and this is skipped.
+        if self.dlss.is_some() {
+            draw(&mut self.dlss, format!("{}: {}", tr("fpsmaster.perf.dlss"), on_off(st.dlss)));
+        }
         draw(&mut self.rt, format!("{}: {}", tr("fpsmaster.perf.rt"), on_off(st.ray_tracing)));
         draw(
             &mut self.rt_quality,
@@ -183,13 +193,15 @@ impl GuiScreen for GuiPerformance {
             st.clone().render_scale_fraction(),
             &format!("{}: {}%", tr("fpsmaster.options.renderScale"), st.clone().render_scale_percent()),
         );
-        draw_slider(
-            ui,
-            self.dlss_quality_rect,
-            s,
-            st.clone().dlss_quality_fraction(),
-            &format!("DLSS {}: {}", tr("fpsmaster.perf.rt.quality"), dlss_quality_label(st.dlss_quality)),
-        );
+        if cfg!(feature = "dlss") {
+            draw_slider(
+                ui,
+                self.dlss_quality_rect,
+                s,
+                st.clone().dlss_quality_fraction(),
+                &format!("DLSS {}: {}", tr("fpsmaster.perf.rt.quality"), dlss_quality_label(st.dlss_quality)),
+            );
+        }
         if let Some(b) = &self.done {
             b.draw(ui, s, ctx.mouse, ctx.mouse_down);
         }
