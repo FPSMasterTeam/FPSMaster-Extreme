@@ -103,8 +103,14 @@ fn light_level(l: f32) -> f32 {
     return l / (4.0 - 3.0 * clamp(l, 0.0, 1.0));
 }
 
+// Day/night brightness with the vanilla lightmap lift + brightness gamma blend,
+// matching chunk.wgsl's vanilla path so water shading tracks the terrain's.
 fn day_night(light: vec2<f32>) -> f32 {
-    return max(light_level(light.x) * camera.sky_brightness, light_level(light.y));
+    let base = max(light_level(light.x) * camera.sky_brightness, light_level(light.y));
+    let low = clamp(base, 0.0, 1.0);
+    let inv = 1.0 - low;
+    let lifted = 1.0 - inv * inv * inv * inv;
+    return mix(low, lifted, lighting.fog_params.w) * 0.96 + 0.03;
 }
 
 // A cheap sky colour for the reflected ray: horizon (fog colour) blending up to a

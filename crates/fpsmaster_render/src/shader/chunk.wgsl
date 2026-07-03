@@ -103,7 +103,8 @@ fn light_level(l: f32) -> f32 {
 
 // Vanilla-style coloured light map: day/night-scaled sky light (cool at night,
 // white by day) combined with a warm torch/block-light glow, with the steep
-// per-level falloff and a small moody floor so nothing is pure black.
+// per-level falloff and vanilla's final lightmap lift (`* 0.96 + 0.03`,
+// EntityRenderer.updateLightmap) so nothing is pure black.
 fn vanilla_lightmap(light: vec2<f32>) -> vec3<f32> {
     let day = camera.sky_brightness;
     let sky = light_level(light.x);
@@ -111,7 +112,7 @@ fn vanilla_lightmap(light: vec2<f32>) -> vec3<f32> {
     let sky_tint = mix(vec3<f32>(0.18, 0.22, 0.34), vec3<f32>(1.0, 1.0, 0.99), day);
     let sky_term = sky_tint * (sky * day);
     let block_term = vec3<f32>(1.0, 0.60, 0.30) * block; // warm torch glow
-    return max(max(sky_term, block_term), vec3<f32>(0.035, 0.04, 0.05));
+    return max(sky_term, block_term) * 0.96 + vec3<f32>(0.03);
 }
 
 // Fraction of the sun visible at this world position (1 = lit, 0 = shadowed),
@@ -136,14 +137,17 @@ fn sun_shadow(world_pos: vec3<f32>, ndotl: f32) -> f32 {
     return sum / 9.0;
 }
 
-// Brightness gamma: pull the shadow/low-light end down while leaving fully-lit
-// surfaces alone. Values in [0,1] are raised to `gamma` (>1 darkens; 1->1,
-// 0->0); anything above 1 (bright sun) passes through linearly so daylight keeps
-// its punch. This is a curve, not a flat multiply — dark gets darker, bright stays.
-fn light_curve(light: vec3<f32>, gamma: f32) -> vec3<f32> {
-    let low = pow(clamp(light, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(gamma));
+// Vanilla brightness ("gamma") curve (EntityRenderer.updateLightmap): the
+// setting in 0..1 blends from the base curve (0, Moody) toward a lifted curve
+// `1 - (1-x)^4` (1, Bright) — it only ever BRIGHTENS the dark end, never
+// darkens below base. Values above 1 (bright sun on the shader path) pass
+// through so daylight keeps its punch.
+fn light_curve(light: vec3<f32>, brightness: f32) -> vec3<f32> {
+    let low = clamp(light, vec3<f32>(0.0), vec3<f32>(1.0));
+    let inv = vec3<f32>(1.0) - low;
+    let lifted = vec3<f32>(1.0) - inv * inv * inv * inv;
     let high = max(light - vec3<f32>(1.0), vec3<f32>(0.0));
-    return low + high;
+    return mix(low, lifted, brightness) + high;
 }
 
 // GGX normal distribution function.
@@ -197,8 +201,9 @@ fn apply_lighting(albedo: vec3<f32>, in: VertexOutput) -> vec3<f32> {
     if (lighting.extra.x > 0.5) {
         return albedo;
     }
-    // Brightness option (fog_params.w in 0..1) → gamma: 1.0 neutral, lower darker.
-    let gamma = 1.0 + (1.0 - lighting.fog_params.w) * 1.5;
+    // Brightness option (fog_params.w in 0..1), fed straight to the vanilla
+    // gamma blend: 0 = Moody base curve, 1 = fully lifted (Bright).
+    let gamma = lighting.fog_params.w;
     if (lighting.flags.x < 0.5) {
         // Vanilla path: coloured light map (warm block light + day/night sky) with
         // the steep per-level falloff, then the brightness gamma.

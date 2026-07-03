@@ -71,7 +71,8 @@ fn light_level(l: f32) -> f32 {
     return l / (4.0 - 3.0 * clamp(l, 0.0, 1.0));
 }
 
-// Vanilla-style coloured light map (matches chunk.wgsl's shaders-off path).
+// Vanilla-style coloured light map (matches chunk.wgsl's shaders-off path),
+// with vanilla's final lightmap lift (`* 0.96 + 0.03`).
 fn vanilla_lightmap(light: vec2<f32>) -> vec3<f32> {
     let day = camera.sky_brightness;
     let sky = light_level(light.x);
@@ -79,13 +80,17 @@ fn vanilla_lightmap(light: vec2<f32>) -> vec3<f32> {
     let sky_tint = mix(vec3<f32>(0.18, 0.22, 0.34), vec3<f32>(1.0, 1.0, 0.99), day);
     let sky_term = sky_tint * (sky * day);
     let block_term = vec3<f32>(1.0, 0.60, 0.30) * block;
-    return max(max(sky_term, block_term), vec3<f32>(0.035, 0.04, 0.05));
+    return max(sky_term, block_term) * 0.96 + vec3<f32>(0.03);
 }
 
-fn light_curve(light: vec3<f32>, gamma: f32) -> vec3<f32> {
-    let low = pow(clamp(light, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(gamma));
+// Vanilla brightness blend (matches chunk.wgsl's light_curve): 0 = Moody base,
+// 1 = lifted `1 - (1-x)^4`; only ever brightens the dark end.
+fn light_curve(light: vec3<f32>, brightness: f32) -> vec3<f32> {
+    let low = clamp(light, vec3<f32>(0.0), vec3<f32>(1.0));
+    let inv = vec3<f32>(1.0) - low;
+    let lifted = vec3<f32>(1.0) - inv * inv * inv * inv;
     let high = max(light - vec3<f32>(1.0), vec3<f32>(0.0));
-    return low + high;
+    return mix(low, lifted, brightness) + high;
 }
 
 fn apply_fog(color: vec3<f32>, world_pos: vec3<f32>) -> vec3<f32> {
@@ -111,7 +116,7 @@ fn sample_tile(repeat_uv: vec2<f32>, tile_origin: vec2<f32>) -> vec4<f32> {
 }
 
 fn shade(in: VsOut, texel: vec4<f32>) -> vec3<f32> {
-    let gamma = 1.0 + (1.0 - lighting.fog_params.w) * 1.5;
+    let gamma = lighting.fog_params.w;
     let albedo = texel.rgb * in.color.rgb;
     // Fullbright preset: skip the lightmap darkening (keep baked AO/face shade).
     let lit = select(albedo * light_curve(vanilla_lightmap(in.light), gamma), albedo, lighting.extra.x > 0.5);
