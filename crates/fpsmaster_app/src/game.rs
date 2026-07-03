@@ -1522,6 +1522,21 @@ impl GameState {
         }
     }
 
+    /// Debug harness (`--camera`): pin the player at a fixed hovering pose so a
+    /// scripted run renders a deterministic viewpoint.
+    pub fn debug_set_pose(&mut self, pos: DVec3, yaw: f32, pitch: f32) {
+        self.player.position = pos;
+        self.previous_player_position = pos;
+        self.player.velocity = DVec3::ZERO;
+        // The camera re-syncs from the player each tick, so pin the player look.
+        self.player.yaw = yaw;
+        self.player.pitch = pitch;
+        self.camera.yaw = yaw;
+        self.camera.pitch = pitch;
+        self.capabilities.allow_flying = true;
+        self.capabilities.flying = true;
+    }
+
     /// Player feet position in world coordinates (vanilla `posX/posY/posZ`),
     /// for the F3 debug overlay.
     pub fn player_position(&self) -> DVec3 {
@@ -1682,6 +1697,37 @@ impl GameState {
     /// the movement snapshot itself via [`Self::movement_snapshot`] *after* the
     /// extension tick, so a mod's silent look rides this tick's flying packet.
     pub fn tick(&mut self, dt: f32) -> Option<Vec<ServerboundPacket>> {
+        // Debug probe (`FPSMASTER_LIGHT_PROBE="x z"`): once per second, log the
+        // block/skylight column at (x, z) as the client sees it.
+        if self.hud_update_counter % 20 == 0 {
+            if let Ok(spec) = std::env::var("FPSMASTER_LIGHT_PROBE") {
+                let coords: Vec<i32> =
+                    spec.split_whitespace().filter_map(|t| t.parse().ok()).collect();
+                for pair in coords.chunks(2) {
+                    let [px, pz] = *pair else { continue };
+                    if !self.world.is_block_column_loaded(px, pz) {
+                        continue;
+                    }
+                    let mut col = String::new();
+                    for y in (30..75).rev() {
+                        let b = self.world.block_at(px, y, pz);
+                        let (bl, sky) = self.world.light_at(px, y, pz);
+                        let kind = if b.is_water() {
+                            'W'
+                        } else if b.is_air() {
+                            '.'
+                        } else {
+                            '#'
+                        };
+                        col.push_str(&format!(" y{y}{kind}s{sky}b{bl}"));
+                        if kind == '#' {
+                            break;
+                        }
+                    }
+                    log::warn!("[light-probe] col ({px},{pz}):{col}");
+                }
+            }
+        }
         // Vanilla GuiIngame.updateTick: a free-running tick counter that drives the
         // heart-shake RNG and the heart/hunger blink timing.
         self.hud_update_counter = self.hud_update_counter.wrapping_add(1);
@@ -7914,3 +7960,4 @@ mod interaction_tests {
         }
     }
 }
+

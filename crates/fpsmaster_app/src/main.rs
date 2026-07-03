@@ -94,6 +94,10 @@ struct LaunchConfig {
     /// once-a-second phase breakdown + per-spike detail on the `frame_profile`
     /// target. See [`frame_profiler`].
     profile_frames: bool,
+    /// Debug camera pin (`--camera "x y z yaw pitch"`): hover the player at a
+    /// fixed pose in the demo world; also disables the scripted-smoke movement
+    /// so dumps/screenshots are deterministic.
+    camera_override: Option<(f64, f64, f64, f32, f32)>,
 }
 
 /// All mutable application state the screens and actions operate on (the
@@ -314,7 +318,7 @@ impl WinitApp {
         let scripted_smoke_static = matches!(
             config.demo_kind,
             game::DemoKind::ChunkStress | game::DemoKind::Terrain | game::DemoKind::SingleCube
-        );
+        ) || config.camera_override.is_some();
         let smoke_profile = config.scripted_smoke_seconds.map(|_| SmokeProfile::new(now));
         let pass_bench = config
             .bench_passes_seconds
@@ -428,10 +432,19 @@ impl ApplicationHandler for WinitApp {
         let username = self.config.username.clone();
 
         let mut app = App {
-            game: if auto_demo {
-                GameState::demo(self.config.demo_kind, renderer.aspect())
-            } else {
-                GameState::empty_for_server(renderer.aspect())
+            game: {
+                let mut game = if auto_demo {
+                    GameState::demo(self.config.demo_kind, renderer.aspect())
+                } else {
+                    GameState::empty_for_server(renderer.aspect())
+                };
+                if let Some((x, y, z, yaw, pitch)) = self.config.camera_override {
+                    // On a server the position is server-authoritative (it will
+                    // be corrected), but the look rotation is client-authoritative
+                    // and sticks — enough to pin a deterministic view.
+                    game.debug_set_pose(glam::DVec3::new(x, y, z), yaw, pitch);
+                }
+                game
             },
             network: auto_connect.as_ref().map(|(host, port)| {
                 log::info!("connecting to {host}:{port} as {username}");
@@ -2843,6 +2856,7 @@ impl LaunchConfig {
         let mut window_size = None;
         let mut demo_kind = game::DemoKind::Landscape;
         let mut profile_frames = false;
+        let mut camera_override = None;
         let mut args = env::args().skip(1);
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -2895,6 +2909,18 @@ impl LaunchConfig {
                     }
                 }
                 "--profile-frames" => profile_frames = true,
+                "--camera" => {
+                    camera_override = args.next().and_then(|value| {
+                        let mut it = value.split_whitespace();
+                        Some((
+                            it.next()?.parse().ok()?,
+                            it.next()?.parse().ok()?,
+                            it.next()?.parse().ok()?,
+                            it.next()?.parse().ok()?,
+                            it.next()?.parse().ok()?,
+                        ))
+                    });
+                }
                 _ => {}
             }
         }
@@ -2909,6 +2935,7 @@ impl LaunchConfig {
             window_size,
             demo_kind,
             profile_frames,
+            camera_override,
         }
     }
 }
