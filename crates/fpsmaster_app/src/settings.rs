@@ -78,9 +78,9 @@ pub struct Settings {
     pub shader_fog: bool,
     /// Bloom glow around bright pixels (independent of the master toggle).
     pub shader_bloom: bool,
-    /// Brightness gamma in 0..=1 (vanilla "Brightness"): 1.0 leaves lighting
-    /// untouched, lower values darken the shadow/low-light end (not a flat
-    /// multiply). Default sits below neutral so nights and caves read dark.
+    /// Brightness in 0..=1 (vanilla "Brightness"/gamma): 0.0 is the Moody base
+    /// curve, 1.0 blends fully toward vanilla's lifted `1-(1-x)^4` curve —
+    /// raising it only ever brightens the dark end, exactly like vanilla.
     pub brightness: f32,
     /// Post-process effects (applied in the tone-map pass / sky pass).
     pub post_vignette: bool,
@@ -138,9 +138,9 @@ pub const MIPMAP_MAX: u32 = 4;
 /// Highest ray-tracing quality preset index (Low = 0, Medium = 1, High = 2,
 /// Path Traced = 3, the experimental full path tracer).
 pub const RT_QUALITY_MAX: u32 = 3;
-// Brightness is a gamma knob (0 = darkest shadows, 1 = neutral), not a flat
-// multiplier — it pulls the dark/low-light end down while leaving fully-lit
-// surfaces alone.
+// Brightness is vanilla's gamma knob (0 = Moody base curve, 1 = fully lifted
+// `1-(1-x)^4`), not a flat multiplier — raising it brightens the dark/low-light
+// end while leaving fully-lit surfaces alone.
 const BRIGHTNESS_MIN: f32 = 0.0;
 const BRIGHTNESS_MAX: f32 = 1.0;
 
