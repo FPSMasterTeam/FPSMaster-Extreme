@@ -122,13 +122,15 @@ fn sky_reflection(dir: vec3<f32>) -> vec3<f32> {
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let texel = textureSample(block_atlas, block_sampler, in.uv);
-    // Deeper, darker water body: darken and tint the texel toward a deep blue.
-    var base = texel.rgb * in.color.rgb * vec3<f32>(0.30, 0.45, 0.62);
     var alpha = texel.a * in.color.a;
 
-    // Plain translucent water when the shader pack is off.
+    // Shaders off: match vanilla 1.8.9. The water texture is already blue and the
+    // biome water multiplier (carried in `in.color`) is 0xFFFFFF for the default
+    // biome, so the surface is simply texel x light. An earlier extra deep-blue
+    // multiply (0.30, 0.45, 0.62) on top of the already-blue texel — compounded by
+    // a blue vertex tint — is what turned water near-black.
     if (lighting.flags.x < 0.5) {
-        return vec4<f32>(base * day_night(in.light), alpha);
+        return vec4<f32>(texel.rgb * in.color.rgb * day_night(in.light), alpha);
     }
 
     let n = normalize(in.normal);

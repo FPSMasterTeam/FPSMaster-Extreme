@@ -218,8 +218,13 @@ impl Default for BiomeColors {
     }
 }
 
-/// Plains water tint applied to the grayscale water texture.
-const WATER_COLOR: [f32; 3] = [0.247, 0.463, 0.894];
+/// Water color multiplier. Vanilla 1.8.9 `water_still.png` is already blue, and
+/// `BlockLiquid.colorMultiplier` returns the biome water color, which defaults
+/// to `waterColorMultiplier = 0xFFFFFF` (white — no tint) for every biome except
+/// swamp. So the multiplier is white: tinting the already-blue texture with a
+/// second blue is what turned water near-black. Per-biome water tint (swamp)
+/// isn't modeled yet; this is the default-biome value.
+const WATER_COLOR: [f32; 3] = [1.0, 1.0, 1.0];
 
 /// Read-only block/light source the mesher walks. Implemented by the live
 /// `World` (synchronous path) and by a self-contained `ChunkNeighborhood`
