@@ -131,11 +131,6 @@ impl GuiTextField {
         self
     }
 
-    pub fn masked(mut self) -> Self {
-        self.masked = true;
-        self
-    }
-
     /// The current committed text.
     pub fn text(&self) -> &str {
         self.input.text()

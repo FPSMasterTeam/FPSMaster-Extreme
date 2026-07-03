@@ -397,6 +397,185 @@ impl TitleState {
     }
 }
 
+/// A background-music command produced by [`MusicTicker`] and drained by the
+/// host (`main.rs`) into the [`SoundManager`], so the game layer never touches
+/// the audio backend directly.
+#[derive(Debug, Clone)]
+pub enum MusicCommand {
+    /// Start the named `sounds.json` event's music (one random variant), e.g.
+    /// `"music.menu"` or `"music.game"`. Replaces any track already playing.
+    Play(String),
+    /// Stop the current music track (e.g. when the music type changes).
+    Stop,
+}
+
+/// Vanilla `MusicTicker.MusicType`: the six music groups, each with its own
+/// random inter-track delay range (in 20 Hz ticks) and `sounds.json` event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MusicType {
+    Menu,
+    Game,
+    Creative,
+    Nether,
+    End,
+    EndBoss,
+}
+
+impl MusicType {
+    /// The `sounds.json` event key for this music group.
+    fn event(self) -> &'static str {
+        match self {
+            MusicType::Menu => "music.menu",
+            MusicType::Game => "music.game",
+            MusicType::Creative => "music.game.creative",
+            MusicType::Nether => "music.game.nether",
+            MusicType::End => "music.game.end",
+            MusicType::EndBoss => "music.game.end.dragon",
+        }
+    }
+
+    /// Vanilla `MusicType(minDelay, maxDelay)`: the inclusive delay range, in
+    /// ticks, waited before the next track of this type plays.
+    fn delay_range(self) -> (i32, i32) {
+        match self {
+            MusicType::Menu => (20, 600),
+            MusicType::Game => (12000, 24000),
+            MusicType::Creative => (12000, 24000),
+            MusicType::Nether => (12000, 24000),
+            MusicType::End => (12000, 24000),
+            // The end-boss theme retriggers with no delay while the fight runs.
+            MusicType::EndBoss => (0, 0),
+        }
+    }
+}
+
+/// Vanilla `MusicTicker` (MCP-919): plays one background track at a time, with a
+/// random delay between tracks, switching groups when the music type changes
+/// (menu vs. in-world / dimension / creative). It emits [`MusicCommand`]s the
+/// host applies to the real [`SoundManager`], and polls a `playing` flag the
+/// host reports back so it knows when a track has finished.
+struct MusicTicker {
+    /// The type of the track currently scheduled/playing, or `None` when idle
+    /// between tracks (waiting out `delay_ticks`).
+    current: Option<MusicType>,
+    /// Ticks remaining before the next track plays (only meaningful while
+    /// `current` is `None`). `i32::MAX` parks the ticker while a track plays.
+    delay_ticks: i32,
+    /// Whether the host reports a music track is currently audible. Mirrors
+    /// vanilla `isSoundPlaying(currentMusic)`.
+    playing: bool,
+    /// Deterministic xorshift RNG for the inter-track delays (no `rand` dep).
+    rng: u32,
+    /// Queued commands for the host to apply this frame.
+    commands: Vec<MusicCommand>,
+}
+
+impl MusicTicker {
+    fn new() -> Self {
+        Self {
+            current: None,
+            // Vanilla seeds `timeUntilNextMusic = 100`.
+            delay_ticks: 100,
+            playing: false,
+            rng: 0x9e37_79b9,
+            commands: Vec::new(),
+        }
+    }
+
+    fn next_rng(&mut self) -> u32 {
+        let mut x = self.rng;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        self.rng = x;
+        x
+    }
+
+    /// A random value in `min..=max` (inclusive), like vanilla `rand.nextInt`.
+    fn rand_range(&mut self, min: i32, max: i32) -> i32 {
+        if max <= min {
+            return min;
+        }
+        let span = (max - min + 1) as u32;
+        min + (self.next_rng() % span) as i32
+    }
+
+    /// Advance one 20 Hz tick against the desired `music_type`, emitting play /
+    /// stop commands. `self.playing` must be kept in sync by the host before the
+    /// call (it reports whether the last-started track is still audible).
+    ///
+    /// Mirrors vanilla `MusicTicker.update`:
+    ///  1. If a different type is now wanted, stop the current track and shorten
+    ///     the delay to `random(0, minDelay/2)`.
+    ///  2. If the current track has finished, clear it and pick a fresh delay
+    ///     `min(random(min, max), delay)`.
+    ///  3. When idle and the delay expires, play the wanted type's event.
+    fn tick(&mut self, wanted: MusicType) {
+        // (1) A change in music type stops the current track early.
+        if let Some(cur) = self.current {
+            if cur != wanted {
+                self.commands.push(MusicCommand::Stop);
+                self.playing = false;
+                self.current = None;
+                let (min, _) = wanted.delay_range();
+                self.delay_ticks = self.rand_range(0, (min / 2).max(0));
+            }
+        }
+        // (2) The current track finished on its own.
+        if self.current.is_some() && !self.playing {
+            self.current = None;
+            let (min, max) = wanted.delay_range();
+            let roll = self.rand_range(min, max);
+            self.delay_ticks = roll.min(self.delay_ticks);
+        }
+        // (3) Idle: count down and start the next track when the delay expires.
+        if self.current.is_none() {
+            self.delay_ticks -= 1;
+            if self.delay_ticks <= 0 {
+                self.commands.push(MusicCommand::Play(wanted.event().to_string()));
+                self.current = Some(wanted);
+                self.playing = true;
+                // Park until the host reports the track has finished; a change
+                // of type or a `playing=false` report reschedules the delay.
+                self.delay_ticks = i32::MAX;
+            }
+        }
+    }
+}
+
+/// An entity-attached positioned sound (minecart, moving mob, …) synced by the
+/// tick loop: its host-side moving-emitter id, the entity it follows, and the
+/// base volume/pitch and loop flag it was spawned with.
+struct EntitySound {
+    /// The id passed to `SoundManager::attach_moving_sound` / `update_moving_sound`.
+    sound_id: u64,
+    entity: EntityId,
+    base_volume: f32,
+}
+
+/// A host-side moving-emitter command drained by `main.rs` each frame.
+#[derive(Debug, Clone)]
+pub enum MovingSoundCommand {
+    /// Spawn a looping/one-shot positioned emitter with the given id.
+    Attach {
+        id: u64,
+        event: String,
+        pos: Vec3,
+        volume: f32,
+        pitch: f32,
+        looping: bool,
+    },
+    /// Move/re-gain an existing emitter.
+    Update {
+        id: u64,
+        pos: Vec3,
+        volume: f32,
+        pitch: f32,
+    },
+    /// Stop and forget an emitter (emitter died / left range).
+    Stop { id: u64 },
+}
+
 pub struct GameState {
     pub world: World,
     pub input: InputState,
@@ -625,6 +804,33 @@ pub struct GameState {
     /// host (`main.rs`) into the audio backend so the game layer stays
     /// audio-free. World coordinates map 1:1 to render coordinates here.
     sound_queue: Vec<QueuedSound>,
+    /// Background-music state machine (menu vs. in-world). Emits `MusicCommand`s
+    /// the host applies to the real `SoundManager`.
+    music_ticker: MusicTicker,
+    /// Current dimension id (0 = overworld, -1 = nether, 1 = end), for the music
+    /// selection. Set on JoinGame/Respawn; `has_sky_light` covers lighting.
+    dimension: i8,
+    /// Vanilla mood-sound countdown (`ambientTickCountdown`): ticks until the
+    /// next `ambient.cave.cave` attempt.
+    mood_tick_countdown: i32,
+    /// LCG state for the vanilla mood-sound block sampler.
+    mood_update_lcg: u32,
+    /// Vanilla `distanceWalkedOnStepModified`: accumulated horizontal distance
+    /// (×0.6) that drives the local player's footstep interval.
+    distance_walked_on_step: f32,
+    /// Vanilla `nextStepDistance`: the distance threshold for the next footstep.
+    next_step_distance: i32,
+    /// The local player's `on_ground` last tick, for the fall-landing edge.
+    prev_on_ground: bool,
+    /// Vanilla `fallDistance`: blocks fallen since last on the ground, for the
+    /// landing sound / fall-damage sound selection.
+    fall_distance: f32,
+    /// Entity-attached looping sounds (minecart, …), synced each tick.
+    entity_sounds: Vec<EntitySound>,
+    /// Next host-side moving-emitter id to hand out.
+    next_moving_sound_id: u64,
+    /// Moving-emitter commands drained by the host each frame.
+    moving_sound_commands: Vec<MovingSoundCommand>,
 }
 
 /// In-progress survival block break: the target cell, the face the dig started
@@ -929,6 +1135,19 @@ impl GameState {
             title: TitleState::default(),
             particles: ParticleSystem::new(),
             sound_queue: Vec::new(),
+            music_ticker: MusicTicker::new(),
+            dimension: 0,
+            // Vanilla seeds `ambientTickCountdown = rand.nextInt(12000)` at world
+            // load; a fixed-but-nonzero seed keeps the first cave sound minutes out.
+            mood_tick_countdown: 0x1357 % 12000,
+            mood_update_lcg: 0x1234_5678,
+            distance_walked_on_step: 0.0,
+            next_step_distance: 1,
+            prev_on_ground: true,
+            fall_distance: 0.0,
+            entity_sounds: Vec::new(),
+            next_moving_sound_id: 1,
+            moving_sound_commands: Vec::new(),
         }
     }
 
@@ -1232,6 +1451,31 @@ impl GameState {
         std::mem::take(&mut self.sound_queue)
     }
 
+    /// Drain this frame's background-music commands (start/stop). The host
+    /// applies them to the real `SoundManager` and reports the resulting play
+    /// state back via [`set_music_playing`](Self::set_music_playing).
+    pub fn take_music_commands(&mut self) -> Vec<MusicCommand> {
+        std::mem::take(&mut self.music_ticker.commands)
+    }
+
+    /// Report whether a music track is currently audible (from
+    /// `SoundManager::is_music_playing`). The `MusicTicker` uses this to detect
+    /// when the current track has finished so it can schedule the next one.
+    pub fn set_music_playing(&mut self, playing: bool) {
+        // Only clear the flag: the ticker sets `playing = true` the tick it asks
+        // the host to start a track, and the host's report may lag a frame while
+        // the ogg decodes. A `false` report means the track has truly ended.
+        if !playing {
+            self.music_ticker.playing = false;
+        }
+    }
+
+    /// Drain this frame's entity-attached moving-emitter commands (attach /
+    /// update / stop). The host applies them to the real `SoundManager`.
+    pub fn take_moving_sound_commands(&mut self) -> Vec<MovingSoundCommand> {
+        std::mem::take(&mut self.moving_sound_commands)
+    }
+
     /// Spawn host-side particles for an extension `SpawnParticle` command.
     /// `type_id` is the vanilla 1.8 S2A particle id; the ext path carries no
     /// trailing VarInt args.
@@ -1370,6 +1614,297 @@ impl GameState {
             volume,
             pitch,
         });
+    }
+
+    /// Attach a looping positioned sound to an entity, tracked and synced each
+    /// tick (position/gain follow the entity, stopped when it dies or leaves
+    /// range). Returns the host-side emitter id. Idempotent per entity: a second
+    /// call for the same entity is ignored so we never double-attach.
+    fn attach_entity_sound(&mut self, entity: EntityId, event: &str, volume: f32, looping: bool) {
+        if self.entity_sounds.iter().any(|s| s.entity == entity) {
+            return;
+        }
+        // The entity must already be in the world (spawn packet processed) so we
+        // have an initial position to bake the emitter's gain/pan from.
+        let Some(pos) = self.world.entity(entity).map(|e| to_render_vec3(e.position)) else {
+            return;
+        };
+        let sound_id = self.next_moving_sound_id;
+        self.next_moving_sound_id += 1;
+        self.entity_sounds.push(EntitySound {
+            sound_id,
+            entity,
+            base_volume: volume,
+        });
+        self.moving_sound_commands.push(MovingSoundCommand::Attach {
+            id: sound_id,
+            event: event.to_string(),
+            pos,
+            // Start near-silent; `sync_entity_sounds` ramps it with speed next tick.
+            volume: 0.001,
+            pitch: 1.0,
+            looping,
+        });
+    }
+
+    /// Stop and forget an entity-attached sound (emitter died / despawned).
+    fn stop_entity_sound(&mut self, entity: EntityId) {
+        if let Some(pos) = self.entity_sounds.iter().position(|s| s.entity == entity) {
+            let s = self.entity_sounds.remove(pos);
+            self.moving_sound_commands
+                .push(MovingSoundCommand::Stop { id: s.sound_id });
+        }
+    }
+
+    /// Sync every entity-attached sound to its entity's current position and
+    /// speed each tick: minecart-style volume ramps with horizontal speed
+    /// (vanilla `MovingSoundMinecart`), and a vanished entity stops its sound.
+    fn sync_entity_sounds(&mut self) {
+        let mut dead: Vec<EntityId> = Vec::new();
+        let mut updates: Vec<MovingSoundCommand> = Vec::new();
+        for s in &mut self.entity_sounds {
+            let Some(entity) = self.world.entity(s.entity) else {
+                dead.push(s.entity);
+                continue;
+            };
+            let pos = to_render_vec3(entity.position);
+            // Vanilla minecart: volume ramps 0..0.7 with horizontal speed; a
+            // stationary cart is (almost) silent. General moving emitters reuse
+            // this so a parked entity fades out.
+            let speed =
+                (entity.velocity.x * entity.velocity.x + entity.velocity.z * entity.velocity.z)
+                    .sqrt() as f32;
+            let volume = if speed >= 0.01 {
+                s.base_volume * (speed / 0.5).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            updates.push(MovingSoundCommand::Update {
+                id: s.sound_id,
+                pos,
+                // Keep a hair above zero so the emitter isn't culled when parked;
+                // the host still attenuates it by distance.
+                volume: volume.max(0.001),
+                pitch: 1.0,
+            });
+        }
+        self.moving_sound_commands.extend(updates);
+        for id in dead {
+            self.stop_entity_sound(id);
+        }
+    }
+
+    /// Attach a looping rolling-sound to every minecart we don't already track
+    /// (vanilla `MovingSoundMinecart`, event `minecart.base`). Kept general: any
+    /// entity kind that vanilla gives a moving sound can be added to the match.
+    /// Sounds detach automatically in [`sync_entity_sounds`] when the entity
+    /// despawns.
+    fn refresh_entity_sound_targets(&mut self) {
+        // Vanilla SpawnObject minecart types: 10 (rideable) and the furnace/
+        // chest/etc. variants share the `minecart.base` rolling sound.
+        let carts: Vec<EntityId> = self
+            .world
+            .entities()
+            .filter(|e| matches!(e.kind, EntityKind::Object(10)))
+            .filter(|e| !self.entity_sounds.iter().any(|s| s.entity == e.id))
+            .map(|e| e.id)
+            .collect();
+        for id in carts {
+            self.attach_entity_sound(id, "minecart.base", 0.7, true);
+        }
+    }
+
+    /// Vanilla `World.playMoodSoundAndCheckLight` (MCP-919 World.java:2637): once
+    /// the mood countdown hits zero, LCG-sample a block near the player and, if
+    /// it is a dark air pocket a few blocks away, play `ambient.cave.cave` and
+    /// rearm the 5–15 minute cooldown.
+    fn tick_ambient_mood(&mut self) {
+        // Sky-less dimensions still get cave sounds in vanilla, but the trigger
+        // needs a loaded column around the player; skip until we've joined.
+        if !self.joined_game {
+            return;
+        }
+        if self.mood_tick_countdown > 0 {
+            self.mood_tick_countdown -= 1;
+            return;
+        }
+        // Fire: sample one candidate block in the player's chunk via the LCG.
+        self.mood_update_lcg = self
+            .mood_update_lcg
+            .wrapping_mul(3)
+            .wrapping_add(1013904223);
+        let i = self.mood_update_lcg >> 2;
+        let jx = (i & 15) as i32;
+        let kz = ((i >> 8) & 15) as i32;
+        let ly = ((i >> 16) & 255) as i32;
+
+        let player = self.player.position;
+        let chunk_x = (player.x.floor() as i32) >> 4;
+        let chunk_z = (player.z.floor() as i32) >> 4;
+        let wx = chunk_x * 16 + jx;
+        let wz = chunk_z * 16 + kz;
+
+        // Rearm even when the candidate fails the checks, matching vanilla (the
+        // countdown is only re-rolled after a successful play; a failed sample
+        // just leaves the countdown at 0 so the next tick tries again). Vanilla
+        // keeps countdown at 0 and retries next tick until a block qualifies.
+        if !self.world.is_block_column_loaded(wx, wz) {
+            return;
+        }
+        let block = self.world.block_at(wx, ly, wz);
+        if !block.is_air() {
+            return;
+        }
+        let (block_light, sky_light) = self.world.light_at(wx, ly, wz);
+        // Dark air: block light <= rand(0..8) AND no sky light (deep underground).
+        let rand_threshold = (self.mood_update_lcg >> 20) % 8;
+        if u32::from(block_light) > rand_threshold || sky_light > 0 {
+            return;
+        }
+        // Must be >4 blocks from the player (squared > 16), so it's not underfoot.
+        let sx = wx as f64 + 0.5;
+        let sy = ly as f64 + 0.5;
+        let sz = wz as f64 + 0.5;
+        let dist_sq = (sx - player.x).powi(2)
+            + (sy - (player.y + STANDING_EYE_HEIGHT)).powi(2)
+            + (sz - player.z).powi(2);
+        if dist_sq <= 16.0 {
+            return;
+        }
+        // Play: volume 0.7, pitch 0.8 + rand*0.2 (range [0.8, 1.0)).
+        let pitch = 0.8 + ((self.mood_update_lcg >> 8) & 0xffff) as f32 / 65536.0 * 0.2;
+        self.queue_sound(
+            "ambient.cave.cave",
+            Vec3::new(sx as f32, sy as f32, sz as f32),
+            0.7,
+            pitch,
+        );
+        // Rearm: 6000..18000 ticks (5–15 minutes).
+        self.mood_tick_countdown = 6000 + ((self.mood_update_lcg >> 24) % 12000) as i32;
+    }
+
+    /// The vanilla `Block.stepSound` event for a footstep on block `id`, mapping
+    /// the `dig.<material>` families onto `step.<material>`. Snow layers, ladders
+    /// and other special step surfaces fall back to their material's family.
+    fn step_sound_for_block(id: u16) -> String {
+        // Reuse the dig-sound material classification and swap the prefix; the
+        // step.* and dig.* event families share material names in 1.8.9.
+        let dig = dig_sound_for_block(id);
+        let material = dig.strip_prefix("dig.").unwrap_or("stone");
+        format!("step.{material}")
+    }
+
+    /// Vanilla client-side movement SFX for the local player, run each tick after
+    /// the move: footsteps on the ground, swim splashes in water, and the fall
+    /// landing / fall-damage sound on touchdown.
+    fn tick_local_movement_sounds(&mut self) {
+        let pos = self.player.position;
+        let prev = self.previous_player_position;
+        let on_ground = self.player.on_ground;
+
+        // Horizontal distance walked this tick (vanilla accumulates dx,dz ×0.6,
+        // excluding vertical motion).
+        let dx = (pos.x - prev.x) as f32;
+        let dz = (pos.z - prev.z) as f32;
+        let horizontal = (dx * dx + dz * dz).sqrt();
+
+        // Block at the player's feet (one below the standing position) and the
+        // block occupied by the feet, for water detection.
+        let fx = pos.x.floor() as i32;
+        let fz = pos.z.floor() as i32;
+        let feet_y = pos.y.floor() as i32;
+        let below = self.world.block_at(fx, feet_y - 1, fz);
+        let feet_block = self.world.block_at(fx, feet_y, fz);
+        let in_water = feet_block.is_water();
+
+        // Fall tracking: accumulate downward motion while airborne; on a
+        // ground touchdown, play the landing/damage sound and reset.
+        let dy = (pos.y - prev.y) as f32;
+        if !on_ground && dy < 0.0 {
+            self.fall_distance += -dy;
+        }
+        let landed = on_ground && !self.prev_on_ground;
+        if landed {
+            let fall = self.fall_distance;
+            // Vanilla EntityLivingBase.fall: damage = ceil(fall - 3.0); the fall
+            // sound only plays when that is positive (a hurt fall).
+            let damage = (fall - 3.0).ceil();
+            if damage > 0.0 {
+                let listener = self.camera.position;
+                let event = if damage > 4.0 {
+                    "game.player.hurt.fall.big"
+                } else {
+                    "game.player.hurt.fall.small"
+                };
+                self.queue_sound(event, listener, 1.0, 1.0);
+            }
+            // Landing step (vanilla playStepSound at fall): quieter, lower pitch.
+            if !in_water && !below.is_air() {
+                let listener = self.camera.position;
+                self.queue_sound(Self::step_sound_for_block(below.id), listener, 0.15, 0.75);
+            }
+            self.fall_distance = 0.0;
+        }
+        if on_ground {
+            self.fall_distance = 0.0;
+        }
+        self.prev_on_ground = on_ground;
+
+        // Footstep accumulation and trigger (vanilla Entity.doBlockCollisions /
+        // playStepSound): only on the ground (or in water) and moving.
+        self.distance_walked_on_step += horizontal * 0.6;
+        if self.distance_walked_on_step > self.next_step_distance as f32 {
+            self.next_step_distance += 1;
+            let listener = self.camera.position;
+            if in_water {
+                // Swim/splash: volume from motion, random pitch.
+                let motion = (dx * dx * 0.2 + dy * dy + dz * dz * 0.2).sqrt() * 0.35;
+                let vol = motion.min(1.0);
+                let r = self.mood_rand_float();
+                let pitch = 1.0 + (r - 0.5) * 0.8; // 1.0 + rand(-0.4, 0.4)
+                self.queue_sound("game.player.swim", listener, vol, pitch);
+            } else if on_ground && !below.is_air() && !below.is_water() {
+                // Regular footstep: block step sound (vanilla volume ×0.15).
+                self.queue_sound(Self::step_sound_for_block(below.id), listener, 0.15, 1.0);
+            }
+        }
+    }
+
+    /// A deterministic 0..1 float from the mood LCG stream (footstep pitch etc.),
+    /// so the local prediction needs no `rand` dependency.
+    fn mood_rand_float(&mut self) -> f32 {
+        self.mood_update_lcg = self
+            .mood_update_lcg
+            .wrapping_mul(1664525)
+            .wrapping_add(1013904223);
+        (self.mood_update_lcg >> 8) as f32 / (1u32 << 24) as f32
+    }
+
+    /// Choose the desired music group for the current world state, matching
+    /// vanilla `Minecraft.getAmbientMusicType`.
+    fn desired_music_type(&self) -> MusicType {
+        if !self.joined_game {
+            return MusicType::Menu;
+        }
+        match self.dimension {
+            -1 => MusicType::Nether,
+            1 => {
+                // Vanilla plays the dragon fight theme while a boss bar is up
+                // (BossStatus active), else the ambient end theme.
+                if self.boss_bar().is_some() {
+                    MusicType::EndBoss
+                } else {
+                    MusicType::End
+                }
+            }
+            _ => {
+                if self.creative && self.capabilities.allow_flying {
+                    MusicType::Creative
+                } else {
+                    MusicType::Game
+                }
+            }
+        }
     }
 
     /// Queue a non-positional UI sound (vanilla `PositionedSoundRecord.create`,
@@ -1740,6 +2275,17 @@ impl GameState {
         // Advance particle effects once per tick (before any early return), so
         // smoke/flame age and move at the vanilla 20 Hz.
         self.particles.tick();
+        // Background music (vanilla MusicTicker): pick the group for the current
+        // world state and advance the inter-track delay. Commands are drained by
+        // the host, which reports the play state back via `set_music_playing`.
+        let music_type = self.desired_music_type();
+        self.music_ticker.tick(music_type);
+        // Random cave/mood ambient sound (vanilla playMoodSoundAndCheckLight).
+        self.tick_ambient_mood();
+        // Sync entity-attached looping sounds (minecarts, …) to their emitters,
+        // and attach one to a suitable moving entity if none is tracked yet.
+        self.refresh_entity_sound_targets();
+        self.sync_entity_sounds();
         // Count down the local player's hurt timer (vanilla EntityLivingBase
         // .onUpdate), fading the hurt-camera tilt over 10 ticks.
         self.player.hurt_time = self.player.hurt_time.saturating_sub(1);
@@ -1981,6 +2527,9 @@ impl GameState {
             self.capabilities.flying = false;
             self.abilities_dirty = true;
         }
+        // Client-side movement SFX (footsteps, swim, fall landing) from this
+        // tick's post-move position.
+        self.tick_local_movement_sounds();
         self.world.upsert_entity(self.player.clone());
         self.advance_view_state();
         self.update_camera(1.0);
@@ -4090,7 +4639,10 @@ impl GameState {
                 slot,
                 item,
             } => self.handle_entity_equipment(entity_id, slot, item),
-            ClientboundPlayPacket::CollectItem { .. } => false,
+            ClientboundPlayPacket::CollectItem {
+                collected_id,
+                collector_id,
+            } => self.handle_collect_item(collected_id, collector_id),
             ClientboundPlayPacket::SoundEffect {
                 name,
                 x,
@@ -4556,9 +5108,12 @@ impl GameState {
     fn handle_join_game(&mut self, entity_id: i32, game_mode: u8, dimension: i8) -> bool {
         self.player.id = EntityId(entity_id);
         self.has_sky_light = dimension == 0;
+        self.dimension = dimension;
         // Low 3 bits are the gamemode; bit 3 is the hardcore flag.
         self.creative = (game_mode & 0x7) == 1;
         self.joined_game = true;
+        // Restart the music delay so a track can start shortly after spawn.
+        self.music_ticker.delay_ticks = 100;
         self.world.upsert_entity(self.player.clone());
         false
     }
@@ -4605,6 +5160,7 @@ impl GameState {
         // respawn point; wait for that position before reporting movement
         // again so we don't send a stale (death-location) position.
         self.has_sky_light = dimension == 0;
+        self.dimension = dimension as i8;
         self.creative = (game_mode & 0x7) == 1;
         self.needs_respawn = false;
         self.is_dead = false;
@@ -4887,6 +5443,39 @@ impl GameState {
         false
     }
 
+    /// S0D CollectItem: play the pickup sound when the local player absorbs an
+    /// item or XP orb (vanilla `EntityItem`/`EntityXPOrb` client sounds). Only
+    /// the local player's pickups make a sound here.
+    fn handle_collect_item(&mut self, collected_id: i32, collector_id: i32) -> bool {
+        if collector_id != self.player.id.0 {
+            return false;
+        }
+        let collected = EntityId(collected_id);
+        // Play at the collected entity's position, or the player if it's gone.
+        let pos = self
+            .world
+            .entity(collected)
+            .map(|e| to_render_vec3(e.position))
+            .unwrap_or(self.camera.position);
+        let is_xp = self.entity_xp.contains_key(&collected)
+            || matches!(
+                self.world.entity(collected).map(|e| e.kind),
+                Some(EntityKind::ExperienceOrb)
+            );
+        if is_xp {
+            // random.orb, volume 0.1, pitch 0.5*(rand*0.7+1.8) -> ~[0.9, 1.15).
+            let r = self.mood_rand_float();
+            let pitch = 0.5 * (r * 0.7 + 1.8);
+            self.queue_sound("random.orb", pos, 0.1, pitch);
+        } else {
+            // random.pop, volume 0.2, pitch (rand*0.7+1.0)*2.0 -> [2.0, 3.4).
+            let r = self.mood_rand_float();
+            let pitch = (r * 0.7 + 1.0) * 2.0;
+            self.queue_sound("random.pop", pos, 0.2, pitch);
+        }
+        false
+    }
+
     fn handle_destroy_entities(&mut self, entity_ids: Vec<i32>) -> bool {
         for id in entity_ids {
             let id = EntityId(id);
@@ -4899,6 +5488,8 @@ impl GameState {
             // Drop both directions of any mount relationship.
             self.vehicles.remove(&id);
             self.vehicles.retain(|_, vehicle| *vehicle != id);
+            // Stop any entity-attached looping sound (minecart, …).
+            self.stop_entity_sound(id);
         }
         false
     }
@@ -7958,6 +8549,258 @@ mod interaction_tests {
                 / (intended.length() * got.length());
             assert!(cos > 0.92, "silent yaw {ys}: world dir drifted, cos={cos}");
         }
+    }
+
+    // ─── Sound triggers (music / ambient / moving / local prediction) ─────────
+
+    /// Stand the local player on a stone floor at an integer column, on the
+    /// ground, and clear any queued sounds so a test starts from a clean slate.
+    fn stand_on_stone(g: &mut GameState, x: i32, y: i32, z: i32) {
+        for dz in -4..=4 {
+            for dx in -4..=4 {
+                g.world.set_block(x + dx, y - 1, z + dz, BlockState::new(1, 0));
+            }
+        }
+        g.player.position = DVec3::new(x as f64 + 0.5, y as f64, z as f64 + 0.5);
+        g.previous_player_position = g.player.position;
+        g.player.on_ground = true;
+        g.prev_on_ground = true;
+        g.player.sync_aabb_to_position();
+        g.camera.position = to_render_vec3(g.player.position);
+        let _ = g.take_sounds();
+    }
+
+    #[test]
+    fn footstep_plays_block_step_sound_at_the_vanilla_interval() {
+        let mut g = GameState::empty_for_server(1.0);
+        stand_on_stone(&mut g, 0, 65, 0);
+        // Walk a bit over one tick: the accumulator is horizontal ×0.6, so ~1.7
+        // blocks trips the first step (nextStepDistance starts at 1).
+        g.previous_player_position = g.player.position;
+        g.player.position.x += 2.0;
+        g.camera.position = to_render_vec3(g.player.position);
+        g.tick_local_movement_sounds();
+        let sounds = g.take_sounds();
+        assert_eq!(sounds.len(), 1, "one footstep expected");
+        assert_eq!(sounds[0].event, "step.stone");
+        assert!((sounds[0].volume - 0.15).abs() < 1e-6);
+    }
+
+    #[test]
+    fn no_footstep_while_airborne() {
+        let mut g = GameState::empty_for_server(1.0);
+        stand_on_stone(&mut g, 0, 65, 0);
+        g.player.on_ground = false;
+        g.previous_player_position = g.player.position;
+        g.player.position.x += 2.0;
+        g.tick_local_movement_sounds();
+        assert!(
+            g.take_sounds().iter().all(|s| !s.event.starts_with("step.")),
+            "no footstep off the ground"
+        );
+    }
+
+    #[test]
+    fn fall_landing_plays_hurt_sound_past_three_blocks() {
+        let mut g = GameState::empty_for_server(1.0);
+        stand_on_stone(&mut g, 0, 65, 0);
+        // Accumulate a >3 block fall while airborne, then land.
+        g.player.on_ground = false;
+        g.prev_on_ground = false;
+        g.fall_distance = 5.0;
+        g.previous_player_position = g.player.position;
+        g.player.on_ground = true; // touchdown edge this tick
+        g.tick_local_movement_sounds();
+        let sounds = g.take_sounds();
+        assert!(
+            sounds.iter().any(|s| s.event == "game.player.hurt.fall.small"),
+            "a 5-block fall plays the small fall-hurt sound: {sounds:?}"
+        );
+    }
+
+    #[test]
+    fn short_fall_is_silent() {
+        let mut g = GameState::empty_for_server(1.0);
+        stand_on_stone(&mut g, 0, 65, 0);
+        g.player.on_ground = false;
+        g.prev_on_ground = false;
+        g.fall_distance = 2.0; // below the 3-block threshold
+        g.player.on_ground = true;
+        g.tick_local_movement_sounds();
+        assert!(
+            !g.take_sounds().iter().any(|s| s.event.starts_with("game.player.hurt.fall")),
+            "a 2-block fall makes no fall-hurt sound"
+        );
+    }
+
+    #[test]
+    fn collect_item_plays_pop_for_local_player() {
+        let mut g = GameState::empty_for_server(1.0);
+        g.player.id = EntityId(1);
+        // An item entity to collect (object kind 2 = item).
+        g.spawn_remote_entity(9, EntityKind::Object(2), 3.0, 65.0, 3.0, 0.0, 0.0);
+        let _ = g.take_sounds();
+        g.apply_play_packet(ClientboundPlayPacket::CollectItem {
+            collected_id: 9,
+            collector_id: 1,
+        });
+        let sounds = g.take_sounds();
+        assert_eq!(sounds.len(), 1);
+        assert_eq!(sounds[0].event, "random.pop");
+    }
+
+    #[test]
+    fn collect_xp_orb_plays_orb_sound() {
+        let mut g = GameState::empty_for_server(1.0);
+        g.player.id = EntityId(1);
+        g.apply_play_packet(ClientboundPlayPacket::SpawnExperienceOrb {
+            entity_id: 8,
+            x: 2.0,
+            y: 65.0,
+            z: 0.0,
+            count: 5,
+        });
+        let _ = g.take_sounds();
+        g.apply_play_packet(ClientboundPlayPacket::CollectItem {
+            collected_id: 8,
+            collector_id: 1,
+        });
+        let sounds = g.take_sounds();
+        assert_eq!(sounds.len(), 1);
+        assert_eq!(sounds[0].event, "random.orb");
+    }
+
+    #[test]
+    fn collect_by_other_player_is_silent() {
+        let mut g = GameState::empty_for_server(1.0);
+        g.player.id = EntityId(1);
+        g.spawn_remote_entity(9, EntityKind::Object(2), 3.0, 65.0, 3.0, 0.0, 0.0);
+        let _ = g.take_sounds();
+        // Collector 42 is not us.
+        g.apply_play_packet(ClientboundPlayPacket::CollectItem {
+            collected_id: 9,
+            collector_id: 42,
+        });
+        assert!(g.take_sounds().is_empty());
+    }
+
+    #[test]
+    fn ambient_cave_triggers_on_a_dark_air_pocket() {
+        let mut g = GameState::empty_for_server(1.0);
+        g.joined_game = true;
+        g.player.position = DVec3::new(8.5, 40.0, 8.5);
+        g.previous_player_position = g.player.position;
+        // Force the countdown to fire and drive the LCG to a known dark-air cell.
+        // Rather than reverse the LCG, fill the whole chunk section with air at a
+        // low, sky-blocked light so whatever cell it samples qualifies, then put
+        // the player far from it vertically so the >4 block check passes.
+        g.mood_tick_countdown = 0;
+        // Load every section of the column as all-air with 0 light, so whatever
+        // y the LCG samples reads as dark (sky-blocked) air.
+        for sy in 0..16 {
+            g.world
+                .load_section(0, 0, sy, &[0u16; 4096], &[0u8; 2048], &[0u8; 2048]);
+        }
+        // Ensure the column reports loaded.
+        assert!(g.world.is_block_column_loaded(8, 8));
+        let mut fired = false;
+        // The sampled y may not be far enough on the first roll; tick a few times.
+        for _ in 0..64 {
+            g.mood_tick_countdown = 0;
+            g.tick_ambient_mood();
+            if g.take_sounds().iter().any(|s| s.event == "ambient.cave.cave") {
+                fired = true;
+                break;
+            }
+        }
+        assert!(fired, "a dark air pocket should eventually play ambient.cave.cave");
+        // After a successful play the cooldown is rearmed into the 5–15 min band.
+        assert!((6000..=18000).contains(&g.mood_tick_countdown));
+    }
+
+    #[test]
+    fn music_ticker_starts_a_game_track_and_reschedules_on_finish() {
+        let mut g = GameState::empty_for_server(1.0);
+        g.joined_game = true;
+        g.dimension = 0;
+        // Drive the delay down to zero; the ticker should emit one Play command.
+        g.music_ticker.delay_ticks = 1;
+        let wanted = g.desired_music_type();
+        assert_eq!(wanted, MusicType::Game);
+        g.music_ticker.tick(wanted);
+        let cmds = g.take_music_commands();
+        assert!(
+            matches!(cmds.as_slice(), [MusicCommand::Play(e)] if e == "music.game"),
+            "expected a single Play(music.game): {cmds:?}"
+        );
+        // While the host reports the track playing, no new command is emitted.
+        g.music_ticker.tick(wanted);
+        assert!(g.take_music_commands().is_empty());
+        // When the track finishes, the ticker clears it and waits out a delay.
+        g.set_music_playing(false);
+        g.music_ticker.tick(wanted);
+        assert!(g.take_music_commands().is_empty(), "a finished track just schedules a delay");
+        assert!(g.music_ticker.current.is_none());
+    }
+
+    #[test]
+    fn music_ticker_switches_track_when_type_changes() {
+        let mut g = GameState::empty_for_server(1.0);
+        g.joined_game = true;
+        g.dimension = 0;
+        g.music_ticker.delay_ticks = 1;
+        g.music_ticker.tick(MusicType::Game);
+        let _ = g.take_music_commands(); // consume the initial Play
+        // Now the world is the nether: the ticker stops the game track.
+        g.music_ticker.tick(MusicType::Nether);
+        let cmds = g.take_music_commands();
+        assert!(
+            cmds.iter().any(|c| matches!(c, MusicCommand::Stop)),
+            "a music-type change stops the current track: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn minecart_spawn_attaches_a_looping_moving_sound() {
+        let mut g = GameState::empty_for_server(1.0);
+        g.joined_game = true;
+        // Spawn a rideable minecart (object kind 10).
+        g.apply_play_packet(ClientboundPlayPacket::SpawnObject {
+            entity_id: 20,
+            kind: 10,
+            x: 4.0,
+            y: 65.0,
+            z: 0.0,
+            yaw: 0.0,
+            pitch: 0.0,
+            data: 0,
+            velocity: None,
+        });
+        g.refresh_entity_sound_targets();
+        let cmds = g.take_moving_sound_commands();
+        assert!(
+            cmds.iter().any(|c| matches!(
+                c,
+                MovingSoundCommand::Attach { event, looping, .. }
+                    if event == "minecart.base" && *looping
+            )),
+            "a minecart gets a looping minecart.base emitter: {cmds:?}"
+        );
+        // A second refresh does not double-attach.
+        g.refresh_entity_sound_targets();
+        assert!(
+            !g.take_moving_sound_commands()
+                .iter()
+                .any(|c| matches!(c, MovingSoundCommand::Attach { .. })),
+            "the minecart sound is attached only once"
+        );
+        // Destroying the cart stops its emitter.
+        g.apply_play_packet(ClientboundPlayPacket::DestroyEntities { entity_ids: vec![20] });
+        let cmds = g.take_moving_sound_commands();
+        assert!(
+            cmds.iter().any(|c| matches!(c, MovingSoundCommand::Stop { .. })),
+            "destroying the cart stops the emitter: {cmds:?}"
+        );
     }
 }
 

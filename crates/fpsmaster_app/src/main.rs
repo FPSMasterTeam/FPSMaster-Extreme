@@ -1,4 +1,3 @@
-mod auth;
 mod chat;
 mod container;
 mod ext_bridge;
@@ -25,33 +24,25 @@ use fpsmaster_render::i18n;
 use std::{
     env,
     path::PathBuf,
-    sync::mpsc::{self, Receiver},
     time::{Duration, Instant},
 };
 
 use anyhow::Context;
-use auth::{AuthEvent, Session};
 use ext_bridge::GameViews;
 use game::GameState;
 use fpsmaster_ext::ReadViews;
-use gui::accounts::GuiAccounts;
 use gui::chat_screen::GuiChat;
 use gui::game_over::GuiGameOver;
 use gui::ingame::{GuiIngame, HudState};
 use gui::ingame_menu::GuiIngameMenu;
 use gui::inventory::GuiContainer;
 use gui::main_menu::GuiMainMenu;
-use gui::progress::{
-    GuiAuthCode, GuiConnecting, GuiDisconnected, GuiProgress, GuiStartingServer, Parent,
-};
+use gui::progress::{GuiConnecting, GuiDisconnected, GuiStartingServer, Parent};
 use singleplayer::LocalServer;
-use gui::{AccountEntry, DrawCtx, GuiAction, GuiScreen, ScreenCtx};
+use gui::{DrawCtx, GuiAction, GuiScreen, ScreenCtx};
 use item_renderer::ItemRenderer;
 use network::{NetworkEvent, NetworkHandle, WalkingPacketState};
-use fpsmaster_protocol::{
-    net::PremiumSession,
-    v1_8_9::packets::{ClientboundPlayPacket, ServerboundPacket},
-};
+use fpsmaster_protocol::v1_8_9::packets::{ClientboundPlayPacket, ServerboundPacket};
 use fpsmaster_render::{RenderStats, Renderer};
 use settings::{FpsCounter, GameAction, Keybinds, Settings};
 
@@ -112,9 +103,6 @@ struct App {
     /// Waiting for the server join to finish (first chunks).
     connecting: bool,
     settings: Settings,
-    ms_session: Option<Session>,
-    auth_rx: Option<Receiver<AuthEvent>>,
-    accounts: auth::AccountStore,
     clipboard: Option<arboard::Clipboard>,
     username: String,
     /// Whether the Tab key is held — shows the player-list overlay.
@@ -200,25 +188,6 @@ struct App {
 }
 
 impl App {
-    fn session_username(&self) -> Option<&str> {
-        self.ms_session.as_ref().map(|s| s.username.as_str())
-    }
-
-    fn account_entries(&self) -> Vec<AccountEntry> {
-        self.accounts
-            .accounts
-            .iter()
-            .map(|account| AccountEntry {
-                username: account.username.clone(),
-                uuid: account.uuid.clone(),
-                active: self
-                    .ms_session
-                    .as_ref()
-                    .is_some_and(|session| session.uuid == account.uuid),
-            })
-            .collect()
-    }
-
     /// Release held movement keys and abort any in-progress dig — called when
     /// a screen opens over gameplay.
     fn suspend_gameplay_input(&mut self, left_held: &mut bool, right_held: &mut bool) {
@@ -229,28 +198,6 @@ impl App {
         if let Some(packet) = self.game.cancel_breaking() {
             if let Some(network) = &self.network {
                 network.send_packet(packet);
-            }
-        }
-    }
-
-    /// Start an auth flow and show its progress screen.
-    fn begin_login(&mut self, token: Option<String>) {
-        let (tx, rx) = mpsc::channel();
-        self.auth_rx = Some(rx);
-        match token {
-            Some(token) => {
-                auth::start_login_with_refresh_token(token, tx);
-                self.screen = Some(Box::new(GuiProgress::new(
-                    "Signing in...",
-                    "Redeeming refresh token",
-                )));
-            }
-            None => {
-                auth::start_login(tx);
-                self.screen = Some(Box::new(GuiProgress::new(
-                    "Microsoft Login",
-                    "Contacting Microsoft...",
-                )));
             }
         }
     }
@@ -461,9 +408,6 @@ impl ApplicationHandler for WinitApp {
             in_world: auto_demo,
             connecting: auto_connect.is_some(),
             settings,
-            ms_session: None,
-            auth_rx: None,
-            accounts: auth::AccountStore::load(),
             clipboard: arboard::Clipboard::new().ok(),
             username,
             tab_open: false,
@@ -774,7 +718,6 @@ impl ApplicationHandler for WinitApp {
             return;
         };
 
-        poll_auth_events(app);
         // Process incoming packets once per FRAME, on the main thread — vanilla's
         // exact cadence (`Minecraft.runGameLoop` calls
         // `NetworkManager.processReceivedPackets` once per rendered frame, NOT per
@@ -1178,6 +1121,22 @@ fn apply_display(window: &winit::window::Window, settings: &Settings) {
     }
 }
 
+/// Snapshot the settings' per-category + master volumes into the audio layer's
+/// [`sound::Volumes`], keeping `sound.rs` decoupled from `Settings`.
+fn volumes_from_settings(s: &Settings) -> sound::Volumes {
+    sound::Volumes {
+        master: s.master_volume,
+        music: s.music_volume,
+        record: s.record_volume,
+        weather: s.weather_volume,
+        block: s.block_volume,
+        hostile: s.hostile_volume,
+        neutral: s.neutral_volume,
+        player: s.player_volume,
+        ambient: s.ambient_volume,
+    }
+}
+
 fn handle_actions(
     app: &mut App,
     renderer: &mut Renderer,
@@ -1224,11 +1183,10 @@ fn handle_actions(
             GuiAction::Connect { host, port } => {
                 app.game = GameState::empty_for_server(renderer.aspect());
                 renderer.upload_world(&app.game.world);
-                app.network = Some(start_network(
+                app.network = Some(NetworkHandle::connect_offline_1_8_9(
                     host.clone(),
                     port,
-                    &app.ms_session,
-                    &app.username,
+                    app.username.clone(),
                 ));
                 app.connecting = true;
                 app.in_world = false;
@@ -1257,50 +1215,13 @@ fn handle_actions(
                             let reply = app.game.run_demo_command(cmd);
                             app.game.chat.push_message(reply);
                         } else {
-                            let name = app
-                                .session_username()
-                                .unwrap_or(&app.username)
-                                .to_owned();
+                            let name = app.username.clone();
                             app.game.chat.push_message(format!("<{name}> {message}"));
                         }
                     }
                 }
             }
             GuiAction::RequestRespawn => app.game.request_respawn(),
-            GuiAction::StartMicrosoftLogin => app.begin_login(None),
-            GuiAction::LoginWithToken(token) => app.begin_login(Some(token)),
-            GuiAction::UseAccount(uuid) => {
-                let token = app
-                    .accounts
-                    .accounts
-                    .iter()
-                    .find(|account| account.uuid == uuid)
-                    .map(|account| account.refresh_token.clone());
-                if let Some(token) = token {
-                    app.begin_login(Some(token));
-                }
-            }
-            GuiAction::RemoveAccount(uuid) => {
-                app.accounts.remove(&uuid);
-                app.accounts.save();
-            }
-            GuiAction::CopyActiveToken => {
-                let token = app
-                    .ms_session
-                    .as_ref()
-                    .and_then(|session| session.refresh_token.clone())
-                    .or_else(|| {
-                        app.accounts
-                            .accounts
-                            .first()
-                            .map(|account| account.refresh_token.clone())
-                    });
-                if let (Some(token), Some(clipboard)) = (token, app.clipboard.as_mut()) {
-                    if clipboard.set_text(token).is_ok() {
-                        log::info!("copied refresh token to clipboard");
-                    }
-                }
-            }
             GuiAction::SetVsync(on) => renderer.set_vsync(on),
             GuiAction::SetRenderScale(scale) => renderer.set_render_scale(scale),
             GuiAction::SetRenderDistance(chunks) => renderer.set_render_distance(chunks),
@@ -1411,49 +1332,6 @@ fn apply_disabled_mods(app: &mut App) {
     }
 }
 
-/// Drain auth-thread events into screen transitions.
-fn poll_auth_events(app: &mut App) {
-    let Some(rx) = &app.auth_rx else { return };
-    let mut clear = false;
-    loop {
-        match rx.try_recv() {
-            Ok(AuthEvent::DeviceCode {
-                user_code,
-                verification_uri,
-            }) => {
-                app.screen = Some(Box::new(GuiAuthCode {
-                    user_code,
-                    verification_uri,
-                }));
-            }
-            Ok(AuthEvent::Status(message)) => {
-                app.screen = Some(Box::new(GuiProgress::new("Signing in...", message)));
-            }
-            Ok(AuthEvent::Success(session)) => {
-                log::info!("MS login success: {} ({})", session.username, session.uuid);
-                app.accounts.record_session(&session);
-                app.ms_session = Some(session);
-                app.screen = Some(Box::new(GuiAccounts::new()));
-                clear = true;
-                break;
-            }
-            Ok(AuthEvent::Failed(err)) => {
-                log::warn!("MS login failed: {err}");
-                app.screen = Some(Box::new(GuiDisconnected::new(
-                    "Login Failed",
-                    err,
-                    Parent::Accounts,
-                )));
-                clear = true;
-                break;
-            }
-            Err(_) => break,
-        }
-    }
-    if clear {
-        app.auth_rx = None;
-    }
-}
 
 /// Drain the ext command queue and apply each command on the main thread.
 /// Called after each dispatch seam so a mod's enqueued commands take effect the
@@ -2385,7 +2263,7 @@ fn build_inventory_preview(
     };
     let skin_row = app
         .game
-        .local_skin_row(app.session_username().unwrap_or(&app.username), app.skin_manager.rows());
+        .local_skin_row(&app.username, app.skin_manager.rows());
     let mut mesh = fpsmaster_render::ModelMesh::new();
     mesh.push_entity(EntityKind::LocalPlayer, glam::Vec3::ZERO, pose.body_yaw, &anim, skin_row);
 
@@ -2469,8 +2347,44 @@ fn render_frame(
             position: app.game.camera.position,
             yaw: app.game.camera.yaw,
         });
+        // Push the current per-category + master volumes so category sliders take
+        // effect (vanilla getNormalizedVolume). Cheap: a plain struct copy.
+        app.sound.set_volumes(volumes_from_settings(&app.settings));
         for queued in app.game.take_sounds() {
             app.sound.play(&queued);
+        }
+        // Background music (vanilla MusicTicker): apply this tick's start/stop
+        // commands, then report the resulting play state back so the ticker can
+        // schedule the next track when the current one finishes.
+        for cmd in app.game.take_music_commands() {
+            match cmd {
+                game::MusicCommand::Play(event) => app.sound.play_music_event(&event),
+                game::MusicCommand::Stop => app.sound.stop_music(),
+            }
+        }
+        app.game.set_music_playing(app.sound.is_music_playing());
+        // Entity-attached moving emitters (minecarts, …): attach / update / stop.
+        for cmd in app.game.take_moving_sound_commands() {
+            match cmd {
+                game::MovingSoundCommand::Attach {
+                    id,
+                    event,
+                    pos,
+                    volume,
+                    pitch,
+                    looping,
+                } => {
+                    app.sound
+                        .attach_moving_sound(id, &event, pos, volume, pitch, looping);
+                }
+                game::MovingSoundCommand::Update {
+                    id,
+                    pos,
+                    volume,
+                    pitch,
+                } => app.sound.update_moving_sound(id, pos, volume, pitch),
+                game::MovingSoundCommand::Stop { id } => app.sound.stop_moving_sound(id),
+            }
         }
         // Start skin downloads for newly-seen textured players, then upload any
         // that finished, so the entity model can sample their atlas rows.
@@ -2648,7 +2562,6 @@ fn render_frame(
     // Build the frame's UI: HUD beneath, screen on top.
     let size = window.inner_size();
     let (width, height) = (size.width as i32, size.height as i32);
-    let account_entries = app.account_entries();
     let mut ui = fpsmaster_render::UiFrame::new();
 
     // Inventory player preview (vanilla `GuiInventory.drawEntityOnScreen`): when
@@ -2661,7 +2574,6 @@ fn render_frame(
         screen,
         game,
         settings,
-        ms_session,
         tab_open,
         ext,
         mod_textures,
@@ -2757,8 +2669,6 @@ fn render_frame(
             in_world: app.in_world,
             has_panorama,
             settings,
-            session_username: ms_session.as_ref().map(|s| s.username.as_str()),
-            accounts: &account_entries,
             hud: Some(&hud),
             mods: &mod_list,
         };
@@ -2814,34 +2724,6 @@ fn render_frame(
     }
     profiler.record("render", render_start.elapsed());
     profiler.end_frame(now, std::time::Duration::from_secs_f32(frame_dt));
-}
-
-/// Start a network connection, choosing premium or offline mode based on the
-/// available session.
-fn start_network(
-    host: String,
-    port: u16,
-    ms_session: &Option<Session>,
-    offline_username: &str,
-) -> NetworkHandle {
-    if let Some(session) = ms_session {
-        log::info!(
-            "connecting to {host}:{port} as {} (premium)",
-            session.username
-        );
-        NetworkHandle::connect_premium_1_8_9(
-            host,
-            port,
-            PremiumSession {
-                access_token: session.access_token.clone(),
-                uuid: session.uuid.clone(),
-                username: session.username.clone(),
-            },
-        )
-    } else {
-        log::info!("connecting to {host}:{port} as {offline_username} (offline)");
-        NetworkHandle::connect_offline_1_8_9(host, port, offline_username.to_owned())
-    }
 }
 
 impl LaunchConfig {

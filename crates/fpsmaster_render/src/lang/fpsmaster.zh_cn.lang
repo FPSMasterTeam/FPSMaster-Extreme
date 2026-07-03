@@ -1,24 +1,11 @@
 # FPSMaster 专有界面文本（原版没有对应键）。叠加在原版 zh_CN 表之上。
 
 # 主菜单 / 暂停菜单
-fpsmaster.menu.accounts=账户
 fpsmaster.menu.mods=模组…
 fpsmaster.menu.demo=试玩世界
 fpsmaster.menu.quitToTitle=退回标题画面
-fpsmaster.account.notSignedIn=未登录
-fpsmaster.account.signedInAs=已登录为
 
 # 账户界面
-fpsmaster.accounts.title=账户
-fpsmaster.accounts.use=使用账户
-fpsmaster.accounts.addMicrosoft=用微软账户添加
-fpsmaster.accounts.addToken=添加令牌
-fpsmaster.accounts.copyToken=复制令牌
-fpsmaster.accounts.empty=还没有账户——在下方添加。
-fpsmaster.accounts.inUse=（使用中）
-fpsmaster.accounts.addTitle=用刷新令牌添加
-fpsmaster.accounts.addInstr=粘贴一个微软刷新令牌（在账户界面按 Cmd/Ctrl+V）：
-fpsmaster.accounts.add=添加账户
 
 # 按键设置界面
 fpsmaster.controls.bindHint=按一个键进行绑定，或按 Esc 取消
@@ -92,10 +79,6 @@ fpsmaster.shaders.clouds=云
 fpsmaster.progress.loadingWorld=正在加载世界…
 fpsmaster.progress.connecting=正在连接服务器…
 fpsmaster.progress.chunksLoaded=已加载 %s 个区块
-fpsmaster.auth.title=微软登录
-fpsmaster.auth.openBrowser=打开浏览器并访问：
-fpsmaster.auth.enterCode=输入代码：
-fpsmaster.auth.waiting=正在等待登录…按 ESC 取消
 fpsmaster.server.startFailed=服务器启动失败
 fpsmaster.server.startTimeout=服务器在 60 秒内未响应
 fpsmaster.server.starting=正在启动本地服务器…
@@ -111,3 +94,16 @@ fpsmaster.merchant.unavailable=目前无法与村民交易
 
 # 语言界面
 fpsmaster.language.title=选择语言
+
+# 音乐与声音选项（原版键；因我们的中文仅靠此叠加层提供，故在此翻译）
+options.sounds=音乐与声音…
+options.sounds.title=音乐与声音选项
+soundCategory.master=主音量
+soundCategory.music=音乐
+soundCategory.record=唱片机/音符盒
+soundCategory.weather=天气
+soundCategory.block=方块
+soundCategory.hostile=敌对生物
+soundCategory.neutral=友好生物
+soundCategory.player=玩家
+soundCategory.ambient=环境

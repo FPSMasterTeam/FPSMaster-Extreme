@@ -110,6 +110,24 @@ pub struct Settings {
     /// Active UI language code (`en_US`, `zh_CN`, …), matching a vanilla `.lang`
     /// file in the assets. Drives [`crate::i18n`].
     pub language: String,
+    /// Per-category sound volumes in 0..=1 (vanilla `mapSoundLevels`). MASTER is
+    /// not stored here — it is a global multiplier applied on top of these and
+    /// always reports `1.0` in vanilla; use [`Settings::master_volume`] for it.
+    /// Each field defaults to `1.0` (vanilla default). Final playback gain is
+    /// `queued * entry * category * master`.
+    pub music_volume: f32,
+    pub record_volume: f32,
+    pub weather_volume: f32,
+    pub block_volume: f32,
+    pub hostile_volume: f32,
+    pub neutral_volume: f32,
+    pub player_volume: f32,
+    pub ambient_volume: f32,
+    /// Global master sound volume in 0..=1 (vanilla "Master Volume" slider).
+    /// Multiplies every category. Vanilla's `getSoundCategoryVolume(MASTER)`
+    /// always returns `1.0`, but the master slider scales all output; this field
+    /// is that slider.
+    pub master_volume: f32,
 }
 
 /// Selectable resolutions (None = native). Common 16:9 modes most panels scale.
@@ -182,6 +200,15 @@ impl Default for Settings {
             keybinds: Keybinds::default(),
             disabled_mods: Vec::new(),
             language: crate::i18n::DEFAULT_LANG.to_owned(),
+            music_volume: 1.0,
+            record_volume: 1.0,
+            weather_volume: 1.0,
+            block_volume: 1.0,
+            hostile_volume: 1.0,
+            neutral_volume: 1.0,
+            player_volume: 1.0,
+            ambient_volume: 1.0,
+            master_volume: 1.0,
         }
     }
 }
@@ -376,6 +403,51 @@ impl Settings {
                         s.language = val.to_owned();
                     }
                 }
+                "master_volume" => {
+                    if let Ok(v) = val.parse() {
+                        s.master_volume = v;
+                    }
+                }
+                "music_volume" => {
+                    if let Ok(v) = val.parse() {
+                        s.music_volume = v;
+                    }
+                }
+                "record_volume" => {
+                    if let Ok(v) = val.parse() {
+                        s.record_volume = v;
+                    }
+                }
+                "weather_volume" => {
+                    if let Ok(v) = val.parse() {
+                        s.weather_volume = v;
+                    }
+                }
+                "block_volume" => {
+                    if let Ok(v) = val.parse() {
+                        s.block_volume = v;
+                    }
+                }
+                "hostile_volume" => {
+                    if let Ok(v) = val.parse() {
+                        s.hostile_volume = v;
+                    }
+                }
+                "neutral_volume" => {
+                    if let Ok(v) = val.parse() {
+                        s.neutral_volume = v;
+                    }
+                }
+                "player_volume" => {
+                    if let Ok(v) = val.parse() {
+                        s.player_volume = v;
+                    }
+                }
+                "ambient_volume" => {
+                    if let Ok(v) = val.parse() {
+                        s.ambient_volume = v;
+                    }
+                }
                 "disabled_mods" => {
                     s.disabled_mods = val
                         .split(',')
@@ -404,6 +476,15 @@ impl Settings {
         s.rt_quality = s.rt_quality.min(RT_QUALITY_MAX);
         s.dlss_quality = s.dlss_quality.min(DLSS_QUALITY_MAX);
         s.brightness = s.brightness.clamp(BRIGHTNESS_MIN, BRIGHTNESS_MAX);
+        s.master_volume = s.master_volume.clamp(0.0, 1.0);
+        s.music_volume = s.music_volume.clamp(0.0, 1.0);
+        s.record_volume = s.record_volume.clamp(0.0, 1.0);
+        s.weather_volume = s.weather_volume.clamp(0.0, 1.0);
+        s.block_volume = s.block_volume.clamp(0.0, 1.0);
+        s.hostile_volume = s.hostile_volume.clamp(0.0, 1.0);
+        s.neutral_volume = s.neutral_volume.clamp(0.0, 1.0);
+        s.player_volume = s.player_volume.clamp(0.0, 1.0);
+        s.ambient_volume = s.ambient_volume.clamp(0.0, 1.0);
         s.resolution = if res_w > 0 && res_h > 0 {
             Some((res_w, res_h))
         } else {
@@ -458,6 +539,15 @@ impl Settings {
         text.push_str(&format!("dlss_quality={}\n", self.dlss_quality));
         text.push_str(&format!("disabled_mods={}\n", self.disabled_mods.join(",")));
         text.push_str(&format!("language={}\n", self.language));
+        text.push_str(&format!("master_volume={}\n", self.master_volume));
+        text.push_str(&format!("music_volume={}\n", self.music_volume));
+        text.push_str(&format!("record_volume={}\n", self.record_volume));
+        text.push_str(&format!("weather_volume={}\n", self.weather_volume));
+        text.push_str(&format!("block_volume={}\n", self.block_volume));
+        text.push_str(&format!("hostile_volume={}\n", self.hostile_volume));
+        text.push_str(&format!("neutral_volume={}\n", self.neutral_volume));
+        text.push_str(&format!("player_volume={}\n", self.player_volume));
+        text.push_str(&format!("ambient_volume={}\n", self.ambient_volume));
         for &(action, code) in self.keybinds.iter() {
             text.push_str(&format!(
                 "key.{}={}\n",
@@ -562,6 +652,55 @@ impl Settings {
         let raw = BRIGHTNESS_MIN + value.clamp(0.0, 1.0) * (BRIGHTNESS_MAX - BRIGHTNESS_MIN);
         // Snap to 5% steps for clean labels.
         self.brightness = ((raw * 20.0).round() / 20.0).clamp(BRIGHTNESS_MIN, BRIGHTNESS_MAX);
+    }
+
+    // ─── Per-category sound volumes (0..=1) ──────────────────────────────────
+    // Setters mirror `set_brightness_from01`: they take a raw slider fraction in
+    // 0..=1 and clamp it. The stored 0..=1 value doubles as the slider fill
+    // fraction. Wired up by the audio options sub-menu (a follow-up GUI task).
+    #[allow(dead_code)]
+    pub fn set_master_volume_from01(&mut self, value: f32) {
+        self.master_volume = value.clamp(0.0, 1.0);
+    }
+
+    #[allow(dead_code)]
+    pub fn set_music_volume_from01(&mut self, value: f32) {
+        self.music_volume = value.clamp(0.0, 1.0);
+    }
+
+    #[allow(dead_code)]
+    pub fn set_record_volume_from01(&mut self, value: f32) {
+        self.record_volume = value.clamp(0.0, 1.0);
+    }
+
+    #[allow(dead_code)]
+    pub fn set_weather_volume_from01(&mut self, value: f32) {
+        self.weather_volume = value.clamp(0.0, 1.0);
+    }
+
+    #[allow(dead_code)]
+    pub fn set_block_volume_from01(&mut self, value: f32) {
+        self.block_volume = value.clamp(0.0, 1.0);
+    }
+
+    #[allow(dead_code)]
+    pub fn set_hostile_volume_from01(&mut self, value: f32) {
+        self.hostile_volume = value.clamp(0.0, 1.0);
+    }
+
+    #[allow(dead_code)]
+    pub fn set_neutral_volume_from01(&mut self, value: f32) {
+        self.neutral_volume = value.clamp(0.0, 1.0);
+    }
+
+    #[allow(dead_code)]
+    pub fn set_player_volume_from01(&mut self, value: f32) {
+        self.player_volume = value.clamp(0.0, 1.0);
+    }
+
+    #[allow(dead_code)]
+    pub fn set_ambient_volume_from01(&mut self, value: f32) {
+        self.ambient_volume = value.clamp(0.0, 1.0);
     }
 
     /// Advance the mipmap level, wrapping `0 → 1 → … → MIPMAP_MAX → 0`.
@@ -986,6 +1125,9 @@ mod tests {
         original.ray_tracing = true;
         original.rt_quality = 2;
         original.dlss = true;
+        original.master_volume = 0.8;
+        original.music_volume = 0.25;
+        original.ambient_volume = 0.0;
         original.save_to(&path);
 
         let loaded = Settings::load_from(&path);
@@ -1000,6 +1142,11 @@ mod tests {
         assert!(loaded.ray_tracing);
         assert_eq!(loaded.rt_quality, 2);
         assert!(loaded.dlss);
+        assert!((loaded.master_volume - 0.8).abs() < 1e-6);
+        assert!((loaded.music_volume - 0.25).abs() < 1e-6);
+        assert!((loaded.ambient_volume - 0.0).abs() < 1e-6);
+        // Untouched category volumes keep their 1.0 default.
+        assert!((loaded.block_volume - 1.0).abs() < 1e-6);
 
         let _ = std::fs::remove_file(&path);
     }
