@@ -7,20 +7,18 @@ use fpsmaster_render::UiFrame;
 use winit::event::{ElementState, KeyEvent};
 use winit::keyboard::{KeyCode, PhysicalKey};
 
-use super::accounts::GuiAccounts;
 use super::main_menu::GuiMainMenu;
 use super::multiplayer::GuiMultiplayer;
 use super::widgets::GuiButton;
 use super::{
     draw_centered_text, draw_default_background, DrawCtx, GuiAction, GuiScreen, ScreenCtx,
-    TEXT_GRAY, TEXT_WHITE, TEXT_YELLOW,
+    TEXT_GRAY, TEXT_WHITE,
 };
 use crate::i18n::{tr, tr_args};
 
 /// Where a screen's "Back" leads.
 #[derive(Debug, Clone, Copy)]
 pub enum Parent {
-    Accounts,
     Multiplayer,
     MainMenu,
 }
@@ -28,34 +26,9 @@ pub enum Parent {
 impl Parent {
     pub fn create(self) -> Box<dyn GuiScreen> {
         match self {
-            Parent::Accounts => Box::new(GuiAccounts::new()),
             Parent::Multiplayer => Box::new(GuiMultiplayer::new()),
             Parent::MainMenu => Box::new(GuiMainMenu::new()),
         }
-    }
-}
-
-/// A title + detail line (auth progress steps, etc.).
-pub struct GuiProgress {
-    pub title: String,
-    pub detail: String,
-}
-
-impl GuiProgress {
-    pub fn new(title: impl Into<String>, detail: impl Into<String>) -> Self {
-        Self {
-            title: title.into(),
-            detail: detail.into(),
-        }
-    }
-}
-
-impl GuiScreen for GuiProgress {
-    fn draw(&mut self, ui: &mut UiFrame, ctx: &DrawCtx) {
-        draw_default_background(ui, ctx);
-        let s = ctx.scale;
-        draw_centered_text(ui, ctx.width, ctx.height / 2 - 16 * s, s, TEXT_WHITE, &self.title);
-        draw_centered_text(ui, ctx.width, ctx.height / 2 + 4 * s, s, TEXT_GRAY, &self.detail);
     }
 }
 
@@ -82,49 +55,6 @@ impl GuiScreen for GuiConnecting {
         };
         draw_centered_text(ui, ctx.width, ctx.height / 2 - 16 * s, s, TEXT_WHITE, &title);
         draw_centered_text(ui, ctx.width, ctx.height / 2 + 4 * s, s, TEXT_GRAY, &detail);
-    }
-}
-
-/// Microsoft device-code prompt.
-pub struct GuiAuthCode {
-    pub user_code: String,
-    pub verification_uri: String,
-}
-
-impl GuiScreen for GuiAuthCode {
-    fn draw(&mut self, ui: &mut UiFrame, ctx: &DrawCtx) {
-        draw_default_background(ui, ctx);
-        let s = ctx.scale;
-        let mid = ctx.height / 2;
-        draw_centered_text(ui, ctx.width, mid - 40 * s, s, TEXT_WHITE, &tr("fpsmaster.auth.title"));
-        draw_centered_text(
-            ui,
-            ctx.width,
-            mid - 20 * s,
-            s,
-            TEXT_GRAY,
-            &tr("fpsmaster.auth.openBrowser"),
-        );
-        draw_centered_text(ui, ctx.width, mid - 8 * s, s, TEXT_WHITE, &self.verification_uri);
-        draw_centered_text(ui, ctx.width, mid + 8 * s, s, TEXT_GRAY, &tr("fpsmaster.auth.enterCode"));
-        draw_centered_text(ui, ctx.width, mid + 20 * s, 2 * s, TEXT_YELLOW, &self.user_code);
-        draw_centered_text(
-            ui,
-            ctx.width,
-            mid + 44 * s,
-            s,
-            TEXT_GRAY,
-            &tr("fpsmaster.auth.waiting"),
-        );
-    }
-
-    fn key_pressed(&mut self, event: &KeyEvent, _ctx: &mut ScreenCtx) -> Vec<GuiAction> {
-        if event.state == ElementState::Pressed
-            && matches!(event.physical_key, PhysicalKey::Code(KeyCode::Escape))
-        {
-            return vec![GuiAction::SetScreen(Box::new(GuiAccounts::new()))];
-        }
-        Vec::new()
     }
 }
 

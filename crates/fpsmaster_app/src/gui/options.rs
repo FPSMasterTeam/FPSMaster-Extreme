@@ -100,6 +100,7 @@ pub struct GuiOptions {
     controls_btn: Option<GuiButton>,
     resource_packs_btn: Option<GuiButton>,
     language_btn: Option<GuiButton>,
+    sound_btn: Option<GuiButton>,
     done: Option<GuiButton>,
     dragging: Option<Slider>,
     /// Whether this was opened from the title screen (Done returns there) vs.
@@ -130,7 +131,9 @@ impl GuiOptions {
         self.controls_btn =
             Some(GuiButton::at_px(x + 102 * s, top + 48 * s, 98 * s, s, tr("options.controls")));
         self.resource_packs_btn =
-            Some(GuiButton::at_px(x, top + 72 * s, 200 * s, s, tr("options.resourcepack")));
+            Some(GuiButton::at_px(x, top + 72 * s, 98 * s, s, tr("options.resourcepack")));
+        self.sound_btn =
+            Some(GuiButton::at_px(x + 102 * s, top + 72 * s, 98 * s, s, tr("options.sounds")));
         self.language_btn =
             Some(GuiButton::at_px(x, top + 96 * s, 200 * s, s, tr("options.language")));
         // A gap above Done, echoing vanilla's separated bottom button.
@@ -156,6 +159,7 @@ impl GuiScreen for GuiOptions {
             self.video_btn.as_ref(),
             self.controls_btn.as_ref(),
             self.resource_packs_btn.as_ref(),
+            self.sound_btn.as_ref(),
             self.language_btn.as_ref(),
             self.done.as_ref(),
         ]
@@ -191,6 +195,9 @@ impl GuiScreen for GuiOptions {
             b.draw(ui, s, ctx.mouse, ctx.mouse_down);
         }
         if let Some(b) = &self.resource_packs_btn {
+            b.draw(ui, s, ctx.mouse, ctx.mouse_down);
+        }
+        if let Some(b) = &self.sound_btn {
             b.draw(ui, s, ctx.mouse, ctx.mouse_down);
         }
         if let Some(b) = &self.language_btn {
@@ -232,6 +239,14 @@ impl GuiScreen for GuiOptions {
                 GuiAction::SetScreen(Box::new(
                     super::resource_packs::GuiResourcePacks::new(self.from_main_menu, ctx.settings),
                 )),
+            ];
+        }
+        if self.sound_btn.as_ref().is_some_and(|b| b.clicked(x, y)) {
+            return vec![
+                GuiAction::SaveSettings,
+                GuiAction::SetScreen(Box::new(super::sound_options::GuiSoundOptions::new(
+                    self.from_main_menu,
+                ))),
             ];
         }
         if self.language_btn.as_ref().is_some_and(|b| b.clicked(x, y)) {

@@ -5,7 +5,6 @@ use fpsmaster_render::{GuiTexture, UiColor, UiFrame, UiRect};
 
 use crate::i18n::tr;
 
-use super::accounts::GuiAccounts;
 use super::demo_select::GuiDemoSelect;
 use super::mods::GuiModList;
 use super::multiplayer::GuiMultiplayer;
@@ -36,17 +35,15 @@ impl GuiMainMenu {
             GuiButton::at_px(cx - 100 * s, j, 200 * s, s, tr("menu.singleplayer")),
             // [1] Multiplayer: (cx-100, j+24), 200×20
             GuiButton::at_px(cx - 100 * s, j + 24 * s, 200 * s, s, tr("menu.multiplayer")),
-            // [2] Accounts: (cx-100, j+48), 200×20 (our equivalent of Realms)
-            GuiButton::at_px(cx - 100 * s, j + 48 * s, 200 * s, s, tr("fpsmaster.menu.accounts")),
-            // [3] Demo World: (cx-100, j+72), 200×20
-            GuiButton::at_px(cx - 100 * s, j + 72 * s, 200 * s, s, tr("fpsmaster.menu.demo")),
-            // [4] Mods: (cx-100, j+96), 200×20 (fpsmaster addition)
-            GuiButton::at_px(cx - 100 * s, j + 96 * s, 200 * s, s, tr("fpsmaster.menu.mods")),
+            // [2] Demo World: (cx-100, j+48), 200×20
+            GuiButton::at_px(cx - 100 * s, j + 48 * s, 200 * s, s, tr("fpsmaster.menu.demo")),
+            // [3] Mods: (cx-100, j+72), 200×20 (fpsmaster addition)
+            GuiButton::at_px(cx - 100 * s, j + 72 * s, 200 * s, s, tr("fpsmaster.menu.mods")),
             // Bottom split row, vanilla-style: Options + Quit side by side.
-            // [5] Options: (cx-100, j+120), 98×20
-            GuiButton::at_px(cx - 100 * s, j + 120 * s, 98 * s, s, tr("menu.options")),
-            // [6] Quit: (cx+2, j+120), 98×20
-            GuiButton::at_px(cx + 2 * s, j + 120 * s, 98 * s, s, tr("menu.quit")),
+            // [4] Options: (cx-100, j+96), 98×20
+            GuiButton::at_px(cx - 100 * s, j + 96 * s, 98 * s, s, tr("menu.options")),
+            // [5] Quit: (cx+2, j+96), 98×20
+            GuiButton::at_px(cx + 2 * s, j + 96 * s, 98 * s, s, tr("menu.quit")),
         ];
     }
 }
@@ -110,19 +107,6 @@ impl GuiScreen for GuiMainMenu {
 
         // Version string: bottom-left, white with shadow.
         ui.text_shadowed(2 * s, ctx.height - 10 * s, s, super::TEXT_WHITE, "FPSMaster Extreme 1.8.9");
-
-        // Account status: bottom-left, just above the version line.
-        let account = match ctx.session_username {
-            Some(name) => format!("{} §a{name}", tr("fpsmaster.account.signedInAs")),
-            None => format!("§7{}", tr("fpsmaster.account.notSignedIn")),
-        };
-        ui.text_shadowed(
-            2 * s,
-            ctx.height - 20 * s,
-            s,
-            super::TEXT_GRAY,
-            &account,
-        );
     }
 
     fn wants_panorama(&self) -> bool {
@@ -130,7 +114,7 @@ impl GuiScreen for GuiMainMenu {
     }
 
     fn mouse_clicked(&mut self, x: f64, y: f64, _ctx: &mut ScreenCtx) -> Vec<GuiAction> {
-        if self.buttons.len() < 7 {
+        if self.buttons.len() < 6 {
             return Vec::new();
         }
         if self.buttons[0].clicked(x, y) {
@@ -140,18 +124,15 @@ impl GuiScreen for GuiMainMenu {
             return vec![GuiAction::SetScreen(Box::new(GuiMultiplayer::new()))];
         }
         if self.buttons[2].clicked(x, y) {
-            return vec![GuiAction::SetScreen(Box::new(GuiAccounts::new()))];
-        }
-        if self.buttons[3].clicked(x, y) {
             return vec![GuiAction::SetScreen(Box::new(GuiDemoSelect::new()))];
         }
-        if self.buttons[4].clicked(x, y) {
+        if self.buttons[3].clicked(x, y) {
             return vec![GuiAction::SetScreen(Box::new(GuiModList::new(true)))];
         }
-        if self.buttons[5].clicked(x, y) {
+        if self.buttons[4].clicked(x, y) {
             return vec![GuiAction::SetScreen(Box::new(GuiOptions::from_main_menu()))];
         }
-        if self.buttons[6].clicked(x, y) {
+        if self.buttons[5].clicked(x, y) {
             return vec![GuiAction::Quit];
         }
         Vec::new()

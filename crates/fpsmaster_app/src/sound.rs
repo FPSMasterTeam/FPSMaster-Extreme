@@ -36,6 +36,112 @@ pub struct QueuedSound {
     pub pitch: f32,
 }
 
+/// Vanilla `SoundCategory` (MCP-919 `SoundCategory.java`). Each `sounds.json`
+/// event declares its category via the `"category"` field; the manager scales a
+/// sound's gain by the matching per-category volume (and the global master).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SoundCategory {
+    Master,
+    Music,
+    Records,
+    Weather,
+    Blocks,
+    Mobs,
+    Animals,
+    Players,
+    Ambient,
+}
+
+impl SoundCategory {
+    /// The lowercase vanilla enum string used in `sounds.json`'s `"category"`
+    /// field (e.g. `Blocks` -> `"block"`, `Mobs` -> `"hostile"`).
+    // Not yet used outside parsing round-trip tests; kept for the GUI/i18n layer.
+    #[allow(dead_code)]
+    pub fn category_name(self) -> &'static str {
+        match self {
+            SoundCategory::Master => "master",
+            SoundCategory::Music => "music",
+            SoundCategory::Records => "record",
+            SoundCategory::Weather => "weather",
+            SoundCategory::Blocks => "block",
+            SoundCategory::Mobs => "hostile",
+            SoundCategory::Animals => "neutral",
+            SoundCategory::Players => "player",
+            SoundCategory::Ambient => "ambient",
+        }
+    }
+
+    /// Parse a `sounds.json` `"category"` string into a [`SoundCategory`].
+    /// Returns `None` for an unknown category so callers can pick a default.
+    pub fn from_str_name(s: &str) -> Option<SoundCategory> {
+        Some(match s {
+            "master" => SoundCategory::Master,
+            "music" => SoundCategory::Music,
+            "record" => SoundCategory::Records,
+            "weather" => SoundCategory::Weather,
+            "block" => SoundCategory::Blocks,
+            "hostile" => SoundCategory::Mobs,
+            "neutral" => SoundCategory::Animals,
+            "player" => SoundCategory::Players,
+            "ambient" => SoundCategory::Ambient,
+            _ => return None,
+        })
+    }
+}
+
+/// A snapshot of the user's per-category volumes (each 0..=1) plus the global
+/// master. `main.rs` pushes this into the [`SoundManager`] via
+/// [`SoundManager::set_volumes`] whenever settings change; the manager reads it
+/// when computing playback gain. Vanilla's final gain is
+/// `queued * entry * category * master` (MCP-919 `getNormalizedVolume`).
+#[derive(Debug, Clone, Copy)]
+pub struct Volumes {
+    pub master: f32,
+    pub music: f32,
+    pub record: f32,
+    pub weather: f32,
+    pub block: f32,
+    pub hostile: f32,
+    pub neutral: f32,
+    pub player: f32,
+    pub ambient: f32,
+}
+
+impl Default for Volumes {
+    fn default() -> Self {
+        Self {
+            master: 1.0,
+            music: 1.0,
+            record: 1.0,
+            weather: 1.0,
+            block: 1.0,
+            hostile: 1.0,
+            neutral: 1.0,
+            player: 1.0,
+            ambient: 1.0,
+        }
+    }
+}
+
+impl Volumes {
+    /// The stored 0..=1 volume for `category`. MASTER always reports `1.0`
+    /// (vanilla `getSoundCategoryVolume(MASTER)`); the master slider is applied
+    /// separately as a global multiplier.
+    pub fn category(&self, category: SoundCategory) -> f32 {
+        match category {
+            SoundCategory::Master => 1.0,
+            SoundCategory::Music => self.music,
+            SoundCategory::Records => self.record,
+            SoundCategory::Weather => self.weather,
+            SoundCategory::Blocks => self.block,
+            SoundCategory::Mobs => self.hostile,
+            SoundCategory::Animals => self.neutral,
+            SoundCategory::Players => self.player,
+            SoundCategory::Ambient => self.ambient,
+        }
+    }
+}
+
 /// One resolvable sound: the asset name (relative path without extension) plus
 /// the per-sound volume/pitch/weight defaults from `sounds.json`.
 #[derive(Debug, Clone)]
@@ -44,6 +150,14 @@ struct SoundEntry {
     volume: f32,
     pitch: f32,
     weight: u32,
+}
+
+/// One `sounds.json` event: its category (shared by all variants, vanilla puts
+/// `"category"` on the event) plus its weighted variant list.
+#[derive(Debug, Clone)]
+struct SoundEvent {
+    category: SoundCategory,
+    entries: Vec<SoundEntry>,
 }
 
 /// The listener pose (camera). World and render coordinates are 1:1 in this
@@ -55,11 +169,30 @@ pub struct Listener {
     pub yaw: f32,
 }
 
+/// A live positioned sound that follows an entity (minecart, mob, …). The game
+/// spawns it with an id, updates its position each frame, and stops it when the
+/// emitter dies. The kira handle is kept alive so gain/pan/rate can be mutated
+/// on the running source (dropping it would stop playback).
+// `handle` and `category` are used every update; `base_volume`/`base_pitch`
+// are recorded on each update as the last-applied pre-spatial values but not
+// read back yet — kept for debugging and a future re-gain-without-move path.
+struct MovingSound {
+    handle: kira::sound::static_sound::StaticSoundHandle,
+    /// The event's category, for applying the per-category volume on updates.
+    category: SoundCategory,
+    /// The base (queued * entry) linear volume, before spatial attenuation.
+    #[allow(dead_code)]
+    base_volume: f32,
+    /// The base playback rate (queued.pitch * entry.pitch), before clamping.
+    #[allow(dead_code)]
+    base_pitch: f32,
+}
+
 pub struct SoundManager {
     /// `None` when no audio device could be opened — every play becomes a no-op.
     manager: Option<AudioManager<DefaultBackend>>,
-    /// Event key -> the weighted sound variants for that event.
-    events: HashMap<String, Vec<SoundEntry>>,
+    /// Event key -> its category and weighted sound variants.
+    events: HashMap<String, SoundEvent>,
     /// Decoded ogg cache, keyed by sound asset name (e.g. `"dig/stone1"`).
     cache: HashMap<String, Option<StaticSoundData>>,
     /// Resolved asset roots to read ogg files from (directories or jars).
@@ -67,6 +200,14 @@ pub struct SoundManager {
     listener: Listener,
     /// Deterministic per-event variant picker (xorshift, no `rand` dependency).
     rng: u32,
+    /// Current per-category + master volumes, pushed from `main.rs` on change.
+    volumes: Volumes,
+    /// The single background music track, if one is playing (MUSIC category).
+    /// Driven by the music methods, which `main.rs` calls from the `MusicTicker`
+    /// commands each frame.
+    music: Option<kira::sound::static_sound::StaticSoundHandle>,
+    /// Entity-attached positioned sounds, keyed by a game-assigned id.
+    moving: HashMap<u64, MovingSound>,
 }
 
 impl SoundManager {
@@ -93,11 +234,22 @@ impl SoundManager {
                 yaw: 0.0,
             },
             rng: 0x1234_5678,
+            volumes: Volumes::default(),
+            music: None,
+            moving: HashMap::new(),
         }
     }
 
     pub fn set_listener(&mut self, listener: Listener) {
         self.listener = listener;
+    }
+
+    /// Update the per-category + master volume snapshot. `main.rs` pushes this
+    /// from `Settings` each in-world frame (via `volumes_from_settings`), so the
+    /// category sliders take effect immediately. Affects newly played sounds and
+    /// the next update of moving/music sounds.
+    pub fn set_volumes(&mut self, volumes: Volumes) {
+        self.volumes = volumes;
     }
 
     /// Resolve and play a queued sound. Positional sounds are attenuated and
@@ -106,12 +258,15 @@ impl SoundManager {
         if self.manager.is_none() {
             return;
         }
-        let Some(entry) = self.pick_entry(&sound.event) else {
+        let Some((entry, category)) = self.pick_entry(&sound.event) else {
             return;
         };
 
-        // Combine the packet volume with the event's per-sound volume.
-        let base_volume = sound.volume * entry.volume;
+        // Combine the packet volume with the event's per-sound volume, then scale
+        // by the per-category volume and the global master (vanilla
+        // getNormalizedVolume: queued * entry * category * master).
+        let category_gain = self.volumes.category(category) * self.volumes.master;
+        let base_volume = sound.volume * entry.volume * category_gain;
         let (gain, panning) = match sound.position {
             Some(pos) => {
                 let Some((gain, panning)) = spatial_gain_pan(self.listener, pos, base_volume)
@@ -129,7 +284,8 @@ impl SoundManager {
         let Some(data) = self.sound_data(&entry.name) else {
             return;
         };
-        let rate = (sound.pitch * entry.pitch).max(0.01) as f64;
+        // Vanilla clamps the combined pitch to [0.5, 2.0] (MCP-919 line 421).
+        let rate = clamp_pitch(sound.pitch * entry.pitch) as f64;
         let data = data
             .volume(amplitude_to_decibels(gain))
             .panning(Panning(panning))
@@ -144,8 +300,11 @@ impl SoundManager {
     }
 
     /// Pick one variant of an event by weight, using the deterministic xorshift.
-    fn pick_entry(&mut self, event: &str) -> Option<SoundEntry> {
-        let entries = self.events.get(event)?;
+    /// Returns the chosen variant and the event's category.
+    fn pick_entry(&mut self, event: &str) -> Option<(SoundEntry, SoundCategory)> {
+        let def = self.events.get(event)?;
+        let category = def.category;
+        let entries = &def.entries;
         if entries.is_empty() {
             return None;
         }
@@ -154,11 +313,11 @@ impl SoundManager {
         for entry in entries {
             let w = entry.weight.max(1);
             if roll < w {
-                return Some(entry.clone());
+                return Some((entry.clone(), category));
             }
             roll -= w;
         }
-        entries.last().cloned()
+        entries.last().cloned().map(|e| (e, category))
     }
 
     /// Decoded ogg for a sound asset name, loaded lazily and cached (including
@@ -174,11 +333,184 @@ impl SoundManager {
         self.cache.insert(name.to_string(), data.clone());
         data
     }
+
+    // ─── Music channel ──────────────────────────────────────────────────────
+
+    /// Start a background music track by its `sounds.json` asset name (e.g.
+    /// `"music/menu/menu"`), replacing any track already playing. Played
+    /// non-positionally (centered) at the MUSIC category × master volume. The
+    /// handle is kept so [`is_music_playing`](Self::is_music_playing) can poll it
+    /// and [`stop_music`](Self::stop_music) can end it. No-op with no audio
+    /// device or a missing asset.
+    #[allow(dead_code)]
+    pub fn play_music(&mut self, asset_name: &str) {
+        // Drop any prior track (dropping the handle stops playback immediately).
+        self.music = None;
+        if self.manager.is_none() {
+            return;
+        }
+        let Some(data) = self.sound_data(asset_name) else {
+            return;
+        };
+        let gain = (self.volumes.music * self.volumes.master).clamp(0.0, 1.0);
+        let data = data.volume(amplitude_to_decibels(gain));
+        if let Some(manager) = self.manager.as_mut() {
+            match manager.play(data) {
+                Ok(handle) => self.music = Some(handle),
+                Err(err) => log::debug!("audio: music play failed: {err}"),
+            }
+        }
+    }
+
+    /// Start background music from a `sounds.json` *event* key (e.g.
+    /// `"music.menu"`), resolving one weighted variant like [`play`](Self::play)
+    /// and playing it as the MUSIC track. This is the game-layer entry point:
+    /// `game.rs` only knows event keys, not the underlying ogg asset paths.
+    pub fn play_music_event(&mut self, event: &str) {
+        let Some((entry, _category)) = self.pick_entry(event) else {
+            log::debug!("audio: music event {event} not found");
+            return;
+        };
+        self.play_music(&entry.name);
+    }
+
+    /// Stop the current music track, if any.
+    pub fn stop_music(&mut self) {
+        if let Some(mut handle) = self.music.take() {
+            handle.stop(kira::Tween::default());
+        }
+    }
+
+    /// Whether a music track is currently playing (not stopped/finished). Used by
+    /// the `MusicTicker` to know when to queue the next track.
+    pub fn is_music_playing(&self) -> bool {
+        use kira::sound::PlaybackState;
+        self.music
+            .as_ref()
+            .map(|h| !matches!(h.state(), PlaybackState::Stopped))
+            .unwrap_or(false)
+    }
+
+    // ─── Movable positioned emitters (entity-attached sounds) ────────────────
+
+    /// Spawn a positioned sound attached to a game-assigned `id`, resolving
+    /// `event` like [`play`](Self::play). The initial spatial gain/pan is baked
+    /// in from `pos`; call [`update_moving_sound`](Self::update_moving_sound)
+    /// each frame with the emitter's new position, and
+    /// [`stop_moving_sound`](Self::stop_moving_sound) when it dies. Returns
+    /// `true` if the sound started (in range and audio available). If `looping`,
+    /// the whole clip loops (minecart-style); otherwise it is a one-shot.
+    pub fn attach_moving_sound(
+        &mut self,
+        id: u64,
+        event: &str,
+        pos: Vec3,
+        volume: f32,
+        pitch: f32,
+        looping: bool,
+    ) -> bool {
+        if self.manager.is_none() {
+            return false;
+        }
+        let Some((entry, category)) = self.pick_entry(event) else {
+            return false;
+        };
+        let base_volume = volume * entry.volume;
+        let base_pitch = pitch * entry.pitch;
+        let category_gain = self.volumes.category(category) * self.volumes.master;
+        let Some((gain, panning)) =
+            spatial_gain_pan(self.listener, pos, base_volume * category_gain)
+        else {
+            return false; // out of range at spawn — nothing to attach
+        };
+        let Some(data) = self.sound_data(&entry.name) else {
+            return false;
+        };
+        let mut data = data
+            .volume(amplitude_to_decibels(gain))
+            .panning(Panning(panning))
+            .playback_rate(PlaybackRate(clamp_pitch(base_pitch) as f64));
+        if looping {
+            data = data.loop_region(0.0..);
+        }
+        let Some(manager) = self.manager.as_mut() else {
+            return false;
+        };
+        match manager.play(data) {
+            Ok(handle) => {
+                self.moving.insert(
+                    id,
+                    MovingSound {
+                        handle,
+                        category,
+                        base_volume,
+                        base_pitch,
+                    },
+                );
+                true
+            }
+            Err(err) => {
+                log::debug!("audio: moving sound play failed: {err}");
+                false
+            }
+        }
+    }
+
+    /// Recompute a moving sound's gain/pan from its new world position (and an
+    /// optionally changed base volume/pitch), applying them to the live source.
+    /// If it has moved out of range, it is stopped and removed. No-op for an
+    /// unknown `id`.
+    pub fn update_moving_sound(&mut self, id: u64, pos: Vec3, volume: f32, pitch: f32) {
+        let category_gain = {
+            let Some(sound) = self.moving.get(&id) else {
+                return;
+            };
+            self.volumes.category(sound.category) * self.volumes.master
+        };
+        let base_volume = volume;
+        let spatial = spatial_gain_pan(self.listener, pos, base_volume * category_gain);
+        let Some(sound) = self.moving.get_mut(&id) else {
+            return;
+        };
+        match spatial {
+            Some((gain, panning)) => {
+                sound.base_volume = base_volume;
+                sound.base_pitch = pitch;
+                let tween = kira::Tween::default();
+                sound
+                    .handle
+                    .set_volume(amplitude_to_decibels(gain), tween);
+                sound.handle.set_panning(Panning(panning), tween);
+                sound
+                    .handle
+                    .set_playback_rate(PlaybackRate(clamp_pitch(pitch) as f64), tween);
+            }
+            None => {
+                // Out of range: stop and forget it.
+                if let Some(mut sound) = self.moving.remove(&id) {
+                    sound.handle.stop(kira::Tween::default());
+                }
+            }
+        }
+    }
+
+    /// Stop and remove a moving sound (e.g. the emitter died). No-op if unknown.
+    pub fn stop_moving_sound(&mut self, id: u64) {
+        if let Some(mut sound) = self.moving.remove(&id) {
+            sound.handle.stop(kira::Tween::default());
+        }
+    }
+
+    /// Whether a moving sound with `id` is currently tracked.
+    #[allow(dead_code)]
+    pub fn has_moving_sound(&self, id: u64) -> bool {
+        self.moving.contains_key(&id)
+    }
 }
 
 /// Parse `sounds.json` into the event -> variants map. Pure over the JSON text
 /// so it is unit-testable without a filesystem.
-fn parse_sounds_json(text: &str) -> HashMap<String, Vec<SoundEntry>> {
+fn parse_sounds_json(text: &str) -> HashMap<String, SoundEvent> {
     let mut events = HashMap::new();
     let Ok(root) = serde_json::from_str::<serde_json::Value>(text) else {
         return events;
@@ -190,6 +522,13 @@ fn parse_sounds_json(text: &str) -> HashMap<String, Vec<SoundEntry>> {
         let Some(list) = value.get("sounds").and_then(|s| s.as_array()) else {
             continue;
         };
+        // Category is per-event; default to Master when absent/unknown (vanilla
+        // treats an unspecified category as the master group).
+        let category = value
+            .get("category")
+            .and_then(|c| c.as_str())
+            .and_then(SoundCategory::from_str_name)
+            .unwrap_or(SoundCategory::Master);
         let mut entries = Vec::new();
         for sound in list {
             let entry = match sound {
@@ -215,10 +554,16 @@ fn parse_sounds_json(text: &str) -> HashMap<String, Vec<SoundEntry>> {
             entries.push(entry);
         }
         if !entries.is_empty() {
-            events.insert(event.clone(), entries);
+            events.insert(event.clone(), SoundEvent { category, entries });
         }
     }
     events
+}
+
+/// Clamp a combined playback rate (pitch) to vanilla's [0.5, 2.0] range
+/// (MCP-919 `SoundManager.getNormalizedPitch`, `clamp_double(pitch, 0.5, 2.0)`).
+fn clamp_pitch(pitch: f32) -> f32 {
+    pitch.clamp(0.5, 2.0)
 }
 
 /// Vanilla distance attenuation + panning for a positioned sound.
@@ -274,7 +619,7 @@ fn next_xorshift(state: &mut u32) -> u32 {
 }
 
 /// Load `sounds.json` from the first asset root that has it.
-fn load_sound_events(roots: &[PathBuf]) -> HashMap<String, Vec<SoundEntry>> {
+fn load_sound_events(roots: &[PathBuf]) -> HashMap<String, SoundEvent> {
     for root in roots {
         if let Some(bytes) = read_asset(root, "assets/minecraft/sounds.json") {
             if let Ok(text) = String::from_utf8(bytes) {
@@ -356,15 +701,78 @@ mod tests {
         let events = parse_sounds_json(SAMPLE);
         assert_eq!(events.len(), 3);
 
-        let dig = &events["dig.stone"];
+        let dig = &events["dig.stone"].entries;
         assert_eq!(dig.len(), 4);
         assert_eq!(dig[0].name, "dig/stone1");
         assert_eq!(dig[0].volume, 1.0);
 
-        let rabbit = &events["mob.rabbit.idle"];
+        let rabbit = &events["mob.rabbit.idle"].entries;
         assert_eq!(rabbit.len(), 1);
         assert_eq!(rabbit[0].name, "mob/rabbit/idle1");
         assert!((rabbit[0].volume - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn parses_event_category() {
+        let events = parse_sounds_json(SAMPLE);
+        assert_eq!(events["dig.stone"].category, SoundCategory::Blocks);
+        assert_eq!(events["mob.rabbit.idle"].category, SoundCategory::Animals);
+        // An event with no "category" field defaults to Master.
+        let e = parse_sounds_json(r#"{ "x": { "sounds": ["a"] } }"#);
+        assert_eq!(e["x"].category, SoundCategory::Master);
+    }
+
+    #[test]
+    fn category_name_round_trips() {
+        for c in [
+            SoundCategory::Master,
+            SoundCategory::Music,
+            SoundCategory::Records,
+            SoundCategory::Weather,
+            SoundCategory::Blocks,
+            SoundCategory::Mobs,
+            SoundCategory::Animals,
+            SoundCategory::Players,
+            SoundCategory::Ambient,
+        ] {
+            assert_eq!(SoundCategory::from_str_name(c.category_name()), Some(c));
+        }
+        assert_eq!(SoundCategory::from_str_name("bogus"), None);
+    }
+
+    #[test]
+    fn master_category_volume_is_always_unity() {
+        let mut v = Volumes::default();
+        v.music = 0.3;
+        // MASTER slot ignores stored value; it is applied via the master field.
+        assert_eq!(v.category(SoundCategory::Master), 1.0);
+        assert!((v.category(SoundCategory::Music) - 0.3).abs() < 1e-6);
+    }
+
+    #[test]
+    fn pitch_clamps_to_vanilla_range() {
+        assert!((clamp_pitch(0.1) - 0.5).abs() < 1e-6);
+        assert!((clamp_pitch(3.0) - 2.0).abs() < 1e-6);
+        assert!((clamp_pitch(1.0) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn category_gain_composes_category_and_master() {
+        // Vanilla getNormalizedVolume: the per-category volume and the master
+        // slider multiply. A half-master, quarter-block world attenuates a block
+        // sound to 1/8 of its base before spatial attenuation.
+        let mut v = Volumes::default();
+        v.master = 0.5;
+        v.block = 0.25;
+        let gain = v.category(SoundCategory::Blocks) * v.master;
+        assert!((gain - 0.125).abs() < 1e-6, "block gain = category*master");
+        // The MASTER category itself always reports unity, so a MASTER-category
+        // sound is scaled by the master slider alone.
+        let master_gain = v.category(SoundCategory::Master) * v.master;
+        assert!((master_gain - 0.5).abs() < 1e-6);
+        // A zeroed category fully silences its sounds regardless of master.
+        v.ambient = 0.0;
+        assert_eq!(v.category(SoundCategory::Ambient) * v.master, 0.0);
     }
 
     #[test]
@@ -378,7 +786,7 @@ mod tests {
         // The event name maps to a weighted list; each variant's `name` resolves
         // to `assets/minecraft/sounds/<name>.ogg`.
         let events = parse_sounds_json(SAMPLE);
-        let entry = &events["dig.stone"][2];
+        let entry = &events["dig.stone"].entries[2];
         let asset = format!("assets/minecraft/sounds/{}.ogg", entry.name);
         assert_eq!(asset, "assets/minecraft/sounds/dig/stone3.ogg");
     }

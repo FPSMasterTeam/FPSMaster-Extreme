@@ -6,7 +6,7 @@ use std::{
 
 use fpsmaster_protocol::{
     io::ProtocolError,
-    net::{BlockingClient, PremiumSession},
+    net::BlockingClient,
     v1_8_9::{
         chunk::{decode_chunk_column, ChunkColumnData},
         packets::{ClientboundPlayPacket, EntityAction, ServerboundPacket},
@@ -176,21 +176,7 @@ impl NetworkHandle {
     pub fn connect_offline_1_8_9(host: String, port: u16, username: String) -> Self {
         let (event_tx, event_rx) = mpsc::channel();
         let (command_tx, command_rx) = mpsc::channel();
-        thread::spawn(move || network_thread(host, port, username, None, event_tx, command_rx));
-        Self {
-            events: event_rx,
-            commands: command_tx,
-        }
-    }
-
-    /// Connect using a premium (Microsoft) session for online-mode servers.
-    pub fn connect_premium_1_8_9(host: String, port: u16, session: PremiumSession) -> Self {
-        let (event_tx, event_rx) = mpsc::channel();
-        let (command_tx, command_rx) = mpsc::channel();
-        let username = session.username.clone();
-        thread::spawn(move || {
-            network_thread(host, port, username, Some(session), event_tx, command_rx)
-        });
+        thread::spawn(move || network_thread(host, port, username, event_tx, command_rx));
         Self {
             events: event_rx,
             commands: command_tx,
@@ -209,7 +195,6 @@ fn network_thread(
     host: String,
     port: u16,
     username: String,
-    session: Option<PremiumSession>,
     events: Sender<NetworkEvent>,
     commands: Receiver<NetworkCommand>,
 ) {
@@ -222,23 +207,11 @@ fn network_thread(
         }
     };
 
-    let login = if let Some(sess) = session {
-        match client.login_premium_1_8_9(&host, port, &sess) {
-            Ok(login) => login,
-            Err(err) => {
-                let _ = events.send(NetworkEvent::Disconnected(format!(
-                    "premium login failed: {err}"
-                )));
-                return;
-            }
-        }
-    } else {
-        match client.login_offline_1_8_9(&host, port, &username) {
-            Ok(login) => login,
-            Err(err) => {
-                let _ = events.send(NetworkEvent::Disconnected(format!("login failed: {err}")));
-                return;
-            }
+    let login = match client.login_offline_1_8_9(&host, port, &username) {
+        Ok(login) => login,
+        Err(err) => {
+            let _ = events.send(NetworkEvent::Disconnected(format!("login failed: {err}")));
+            return;
         }
     };
     let _ = events.send(NetworkEvent::Connected {

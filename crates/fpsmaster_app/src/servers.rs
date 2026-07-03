@@ -8,7 +8,6 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
-use crate::auth;
 use crate::chat;
 
 /// One saved server (vanilla ServerData).
@@ -75,8 +74,18 @@ impl ServerList {
     }
 }
 
+/// The fpsmaster config directory (`<config dir>/fpsmaster/`).
+pub fn config_dir() -> PathBuf {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("APPDATA").map(PathBuf::from))
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        .unwrap_or_else(|| PathBuf::from("."));
+    base.join("fpsmaster")
+}
+
 fn store_path() -> PathBuf {
-    auth::config_dir().join("servers.json")
+    config_dir().join("servers.json")
 }
 
 /// Parse "host" or "host:port", resolving the Minecraft SRV record for bare

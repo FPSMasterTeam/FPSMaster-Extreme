@@ -6,7 +6,6 @@
 //! network or window directly. The in-game HUD is not a screen; it is
 //! [`ingame::GuiIngame`], drawn whenever a world is active.
 
-pub mod accounts;
 pub mod chat_screen;
 pub mod controls;
 pub mod demo_select;
@@ -26,6 +25,7 @@ pub mod performance;
 pub mod progress;
 pub mod resource_packs;
 pub mod shaders;
+pub mod sound_options;
 pub mod widgets;
 
 use fpsmaster_protocol::v1_8_9::packets::ServerboundPacket;
@@ -145,11 +145,6 @@ pub enum GuiAction {
     Quit,
     SendChat(String),
     RequestRespawn,
-    StartMicrosoftLogin,
-    LoginWithToken(String),
-    UseAccount(String),
-    RemoveAccount(String),
-    CopyActiveToken,
     /// Settings were edited; the renderer must apply the new vsync mode.
     SetVsync(bool),
     /// Apply the 3D-world render-resolution scale (recreates off-screen targets).
@@ -225,8 +220,6 @@ pub struct DrawCtx<'a> {
     /// Whether the GPU panorama skybox is being rendered behind this screen.
     pub has_panorama: bool,
     pub settings: &'a Settings,
-    pub session_username: Option<&'a str>,
-    pub accounts: &'a [AccountEntry],
     /// HUD data when a world session is active (inventory screen, HUD).
     pub hud: Option<&'a HudState<'a>>,
     /// Snapshot of loaded mods for the mod-management screen.
@@ -246,15 +239,6 @@ pub struct ScreenCtx<'a> {
     pub mouse: (f64, f64),
 }
 
-/// A saved account row for the accounts screen.
-#[derive(Debug, Clone)]
-pub struct AccountEntry {
-    pub username: String,
-    pub uuid: String,
-    /// Whether this is the currently signed-in account.
-    pub active: bool,
-}
-
 /// GUI pixel scale shared by every screen and the HUD (same formula the
 /// renderer rasterizes the UI buffer at, so all layout snaps to GUI pixels).
 pub fn gui_scale(width: i32, height: i32) -> i32 {
@@ -266,7 +250,6 @@ pub fn gui_scale(width: i32, height: i32) -> i32 {
 pub(crate) const TEXT_WHITE: UiColor = UiColor::rgba(255, 255, 255, 255);
 pub(crate) const TEXT_GRAY: UiColor = UiColor::rgba(160, 160, 160, 255);
 pub(crate) const TEXT_YELLOW: UiColor = UiColor::rgba(255, 255, 85, 255);
-pub(crate) const TEXT_GREEN: UiColor = UiColor::rgba(85, 255, 85, 255);
 
 /// Vanilla `drawDefaultBackground`: the tiled dirt texture (tinted gray 64,
 /// one repeat per 32 GUI px) on menus, or a translucent scrim over a world.

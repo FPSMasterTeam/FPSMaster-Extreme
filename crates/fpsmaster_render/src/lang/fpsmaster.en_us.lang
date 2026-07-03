@@ -3,24 +3,11 @@
 # (menu.*, gui.*, options.*, selectServer.*, deathScreen.*, …) and are not here.
 
 # Main menu / pause menu additions
-fpsmaster.menu.accounts=Accounts
 fpsmaster.menu.mods=Mods...
 fpsmaster.menu.demo=Demo World
 fpsmaster.menu.quitToTitle=Quit to Title
-fpsmaster.account.notSignedIn=Not signed in
-fpsmaster.account.signedInAs=Signed in as
 
 # Accounts screen
-fpsmaster.accounts.title=Accounts
-fpsmaster.accounts.use=Use Account
-fpsmaster.accounts.addMicrosoft=Add with Microsoft
-fpsmaster.accounts.addToken=Add Token
-fpsmaster.accounts.copyToken=Copy Token
-fpsmaster.accounts.empty=No accounts yet — add one below.
-fpsmaster.accounts.inUse=(in use)
-fpsmaster.accounts.addTitle=Add with Refresh Token
-fpsmaster.accounts.addInstr=Paste a Microsoft refresh token (Cmd/Ctrl+V on the Accounts screen):
-fpsmaster.accounts.add=Add Account
 
 # Controls screen
 fpsmaster.controls.bindHint=Press a key to bind, or Escape to cancel
@@ -94,10 +81,6 @@ fpsmaster.shaders.clouds=Clouds
 fpsmaster.progress.loadingWorld=Loading world...
 fpsmaster.progress.connecting=Connecting to server...
 fpsmaster.progress.chunksLoaded=%s chunks loaded
-fpsmaster.auth.title=Microsoft Login
-fpsmaster.auth.openBrowser=Open your browser and go to:
-fpsmaster.auth.enterCode=Enter code:
-fpsmaster.auth.waiting=Waiting for login... ESC to cancel
 fpsmaster.server.startFailed=Failed to start server
 fpsmaster.server.startTimeout=Server did not respond within 60 seconds
 fpsmaster.server.starting=Starting local server...
@@ -113,6 +96,20 @@ fpsmaster.merchant.unavailable=Can't trade with villager at the moment
 
 # Language screen
 fpsmaster.language.title=Select Language
+
+# Music & Sound options (vanilla keys; kept here so they translate in the
+# overlay-only languages we ship, matching the vanilla en_US strings).
+options.sounds=Music & Sounds...
+options.sounds.title=Music & Sound Options
+soundCategory.master=Master Volume
+soundCategory.music=Music
+soundCategory.record=Jukebox/Noteblocks
+soundCategory.weather=Weather
+soundCategory.block=Blocks
+soundCategory.hostile=Hostile Creatures
+soundCategory.neutral=Friendly Creatures
+soundCategory.player=Players
+soundCategory.ambient=Ambient/Environment
 
 # Server-sent chat translation patterns, embedded so messages still format
 # correctly when the vanilla language tables are unavailable (offline / tests).
