@@ -710,7 +710,8 @@ fn tint3(tint: Tint) -> [f32; 3] {
         Tint::None => [1.0, 1.0, 1.0],
         Tint::Grass => biome.grass,
         Tint::Foliage => biome.foliage,
-        Tint::Water => [0.247, 0.463, 0.894],
+        // Vanilla water multiplier is 0xFFFFFF (white); the texture is already blue.
+        Tint::Water => [1.0, 1.0, 1.0],
         Tint::Rgb(rgb) => rgb,
     }
 }
