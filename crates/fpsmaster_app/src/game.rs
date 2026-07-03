@@ -1458,6 +1458,17 @@ impl GameState {
         std::mem::take(&mut self.music_ticker.commands)
     }
 
+    /// Advance ONLY the background-music ticker for one client tick, without any
+    /// world/physics simulation. The host calls this while no world is active
+    /// (the title screen) so menu music plays there too — vanilla runs the
+    /// `MusicTicker` from `Minecraft.runTick` regardless of world state. With no
+    /// world joined, [`desired_music_type`](Self::desired_music_type) resolves
+    /// to [`MusicType::Menu`]. Commands are drained via `take_music_commands`.
+    pub fn tick_menu_music(&mut self) {
+        let music_type = self.desired_music_type();
+        self.music_ticker.tick(music_type);
+    }
+
     /// Report whether a music track is currently audible (from
     /// `SoundManager::is_music_playing`). The `MusicTicker` uses this to detect
     /// when the current track has finished so it can schedule the next one.

@@ -64,27 +64,36 @@ sdk/                                # 可选，随包附带
 
 ---
 
-## 3. Registry 条目（后端 `/api/v1/launcher/versions/available`）
+## 3. Registry（新 release 系统）
+
+> 后端已**移除**旧的 `client_versions` / `versionType` / `/versions/available` 系统，
+> EDGE/NOVA/EXTREME 全部走 `release_entries`。详见 backend README「Launcher 发布体系」。
+
+**写入（CI 发布）** —— 每个平台一条，`POST /api/v1/launcher/releases/ci`：
 
 ```json
 {
-  "id": "extreme-0.3.1",
-  "channel": "release",
-  "versionType": "EXTREME",
+  "productCode": "extreme",
+  "channelCode": "release",
   "versionName": "0.3.1",
-  "downloadUrl": "https://cdn.fpsmaster.top/extreme/0.3.1/FPSMaster-Extreme-0.3.1-<target>.tar.gz",
+  "commitHash": "<sha>",
+  "downloadUrl": "https://cdn.fpsmaster.top/extreme/0.3.1/FPSMaster-Extreme-0.3.1-macos-aarch64.tar.gz",
   "checksum": "<sha256>",
   "fileSize": 15728640,
-  "manifestUrl": "https://cdn.fpsmaster.top/extreme/0.3.1/FPSMaster-Extreme-0.3.1-<target>.manifest.json",
+  "manifestUrl": "https://cdn.fpsmaster.top/extreme/0.3.1/FPSMaster-Extreme-0.3.1-macos-aarch64.manifest.json",
   "minLauncherVersion": "0.3.6",
+  "target": "macos-aarch64",
   "enabled": true,
-  "recommended": true,
-  "target": "<per-platform>"
+  "recommended": true
 }
 ```
 
-后端须按请求平台返回对应 `target` 的 `downloadUrl` / `checksum` / `manifestUrl`
-（与 Launcher 自更新 `releases/ci` 的 per-target 上传方式一致）。
+请求头 `X-CI-Token: <token>`。三平台各 POST 一次（不同 `target`）。
+
+**读取** —— Launcher 按当前平台调
+`GET /api/v1/launcher/releases/available?target=<平台>`（需认证），后端只返回该平台
+可安装的条目；EXTREME 每个 target 一条，`downloadUrl`/`checksum` 即该平台产物。
+`nova`/`extreme` 的 `beta`/`nightly` 渠道仅 SPONSOR/ADMIN 可见。
 
 ---
 
