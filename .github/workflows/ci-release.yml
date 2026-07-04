@@ -116,6 +116,20 @@ jobs:
         shell: bash
         run: scripts/package-launcher.sh --target ${{ matrix.target }}
 
+      # Guard: release tarballs must never ship the dev-only extensions (mods/,
+      # incl. a scaffold/auto-aim cheat) or the extension SDK (sdk/). Fail hard
+      # if they ever creep back in — end users get a clean client only.
+      - name: Verify package excludes dev extensions + SDK
+        shell: bash
+        run: |
+          tarball="$(ls dist-launcher/FPSMaster-Extreme-*-${{ matrix.target }}.tar.gz)"
+          if tar -tzf "$tarball" | sed 's|^\./||' | grep -qiE '^(mods|sdk)/'; then
+            echo "::error::release package must not bundle mods/ or sdk/" >&2
+            tar -tzf "$tarball" | sed 's|^\./||' | grep -iE '^(mods|sdk)/' >&2
+            exit 1
+          fi
+          echo "ok: $tarball ships no mods/ or sdk/"
+
       - name: Capture artifact metadata
         shell: bash
         env:
