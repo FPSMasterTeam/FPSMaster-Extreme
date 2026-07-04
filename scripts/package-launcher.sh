@@ -15,6 +15,10 @@
 #     these legally and points the client at them via --assets)
 #   - local_server/  (bundled test server — not needed for end users)
 #   - fpsmaster_options.txt (user config — the client generates it on first run)
+#   - mods/          (built-in extensions are dev demos only — including a
+#     scaffold/auto-aim cheat — so they must NOT ship to end users; the client
+#     loads user-supplied extensions from a mods/ dir they create themselves)
+#   - sdk/           (extension developer kit — not needed by end users)
 #
 # Usage:
 #   scripts/package-launcher.sh [--target <name>] [--download-url <url>] [--dlss] [--out <dir>]
@@ -112,8 +116,10 @@ if [[ "$DLSS" == "1" ]]; then
   fi
 fi
 
-# --- 5. bundled mods / resourcepacks / sdk (optional; local_assets excluded) ---
-for d in mods resourcepacks sdk; do
+# --- 5. bundled resourcepacks (optional). mods/ (dev-demo extensions, incl. a
+#        scaffold cheat) and sdk/ (extension dev kit) are intentionally NOT
+#        shipped — see the exclusion note in the header. ---
+for d in resourcepacks; do
   if [[ -d "$REPO_ROOT/$d" ]]; then
     cp -R "$REPO_ROOT/$d" "$STAGE/$d"
     echo "  + $d/"
