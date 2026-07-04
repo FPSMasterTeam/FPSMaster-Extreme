@@ -700,6 +700,10 @@ pub struct GameState {
     /// Player chunk at the last `enforce_render_distance` pass, so the scan runs
     /// only when crossing a chunk boundary.
     last_residency_chunk: Option<ChunkPos>,
+    /// Set for a built-in single-player world: the terrain generator that
+    /// streams chunks around the player (`stream_local_world`). `None` for demo
+    /// worlds and server sessions, which get their chunks elsewhere.
+    local_worldgen: Option<WorldGen>,
     /// Block changes received for chunks that weren't loaded yet, replayed once
     /// the chunk arrives (otherwise spawn-platform blocks can be lost).
     pending_block_changes: std::collections::HashMap<ChunkPos, Vec<(i32, i32, i32, BlockState)>>,
@@ -1032,6 +1036,118 @@ impl GameState {
         )
     }
 
+    /// A built-in, server-less single-player world backed by [`WorldGen`]. The
+    /// spawn area is generated up front so terrain is visible immediately;
+    /// [`stream_local_world`](Self::stream_local_world) extends it as the player
+    /// moves. Runs in creative (instant dig, a hotbar of blocks, flight) — the
+    /// mode is deliberately move/dig/build only, with no server or survival loop.
+    pub fn local_world(seed: i64, aspect: f32) -> Self {
+        let generator = WorldGen::new(seed);
+        let mut world = World::new();
+        // Generate only a tiny spawn platform up front so the player has ground
+        // to stand on immediately. Everything else is streamed in gradually by
+        // `stream_local_world` and meshed on the background worker — exactly like
+        // a server session. This is deliberately small: the caller meshes the
+        // initial world synchronously via `upload_world`, and meshing a large
+        // area in one blocking call wedges the main thread (and, in a debug
+        // build, can hang the whole machine).
+        const INIT_RADIUS: i32 = 1;
+        for cz in -INIT_RADIUS..=INIT_RADIUS {
+            for cx in -INIT_RADIUS..=INIT_RADIUS {
+                generator.generate_chunk(&mut world, cx, cz);
+            }
+        }
+        let spawn_h = generator.height(0, 0);
+        let spawn = DVec3::new(0.5, spawn_h as f64 + 1.0, 0.5);
+        let mut state = Self::new(world, EntityId(0), spawn, aspect);
+        state.local_worldgen = Some(generator);
+        // Move/dig/build only: creative gives instant break, reach, and flight,
+        // and skips the survival/hunger/damage loops the mode doesn't want.
+        state.creative = true;
+        state.capabilities.creative = true;
+        state.capabilities.allow_flying = true;
+        // Stock the hotbar with common placeable blocks so building works out of
+        // the box: stone, dirt, grass, cobblestone, planks, log, leaves, glass,
+        // glowstone.
+        let hotbar = [1i16, 3, 2, 4, 5, 17, 18, 20, 89];
+        for (i, id) in hotbar.into_iter().enumerate() {
+            state.inventory[36 + i] = Some(SlotItem::new(id, 64, 0));
+        }
+        state
+    }
+
+    /// Single-player chunk streaming: generate any ungenerated columns within
+    /// `render_distance` of the player and drop columns that drifted far past it
+    /// (their block data — GPU meshes are freed via the returned sections).
+    /// Newly generated columns are marked dirty so the mesher picks them up. A
+    /// no-op unless this is a generated single-player world.
+    pub fn stream_local_world(&mut self, render_distance: u32) -> Vec<SectionPos> {
+        // `WorldGen` is `Copy`, so lifting it out releases the borrow on `self`
+        // and lets us mutate `self.world` below.
+        let Some(generator) = self.local_worldgen else {
+            return Vec::new();
+        };
+        let px = (self.player.position.x.floor() as i32).div_euclid(16);
+        let pz = (self.player.position.z.floor() as i32).div_euclid(16);
+        let r = render_distance as i32;
+
+        // Generate at most a few new columns per call, nearest-first, and only
+        // while the mesh backlog is small. This is the critical backpressure: the
+        // main loop drains `MESH_SUBMITS_PER_FRAME` (40) dirty sections/frame into
+        // the background mesher, so generating faster than that just piles up
+        // multi-MB chunk snapshots in the mesher queue until memory is exhausted.
+        // Gate on the backlog and mark only the column's non-empty sections (~5,
+        // not all 16) so what we add each frame stays within the drain rate.
+        const GEN_BUDGET: usize = 12;
+        const BACKLOG_LIMIT: usize = 80;
+        if self.dirty_chunks.len() < BACKLOG_LIMIT {
+            let mut missing: Vec<ChunkPos> = Vec::new();
+            for dz in -r..=r {
+                for dx in -r..=r {
+                    let pos = ChunkPos::new(px + dx, pz + dz);
+                    if self.world.chunk(pos).is_none() {
+                        missing.push(pos);
+                    }
+                }
+            }
+            missing.sort_by_key(|p| (p.x - px).pow(2) + (p.z - pz).pow(2));
+            for pos in missing.into_iter().take(GEN_BUDGET) {
+                generator.generate_chunk(&mut self.world, pos.x, pos.z);
+                // Only the sections that actually got blocks exist; marking the
+                // empty air sections above would just churn the mesher for nothing.
+                let ys: Vec<i32> = self
+                    .world
+                    .chunk(pos)
+                    .map(|c| c.sections().map(|s| s.y()).collect())
+                    .unwrap_or_default();
+                for sy in ys {
+                    self.dirty_chunks.insert(SectionPos::new(pos.x, sy, pos.z));
+                }
+            }
+        }
+
+        // Unload far columns to bound memory as the player explores; they are
+        // regenerated deterministically on return. Kept just past the
+        // render-distance GPU-eviction margin (RESIDENCY_MARGIN = 2) so block
+        // data stays a close, bounded superset of what's on screen.
+        let keep = r + 3;
+        let far: Vec<ChunkPos> = self
+            .world
+            .chunks()
+            .map(|c| c.position)
+            .filter(|p| (p.x - px).abs() > keep || (p.z - pz).abs() > keep)
+            .collect();
+        let mut removed = Vec::new();
+        for p in far {
+            self.world.remove_chunk(p);
+            self.dirty_chunks.retain(|s| s.x != p.x || s.z != p.z);
+            for sy in 0..16 {
+                removed.push(SectionPos::new(p.x, sy, p.z));
+            }
+        }
+        removed
+    }
+
     fn new(mut world: World, player_id: EntityId, position: DVec3, aspect: f32) -> Self {
         let player = EntityState::new_local_player(player_id, position);
         world.upsert_entity(player.clone());
@@ -1090,6 +1206,7 @@ impl GameState {
             urgent_remesh: HashSet::new(),
             evicted_columns: HashSet::new(),
             last_residency_chunk: None,
+            local_worldgen: None,
             pending_block_changes: std::collections::HashMap::new(),
             chest_lid_angles: std::collections::HashMap::new(),
             chest_open_targets: std::collections::HashMap::new(),
@@ -6375,6 +6492,88 @@ fn place_tree(world: &mut World, x: i32, y: i32, z: i32) {
     }
 }
 
+/// The simplest usable infinite terrain generator for single-player. It is a
+/// pure height-mapped surface — bedrock, a stone body, three dirt layers and a
+/// grass top — sampled from the same overlapping-sine field as the terrain demo
+/// ([`terrain_height`]), shifted by the world seed. No caves, biomes, water or
+/// structures beyond a couple of trees: single-player only needs somewhere to
+/// stand, dig and build. It is deterministic, so a column regenerates
+/// identically after being unloaded and revisited.
+#[derive(Clone, Copy)]
+pub struct WorldGen {
+    seed: i64,
+}
+
+impl WorldGen {
+    pub fn new(seed: i64) -> Self {
+        Self { seed }
+    }
+
+    /// Surface (top grass block) height at world column `(x, z)`. The seed
+    /// offsets the sample point so different seeds yield different terrain from
+    /// the shared sine field; clamped to leave room for the dirt/bedrock layers.
+    fn height(&self, x: i32, z: i32) -> i32 {
+        let ox = (self.seed & 0xffff) as i32 - 0x8000;
+        let oz = ((self.seed >> 16) & 0xffff) as i32 - 0x8000;
+        terrain_height(x.wrapping_add(ox), z.wrapping_add(oz)).clamp(5, 240)
+    }
+
+    /// Generate one 16×16 chunk column into `world`: blocks plus full daylight
+    /// skylight on and above the surface (so the mesher lights it without a
+    /// world-wide skylight recompute). Trees are kept fully inside the column so
+    /// generating one chunk never spawns a partial neighbour.
+    fn generate_chunk(&self, world: &mut World, cx: i32, cz: i32) {
+        for lx in 0..16 {
+            for lz in 0..16 {
+                let x = cx * 16 + lx;
+                let z = cz * 16 + lz;
+                let h = self.height(x, z);
+
+                world.set_block(x, 0, z, BlockState::new(7, 0)); // bedrock
+                for y in 1..h.saturating_sub(3).max(1) {
+                    // A little scattered coal/iron so bare stone has some interest.
+                    let r = hash2d(x, y.wrapping_mul(37) + z, self.seed as u32 ^ 0x9e37_79b9);
+                    let block = if r % 96 == 0 {
+                        BlockState::new(16, 0) // coal ore
+                    } else if r % 160 == 0 {
+                        BlockState::new(15, 0) // iron ore
+                    } else {
+                        BlockState::STONE
+                    };
+                    world.set_block(x, y, z, block);
+                }
+                for y in h.saturating_sub(3).max(1)..h {
+                    world.set_block(x, y, z, BlockState::DIRT);
+                }
+                world.set_block(x, h, z, BlockState::GRASS);
+            }
+        }
+
+        // Up to two deterministic oak trees per chunk. The trunk is placed at
+        // local 2..=13 so the ±2 leaf canopy stays inside this chunk column and
+        // doesn't create a phantom neighbour that streaming would skip.
+        for salt in [0x1111u32, 0x2222] {
+            let r = hash2d(cx, cz, self.seed as u32 ^ salt);
+            if r % 3 != 0 {
+                continue;
+            }
+            let lx = (r % 12 + 2) as i32;
+            let lz = ((r >> 8) % 12 + 2) as i32;
+            let x = cx * 16 + lx;
+            let z = cz * 16 + lz;
+            let h = self.height(x, z);
+            place_tree(world, x, h + 1, z);
+        }
+
+        // Cast vertical sky-light for the column: surface and open air above stay
+        // fully lit, everything under the top block goes dark. Sections ship
+        // fully sky-lit otherwise, which would make the underground fullbright.
+        world
+            .chunk_mut_or_insert(ChunkPos::new(cx, cz))
+            .recompute_vertical_skylight();
+    }
+}
+
 /// Landscape demo: hilly terrain, trees, a lake, scattered ores, animals.
 /// Returns the spawn position.
 fn build_demo_landscape(world: &mut World) -> DVec3 {
@@ -6710,6 +6909,39 @@ fn armor_points(id: i16) -> i32 {
 mod interaction_tests {
     use super::*;
     use fpsmaster_core::{BlockState, EntityId, EntityKind};
+
+    /// Headless load-model check for single-player streaming: simulate frames of
+    /// `stream_local_world` + the main loop's dirty drain (`MESH_SUBMITS_PER_FRAME`)
+    /// and confirm the generation backlog and loaded-chunk count stay bounded —
+    /// i.e. generation never outpaces the mesher and floods the pipeline. No GPU.
+    #[test]
+    fn local_world_streaming_backlog_is_bounded() {
+        const DRAIN_PER_FRAME: usize = 40; // MESH_SUBMITS_PER_FRAME in main.rs
+        let mut game = GameState::local_world(0x1234_5678, 1.0);
+        let rd = 12u32;
+        let mut max_dirty = 0usize;
+        let mut max_chunks = 0usize;
+        for frame in 0..600 {
+            game.stream_local_world(rd);
+            let _ = game.take_dirty_chunks_budget(DRAIN_PER_FRAME);
+            max_dirty = max_dirty.max(game.dirty_chunks.len());
+            max_chunks = max_chunks.max(game.world.chunks().count());
+            if frame % 3 == 0 {
+                game.player.position.x += 4.0; // keep the player moving into fresh terrain
+            }
+        }
+        println!(
+            "[stream] max_dirty_backlog={max_dirty} max_loaded_chunks={max_chunks} final_dirty={} final_chunks={}",
+            game.dirty_chunks.len(),
+            game.world.chunks().count()
+        );
+        // The mesher drains 40 sections/frame; the backlog must not run away.
+        assert!(
+            max_dirty < DRAIN_PER_FRAME * 20,
+            "dirty backlog exploded to {max_dirty}"
+        );
+        assert!(max_chunks < 3000, "loaded chunk count exploded to {max_chunks}");
+    }
 
     #[test]
     fn death_roll_follows_the_vanilla_fall_over_curve() {

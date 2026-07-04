@@ -9,8 +9,8 @@ mod network;
 mod particle;
 mod player_list;
 mod scoreboard;
-mod singleplayer;
 mod skin;
+mod worlds;
 mod servers;
 mod settings;
 mod sound;
@@ -37,8 +37,7 @@ use gui::ingame::{GuiIngame, HudState};
 use gui::ingame_menu::GuiIngameMenu;
 use gui::inventory::GuiContainer;
 use gui::main_menu::GuiMainMenu;
-use gui::progress::{GuiConnecting, GuiDisconnected, GuiStartingServer, Parent};
-use singleplayer::LocalServer;
+use gui::progress::{GuiConnecting, GuiDisconnected, Parent};
 use gui::{DrawCtx, GuiAction, GuiScreen, ScreenCtx};
 use item_renderer::ItemRenderer;
 use network::{NetworkEvent, NetworkHandle, WalkingPacketState};
@@ -109,8 +108,6 @@ struct App {
     tab_open: bool,
     /// Per-player skin downloads and atlas-row allocation.
     skin_manager: skin::SkinManager,
-    /// Child process for the local Paper server (singleplayer mode).
-    local_server: Option<LocalServer>,
     /// Vanilla `panoramaTimer` — incremented every frame on the title screen.
     panorama_timer: f32,
     /// Reused across frames so the per-frame entity rebuild keeps its vertex/index
@@ -412,7 +409,6 @@ impl ApplicationHandler for WinitApp {
             username,
             tab_open: false,
             skin_manager: skin::SkinManager::new(),
-            local_server: None,
             panorama_timer: 0.0,
             entity_model: fpsmaster_render::ModelMesh::new(),
             entity_glint: fpsmaster_render::ModelMesh::new(),
@@ -1172,23 +1168,14 @@ fn handle_actions(
                 app.in_world = true;
                 app.screen = None;
             }
-            GuiAction::StartSingleplayer => {
-                match LocalServer::start(&app.username) {
-                    Ok((server, ready_rx)) => {
-                        let port = server.port();
-                        app.local_server = Some(server);
-                        app.screen =
-                            Some(Box::new(GuiStartingServer::new(ready_rx, port)));
-                    }
-                    Err(msg) => {
-                        log::error!("singleplayer: {msg}");
-                        app.screen = Some(Box::new(GuiDisconnected::new(
-                            "Failed to start server",
-                            msg,
-                            Parent::MainMenu,
-                        )));
-                    }
-                }
+            GuiAction::StartLocalWorld { seed } => {
+                // Built-in single-player: a locally generated world, no server.
+                app.network = None;
+                app.connecting = false;
+                app.game = GameState::local_world(seed, renderer.aspect());
+                renderer.upload_world(&app.game.world);
+                app.in_world = true;
+                app.screen = None;
             }
             GuiAction::Connect { host, port } => {
                 app.game = GameState::empty_for_server(renderer.aspect());
@@ -1204,7 +1191,6 @@ fn handle_actions(
             }
             GuiAction::QuitToTitle => {
                 app.network = None;
-                app.local_server = None;
                 app.connecting = false;
                 app.in_world = false;
                 // Drop the session world; the title screen needs none.
@@ -2001,20 +1987,13 @@ fn pump_network(app: &mut App, window: &winit::window::Window, cursor_captured: 
     }
 
     if let Some(message) = disconnect {
-        let was_singleplayer = app.local_server.is_some();
         app.network = None;
-        app.local_server = None;
         app.in_world = false;
         app.connecting = false;
-        let parent = if was_singleplayer {
-            Parent::MainMenu
-        } else {
-            Parent::Multiplayer
-        };
         app.screen = Some(Box::new(GuiDisconnected::new(
             "Connection Lost",
             message,
-            parent,
+            Parent::Multiplayer,
         )));
     } else if app.connecting && app.game.loaded_chunk_count() > 0 {
         // World data has arrived: enter gameplay.
@@ -2318,6 +2297,14 @@ fn render_frame(
     // out of view (keeping their block data) so resident VRAM stays bounded even
     // on servers that never send ChunkUnload. Runs only on a chunk-boundary
     // crossing; any re-mesh it needs is queued through the dirty budget below.
+    // Single-player world streaming: generate the columns newly in range and
+    // drop far ones (a no-op for demo/server sessions). New columns are marked
+    // dirty and meshed through the budget below; dropped ones free their meshes.
+    let stream_removed = app.game.stream_local_world(app.settings.render_distance);
+    if !stream_removed.is_empty() {
+        renderer.drop_chunk_sections(&stream_removed);
+    }
+
     let evict_start = Instant::now();
     let evicted = app.game.enforce_render_distance(app.settings.render_distance);
     if !evicted.is_empty() {

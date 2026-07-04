@@ -5,11 +5,11 @@ use fpsmaster_render::{GuiTexture, UiColor, UiFrame, UiRect};
 
 use crate::i18n::tr;
 
-use super::demo_select::GuiDemoSelect;
 use super::mods::GuiModList;
 use super::multiplayer::GuiMultiplayer;
 use super::options::GuiOptions;
 use super::widgets::GuiButton;
+use super::world_select::GuiSelectWorld;
 use super::{draw_default_background, DrawCtx, GuiAction, GuiScreen, ScreenCtx};
 
 #[derive(Default)]
@@ -31,19 +31,17 @@ impl GuiMainMenu {
         let j = ctx.height / 4 + 48 * s;
 
         self.buttons = vec![
-            // [0] Singleplayer: (cx-100, j), 200×20
+            // [0] Singleplayer: (cx-100, j), 200×20 — opens the world-select screen.
             GuiButton::at_px(cx - 100 * s, j, 200 * s, s, tr("menu.singleplayer")),
             // [1] Multiplayer: (cx-100, j+24), 200×20
             GuiButton::at_px(cx - 100 * s, j + 24 * s, 200 * s, s, tr("menu.multiplayer")),
-            // [2] Demo World: (cx-100, j+48), 200×20
-            GuiButton::at_px(cx - 100 * s, j + 48 * s, 200 * s, s, tr("fpsmaster.menu.demo")),
-            // [3] Mods: (cx-100, j+72), 200×20 (fpsmaster addition)
-            GuiButton::at_px(cx - 100 * s, j + 72 * s, 200 * s, s, tr("fpsmaster.menu.mods")),
+            // [2] Mods: (cx-100, j+48), 200×20 (fpsmaster addition)
+            GuiButton::at_px(cx - 100 * s, j + 48 * s, 200 * s, s, tr("fpsmaster.menu.mods")),
             // Bottom split row, vanilla-style: Options + Quit side by side.
-            // [4] Options: (cx-100, j+96), 98×20
-            GuiButton::at_px(cx - 100 * s, j + 96 * s, 98 * s, s, tr("menu.options")),
-            // [5] Quit: (cx+2, j+96), 98×20
-            GuiButton::at_px(cx + 2 * s, j + 96 * s, 98 * s, s, tr("menu.quit")),
+            // [3] Options: (cx-100, j+72), 98×20
+            GuiButton::at_px(cx - 100 * s, j + 72 * s, 98 * s, s, tr("menu.options")),
+            // [4] Quit: (cx+2, j+72), 98×20
+            GuiButton::at_px(cx + 2 * s, j + 72 * s, 98 * s, s, tr("menu.quit")),
         ];
     }
 }
@@ -114,25 +112,22 @@ impl GuiScreen for GuiMainMenu {
     }
 
     fn mouse_clicked(&mut self, x: f64, y: f64, _ctx: &mut ScreenCtx) -> Vec<GuiAction> {
-        if self.buttons.len() < 6 {
+        if self.buttons.len() < 5 {
             return Vec::new();
         }
         if self.buttons[0].clicked(x, y) {
-            return vec![GuiAction::StartSingleplayer];
+            return vec![GuiAction::SetScreen(Box::new(GuiSelectWorld::new()))];
         }
         if self.buttons[1].clicked(x, y) {
             return vec![GuiAction::SetScreen(Box::new(GuiMultiplayer::new()))];
         }
         if self.buttons[2].clicked(x, y) {
-            return vec![GuiAction::SetScreen(Box::new(GuiDemoSelect::new()))];
-        }
-        if self.buttons[3].clicked(x, y) {
             return vec![GuiAction::SetScreen(Box::new(GuiModList::new(true)))];
         }
-        if self.buttons[4].clicked(x, y) {
+        if self.buttons[3].clicked(x, y) {
             return vec![GuiAction::SetScreen(Box::new(GuiOptions::from_main_menu()))];
         }
-        if self.buttons[5].clicked(x, y) {
+        if self.buttons[4].clicked(x, y) {
             return vec![GuiAction::Quit];
         }
         Vec::new()
