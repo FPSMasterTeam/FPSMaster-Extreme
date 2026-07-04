@@ -15,7 +15,7 @@ use crate::{
     mesh_worker::MeshWorker,
     texture::TextureAtlasImage,
     AtlasUv, BiomeColors, Camera, ChunkMesh, ChunkMeshBuffers, ChunkVertex, Frustum, GuiAtlas,
-    ModelMesh, ModelVertex, UiFrame, Vertex,
+    ModelMesh, ModelVertex, UiFrame, UiVertex, Vertex,
 };
 
 // GPU resource builders & render helpers (bind groups, textures, depth targets,
@@ -559,18 +559,6 @@ struct PanoramaResources {
     uniform_buffer: wgpu::Buffer,
 }
 
-/// Persistent GPU resources for the UI overlay. The overlay texture is the size
-/// of the surface and only re-rasterized/re-uploaded when the `UiFrame` actually
-/// changes, instead of allocating and uploading a full-screen texture every
-/// frame.
-struct UiCache {
-    texture: wgpu::Texture,
-    bind_group: wgpu::BindGroup,
-    width: u32,
-    height: u32,
-    last_commands: Vec<crate::ui::UiCommand>,
-}
-
 /// Per-pass draw toggles used to attribute GPU cost on hardware where timestamp
 /// queries return nothing (the Intel iGPU): skipping a pass and re-measuring
 /// reveals its share. Driven by the `--bench-passes` benchmark via
@@ -785,12 +773,16 @@ pub struct Renderer {
     crosshair_pipeline: wgpu::RenderPipeline,
     ui_bind_group_layout: wgpu::BindGroupLayout,
     ui_sampler: wgpu::Sampler,
-    ui_cache: Option<UiCache>,
+    /// Atlas bind groups (white texel, font sheets, GUI/item/block atlases,
+    /// favicons) shared by all three UI quad layers, uploaded lazily.
+    ui_quad_res: UiQuadResources,
+    /// Background UI layer (hotbar, chat, menus) drawn under the 3D block icons.
+    ui_back: UiQuadLayer,
     /// Foreground UI layer (counts, hover, carried stack) drawn over the 3D
     /// block-icon cube pass.
-    ui_overlay_cache: Option<UiCache>,
+    ui_overlay: UiQuadLayer,
     /// Crosshair layer, drawn with `crosshair_pipeline` over the 3D scene.
-    crosshair_cache: Option<UiCache>,
+    ui_crosshair: UiQuadLayer,
     /// Identity view-projection so the GUI cube pass can take pre-baked clip
     /// coordinates straight through the shared shader.
     gui_camera_bind_group: wgpu::BindGroup,
@@ -1724,6 +1716,13 @@ impl Renderer {
             mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
+        // Batched UI quad renderer: shared atlas bind groups + one growable
+        // vertex buffer per layer (background / overlay / crosshair).
+        let ui_quad_res =
+            UiQuadResources::new(&device, &queue, &ui_bind_group_layout, &ui_sampler);
+        let ui_back = UiQuadLayer::new("ui-back");
+        let ui_overlay = UiQuadLayer::new("ui-overlay");
+        let ui_crosshair = UiQuadLayer::new("ui-crosshair");
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("chunk-pipeline-layout"),
             bind_group_layouts: &[Some(&camera_layout), Some(&texture_layout)],
@@ -3439,7 +3438,7 @@ impl Renderer {
                 module: &ui_shader,
                 entry_point: Some("vs_main"),
                 compilation_options: Default::default(),
-                buffers: &[],
+                buffers: &[UiVertex::layout()],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &ui_shader,
@@ -3485,7 +3484,7 @@ impl Renderer {
                 module: &ui_shader,
                 entry_point: Some("vs_main"),
                 compilation_options: Default::default(),
-                buffers: &[],
+                buffers: &[UiVertex::layout()],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &ui_shader,
@@ -4897,9 +4896,10 @@ impl Renderer {
             crosshair_pipeline,
             ui_bind_group_layout,
             ui_sampler,
-            ui_cache: None,
-            ui_overlay_cache: None,
-            crosshair_cache: None,
+            ui_quad_res,
+            ui_back,
+            ui_overlay,
+            ui_crosshair,
             gui_camera_bind_group,
             gui_item_mesh: None,
             gui_glint_mesh: None,
@@ -9853,21 +9853,35 @@ impl Renderer {
             multiview_mask: None,
             });
             // UI background layer (under the 3D block icons).
-            if let Some(cache) = &self.ui_cache {
+            if let Some(buffer) = self.ui_back.buffer.as_ref() {
                 up.set_pipeline(&self.ui_pipeline);
-                up.set_bind_group(0, &cache.bind_group, &[]);
-                up.draw(0..3, 0..1);
-                draw_calls += 1;
+                up.set_vertex_buffer(0, buffer.slice(..));
+                for batch in self.ui_back.batches() {
+                    if let Some(bind_group) =
+                        self.ui_quad_res.bind_group(batch.texture, &self.ui_back.geo)
+                    {
+                        up.set_bind_group(0, bind_group, &[]);
+                        up.draw(batch.first_vertex..batch.first_vertex + batch.vertex_count, 0..1);
+                        draw_calls += 1;
+                    }
+                }
             }
             // Crosshair: drawn over the scene (and the vignette/HUD background)
             // with the inversion blend, like vanilla `GuiIngame`. The layer is a
             // no-op where transparent, so an empty crosshair (screen open) costs
             // nothing visible.
-            if let Some(cache) = &self.crosshair_cache {
+            if let Some(buffer) = self.ui_crosshair.buffer.as_ref() {
                 up.set_pipeline(&self.crosshair_pipeline);
-                up.set_bind_group(0, &cache.bind_group, &[]);
-                up.draw(0..3, 0..1);
-                draw_calls += 1;
+                up.set_vertex_buffer(0, buffer.slice(..));
+                for batch in self.ui_crosshair.batches() {
+                    if let Some(bind_group) =
+                        self.ui_quad_res.bind_group(batch.texture, &self.ui_crosshair.geo)
+                    {
+                        up.set_bind_group(0, bind_group, &[]);
+                        up.draw(batch.first_vertex..batch.first_vertex + batch.vertex_count, 0..1);
+                        draw_calls += 1;
+                    }
+                }
             }
             // 3D block icons: convex cubes (cull-free) baked into clip space via
             // the identity camera. The pass cleared depth to the far plane, so
@@ -9917,11 +9931,18 @@ impl Renderer {
                 draw_calls += 1;
             }
             // UI foreground layer (counts, hover, carried stack) over the cubes.
-            if let Some(cache) = &self.ui_overlay_cache {
+            if let Some(buffer) = self.ui_overlay.buffer.as_ref() {
                 up.set_pipeline(&self.ui_pipeline);
-                up.set_bind_group(0, &cache.bind_group, &[]);
-                up.draw(0..3, 0..1);
-                draw_calls += 1;
+                up.set_vertex_buffer(0, buffer.slice(..));
+                for batch in self.ui_overlay.batches() {
+                    if let Some(bind_group) =
+                        self.ui_quad_res.bind_group(batch.texture, &self.ui_overlay.geo)
+                    {
+                        up.set_bind_group(0, bind_group, &[]);
+                        up.draw(batch.first_vertex..batch.first_vertex + batch.vertex_count, 0..1);
+                        draw_calls += 1;
+                    }
+                }
             }
         }
         // Resolve this frame's timestamps into the readback buffer (still in the
@@ -9972,61 +9993,29 @@ impl Renderer {
         Ok(())
     }
 
-    /// Ensure `self.ui_cache` holds a GPU texture matching `ui`. The texture is
-    /// re-created only when the surface size changes and re-rasterized/uploaded
-    /// only when the `UiFrame` content differs from the last upload, so a static
-    /// HUD costs nothing per frame. The buffer is rasterized at GUI resolution
-    /// (window size / gui pixel scale) and upscaled nearest by the UI pass —
-    /// the vanilla chunky look at a fraction of the CPU/upload cost.
+    /// Tessellate the three UI layers into GPU quad batches, upload their vertex
+    /// buffers, and ensure every referenced atlas texture is uploaded. Quads are
+    /// emitted in command order (one draw per contiguous same-texture run) so
+    /// painter's ordering holds; the nearest sampler reproduces the vanilla
+    /// chunky scale directly at native resolution — no full-screen CPU rasterize
+    /// or per-frame texture re-upload.
     fn prepare_ui(&mut self, ui: &UiFrame) {
-        // Rasterize at HALF the GUI scale (2 buffer px per GUI px): the
-        // unicode font pages draw 16px CJK glyphs into 8 GUI px, so a
-        // 1px-per-GUI-px buffer would drop half their rows/columns. Two
-        // buffer px per GUI px keeps them 1:1 while still rasterizing at a
-        // quarter of the full-resolution cost.
-        let scale = crate::ui::gui_pixel_scale(self.config.width, self.config.height).max(1);
-        let divisor = (scale / 2).max(1);
-        let width = self.config.width.div_ceil(divisor).max(1);
-        let height = self.config.height.div_ceil(divisor).max(1);
-        prepare_ui_layer(
+        let (width, height) = (self.config.width, self.config.height);
+        let back = UiFrame::tessellate(ui.back_commands(), width, height, &self.gui_atlas);
+        let overlay = UiFrame::tessellate(ui.overlay_commands(), width, height, &self.gui_atlas);
+        let crosshair =
+            UiFrame::tessellate(ui.crosshair_commands(), width, height, &self.gui_atlas);
+        self.ui_quad_res.ensure(
             &self.device,
             &self.queue,
-            &mut self.ui_cache,
             &self.ui_bind_group_layout,
             &self.ui_sampler,
             &self.gui_atlas,
-            ui.back_commands(),
-            width,
-            height,
-            divisor,
-            "ui-back",
+            &[&back, &overlay, &crosshair],
         );
-        prepare_ui_layer(
-            &self.device,
-            &self.queue,
-            &mut self.ui_overlay_cache,
-            &self.ui_bind_group_layout,
-            &self.ui_sampler,
-            &self.gui_atlas,
-            ui.overlay_commands(),
-            width,
-            height,
-            divisor,
-            "ui-front",
-        );
-        prepare_ui_layer(
-            &self.device,
-            &self.queue,
-            &mut self.crosshair_cache,
-            &self.ui_bind_group_layout,
-            &self.ui_sampler,
-            &self.gui_atlas,
-            ui.crosshair_commands(),
-            width,
-            height,
-            divisor,
-            "ui-crosshair",
-        );
+        self.ui_back.upload(&self.device, &self.queue, back);
+        self.ui_overlay.upload(&self.device, &self.queue, overlay);
+        self.ui_crosshair.upload(&self.device, &self.queue, crosshair);
 
         // 3D block icons, baked into clip space for the GPU cube pass.
         let surface = (self.config.width as f32, self.config.height as f32);

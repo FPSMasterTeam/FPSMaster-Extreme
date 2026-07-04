@@ -82,6 +82,48 @@ struct Style {
     italic: bool,
 }
 
+/// Which font atlas a [`FontQuad`] samples: the 128×128 `ascii.png` sheet or a
+/// 256×256 `unicode_page_XX.png`. The GPU UI batcher uploads the matching sheet
+/// (via [`Font::ascii_image`] / [`Font::page_image`]) and normalizes the source
+/// pixels against 128 or 256 accordingly.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum FontTex {
+    Ascii,
+    Page(u8),
+}
+
+/// One glyph placement for the GPU UI batcher: a source sub-rect in a font atlas
+/// scaled into a destination screen rect, tinted by `color`. `shear` is the
+/// italic offset (top edge shifted `+shear` px, bottom edge `-shear`), matching
+/// the CPU blit's per-row shear.
+#[derive(Clone, Copy)]
+pub struct FontQuad {
+    pub tex: FontTex,
+    pub sx: u32,
+    pub sy: u32,
+    pub sw: u32,
+    pub sh: u32,
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+    pub color: [u8; 4],
+    pub shear: i32,
+}
+
+/// A single item emitted by [`Font::layout`]: either a textured glyph quad or a
+/// solid rect (the strikethrough / underline runs, which are flat fills).
+pub enum FontDraw {
+    Glyph(FontQuad),
+    Solid {
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        color: [u8; 4],
+    },
+}
+
 impl Font {
     fn load_default() -> Self {
         let ascii = texture::load_asset_image("assets/minecraft/textures/font/ascii.png")
@@ -267,6 +309,187 @@ impl Font {
                 );
             }
             cursor += advance;
+        }
+    }
+
+    /// The `ascii.png` sheet (128×128), for GPU upload by the UI batcher.
+    pub fn ascii_image(&self) -> &RgbaImage {
+        &self.ascii
+    }
+
+    /// The `unicode_page_XX.png` sheet for `page` (loading it on first use), or
+    /// None if the asset is missing. Shared via `Arc` with the CPU draw cache.
+    pub fn page_image(&self, page: u8) -> Option<Arc<RgbaImage>> {
+        self.unicode_page(page)
+    }
+
+    /// Emit the textured-quad placements for §-coded `text`, mirroring
+    /// [`Font::draw`] exactly (same advances, colour codes, bold/italic, and
+    /// strikethrough/underline runs) but producing glyph quads instead of
+    /// blitting pixels — the GPU UI path. With `shadow`, the vanilla drop shadow
+    /// (`+scale,+scale`, colours quartered) is emitted first, under the main run.
+    #[allow(clippy::too_many_arguments)]
+    pub fn layout(
+        &self,
+        x: i32,
+        y: i32,
+        scale: i32,
+        base: [u8; 4],
+        shadow: bool,
+        text: &str,
+        emit: &mut dyn FnMut(FontDraw),
+    ) {
+        let scale = scale.max(1);
+        if shadow {
+            self.layout_pass(x + scale, y + scale, scale, base, true, text, emit);
+        }
+        self.layout_pass(x, y, scale, base, false, text, emit);
+    }
+
+    /// One §-aware pass (the shadow pass sets `darken`). Factored out of
+    /// [`Font::layout`]; the parse/advance/style logic matches [`Font::draw`].
+    #[allow(clippy::too_many_arguments)]
+    fn layout_pass(
+        &self,
+        x: i32,
+        y: i32,
+        scale: i32,
+        base: [u8; 4],
+        darken: bool,
+        text: &str,
+        emit: &mut dyn FnMut(FontDraw),
+    ) {
+        let base_rgb = if darken {
+            [base[0] / 4, base[1] / 4, base[2] / 4]
+        } else {
+            [base[0], base[1], base[2]]
+        };
+        let alpha = base[3];
+        let reset = Style {
+            color: base_rgb,
+            bold: false,
+            strikethrough: false,
+            underline: false,
+            italic: false,
+        };
+        let mut style = reset;
+        let mut cursor = x;
+        let mut chars = text.chars();
+        while let Some(c) = chars.next() {
+            if c == '§' {
+                let Some(code) = chars.next() else { break };
+                if let Some(rgb) = legacy_color(code) {
+                    style = reset;
+                    style.color = if darken {
+                        [rgb[0] / 4, rgb[1] / 4, rgb[2] / 4]
+                    } else {
+                        rgb
+                    };
+                } else {
+                    match code.to_ascii_lowercase() {
+                        'l' => style.bold = true,
+                        'm' => style.strikethrough = true,
+                        'n' => style.underline = true,
+                        'o' => style.italic = true,
+                        'r' => style = reset,
+                        _ => {}
+                    }
+                }
+                continue;
+            }
+
+            let color = [style.color[0], style.color[1], style.color[2], alpha];
+            let mut advance = self.advance_px(c, scale);
+            self.emit_glyph(cursor, y, scale, color, c, style.italic, emit);
+            if style.bold && advance > 0 {
+                self.emit_glyph(cursor + scale, y, scale, color, c, style.italic, emit);
+                advance += scale;
+            }
+            if style.strikethrough {
+                emit(FontDraw::Solid {
+                    x: cursor,
+                    y: y + 3 * scale,
+                    w: advance,
+                    h: scale,
+                    color,
+                });
+            }
+            if style.underline {
+                emit(FontDraw::Solid {
+                    x: cursor - scale,
+                    y: y + 8 * scale,
+                    w: advance + scale,
+                    h: scale,
+                    color,
+                });
+            }
+            cursor += advance;
+        }
+    }
+
+    /// Emit one glyph quad (or recurse to the `?` fallback). The source rect and
+    /// destination scaling mirror [`Font::draw_glyph`] so the GPU and CPU paths
+    /// place glyphs identically.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_glyph(
+        &self,
+        x: i32,
+        y: i32,
+        scale: i32,
+        color: [u8; 4],
+        c: char,
+        italic: bool,
+        emit: &mut dyn FnMut(FontDraw),
+    ) {
+        let shear = if italic { scale } else { 0 };
+        if let Some(&slot) = self.index_of.get(&c) {
+            let advance = self.advance[slot as usize] as i32;
+            if advance > 1 {
+                emit(FontDraw::Glyph(FontQuad {
+                    tex: FontTex::Ascii,
+                    sx: (slot as u32 % 16) * 8,
+                    sy: (slot as u32 / 16) * 8,
+                    sw: (advance - 1) as u32,
+                    sh: 8,
+                    x,
+                    y,
+                    w: (advance - 1) * scale,
+                    h: 8 * scale,
+                    color,
+                    shear,
+                }));
+            }
+            return;
+        }
+        if c as u32 > 0xFFFF {
+            return;
+        }
+        if self.glyph_sizes.is_some() {
+            if let Some((start, end)) = self.unicode_span(c) {
+                let cp = c as u32;
+                let page = (cp >> 8) as u8;
+                // Only emit when the page sheet actually loaded (matches draw_glyph).
+                if self.unicode_page(page).is_some() {
+                    let src_w = (end + 1 - start) as u32;
+                    emit(FontDraw::Glyph(FontQuad {
+                        tex: FontTex::Page(page),
+                        sx: (cp % 16) * 16 + start as u32,
+                        sy: (cp / 16 % 16) * 16,
+                        sw: src_w,
+                        sh: 16,
+                        x,
+                        y,
+                        w: (src_w as i32 * scale + 1) / 2,
+                        h: 8 * scale,
+                        color,
+                        shear,
+                    }));
+                }
+            }
+            return;
+        }
+        if c != '?' {
+            self.emit_glyph(x, y, scale, color, '?', italic, emit);
         }
     }
 
