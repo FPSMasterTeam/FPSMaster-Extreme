@@ -13,6 +13,7 @@ CLAUDE.md
 
 # Runtime artifacts
 fpsmaster_options.txt
+fpsmaster_worlds.json
 logs/
 
 # Machine-local Claude Code config (settings.local.json, etc.)

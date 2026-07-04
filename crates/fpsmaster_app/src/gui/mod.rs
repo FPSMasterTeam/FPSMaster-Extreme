@@ -27,6 +27,7 @@ pub mod resource_packs;
 pub mod shaders;
 pub mod sound_options;
 pub mod widgets;
+pub mod world_select;
 
 use fpsmaster_protocol::v1_8_9::packets::ServerboundPacket;
 use fpsmaster_render::{GuiTexture, UiColor, UiFrame, UiRect};
@@ -138,8 +139,8 @@ pub enum GuiAction {
     /// Close the screen and return to gameplay (re-captures the cursor).
     CloseScreen,
     StartDemo(crate::game::DemoKind),
-    /// Launch a local Paper server and auto-connect once it's ready.
-    StartSingleplayer,
+    /// Enter a built-in, server-less single-player world generated from `seed`.
+    StartLocalWorld { seed: i64 },
     Connect { host: String, port: u16 },
     QuitToTitle,
     Quit,

@@ -1,13 +1,10 @@
 //! Non-interactive progress screens (connecting / signing in / device code)
 //! and the disconnected/error screen.
 
-use std::sync::mpsc::Receiver;
-
 use fpsmaster_render::UiFrame;
 use winit::event::{ElementState, KeyEvent};
 use winit::keyboard::{KeyCode, PhysicalKey};
 
-use super::main_menu::GuiMainMenu;
 use super::multiplayer::GuiMultiplayer;
 use super::widgets::GuiButton;
 use super::{
@@ -20,14 +17,12 @@ use crate::i18n::{tr, tr_args};
 #[derive(Debug, Clone, Copy)]
 pub enum Parent {
     Multiplayer,
-    MainMenu,
 }
 
 impl Parent {
     pub fn create(self) -> Box<dyn GuiScreen> {
         match self {
             Parent::Multiplayer => Box::new(GuiMultiplayer::new()),
-            Parent::MainMenu => Box::new(GuiMainMenu::new()),
         }
     }
 }
@@ -115,90 +110,6 @@ impl GuiScreen for GuiDisconnected {
             )
         {
             return vec![GuiAction::SetScreen(self.parent.create())];
-        }
-        Vec::new()
-    }
-}
-
-/// Waiting for the local Paper server to accept connections.
-pub struct GuiStartingServer {
-    ready_rx: Receiver<bool>,
-    port: u16,
-    cancel: Option<GuiButton>,
-}
-
-impl GuiStartingServer {
-    pub fn new(ready_rx: Receiver<bool>, port: u16) -> Self {
-        Self {
-            ready_rx,
-            port,
-            cancel: None,
-        }
-    }
-}
-
-impl GuiScreen for GuiStartingServer {
-    fn clicks_button(&self, x: f64, y: f64) -> bool {
-        self.cancel.as_ref().is_some_and(|b| b.clicked(x, y))
-    }
-
-    fn draw(&mut self, ui: &mut UiFrame, ctx: &DrawCtx) {
-        let s = ctx.scale;
-        let cancel = GuiButton::at_px(
-            (ctx.width - 200 * s) / 2,
-            ctx.height / 2 + 24 * s,
-            200 * s,
-            s,
-            tr("gui.cancel"),
-        );
-        draw_default_background(ui, ctx);
-        draw_centered_text(
-            ui,
-            ctx.width,
-            ctx.height / 2 - 16 * s,
-            s,
-            TEXT_WHITE,
-            &tr("fpsmaster.server.starting"),
-        );
-        draw_centered_text(
-            ui,
-            ctx.width,
-            ctx.height / 2 + 4 * s,
-            s,
-            TEXT_GRAY,
-            &tr("fpsmaster.server.waiting"),
-        );
-        cancel.draw(ui, s, ctx.mouse, ctx.mouse_down);
-        self.cancel = Some(cancel);
-    }
-
-    fn update(&mut self, _ctx: &mut ScreenCtx) -> Vec<GuiAction> {
-        match self.ready_rx.try_recv() {
-            Ok(true) => vec![GuiAction::Connect {
-                host: "localhost".into(),
-                port: self.port,
-            }],
-            Ok(false) => vec![GuiAction::SetScreen(Box::new(GuiDisconnected::new(
-                tr("fpsmaster.server.startFailed"),
-                tr("fpsmaster.server.startTimeout"),
-                Parent::MainMenu,
-            )))],
-            Err(_) => Vec::new(),
-        }
-    }
-
-    fn mouse_clicked(&mut self, x: f64, y: f64, _ctx: &mut ScreenCtx) -> Vec<GuiAction> {
-        if self.cancel.as_ref().is_some_and(|b| b.clicked(x, y)) {
-            return vec![GuiAction::QuitToTitle];
-        }
-        Vec::new()
-    }
-
-    fn key_pressed(&mut self, event: &KeyEvent, _ctx: &mut ScreenCtx) -> Vec<GuiAction> {
-        if event.state == ElementState::Pressed
-            && matches!(event.physical_key, PhysicalKey::Code(KeyCode::Escape))
-        {
-            return vec![GuiAction::QuitToTitle];
         }
         Vec::new()
     }
