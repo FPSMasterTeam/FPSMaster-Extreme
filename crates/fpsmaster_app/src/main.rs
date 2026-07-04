@@ -7,6 +7,7 @@ mod gui;
 mod item_renderer;
 mod network;
 mod particle;
+mod perf_capture;
 mod player_list;
 mod scoreboard;
 mod skin;
@@ -249,6 +250,8 @@ struct WinitApp {
     /// Per-frame CPU phase profiler (active only with `--profile-frames` /
     /// `RUST_LOG=frame_profile=debug`).
     profiler: frame_profiler::FrameProfiler,
+    /// Interactive render profiler toggled with F10 (`Some` while capturing).
+    perf_capture: Option<perf_capture::PerfCapture>,
     window_shown: bool,
     /// The window is fully hidden/occluded (backgrounded, minimized, covered).
     /// While set, rendering is skipped — see the note in `about_to_wait`.
@@ -305,6 +308,7 @@ impl WinitApp {
             smoke_profile,
             pass_bench,
             profiler: frame_profiler::FrameProfiler::new(now),
+            perf_capture: None,
             window_shown: false,
             occluded: false,
         }
@@ -446,7 +450,7 @@ impl ApplicationHandler for WinitApp {
             app.ext.register(Box::new(fpsmaster_ext::dev::DemoMod::new()));
         }
         // Load `.js` (and, later, native) mods from `mods/` next to the working
-        // directory. F10 reloads them at runtime.
+        // directory. Shift+F10 reloads them at runtime.
         let loaded = app.ext.load_mods(std::path::Path::new("mods"));
         apply_disabled_mods(&mut app);
         if !loaded.is_empty() {
@@ -490,14 +494,22 @@ impl ApplicationHandler for WinitApp {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                // F10: hot-reload `mods/` (dev convenience; never consumed by mods).
+                // F10: toggle the interactive render profiler (start/stop a
+                // capture). Shift+F10 keeps the dev-only `mods/` hot-reload.
                 if event.state == ElementState::Pressed
                     && !event.repeat
                     && matches!(event.physical_key, PhysicalKey::Code(KeyCode::F10))
                 {
-                    let loaded = app.ext.reload_mods(std::path::Path::new("mods"));
-                    apply_disabled_mods(app);
-                    log::info!("[ext] reloaded {} mod(s): {:?}", loaded.len(), loaded);
+                    if self.modifiers.shift_key() {
+                        let loaded = app.ext.reload_mods(std::path::Path::new("mods"));
+                        apply_disabled_mods(app);
+                        log::info!("[ext] reloaded {} mod(s): {:?}", loaded.len(), loaded);
+                    } else if let Some(capture) = self.perf_capture.take() {
+                        log::info!("{}", capture.finish(Instant::now()));
+                    } else {
+                        self.perf_capture = Some(perf_capture::PerfCapture::new(Instant::now()));
+                        log::info!("[perf] capture started — press F10 again to stop");
+                    }
                 }
                 if event.state == ElementState::Pressed
                     && !event.repeat
@@ -961,6 +973,12 @@ impl ApplicationHandler for WinitApp {
             renderer.set_debug_tris(&[]);
             app.ext_lines_on = false;
         }
+        // While a perf capture runs, feed the HUD indicator (secs, frames) and
+        // force GPU timing on so the samples carry a real `gpu_us`.
+        let capture_status = self
+            .perf_capture
+            .as_ref()
+            .map(|c| (c.elapsed(Instant::now()), c.frames()));
         render_frame(
             renderer,
             app,
@@ -974,6 +992,7 @@ impl ApplicationHandler for WinitApp {
             self.mouse_down_left,
             self.f3_debug,
             self.smoke_profile.is_some() || self.pass_bench.is_some(),
+            capture_status,
             &mut self.profiler,
         );
         if let Some(profile) = self.smoke_profile.as_mut() {
@@ -981,6 +1000,13 @@ impl ApplicationHandler for WinitApp {
         }
         if let Some(bench) = self.pass_bench.as_mut() {
             bench.record(renderer.last_stats(), Instant::now());
+        }
+        if let Some(capture) = self.perf_capture.as_mut() {
+            capture.record(
+                renderer.last_stats(),
+                self.profiler.last_frame_phases(),
+                Instant::now(),
+            );
         }
         // Adaptive resolution: drive the world render scale off the occlusion-proof
         // GPU frame time toward the target budget. Steps by 0.05 at most once a
@@ -2266,6 +2292,29 @@ fn build_inventory_preview(
     }));
 }
 
+/// Top-centre "● REC PERF" banner shown while an F10 capture is running, so the
+/// user always knows sampling is live (menus and F1-hidden HUD included).
+fn draw_capture_indicator(
+    ui: &mut fpsmaster_render::UiFrame,
+    width: i32,
+    scale: i32,
+    secs: f32,
+    frames: usize,
+) {
+    use fpsmaster_render::{text_height, text_width, UiColor, UiRect};
+    let text = format!("\u{25CF} REC PERF  {secs:.1}s  {frames} frames");
+    let pad = 2 * scale;
+    let w = text_width(&text, scale);
+    let h = text_height(scale);
+    let x = (width - w) / 2;
+    let y = pad;
+    ui.rect(
+        UiRect::new(x - pad, y - scale, w + 2 * pad, h + 2 * scale),
+        UiColor::rgba(0, 0, 0, 170),
+    );
+    ui.text_shadowed(x, y, scale, UiColor::rgba(255, 80, 80, 255), text);
+}
+
 /// Render one frame: world, entities + first-person hand, HUD and the open
 /// screen. Driven from `AboutToWait` so the frame rate is paced by our own
 /// vsync/FPS-cap logic instead of macOS Core Animation throttling.
@@ -2283,6 +2332,8 @@ fn render_frame(
     mouse_down: bool,
     f3_debug: bool,
     smoke_active: bool,
+    // `Some((elapsed_secs, frames))` while an F10 perf capture is running.
+    capture_status: Option<(f32, usize)>,
     profiler: &mut frame_profiler::FrameProfiler,
 ) {
     let now = Instant::now();
@@ -2296,7 +2347,9 @@ fn render_frame(
 
     // The GPU-time readback costs ~0.04 ms/frame, so only measure it when its
     // number is actually shown: the F3 overlay, or a scripted benchmark run.
-    renderer.set_gpu_timing(f3_debug || smoke_active || app.settings.adaptive_resolution);
+    renderer.set_gpu_timing(
+        f3_debug || smoke_active || capture_status.is_some() || app.settings.adaptive_resolution,
+    );
 
     // Render-distance safety net: free the GPU meshes of columns that drifted
     // out of view (keeping their block data) so resident VRAM stays bounded even
@@ -2677,6 +2730,12 @@ fn render_frame(
             mods: &mod_list,
         };
         screen.draw(&mut ui, &ctx);
+    }
+
+    // F10 perf-capture indicator, drawn on top of everything so it stays visible
+    // through open menus and with the HUD hidden.
+    if let Some((secs, frames)) = capture_status {
+        draw_capture_indicator(&mut ui, width, gui::gui_scale(width, height), secs, frames);
     }
 
     // Drive the day/night sky and lightmap from the world clock (interpolated

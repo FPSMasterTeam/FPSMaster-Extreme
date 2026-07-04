@@ -38,6 +38,9 @@ pub struct FrameProfiler {
     ema_ms: f32,
     /// Last completed window summary, served to the F3 overlay.
     latest: PhaseSummary,
+    /// The just-completed frame's per-phase durations, kept after `cur` is
+    /// cleared so a per-frame consumer (the F10 perf capture) can sample them.
+    last_frame_phases: BTreeMap<&'static str, Duration>,
 }
 
 impl FrameProfiler {
@@ -53,6 +56,7 @@ impl FrameProfiler {
             last_flush: now,
             ema_ms: 0.0,
             latest: PhaseSummary::default(),
+            last_frame_phases: BTreeMap::new(),
         }
     }
 
@@ -60,6 +64,13 @@ impl FrameProfiler {
     /// overlay. Empty until the first window completes.
     pub fn latest(&self) -> &PhaseSummary {
         &self.latest
+    }
+
+    /// The per-phase CPU durations of the frame that just closed (via
+    /// [`Self::end_frame`]). Unlike [`Self::latest`] this is a single frame, not
+    /// a windowed average, so the F10 capture can build its own statistics.
+    pub fn last_frame_phases(&self) -> &BTreeMap<&'static str, Duration> {
+        &self.last_frame_phases
     }
 
     /// Record one phase's duration for the current frame. Overwrites, so each
@@ -103,6 +114,9 @@ impl FrameProfiler {
         self.frame_sum += cpu;
         self.frame_max = self.frame_max.max(cpu);
         self.frames += 1;
+        // Hand the closed frame's phases to any per-frame consumer before we
+        // reset `cur` for the next frame.
+        std::mem::swap(&mut self.last_frame_phases, &mut self.cur);
         self.cur.clear();
 
         if now.duration_since(self.last_flush) >= Duration::from_secs(1) {
