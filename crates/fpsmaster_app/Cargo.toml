@@ -1,6 +1,8 @@
 [package]
 name = "fpsmaster_app"
-version = "0.3.1"
+# Product version shown in-game (title screen / window / F3), sourced at compile
+# time via CARGO_PKG_VERSION — the single source of truth for the display version.
+version = "1.0.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

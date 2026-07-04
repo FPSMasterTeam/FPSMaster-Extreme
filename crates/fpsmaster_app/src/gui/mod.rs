@@ -243,10 +243,25 @@ pub struct ScreenCtx<'a> {
     pub mouse: (f64, f64),
 }
 
+/// The active GUI-scale preference (vanilla `guiScale`: `0` = Auto, `1..` = a
+/// fixed cap), published once per frame from [`Settings`] by the render loop.
+/// Every menu and HUD reads the scale through the ambient [`gui_scale`] helper —
+/// which is a pure function of the window size — so the preference lives here as
+/// frame-global state rather than being threaded through dozens of draw calls.
+static GUI_SCALE_PREF: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Publish the user's GUI-scale preference for this frame. Call before any
+/// screen or HUD draw so [`gui_scale`] resolves against the current setting.
+pub fn set_gui_scale_pref(pref: u32) {
+    GUI_SCALE_PREF.store(pref, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// GUI pixel scale shared by every screen and the HUD (same formula the
 /// renderer rasterizes the UI buffer at, so all layout snaps to GUI pixels).
+/// Honors the GUI-scale preference set via [`set_gui_scale_pref`].
 pub fn gui_scale(width: i32, height: i32) -> i32 {
-    fpsmaster_render::gui_pixel_scale(width.max(1) as u32, height.max(1) as u32) as i32
+    let pref = GUI_SCALE_PREF.load(std::sync::atomic::Ordering::Relaxed);
+    fpsmaster_render::gui_pixel_scale_capped(width.max(1) as u32, height.max(1) as u32, pref) as i32
 }
 
 // ─── Shared drawing helpers ──────────────────────────────────────────────────

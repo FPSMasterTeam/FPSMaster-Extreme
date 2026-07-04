@@ -228,7 +228,7 @@ fn draw_debug_overlay(
 
     let grounded = if info.on_ground { "yes" } else { "no" };
     let left = [
-        format!("FPSMaster Extreme  {fps:.0} fps"),
+        format!("{}  {fps:.0} fps", crate::version::title()),
         format!("XYZ: {fx:.3} / {fy:.3} / {fz:.3}"),
         format!("Block: {bx} {by} {bz}  (grounded: {grounded})"),
         format!("Chunk: {rx} {ry} {rz} in {cx} {cz}"),

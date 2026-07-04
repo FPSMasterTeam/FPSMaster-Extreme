@@ -15,11 +15,17 @@ use super::{draw_default_background, DrawCtx, GuiAction, GuiScreen, ScreenCtx};
 #[derive(Default)]
 pub struct GuiMainMenu {
     buttons: Vec<GuiButton>,
+    /// A random line from the vanilla `texts/splashes.txt`, chosen once when the
+    /// title screen is (re)opened — vanilla re-rolls it in `GuiMainMenu.initGui`.
+    splash: Option<String>,
 }
 
 impl GuiMainMenu {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            splash: pick_splash(),
+            ..Self::default()
+        }
     }
 
     /// Vanilla `initGui` + `addSingleplayerMultiplayerButtons`.
@@ -71,30 +77,42 @@ impl GuiScreen for GuiMainMenu {
         }
 
         let s = ctx.scale;
+        let cx = ctx.width / 2;
 
-        // Custom MINECRAFT logo (single image, 1364×214). Drawn 256 GUI px wide,
-        // aspect-preserved (~40 GUI px tall), centered horizontally near the top.
-        const LOGO_SRC_W: u32 = 1364;
-        const LOGO_SRC_H: u32 = 214;
-        let logo_w = 256 * s;
-        let logo_h = logo_w * LOGO_SRC_H as i32 / LOGO_SRC_W as i32;
-        let logo_x = (ctx.width - logo_w) / 2;
+        // Vanilla MINECRAFT logo from gui/title/minecraft.png: two 155×44 halves
+        // (rows at v=0 and v=45 of the 256×256 sheet) blitted side by side, exactly
+        // like vanilla `GuiMainMenu` (`j = width/2 - 137`, logo at y=30).
         let logo_y = 30 * s;
+        let j = cx - 137 * s;
+        ui.image(UiRect::new(j, logo_y, 155 * s, 44 * s), GuiTexture::Title, 0, 0, 155, 44);
         ui.image(
-            UiRect::new(logo_x, logo_y, logo_w, logo_h),
+            UiRect::new(j + 155 * s, logo_y, 155 * s, 44 * s),
             GuiTexture::Title,
             0,
-            0,
-            LOGO_SRC_W,
-            LOGO_SRC_H,
+            45,
+            155,
+            44,
         );
+
+        // Splash text from the vanilla texts/splashes.txt, yellow with a shadow near
+        // the logo's lower-right (vanilla anchors it at width/2+90, tilted ~20° and
+        // pulsing — the tilt/pulse need rotated, fractionally-scaled glyphs the UI
+        // layer has no primitive for, so it renders upright at the GUI scale).
+        if let Some(splash) = &self.splash {
+            let splash_w = fpsmaster_render::text_width(splash, s);
+            let splash_x = (cx + 88 * s - splash_w / 2)
+                .min(ctx.width - splash_w - 2 * s)
+                .max(2 * s);
+            let splash_y = logo_y + 34 * s;
+            ui.text_shadowed(splash_x, splash_y, s, super::TEXT_YELLOW, splash);
+        }
 
         // Brand subtitle under the logo: "FPSMaster Extreme", centered.
         {
-            let brand = "FPSMaster Extreme";
+            let brand = crate::version::PRODUCT_NAME;
             let brand_w = fpsmaster_render::text_width(brand, s);
             let brand_x = (ctx.width - brand_w) / 2;
-            let brand_y = logo_y + logo_h + 2 * s;
+            let brand_y = logo_y + 46 * s;
             ui.text_shadowed(brand_x, brand_y, s, super::TEXT_YELLOW, brand);
         }
 
@@ -104,7 +122,13 @@ impl GuiScreen for GuiMainMenu {
         }
 
         // Version string: bottom-left, white with shadow.
-        ui.text_shadowed(2 * s, ctx.height - 10 * s, s, super::TEXT_WHITE, "FPSMaster Extreme 1.8.9");
+        ui.text_shadowed(
+            2 * s,
+            ctx.height - 10 * s,
+            s,
+            super::TEXT_WHITE,
+            crate::version::title(),
+        );
     }
 
     fn wants_panorama(&self) -> bool {
@@ -132,4 +156,28 @@ impl GuiScreen for GuiMainMenu {
         }
         Vec::new()
     }
+}
+
+/// The vanilla splash file, one splash per line, under the active assets.
+const SPLASHES_ASSET: &str = "assets/minecraft/texts/splashes.txt";
+
+/// Pick a random splash line from the vanilla [`SPLASHES_ASSET`], or `None` when
+/// the asset is unavailable (no vanilla assets extracted). Blank lines are
+/// dropped; the choice is seeded from the wall clock so it varies per visit,
+/// matching vanilla's per-`initGui` re-roll.
+fn pick_splash() -> Option<String> {
+    let text = fpsmaster_render::read_asset_string(SPLASHES_ASSET)?;
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    Some(lines[(seed % lines.len() as u128) as usize].to_owned())
 }

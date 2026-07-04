@@ -68,6 +68,11 @@ pub struct Settings {
     /// compositor and lets the display hardware scale a lower mode — cheap present
     /// at a full-screen image). Off = windowed.
     pub fullscreen: bool,
+    /// GUI scale (vanilla "GUI Scale"): `0` = Auto (the largest scale that fits),
+    /// `1..=GUI_SCALE_MAX` = a fixed upper cap on the pixel scale of every menu
+    /// and HUD. The window-fit rule still bounds it, so a fixed value never blows
+    /// the UI up past what the window can hold.
+    pub gui_scale: u32,
     /// Shader pack master switch: per-pixel directional sun + ambient lighting.
     pub shaders: bool,
     /// Sun shadow map (only active while `shaders` is on).
@@ -153,6 +158,10 @@ pub const RENDER_DIST_MIN: u32 = 2;
 pub const RENDER_DIST_MAX: u32 = 32;
 /// Highest selectable mipmap level (16px tiles → mips 0..4).
 pub const MIPMAP_MAX: u32 = 4;
+/// Highest fixed GUI scale the option cycles to (`0` = Auto, then `1..=4`).
+/// Matches the useful vanilla range (Small/Normal/Large) plus one step for
+/// high-DPI displays where Auto already resolves to 4+.
+pub const GUI_SCALE_MAX: u32 = 4;
 /// Highest ray-tracing quality preset index (Low = 0, Medium = 1, High = 2,
 /// Path Traced = 3, the experimental full path tracer).
 pub const RT_QUALITY_MAX: u32 = 3;
@@ -181,6 +190,7 @@ impl Default for Settings {
             mipmap_levels: MIPMAP_MAX,
             resolution: None,
             fullscreen: false,
+            gui_scale: 0,
             shaders: false,
             shader_shadows: true,
             shader_specular: true,
@@ -316,6 +326,11 @@ impl Settings {
                 "fullscreen" => {
                     if let Ok(v) = val.parse() {
                         s.fullscreen = v;
+                    }
+                }
+                "gui_scale" => {
+                    if let Ok(v) = val.parse() {
+                        s.gui_scale = v;
                     }
                 }
                 "shaders" => {
@@ -473,6 +488,7 @@ impl Settings {
         s.render_scale = s.render_scale.clamp(RENDER_SCALE_MIN, 1.0);
         s.render_distance = s.render_distance.clamp(RENDER_DIST_MIN, RENDER_DIST_MAX);
         s.mipmap_levels = s.mipmap_levels.min(MIPMAP_MAX);
+        s.gui_scale = s.gui_scale.min(GUI_SCALE_MAX);
         s.rt_quality = s.rt_quality.min(RT_QUALITY_MAX);
         s.dlss_quality = s.dlss_quality.min(DLSS_QUALITY_MAX);
         s.brightness = s.brightness.clamp(BRIGHTNESS_MIN, BRIGHTNESS_MAX);
@@ -532,6 +548,7 @@ impl Settings {
             self.old_animations,
             self.resource_pack.as_deref().unwrap_or(""),
         );
+        text.push_str(&format!("gui_scale={}\n", self.gui_scale));
         text.push_str(&format!("taa={}\n", self.taa));
         text.push_str(&format!("ray_tracing={}\n", self.ray_tracing));
         text.push_str(&format!("rt_quality={}\n", self.rt_quality));
@@ -717,6 +734,24 @@ impl Settings {
             crate::i18n::tr("options.off")
         } else {
             self.mipmap_levels.to_string()
+        }
+    }
+
+    /// Advance the GUI scale, wrapping `Auto(0) → 1 → … → GUI_SCALE_MAX → Auto`.
+    pub fn cycle_gui_scale(&mut self) {
+        self.gui_scale = if self.gui_scale >= GUI_SCALE_MAX {
+            0
+        } else {
+            self.gui_scale + 1
+        };
+    }
+
+    /// Value label for the GUI-scale button: `Auto` at 0, else the number.
+    pub fn gui_scale_label(self) -> String {
+        if self.gui_scale == 0 {
+            crate::i18n::tr("options.guiScale.auto")
+        } else {
+            self.gui_scale.to_string()
         }
     }
 
@@ -1120,6 +1155,7 @@ mod tests {
         original.render_scale = 0.7;
         original.fancy_graphics = false;
         original.mipmap_levels = 2;
+        original.gui_scale = 3;
         original.brightness = 0.55;
         original.old_animations = true;
         original.ray_tracing = true;
@@ -1137,6 +1173,7 @@ mod tests {
         assert!((loaded.render_scale - 0.7).abs() < 1e-6);
         assert!(!loaded.fancy_graphics);
         assert_eq!(loaded.mipmap_levels, 2);
+        assert_eq!(loaded.gui_scale, 3);
         assert!((loaded.brightness - 0.55).abs() < 1e-6);
         assert!(loaded.old_animations);
         assert!(loaded.ray_tracing);

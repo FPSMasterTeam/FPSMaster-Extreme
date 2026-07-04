@@ -35,6 +35,6 @@ pub use texture::{
     list_lang_codes, read_asset_string,
 };
 pub use ui::{
-    gui_pixel_scale, text_height, text_width, GuiAtlas, GuiTexture, UiBatch, UiColor, UiFrame,
-    UiGeometry, UiRect, UiTextureId, UiVertex,
+    gui_pixel_scale, gui_pixel_scale_capped, text_height, text_width, GuiAtlas, GuiTexture,
+    UiBatch, UiColor, UiFrame, UiGeometry, UiRect, UiTextureId, UiVertex,
 };

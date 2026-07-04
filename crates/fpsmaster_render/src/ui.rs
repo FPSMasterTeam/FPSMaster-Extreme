@@ -16,7 +16,8 @@ pub enum GuiTexture {
     Inventory,
     /// gui/options_background.png — the tiled dirt menu background.
     OptionsBackground,
-    /// Custom single-image MINECRAFT title logo bundled with the binary.
+    /// gui/title/minecraft.png — the vanilla MINECRAFT title logo (256×256 sheet,
+    /// blitted from two 155×44 halves, matching vanilla `GuiMainMenu`).
     Title,
     /// gui/container/generic_54.png — the chest window (1..6 rows, blitted in
     /// two parts) and the fallback for unmodelled container types.
@@ -78,10 +79,8 @@ impl GuiAtlas {
             icons: crate::texture::load_gui_image("icons"),
             inventory: crate::texture::load_gui_image("container/inventory"),
             options_background: crate::texture::load_gui_image("options_background"),
-            // Custom single-image MINECRAFT logo bundled with the binary.
-            title: image::load_from_memory(include_bytes!("embedded/title_logo.png"))
-                .ok()
-                .map(|img| img.to_rgba8()),
+            // Vanilla MINECRAFT logo from the active assets (gui/title/minecraft.png).
+            title: crate::texture::load_gui_image("title/minecraft"),
             chest: crate::texture::load_gui_image("container/generic_54"),
             dispenser: crate::texture::load_gui_image("container/dispenser"),
             hopper: crate::texture::load_gui_image("container/hopper"),
@@ -914,8 +913,19 @@ impl<'a> Tess<'a> {
 /// The GUI pixel scale for a window of `width`×`height` (vanilla
 /// `ScaledResolution` auto gui-scale with `guiScale=0`).
 pub fn gui_pixel_scale(width: u32, height: u32) -> u32 {
+    gui_pixel_scale_capped(width, height, 0)
+}
+
+/// The GUI pixel scale for a window of `width`×`height` under a user GUI-scale
+/// preference, matching vanilla `ScaledResolution`: `gui_scale` `0` means "Auto"
+/// (the largest scale that still fits a 320×240 layout), while `1..` is a fixed
+/// upper cap (Small/Normal/Large/…). The window-fit conditions still bound the
+/// result, so a fixed cap never forces a UI too large for the window — it only
+/// ever holds the scale *lower* than Auto would pick.
+pub fn gui_pixel_scale_capped(width: u32, height: u32, gui_scale: u32) -> u32 {
+    let cap = if gui_scale == 0 { 1000 } else { gui_scale };
     let mut scale = 1u32;
-    while scale < 1000
+    while scale < cap
         && width / (scale + 1) >= 320
         && height / (scale + 1) >= 240
     {
@@ -948,6 +958,22 @@ fn item_swatch_color(id: i16) -> UiColor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gui_scale_auto_matches_uncapped_and_cap_bounds_it() {
+        // 1080p: Auto (0) resolves to 4, and the plain helper agrees.
+        assert_eq!(gui_pixel_scale_capped(1920, 1080, 0), 4);
+        assert_eq!(gui_pixel_scale(1920, 1080), 4);
+        // A fixed cap only ever holds the scale lower than Auto.
+        assert_eq!(gui_pixel_scale_capped(1920, 1080, 1), 1);
+        assert_eq!(gui_pixel_scale_capped(1920, 1080, 2), 2);
+        // 720p only fits 3, so a cap of 4 still resolves to 3 (never oversized).
+        assert_eq!(gui_pixel_scale_capped(1280, 720, 0), 3);
+        assert_eq!(gui_pixel_scale_capped(1280, 720, 4), 3);
+        // Tiny window: scale is at least 1 whatever the cap.
+        assert_eq!(gui_pixel_scale_capped(200, 200, 0), 1);
+        assert_eq!(gui_pixel_scale_capped(200, 200, 3), 1);
+    }
 
     #[test]
     fn gradient_rect_emits_one_white_quad_with_top_and_bottom_colors() {

@@ -607,6 +607,11 @@ pub struct InventoryPreview<'a> {
 }
 
 pub struct Renderer {
+    /// The window we present to. Held so we can call `pre_present_notify()` right
+    /// before `frame.present()` — on macOS this hands the drawable to the
+    /// compositor in sync with the display refresh, without it static frames can
+    /// flicker (a screen recorder forcing continuous composite masks the tell).
+    window: Arc<Window>,
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -1191,6 +1196,9 @@ fn request_standard_adapter(
 impl Renderer {
     pub fn new(window: Arc<Window>) -> Result<Self, RendererError> {
         let size = window.inner_size();
+        // Kept for `pre_present_notify()` at present time (the adapter helpers
+        // below consume the original `window`).
+        let present_window = window.clone();
         // Honour WGPU_BACKEND / WGPU_ADAPTER_NAME etc. so the backend can be picked
         // from the environment (e.g. WGPU_BACKEND=dx12 for per-backend testing).
         let instance_descriptor =
@@ -1337,11 +1345,23 @@ impl Renderer {
         let present_modes = caps.present_modes.clone();
         log::info!("surface present modes available: {present_modes:?}");
         let present_mode = pick_present_mode(&present_modes, false);
-        let alpha_mode = caps
-            .alpha_modes
-            .first()
-            .copied()
-            .unwrap_or(wgpu::CompositeAlphaMode::Auto);
+        // Prefer an OPAQUE surface: a game window is fully opaque, and the UI pass
+        // alpha-blends onto the swapchain, which can leave the drawable's alpha
+        // channel < 1 in UI regions. If the window server treats the drawable as
+        // premultiplied it then composites those pixels against the desktop, and
+        // the macOS direct-scanout path (used only when nothing is capturing the
+        // screen) renders that inconsistently — static UI flickers, yet a screen
+        // recorder (which forces compositing) hides it. Opaque ignores the alpha
+        // channel entirely, so the window is stable regardless of the path.
+        log::info!("surface alpha modes available: {:?}", caps.alpha_modes);
+        let alpha_mode = if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::Opaque) {
+            wgpu::CompositeAlphaMode::Opaque
+        } else {
+            caps.alpha_modes
+                .first()
+                .copied()
+                .unwrap_or(wgpu::CompositeAlphaMode::Auto)
+        };
         let config = wgpu::SurfaceConfiguration {
             // COPY_SRC additionally allows the FPSMASTER_DUMP_FRAME debug hook to
             // read back the post-processed swapchain image.
@@ -1356,7 +1376,11 @@ impl Renderer {
             present_mode,
             alpha_mode,
             view_formats: vec![],
-            desired_maximum_frame_latency: 2,
+            // Per present mode: 1 for the unsynced modes (drawable back-pressure
+            // paces Immediate to the refresh, killing the tearing that reads as
+            // GUI flicker, at the lowest latency); 2 for Fifo (a spare frame keeps
+            // vsync from hitching on a spike). Kept in sync in `set_vsync`.
+            desired_maximum_frame_latency: frame_latency_for(present_mode),
         };
         surface.configure(&device, &config);
 
@@ -4809,6 +4833,7 @@ impl Renderer {
         });
 
         let mut renderer = Self {
+            window: present_window,
             surface,
             device,
             queue,
@@ -6206,11 +6231,22 @@ impl Renderer {
     }
 
     /// Write the post-pass parameters (bloom + grade) for the current off-screen
-    /// size and bloom toggle.
+    /// size and bloom toggle, gated by the live shader-master state.
     fn update_post_params(&self) {
+        let params = self.compute_post_params(self.shaders_enabled);
+        self.queue
+            .write_buffer(&self.post_params_buffer, 0, bytemuck::cast_slice(&params));
+    }
+
+    /// The 16-float post-pass parameter block for a given shader-master state.
+    /// With `shaders_on == false` it is the passthrough set (no tone-map/grade
+    /// and every effect zeroed), which the title-screen panorama uses so the
+    /// background image is shown raw — untouched by the shader toggle or any
+    /// shader effect (see [`render_inner`]).
+    fn compute_post_params(&self, shaders_on: bool) -> [f32; 16] {
         let (w, h) = self.scaled_dims();
         // All post effects are gated by the master shader toggle.
-        let sh = self.shaders_enabled;
+        let sh = shaders_on;
         let on = |b: bool, v: f32| if sh && b { v } else { 0.0 };
         // p: bloom threshold, bloom intensity, texel.x, texel.y
         // q: exposure, saturation, contrast, bloom-enabled
@@ -6220,7 +6256,7 @@ impl Renderer {
         // soft-knee bright-pass) for a cinematic highlight glow, plus a touch of extra
         // saturation + contrast. Exposure stays slightly under so sunlit blocks keep
         // texture detail (under-exposure + blooming highlights reads as drama).
-        let params = [
+        [
             0.9f32,
             0.72,
             1.0 / w as f32,
@@ -6251,9 +6287,7 @@ impl Renderer {
             // s.z: add the volumetric in-scatter target.
             on(self.volumetric_enabled, 1.0),
             0.0,
-        ];
-        self.queue
-            .write_buffer(&self.post_params_buffer, 0, bytemuck::cast_slice(&params));
+        ]
     }
 
     pub fn aspect(&self) -> f32 {
@@ -6265,8 +6299,14 @@ impl Renderer {
     /// only when the effective present mode actually changes.
     pub fn set_vsync(&mut self, vsync: bool) {
         let desired = pick_present_mode(&self.present_modes, vsync);
-        if self.config.present_mode != desired {
+        let desired_latency = frame_latency_for(desired);
+        if self.config.present_mode != desired
+            || self.config.desired_maximum_frame_latency != desired_latency
+        {
             self.config.present_mode = desired;
+            // Fifo wants a deeper queue (spike tolerance); the unsynced modes want
+            // a shallow one (pacing + latency). See `frame_latency_for`.
+            self.config.desired_maximum_frame_latency = desired_latency;
             self.surface.configure(&self.device, &self.config);
         }
         log::info!(
@@ -8370,6 +8410,16 @@ impl Renderer {
         // When the title screen requests the panorama, upload its rotation
         // uniforms; the pass below draws it instead of the sky+world.
         let panorama_active = panorama_timer.is_some() && self.panorama.is_some();
+        // The title-screen panorama is the raw vanilla background: force the post
+        // pass into its shaders-off passthrough while it's active so neither the
+        // shader toggle nor any shader effect (tone-map/grade/bloom/vignette/dof/
+        // chromatic/motion-blur/volumetric) alters it. World frames re-write the
+        // settings-derived params, so this self-corrects on the next world frame.
+        {
+            let params = self.compute_post_params(self.shaders_enabled && !panorama_active);
+            self.queue
+                .write_buffer(&self.post_params_buffer, 0, bytemuck::cast_slice(&params));
+        }
         if let (Some(timer), Some(pan)) = (panorama_timer, &self.panorama) {
             // Vanilla: pitch = sin(timer/400)*25+20 degrees, yaw = -timer*0.1 degrees.
             let pitch = ((timer / 400.0).sin() * 25.0 + 20.0).to_radians();
@@ -9976,6 +10026,11 @@ impl Renderer {
         }
 
         let t_present = Instant::now();
+        // Tell the windowing system a present is imminent so it can schedule the
+        // drawable against the display refresh. On macOS this keeps presentation
+        // in sync with the compositor; skipping it lets static frames flicker
+        // (and a screen recorder, which forces continuous composite, hides it).
+        self.window.pre_present_notify();
         frame.present();
         let present_us = t_present.elapsed().as_micros() as u32;
 

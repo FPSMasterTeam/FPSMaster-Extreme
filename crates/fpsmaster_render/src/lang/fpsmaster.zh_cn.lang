@@ -107,3 +107,7 @@ soundCategory.hostile=敌对生物
 soundCategory.neutral=友好生物
 soundCategory.player=玩家
 soundCategory.ambient=环境
+
+# 界面缩放（原版键；因我们的中文仅靠此叠加层提供，故在此翻译）
+options.guiScale=界面缩放
+options.guiScale.auto=自动

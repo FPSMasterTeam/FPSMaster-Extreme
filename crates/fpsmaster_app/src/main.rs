@@ -15,6 +15,7 @@ mod servers;
 mod settings;
 mod sound;
 mod text_input;
+mod version;
 
 // The i18n engine lives in `fpsmaster_render` (it owns asset access and is shared
 // with item/block name localization); re-export it so the rest of the app keeps
@@ -320,7 +321,7 @@ impl ApplicationHandler for WinitApp {
             None => LogicalSize::new(1280.0, 720.0).into(),
         };
         let attrs = Window::default_attributes()
-            .with_title("FPSMaster Extreme - Rust Minecraft Client")
+            .with_title(format!("{} - Rust Minecraft Client", version::title()))
             .with_inner_size(initial_size)
             .with_visible(false);
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
@@ -2288,6 +2289,10 @@ fn render_frame(
     let frame_dt = (now - *last_frame).as_secs_f32().min(0.1);
     fps_counter.tick(now);
     *last_frame = now;
+
+    // Publish the GUI-scale preference for this frame so every menu/HUD draw
+    // (and the inventory preview below) resolves `gui::gui_scale` against it.
+    gui::set_gui_scale_pref(app.settings.gui_scale);
 
     // The GPU-time readback costs ~0.04 ms/frame, so only measure it when its
     // number is actually shown: the F3 overlay, or a scripted benchmark run.
