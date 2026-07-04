@@ -1254,7 +1254,8 @@ impl Renderer {
             info.backend
         );
 
-        let optional_features = adapter.features()
+        #[allow(unused_mut)]
+        let mut optional_features = adapter.features()
             & (wgpu::Features::TIMESTAMP_QUERY
                 | wgpu::Features::MULTI_DRAW_INDIRECT_COUNT
                 // Hardware ray tracing for sun shadows + RTAO. Requested only when
@@ -1262,6 +1263,17 @@ impl Renderer {
                 // backends); absent on the GL fallback, so the default path is
                 // unaffected.
                 | wgpu::Features::EXPERIMENTAL_RAY_QUERY);
+        // wgpu's hardware ray tracing on the Metal backend is experimental and, in
+        // practice, hangs and corrupts the GPU on Apple Silicon — Metal reports
+        // EXPERIMENTAL_RAY_QUERY support but executing ray queries produces garbage.
+        // The ROI of supporting RT on macOS is too low to chase, so never request it
+        // there: this forces `rt_supported = false` below, which greys out the toggle
+        // and skips building every RT pipeline, shader and bind group. RT stays fully
+        // available on the Windows/Linux builds where the backends support it.
+        #[cfg(target_os = "macos")]
+        {
+            optional_features &= !wgpu::Features::EXPERIMENTAL_RAY_QUERY;
+        }
         let device_descriptor = wgpu::DeviceDescriptor {
             label: Some("fpsmaster-device"),
             required_features: optional_features,
