@@ -9,98 +9,293 @@ use fpsmaster_core::SectionPos;
 use wgpu::util::DeviceExt;
 use crate::{
     texture::{EntityAtlasImage, SkyAtlasImage, TextureAtlasImage, TextureAtlasSource},
-    AtlasUv, BiomeColors, Frustum, GuiAtlas, ModelVertex, UiFrame, Vertex,
+    ui::{UiBatch, UiGeometry, UiTextureId, UiVertex},
+    AtlasUv, BiomeColors, Frustum, GuiAtlas, GuiTexture, ModelVertex, Vertex,
 };
 use super::*;
 
-/// Re-rasterize one UI layer into its cached GPU texture, recreating the texture
-/// on a surface resize and re-uploading only when the command list changed.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn prepare_ui_layer(
+/// Upload an RGBA image as an sRGB UI atlas texture and build its bind group
+/// (texture + the shared nearest sampler). The `BindGroup` keeps the texture and
+/// view alive, so neither is returned.
+fn upload_ui_texture(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
-    cache: &mut Option<UiCache>,
     layout: &wgpu::BindGroupLayout,
     sampler: &wgpu::Sampler,
-    gui: &GuiAtlas,
-    commands: &[crate::ui::UiCommand],
+    data: &[u8],
     width: u32,
     height: u32,
-    divisor: u32,
     label: &str,
-) {
-    let needs_new_texture = cache
-        .as_ref()
-        .is_none_or(|cache| cache.width != width || cache.height != height);
-    if needs_new_texture {
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some(label),
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some(label),
-            layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(sampler),
-                },
-            ],
-        });
-        *cache = Some(UiCache {
-            texture,
-            bind_group,
-            width,
-            height,
-            // Force the upload below by storing a list that won't match.
-            last_commands: vec![crate::ui::UiCommand::Rect {
-                rect: crate::ui::UiRect::new(-1, -1, 0, 0),
-                color: crate::ui::UiColor::rgba(0, 0, 0, 0),
-            }],
-        });
-    }
-
-    let cache = cache.as_mut().expect("ui cache just set");
-    if !needs_new_texture && cache.last_commands == commands {
-        return;
-    }
-
-    let pixels = UiFrame::rasterize(commands, width, height, divisor, gui);
+) -> wgpu::BindGroup {
+    let (w, h) = (width.max(1), height.max(1));
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
     queue.write_texture(
         wgpu::TexelCopyTextureInfo {
-            texture: &cache.texture,
+            texture: &texture,
             mip_level: 0,
             origin: wgpu::Origin3d::ZERO,
             aspect: wgpu::TextureAspect::All,
         },
-        &pixels,
+        data,
         wgpu::TexelCopyBufferLayout {
             offset: 0,
-            bytes_per_row: Some(4 * width),
-            rows_per_image: Some(height),
+            bytes_per_row: Some(4 * w),
+            rows_per_image: Some(h),
         },
         wgpu::Extent3d {
-            width,
-            height,
+            width: w,
+            height: h,
             depth_or_array_layers: 1,
         },
     );
-    cache.last_commands = commands.to_vec();
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some(label),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+        ],
+    })
+}
+
+/// The atlas bind groups the batched UI pass samples: a shared 1×1 white texel
+/// for solid fills, the font sheets, the GUI/item/block atlases and any
+/// free-standing (favicon / mod) images. All are uploaded lazily on first use
+/// (the raw-image cache is pruned each frame to what the frame references) and
+/// bound through the shared `ui_bind_group_layout`.
+pub(super) struct UiQuadResources {
+    white: wgpu::BindGroup,
+    ascii: wgpu::BindGroup,
+    pages: HashMap<u8, wgpu::BindGroup>,
+    gui: HashMap<GuiTexture, wgpu::BindGroup>,
+    blocks: Option<wgpu::BindGroup>,
+    items: Option<wgpu::BindGroup>,
+    /// Keyed by `Arc` pointer identity so a stable favicon uploads once.
+    raw: HashMap<usize, wgpu::BindGroup>,
+}
+
+impl UiQuadResources {
+    pub(super) fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        layout: &wgpu::BindGroupLayout,
+        sampler: &wgpu::Sampler,
+    ) -> Self {
+        let white = upload_ui_texture(
+            device,
+            queue,
+            layout,
+            sampler,
+            &[255, 255, 255, 255],
+            1,
+            1,
+            "ui-white",
+        );
+        let ascii_img = crate::font::font().ascii_image();
+        let (aw, ah) = ascii_img.dimensions();
+        let ascii = upload_ui_texture(
+            device,
+            queue,
+            layout,
+            sampler,
+            ascii_img.as_raw(),
+            aw,
+            ah,
+            "ui-font-ascii",
+        );
+        Self {
+            white,
+            ascii,
+            pages: HashMap::new(),
+            gui: HashMap::new(),
+            blocks: None,
+            items: None,
+            raw: HashMap::new(),
+        }
+    }
+
+    /// Ensure every texture referenced by `geos` this frame is uploaded, and drop
+    /// cached raw images the frame no longer references. (Uploads are gated on the
+    /// source image actually loading, so `contains_key` + `insert` is clearer than
+    /// the entry API here.)
+    #[allow(clippy::map_entry)]
+    pub(super) fn ensure(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        layout: &wgpu::BindGroupLayout,
+        sampler: &wgpu::Sampler,
+        gui: &GuiAtlas,
+        geos: &[&UiGeometry],
+    ) {
+        let mut needed_raw: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for geo in geos {
+            for img in &geo.raw_images {
+                needed_raw.insert(std::sync::Arc::as_ptr(img) as usize);
+            }
+        }
+        self.raw.retain(|key, _| needed_raw.contains(key));
+
+        for geo in geos {
+            for batch in &geo.batches {
+                match batch.texture {
+                    UiTextureId::White | UiTextureId::FontAscii => {}
+                    UiTextureId::FontPage(page) => {
+                        if !self.pages.contains_key(&page) {
+                            if let Some(img) = crate::font::font().page_image(page) {
+                                let (w, h) = img.dimensions();
+                                let bg = upload_ui_texture(
+                                    device,
+                                    queue,
+                                    layout,
+                                    sampler,
+                                    img.as_raw(),
+                                    w,
+                                    h,
+                                    "ui-font-page",
+                                );
+                                self.pages.insert(page, bg);
+                            }
+                        }
+                    }
+                    UiTextureId::Gui(texture) => {
+                        if !self.gui.contains_key(&texture) {
+                            if let Some(img) = gui.image(texture) {
+                                let (w, h) = img.dimensions();
+                                let bg = upload_ui_texture(
+                                    device, queue, layout, sampler, img.as_raw(), w, h, "ui-gui",
+                                );
+                                self.gui.insert(texture, bg);
+                            }
+                        }
+                    }
+                    UiTextureId::Blocks => {
+                        if self.blocks.is_none() {
+                            if let Some(img) = gui.blocks_image() {
+                                let (w, h) = img.dimensions();
+                                self.blocks = Some(upload_ui_texture(
+                                    device, queue, layout, sampler, img.as_raw(), w, h, "ui-blocks",
+                                ));
+                            }
+                        }
+                    }
+                    UiTextureId::Items => {
+                        if self.items.is_none() {
+                            if let Some(img) = gui.items_image() {
+                                let (w, h) = img.dimensions();
+                                self.items = Some(upload_ui_texture(
+                                    device, queue, layout, sampler, img.as_raw(), w, h, "ui-items",
+                                ));
+                            }
+                        }
+                    }
+                    UiTextureId::Raw(idx) => {
+                        if let Some(img) = geo.raw_images.get(idx) {
+                            let key = std::sync::Arc::as_ptr(img) as usize;
+                            if !self.raw.contains_key(&key) {
+                                let (w, h) = img.dimensions();
+                                let bg = upload_ui_texture(
+                                    device, queue, layout, sampler, img.as_raw(), w, h, "ui-raw",
+                                );
+                                self.raw.insert(key, bg);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The bind group for a batch's texture, or None if it failed to load (the
+    /// batch is then skipped — a missing texture draws nothing, as before).
+    pub(super) fn bind_group(
+        &self,
+        texture: UiTextureId,
+        geo: &UiGeometry,
+    ) -> Option<&wgpu::BindGroup> {
+        match texture {
+            UiTextureId::White => Some(&self.white),
+            UiTextureId::FontAscii => Some(&self.ascii),
+            UiTextureId::FontPage(page) => self.pages.get(&page),
+            UiTextureId::Gui(texture) => self.gui.get(&texture),
+            UiTextureId::Blocks => self.blocks.as_ref(),
+            UiTextureId::Items => self.items.as_ref(),
+            UiTextureId::Raw(idx) => {
+                let img = geo.raw_images.get(idx)?;
+                self.raw.get(&(std::sync::Arc::as_ptr(img) as usize))
+            }
+        }
+    }
+}
+
+/// One tessellated UI layer's vertex buffer plus its batch list. The buffer grows
+/// as needed and is rewritten each frame; empty layers keep the buffer and just
+/// stop drawing.
+pub(super) struct UiQuadLayer {
+    pub(super) buffer: Option<wgpu::Buffer>,
+    capacity_verts: u64,
+    pub(super) geo: UiGeometry,
+    label: &'static str,
+}
+
+impl UiQuadLayer {
+    pub(super) fn new(label: &'static str) -> Self {
+        Self {
+            buffer: None,
+            capacity_verts: 0,
+            geo: UiGeometry::default(),
+            label,
+        }
+    }
+
+    /// Replace this layer's geometry, growing (with headroom) and rewriting the
+    /// vertex buffer. Takes `geo` by value so its batches / raw-image keepalives
+    /// stay owned for the frame's draws.
+    pub(super) fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, geo: UiGeometry) {
+        if !geo.vertices.is_empty() {
+            let needed = geo.vertices.len() as u64;
+            if self.buffer.is_none() || needed > self.capacity_verts {
+                let capacity = needed.next_power_of_two().max(256);
+                self.buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(self.label),
+                    size: capacity * std::mem::size_of::<UiVertex>() as u64,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }));
+                self.capacity_verts = capacity;
+            }
+            queue.write_buffer(
+                self.buffer.as_ref().expect("ui layer buffer just set"),
+                0,
+                bytemuck::cast_slice(&geo.vertices),
+            );
+        }
+        self.geo = geo;
+    }
+
+    pub(super) fn batches(&self) -> &[UiBatch] {
+        &self.geo.batches
+    }
 }
 
 /// Refill a persistent vertex+index buffer pair in place, reallocating (with
