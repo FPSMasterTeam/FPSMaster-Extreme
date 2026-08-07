@@ -5,12 +5,6 @@ on:
   push:
     branches:
       - main
-      - nightly
-      - nightly/**
-      - cannary
-      - cannary/**
-      - beta
-      - beta/**
       - release
       - release/**
   workflow_dispatch:
@@ -43,12 +37,13 @@ jobs:
           ref="${GITHUB_REF_NAME}"
           channel=""
           should_publish="false"
+          # Extreme only ships the release channel.
           case "$ref" in
             main|release|release/*) channel="release"; should_publish="true" ;;
-            cannary|cannary/*)      channel="cannary"; should_publish="true" ;;
-            beta|beta/*)            channel="beta";    should_publish="true" ;;
-            nightly|nightly/*)      channel="nightly"; should_publish="true" ;;
           esac
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            should_publish="false"
+          fi
           echo "channel=$channel" >> "$GITHUB_OUTPUT"
           echo "should_publish=$should_publish" >> "$GITHUB_OUTPUT"
 
@@ -59,15 +54,10 @@ jobs:
           base_version="$(grep -m1 '^version' crates/fpsmaster_app/Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
           commit_hash="$(printf '%s' "$GITHUB_SHA" | tr '[:upper:]' '[:lower:]')"
           short_sha="${commit_hash:0:8}"
-          channel="${{ steps.channel.outputs.channel }}"
-          if [ "$channel" = "release" ]; then
-            version_name="$base_version"
-          else
-            version_name="$base_version-$channel.$GITHUB_RUN_NUMBER+$short_sha"
-          fi
+          version_name="$base_version"
           echo "commit_hash=$commit_hash" >> "$GITHUB_OUTPUT"
           echo "version_name=$version_name" >> "$GITHUB_OUTPUT"
-          echo "release_tag=extreme-$channel-$GITHUB_RUN_NUMBER-$short_sha" >> "$GITHUB_OUTPUT"
+          echo "release_tag=extreme-release-$GITHUB_RUN_NUMBER-$short_sha" >> "$GITHUB_OUTPUT"
           changelog="$(git log -1 --pretty=format:'%s%n%n%b')"
           {
             echo "changelog<<EOF"
