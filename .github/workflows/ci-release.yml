@@ -3,6 +3,8 @@ name: Extreme CI Release
 on:
   pull_request:
   push:
+    branches:
+      - main
     tags:
       - 'v*'
   workflow_dispatch:
@@ -36,7 +38,8 @@ jobs:
           channel=""
           should_publish="false"
 
-          if [ "${GITHUB_REF_TYPE}" = "tag" ] && [[ "${GITHUB_REF_NAME}" == v* ]]; then
+          # Publish exclusively from release tags (branch pushes only build).
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
             version_name="${GITHUB_REF_NAME#v}"
             if [[ ! "$version_name" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
               echo "Extreme only accepts release tags like v1.2.3 (got ${GITHUB_REF_NAME})" >&2
