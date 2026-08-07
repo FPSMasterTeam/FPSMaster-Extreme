@@ -191,11 +191,17 @@ jobs:
             release-dist/*.manifest.json
           fail_on_unmatched_files: true
 
-      - name: Notify release API
+      - name: Upload to Qiniu OSS and notify release API
         shell: bash
         env:
           FPSMASTER_CI_API_BASE_URL: ${{ secrets.FPSMASTER_CI_API_BASE_URL }}
           FPSMASTER_CI_UPLOAD_TOKEN: ${{ secrets.FPSMASTER_CI_UPLOAD_TOKEN }}
+          QINIU_ACCESS_KEY: ${{ secrets.QINIU_ACCESS_KEY }}
+          QINIU_SECRET_KEY: ${{ secrets.QINIU_SECRET_KEY }}
+          QINIU_BUCKET: ${{ secrets.QINIU_BUCKET }}
+          QINIU_S3_ENDPOINT: ${{ secrets.QINIU_S3_ENDPOINT }}
+          QINIU_S3_REGION: ${{ secrets.QINIU_S3_REGION }}
+          QINIU_CDN_BASE_URL: ${{ secrets.QINIU_CDN_BASE_URL }}
           CHANNEL: ${{ needs.resolve.outputs.channel }}
           VERSION_NAME: ${{ needs.resolve.outputs.version_name }}
           COMMIT_HASH: ${{ needs.resolve.outputs.commit_hash }}
@@ -205,6 +211,12 @@ jobs:
             echo "Release API secrets are not configured" >&2
             exit 1
           fi
+          if [ -z "$QINIU_ACCESS_KEY" ] || [ -z "$QINIU_SECRET_KEY" ] || [ -z "$QINIU_BUCKET" ] || [ -z "$QINIU_S3_ENDPOINT" ] || [ -z "$QINIU_CDN_BASE_URL" ]; then
+            echo "Qiniu OSS secrets are not configured" >&2
+            exit 1
+          fi
+
+          python3 -m pip install --quiet --user boto3
 
           shopt -s nullglob
           metadata_files=(release-dist/*.json)
@@ -222,17 +234,33 @@ jobs:
               exit 1
             fi
 
-            upload_response="$(curl --fail-with-body --show-error --silent \
-              -X POST \
-              -H "X-CI-Token: ${FPSMASTER_CI_UPLOAD_TOKEN}" \
-              -F "file=@${artifact_path}" \
-              "${FPSMASTER_CI_API_BASE_URL%/}/api/v1/launcher/releases/upload")"
+            object_key="extreme/${CHANNEL}/${VERSION_NAME}/${COMMIT_HASH}/${target}/${asset_name}"
+            export ARTIFACT_PATH="$artifact_path" OBJECT_KEY="$object_key"
+            download_url="$(python3 - <<'PY'
+import os
+import boto3
 
-            export UPLOAD_RESPONSE="$upload_response"
-            export TARGET="$target"
-            export CHECKSUM="$checksum"
-            export FILE_SIZE="$file_size"
-            python3 -c 'import json, os; upload = json.loads(os.environ["UPLOAD_RESPONSE"])["data"]; payload = dict(productCode=os.environ["PRODUCT_CODE"], channelCode=os.environ["CHANNEL"], versionName=os.environ["VERSION_NAME"], commitHash=os.environ["COMMIT_HASH"], artifactSourceType="UPLOADED_FILE", downloadUrl=upload["url"], fileBucket=upload.get("bucket") or "", fileKey=upload.get("key") or "", fileSize=int(os.environ["FILE_SIZE"]), checksum=os.environ["CHECKSUM"], recommended=True, target=os.environ["TARGET"], changelog=os.environ["CHANGELOG"]); open("payload.json", "w", encoding="utf-8").write(json.dumps(payload, ensure_ascii=False))'
+endpoint = os.environ["QINIU_S3_ENDPOINT"].rstrip("/")
+cdn = os.environ["QINIU_CDN_BASE_URL"].rstrip("/")
+bucket = os.environ["QINIU_BUCKET"]
+key = os.environ["OBJECT_KEY"]
+path = os.environ["ARTIFACT_PATH"]
+
+client = boto3.client(
+    "s3",
+    endpoint_url=endpoint,
+    aws_access_key_id=os.environ["QINIU_ACCESS_KEY"],
+    aws_secret_access_key=os.environ["QINIU_SECRET_KEY"],
+    region_name=os.environ.get("QINIU_S3_REGION") or "ap-southeast-1",
+)
+client.upload_file(path, bucket, key)
+print(f"{cdn}/{key}")
+PY
+)"
+            echo "Uploaded ${asset_name} -> ${download_url}"
+
+            export TARGET="$target" CHECKSUM="$checksum" FILE_SIZE="$file_size" DOWNLOAD_URL="$download_url"
+            python3 -c 'import json, os; payload = dict(productCode=os.environ["PRODUCT_CODE"], channelCode=os.environ["CHANNEL"], versionName=os.environ["VERSION_NAME"], commitHash=os.environ["COMMIT_HASH"], artifactSourceType="external_url", downloadUrl=os.environ["DOWNLOAD_URL"], fileSize=int(os.environ["FILE_SIZE"]), checksum=os.environ["CHECKSUM"], recommended=True, target=os.environ["TARGET"], changelog=os.environ["CHANGELOG"]); open("payload.json", "w", encoding="utf-8").write(json.dumps(payload, ensure_ascii=False))'
 
             curl --fail-with-body --show-error --silent \
               -X POST \
