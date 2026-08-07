@@ -3,10 +3,8 @@ name: Extreme CI Release
 on:
   pull_request:
   push:
-    branches:
-      - main
-      - release
-      - release/**
+    tags:
+      - 'v*'
   workflow_dispatch:
 
 permissions:
@@ -34,16 +32,24 @@ jobs:
         id: channel
         shell: bash
         run: |
-          ref="${GITHUB_REF_NAME}"
+          # Extreme only ships release tags: v1.0.0 (no -beta / prerelease).
           channel=""
           should_publish="false"
-          # Extreme only ships the release channel.
-          case "$ref" in
-            main|release|release/*) channel="release"; should_publish="true" ;;
-          esac
-          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+
+          if [ "${GITHUB_REF_TYPE}" = "tag" ] && [[ "${GITHUB_REF_NAME}" == v* ]]; then
+            version_name="${GITHUB_REF_NAME#v}"
+            if [[ ! "$version_name" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "Extreme only accepts release tags like v1.2.3 (got ${GITHUB_REF_NAME})" >&2
+              exit 1
+            fi
+            channel="release"
+            should_publish="true"
+          fi
+
+          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ] || [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
             should_publish="false"
           fi
+
           echo "channel=$channel" >> "$GITHUB_OUTPUT"
           echo "should_publish=$should_publish" >> "$GITHUB_OUTPUT"
 
@@ -51,19 +57,29 @@ jobs:
         id: meta
         shell: bash
         run: |
-          base_version="$(grep -m1 '^version' crates/fpsmaster_app/Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
           commit_hash="$(printf '%s' "$GITHUB_SHA" | tr '[:upper:]' '[:lower:]')"
           short_sha="${commit_hash:0:8}"
-          version_name="$base_version"
+          should_publish="${{ steps.channel.outputs.should_publish }}"
+
+          if [ "$should_publish" = "true" ]; then
+            version_name="${GITHUB_REF_NAME#v}"
+            release_tag="${GITHUB_REF_NAME}"
+          else
+            base_version="$(grep -m1 '^version' crates/fpsmaster_app/Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+            version_name="${base_version}-ci.${GITHUB_RUN_NUMBER}+${short_sha}"
+            release_tag="extreme-${version_name}"
+          fi
+
           echo "commit_hash=$commit_hash" >> "$GITHUB_OUTPUT"
           echo "version_name=$version_name" >> "$GITHUB_OUTPUT"
-          echo "release_tag=extreme-release-$GITHUB_RUN_NUMBER-$short_sha" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
           changelog="$(git log -1 --pretty=format:'%s%n%n%b')"
           {
             echo "changelog<<EOF"
             printf '%s\n' "$changelog"
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
+          echo "Resolved Extreme version: $version_name (publish=$should_publish)"
 
   build:
     needs: resolve
