@@ -818,6 +818,12 @@ pub struct Renderer {
     lightning_flash: bool,
     /// Standing water 0..=1; drives the puddle mask independently of rain.
     puddle_level: f32,
+    /// Screen-space AO: user toggle plus its per-size resources.
+    ssao_enabled: bool,
+    ssao_pipeline: wgpu::RenderPipeline,
+    ssao_layout: wgpu::BindGroupLayout,
+    ssao_bind_group: Option<wgpu::BindGroup>,
+    ssao_params_buffer: wgpu::Buffer,
     /// Debug/test override: treat every column as snowy.
     force_snow: bool,
     ui_pipeline: wgpu::RenderPipeline,
@@ -3069,6 +3075,100 @@ impl Renderer {
             cache: None,
             multiview_mask: None,
         });
+        // --- Screen-space AO -------------------------------------------------
+        let ssao_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("ssao-shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../shader/ssao.wgsl").into()),
+        });
+        let ssao_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("ssao-layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        // Unfilterable float, not `Depth`: naga's GLSL backend maps a
+                        // depth texture to sampler2DShadow, which has no textureLoad.
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let ssao_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("ssao-pipeline-layout"),
+            bind_group_layouts: &[Some(&ssao_layout)],
+            ..Default::default()
+        });
+        let ssao_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("ssao-pipeline"),
+            layout: Some(&ssao_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &ssao_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &ssao_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    // MULTIPLY straight onto the lit scene: AO scales what is
+                    // already there rather than adding a grey wash.
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::Dst,
+                            dst_factor: wgpu::BlendFactor::Zero,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                        alpha: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::Zero,
+                            dst_factor: wgpu::BlendFactor::One,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                    }),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            cache: None,
+            multiview_mask: None,
+        });
+        // radius (blocks), strength, bias, pad. A small radius keeps this a
+        // CONTACT shadow: the chunk mesh already bakes vanilla's corner AO, and a
+        // wide radius would darken the same corners a second time.
+        let ssao_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("ssao-params"),
+            contents: bytemuck::cast_slice(&[0.55f32, 0.9, 0.03, 0.0]),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+
         let model_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("model-pipeline-layout"),
@@ -5080,6 +5180,11 @@ impl Renderer {
             weather: [0.0, 0.0],
             lightning_flash: false,
             puddle_level: 0.0,
+            ssao_enabled: false,
+            ssao_pipeline,
+            ssao_layout,
+            ssao_bind_group: None,
+            ssao_params_buffer,
             force_snow: false,
             weather_mesh: None,
             weather_rain_indices: 0,
@@ -5617,6 +5722,26 @@ impl Renderer {
     /// exclusive (the UI enforces it); both share the same jittered low-res inputs.
     fn temporal_resolve_active(&self) -> bool {
         self.taa_enabled || self.dlss_active()
+    }
+
+    /// Whether the raster SSAO pass runs this frame.
+    ///
+    /// Mutually exclusive with the ray-traced paths: `rt_quality >= 1` already
+    /// composites its own sky-GI/occlusion term, and the path tracer overwrites
+    /// the colour target outright, so stacking a screen-space term on either
+    /// would double-darken.
+    fn ssao_active(&self) -> bool {
+        self.ssao_enabled && self.rt_quality == 0 && !self.path_tracing()
+    }
+
+    /// Toggle screen-space ambient occlusion.
+    pub fn set_ssao_enabled(&mut self, on: bool) {
+        if self.ssao_enabled == on {
+            return;
+        }
+        self.ssao_enabled = on;
+        // The AO target and its bind group live at render resolution.
+        self.rebuild_scaled_targets();
     }
 
     /// Build the DLSS context on first use, sized to the display. Deliberately NOT
@@ -6395,6 +6520,31 @@ impl Renderer {
             self.dlss_output_tex = dlss_output_tex;
             self.dlss_output_view = dlss_output_view;
         }
+        // Rebuilt here because it holds the depth view, which this function just
+        // re-created; a stale view survives a resize or render-scale change and
+        // silently reads the wrong texture.
+        self.ssao_bind_group = if self.ssao_enabled {
+            Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("ssao-bind-group"),
+                layout: &self.ssao_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&self.depth_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: self.post_camera_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: self.ssao_params_buffer.as_entire_binding(),
+                    },
+                ],
+            }))
+        } else {
+            None
+        };
         self.offscreen_view = Some(view);
         self.offscreen_tex = Some(color);
         self.update_post_params();
@@ -8779,7 +8929,13 @@ impl Renderer {
                         // motion-vector pass that feeds TAA / the MV debug view.
                         // Otherwise discard it (cheaper). Without this, TAA reads
                         // undefined depth and the whole scene ghosts on motion.
-                        store: if self.shaders_enabled || self.temporal_resolve_active() || self.mv_debug {
+                        // SSAO reads this back; forgetting it here yields a
+                        // silently all-white AO rather than an error.
+                        store: if self.shaders_enabled
+                            || self.temporal_resolve_active()
+                            || self.mv_debug
+                            || self.ssao_active()
+                        {
                             wgpu::StoreOp::Store
                         } else {
                             wgpu::StoreOp::Discard
@@ -9559,6 +9715,35 @@ impl Renderer {
                 fs_pass(&mut encoder, "rtao-denoise-pass", den_view, clear, den_pipe, den_bg, None);
                 // 3. Multiply the denoised AO onto the offscreen scene (multiply blend).
                 fs_pass(&mut encoder, "rtao-apply-pass", view, wgpu::LoadOp::Load, apply_pipe, apply_bg, None);
+            }
+        }
+
+        // Screen-space AO. Sits exactly where the ray-traced AO does and for the
+        // same reasons: after the world is lit, but BEFORE water and before the
+        // temporal upscale, so any residual noise is resolved by TAA/DLSS rather
+        // than carried into the final image.
+        if self.ssao_active() {
+            if let Some(bind_group) = self.ssao_bind_group.as_ref() {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("ssao-pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_pipeline(&self.ssao_pipeline);
+                pass.set_bind_group(0, bind_group, &[]);
+                pass.draw(0..3, 0..1);
+                draw_calls += 1;
             }
         }
 

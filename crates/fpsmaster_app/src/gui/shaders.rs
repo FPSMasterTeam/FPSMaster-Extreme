@@ -18,6 +18,7 @@ pub struct GuiShaders {
     specular: Option<GuiButton>,
     fog: Option<GuiButton>,
     bloom: Option<GuiButton>,
+    ssao: Option<GuiButton>,
     volumetric: Option<GuiButton>,
     // Right column: post / world.
     vignette: Option<GuiButton>,
@@ -64,13 +65,14 @@ impl GuiShaders {
         self.fog = Some(GuiButton::at_px(x, row(3), cw, s, ""));
         self.bloom = Some(GuiButton::at_px(x, row(4), cw, s, "").disabled(off));
         self.volumetric = Some(GuiButton::at_px(x, row(5), cw, s, "").disabled(off));
+        self.ssao = Some(GuiButton::at_px(x, row(6), cw, s, "").disabled(off));
         self.vignette = Some(GuiButton::at_px(xr, row(0), cw, s, "").disabled(off));
         self.chromatic = Some(GuiButton::at_px(xr, row(1), cw, s, "").disabled(off));
         self.dof = Some(GuiButton::at_px(xr, row(2), cw, s, "").disabled(off));
         self.motion_blur = Some(GuiButton::at_px(xr, row(3), cw, s, "").disabled(off));
         self.auto_exposure = Some(GuiButton::at_px(xr, row(4), cw, s, "").disabled(off));
         self.clouds = Some(GuiButton::at_px(xr, row(5), cw, s, "").disabled(off));
-        self.done = Some(GuiButton::at_px(x, row(6) + 12 * s, 200 * s, s, tr("gui.done")));
+        self.done = Some(GuiButton::at_px(x, row(7) + 12 * s, 200 * s, s, tr("gui.done")));
     }
 }
 
@@ -120,6 +122,7 @@ impl GuiScreen for GuiShaders {
         draw(&mut self.fog, entry("fpsmaster.shaders.fog", st.shader_fog));
         draw(&mut self.bloom, entry("fpsmaster.shaders.bloom", st.shader_bloom));
         draw(&mut self.volumetric, entry("fpsmaster.shaders.volLight", st.volumetric_light));
+        draw(&mut self.ssao, entry("fpsmaster.shaders.ssao", st.shader_ssao));
         draw(&mut self.vignette, entry("fpsmaster.shaders.vignette", st.post_vignette));
         draw(&mut self.chromatic, entry("fpsmaster.shaders.chroma", st.post_chromatic));
         draw(&mut self.dof, entry("fpsmaster.shaders.dof", st.post_dof));
@@ -147,6 +150,10 @@ impl GuiScreen for GuiShaders {
         if self.fog.as_ref().is_some_and(|b| b.clicked(x, y)) {
             ctx.settings.shader_fog = !ctx.settings.shader_fog;
             return vec![GuiAction::SetShaderFog(ctx.settings.shader_fog)];
+        }
+        if self.ssao.as_ref().is_some_and(|b| b.clicked(x, y)) {
+            ctx.settings.shader_ssao = !ctx.settings.shader_ssao;
+            return vec![GuiAction::SetShaderSsao(ctx.settings.shader_ssao)];
         }
         if self.bloom.as_ref().is_some_and(|b| b.clicked(x, y)) {
             ctx.settings.shader_bloom = !ctx.settings.shader_bloom;

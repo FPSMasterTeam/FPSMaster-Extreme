@@ -70,6 +70,7 @@ fpsmaster.shaders.specular=Specular
 fpsmaster.shaders.fog=Fog
 fpsmaster.shaders.bloom=Bloom
 fpsmaster.shaders.volLight=VolLight
+fpsmaster.shaders.ssao=SSAO
 fpsmaster.shaders.vignette=Vignette
 fpsmaster.shaders.chroma=Chroma
 fpsmaster.shaders.dof=DoF

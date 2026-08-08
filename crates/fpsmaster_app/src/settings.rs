@@ -78,6 +78,8 @@ pub struct Settings {
     pub shader_fog: bool,
     /// Bloom glow around bright pixels (independent of the master toggle).
     pub shader_bloom: bool,
+    /// Screen-space ambient occlusion (only active while `shaders` is on).
+    pub shader_ssao: bool,
     /// Brightness in 0..=1 (vanilla "Brightness"/gamma): 0.0 is the Moody base
     /// curve, 1.0 blends fully toward vanilla's lifted `1-(1-x)^4` curve —
     /// raising it only ever brightens the dark end, exactly like vanilla.
@@ -190,6 +192,7 @@ impl Default for Settings {
             // `Renderer::set_fog_enabled`), so it defaults on for vanilla parity.
             shader_fog: true,
             shader_bloom: false,
+            shader_ssao: true,
             // Vanilla's Brightness slider defaults to 0.0 ("Moody"); 0.5 pre-lifted the
             // dark end of the lightmap curve and flattened the whole image.
             brightness: 0.0,
@@ -342,6 +345,11 @@ impl Settings {
                 "shader_fog" => {
                     if let Ok(v) = val.parse() {
                         s.shader_fog = v;
+                    }
+                }
+                "shader_ssao" => {
+                    if let Ok(v) = val.parse() {
+                        s.shader_ssao = v;
                     }
                 }
                 "shader_bloom" => {
@@ -508,7 +516,7 @@ impl Settings {
     fn save_to(&self, path: &std::path::Path) {
         let (res_w, res_h) = self.resolution.unwrap_or((0, 0));
         let mut text = format!(
-            "sensitivity={}\nvsync={}\nfps_cap={}\nrender_scale={}\nrender_distance={}\nadaptive_resolution={}\nsmooth_lighting={}\nfancy_graphics={}\nmipmap_levels={}\nresolution_w={}\nresolution_h={}\nfullscreen={}\nshaders={}\nshader_shadows={}\nshader_specular={}\nshader_fog={}\nshader_bloom={}\nbrightness={}\npost_vignette={}\npost_chromatic={}\npost_dof={}\npost_motion_blur={}\npost_auto_exposure={}\nvolumetric_clouds={}\nvolumetric_light={}\nshow_fps={}\nold_animations={}\nresource_pack={}\n",
+            "sensitivity={}\nvsync={}\nfps_cap={}\nrender_scale={}\nrender_distance={}\nadaptive_resolution={}\nsmooth_lighting={}\nfancy_graphics={}\nmipmap_levels={}\nresolution_w={}\nresolution_h={}\nfullscreen={}\nshaders={}\nshader_shadows={}\nshader_specular={}\nshader_fog={}\nshader_bloom={}\nshader_ssao={}\nbrightness={}\npost_vignette={}\npost_chromatic={}\npost_dof={}\npost_motion_blur={}\npost_auto_exposure={}\nvolumetric_clouds={}\nvolumetric_light={}\nshow_fps={}\nold_animations={}\nresource_pack={}\n",
             self.sensitivity,
             self.vsync,
             self.fps_cap,
@@ -526,6 +534,7 @@ impl Settings {
             self.shader_specular,
             self.shader_fog,
             self.shader_bloom,
+            self.shader_ssao,
             self.brightness,
             self.post_vignette,
             self.post_chromatic,
