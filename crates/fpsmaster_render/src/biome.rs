@@ -28,8 +28,13 @@ pub struct BiomeInfo {
 
 const WHITE: [u8; 3] = [255, 255, 255];
 
-/// Swampland's grass/foliage. Vanilla picks between two values from a noise
-/// field; this is the one that covers most of a swamp (`6975545`).
+/// Swampland's grass/foliage (`6975545`).
+///
+/// Vanilla's swamp GRASS is two-valued — `GRASS_COLOR_NOISE < -0.1 ? 0x4C763C :
+/// 0x6A7039` — which mottles a swamp roughly half and half, since the threshold
+/// sits just below the noise field's midpoint. Only the FOLIAGE is
+/// unconditionally this value. Using one constant for both is a deliberate
+/// approximation: it costs the mottling, not the hue.
 const SWAMP_FOLIAGE: [u8; 3] = [0x6A, 0x70, 0x39];
 /// `BiomeGenSwamp.waterColorMultiplier` = 14745518.
 const SWAMP_WATER: [u8; 3] = [0xE0, 0xFF, 0xAE];
@@ -87,10 +92,17 @@ const fn roofed_forest() -> BiomeInfo {
 /// Whether a biome gets weather at all.
 ///
 /// Vanilla tracks this as `enableRain`, cleared by `setDisableRain()` on desert,
-/// savanna, mesa, the Nether and the End — which is exactly the set whose
-/// rainfall is 0. Deriving it from the climate table avoids maintaining a second
-/// hand-written list that could drift out of step with the first.
+/// savanna, mesa, the Nether and the End. That is *almost* exactly the set whose
+/// rainfall is 0, so deriving it from the climate table avoids maintaining a
+/// second hand-written list — with one special case, below.
 pub fn precipitates(id: u8) -> bool {
+    // The End is the one biome where the rainfall derivation fails: `BiomeGenEnd`
+    // never calls `setTemperatureRainfall`, so it keeps the 0.5/0.5 defaults, yet
+    // it also calls `setDisableRain()`. Every other no-precipitation biome
+    // (desert, savanna, mesa, the Nether) does have rainfall 0.
+    if id == 9 {
+        return false;
+    }
     biome_info(id).downfall > 0.0
 }
 
@@ -172,7 +184,10 @@ pub fn biome_info(id: u8) -> BiomeInfo {
         160 => plain(0.25, 0.8),       // Mega Spruce Taiga
         161 => plain(0.25, 0.8),       // Redwood Taiga Hills M
         162 => plain(0.2, 0.3),        // Extreme Hills+ M
-        163 => plain(1.2, 0.0),        // Savanna M
+        // Savanna M is NOT a plain copy: `BiomeGenSavanna.createMutatedBiome`
+        // sets `temperature = (base + 1.0) * 0.5`, so 1.2 becomes 1.1. (Savanna
+        // Plateau M keeps 1.0 only because 1.0 is that formula's fixed point.)
+        163 => plain(1.1, 0.0),        // Savanna M
         164 => plain(1.0, 0.0),        // Savanna Plateau M
         165..=167 => mesa(),           // Mesa Bryce / Plateau F M / Plateau M
         _ => plain(0.8, 0.4),          // unknown -> plains
@@ -199,8 +214,9 @@ impl Colormap {
 
     /// Vanilla `ColorizerGrass.getGrassColor`: rainfall is scaled by temperature,
     /// then both are inverted into a 0..255 index. Out-of-range climates clamp,
-    /// which is what vanilla's `& 0xFF` index masking effectively does for the
-    /// values in the biome table.
+    /// matching `BiomeGenBase.getGrassColorAtPos`, which runs both through
+    /// `MathHelper.clamp_float(_, 0, 1)` before the lookup. (There is no index
+    /// masking in vanilla — `ColorizerFoliage` has no bounds guard at all.)
     pub fn sample(&self, temperature: f32, downfall: f32) -> [u8; 3] {
         if self.pixels.is_empty() {
             return [255, 255, 255];
@@ -341,6 +357,32 @@ mod tests {
         assert_ne!(plains, taiga);
         assert_ne!(plains, desert);
         assert_ne!(plains, jungle);
+    }
+
+    /// Both of these were wrong until the table was checked against decompiled
+    /// 1.8.9 source — and both looked entirely plausible, which is the point.
+    #[test]
+    fn the_two_cases_the_climate_table_got_wrong() {
+        // `BiomeGenSavanna.createMutatedBiome` halves the temperature toward 1.0
+        // rather than copying it, so Savanna M is 1.1, not the base 1.2.
+        assert_eq!(biome_info(163).temperature, 1.1);
+        assert_eq!(biome_info(35).temperature, 1.2, "the base is unchanged");
+        // Savanna Plateau M lands on 1.0 either way — 1.0 is the formula's fixed
+        // point — so it is right by luck, not by the rule.
+        assert_eq!(biome_info(164).temperature, 1.0);
+
+        // The End keeps the 0.5/0.5 climate defaults yet still calls
+        // setDisableRain(), so it is the one biome `downfall > 0` gets wrong.
+        assert_eq!(biome_info(9).downfall, 0.5);
+        assert!(!precipitates(9), "The End has no weather");
+        // Every other dry biome really does have rainfall 0.
+        for id in [2u8, 8, 17, 35, 36, 37, 38, 39, 130, 163, 164, 165, 166, 167] {
+            assert!(!precipitates(id), "biome {id} should be dry");
+        }
+        // And the wet ones still are.
+        for id in [0u8, 1, 4, 5, 6, 12, 21, 29] {
+            assert!(precipitates(id), "biome {id} should get weather");
+        }
     }
 
     #[test]
