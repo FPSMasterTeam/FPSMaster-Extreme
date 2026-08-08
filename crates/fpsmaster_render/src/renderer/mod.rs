@@ -2510,7 +2510,7 @@ impl Renderer {
         // Normal G-buffer pipelines (RT only): re-draw the opaque chunks with fs_normal
         // into the AO pass's normal target, depth-tested (LessEqual, no write) against
         // the world depth so only visible surfaces write. Uses the non-RT chunk module.
-        let (normal_solid_pipeline, normal_cutout_pipeline) = if rt_supported {
+        let (normal_solid_pipeline, normal_cutout_pipeline) = {
             let normal_target = wgpu::ColorTargetState {
                 format: wgpu::TextureFormat::Rgba8Unorm,
                 blend: None,
@@ -2553,12 +2553,14 @@ impl Renderer {
                     multiview_mask: None,
                 })
             };
+            // Built unconditionally: these use the plain chunk module and the
+            // lit pipeline layout, nothing ray-traced. They were created inside
+            // `if rt_supported` only because RTAO happened to be their first
+            // consumer; SSAO wants the same buffer.
             (
                 Some(make_normal("chunk-normal-pipeline", "fs_normal")),
                 Some(make_normal("chunk-normal-cutout-pipeline", "fs_normal_cutout")),
             )
-        } else {
-            (None, None)
         };
 
         // The GUI block-icon cube pass reuses the cutout shader but must NOT
@@ -3115,6 +3117,16 @@ impl Renderer {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
         let ssao_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -3166,7 +3178,7 @@ impl Renderer {
         let ssao_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("ssao-params"),
             contents: bytemuck::cast_slice(&[0.55f32, 0.9, 0.03, 0.0]),
-            usage: wgpu::BufferUsages::UNIFORM,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
         let model_pipeline_layout =
@@ -5724,6 +5736,100 @@ impl Renderer {
         self.taa_enabled || self.dlss_active()
     }
 
+
+    /// Re-draw opaque + cutout chunks with `fs_normal` into the normal/albedo
+    /// G-buffer, depth-tested against the world depth so only visible surfaces
+    /// write.
+    ///
+    /// Shared by RTAO and the raster SSAO. It used to live inside the RT block's
+    /// `if let` tuple destructure, which made a plain geometry pass unavailable
+    /// without hardware ray query even though it needs none.
+    #[allow(clippy::too_many_arguments)]
+    fn render_normal_gbuffer(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        normal_view: &wgpu::TextureView,
+        albedo_view: &wgpu::TextureView,
+        solid_pipeline: &wgpu::RenderPipeline,
+        cutout_pipeline: &wgpu::RenderPipeline,
+        solid_batches: &[PageBatch],
+        cutout_batches: &[PageBatch],
+    ) {
+        let mut np = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("normal-gbuffer-pass"),
+                color_attachments: &[
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: normal_view,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            // Clear to encoded zero-normal so unwritten pixels
+                            // (sky / entities) get no GI.
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 0.5,
+                                g: 0.5,
+                                b: 0.5,
+                                a: 1.0,
+                            }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    }),
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: albedo_view,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            // Clear albedo to transparent black: rgb 0 → no GI added
+                            // on unwritten px (RTAO apply uses rgb only), and ALPHA 0
+                            // marks "no opaque chunk here" so the path-trace denoiser
+                            // can keep the rasterized entities/hand at those pixels
+                            // (Color::BLACK has alpha 1, which broke that mask).
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 0.0,
+                                g: 0.0,
+                                b: 0.0,
+                                a: 0.0,
+                            }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    }),
+                ],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                occlusion_query_set: None,
+                timestamp_writes: None,
+                multiview_mask: None,
+            });
+            np.set_bind_group(0, &self.camera_bind_group, &[]);
+            np.set_bind_group(1, &self.texture_bind_groups[self.mipmap_levels as usize], &[]);
+            np.set_bind_group(2, &self.lighting_bind_group, &[]);
+            let mut draw_layer = |pipe: &wgpu::RenderPipeline,
+                                  batches: &[PageBatch],
+                                  layer: &ChunkLayer| {
+                np.set_pipeline(pipe);
+                for batch in batches {
+                    let page = &layer.pages[batch.page];
+                    np.set_vertex_buffer(0, page.vertex_buf.slice(..));
+                    np.set_index_buffer(page.index_buf.slice(..), wgpu::IndexFormat::Uint16);
+                    for c in &batch.cmds {
+                        np.draw_indexed(
+                            c.first_index..c.first_index + c.index_count,
+                            c.base_vertex,
+                            0..1,
+                        );
+                    }
+                }
+            };
+            draw_layer(solid_pipeline, solid_batches, &self.chunk_solid);
+            draw_layer(cutout_pipeline, cutout_batches, &self.chunk_cutout);
+    }
+
     /// Whether the raster SSAO pass runs this frame.
     ///
     /// Mutually exclusive with the ray-traced paths: `rt_quality >= 1` already
@@ -6240,6 +6346,34 @@ impl Renderer {
         self.mv_tex = Some(mv);
         self.mv_view = Some(mv_view);
 
+        // Normal + albedo G-buffer. Written by the chunk shader's `fs_normal`, and
+        // consumed by RTAO, the path-trace denoiser AND the raster SSAO — so it is
+        // allocated unconditionally rather than living inside the RT block below,
+        // where it originally sat only because RTAO was its first consumer.
+        {
+            let make_gbuf = |label: &str, device: &wgpu::Device| {
+                let t = device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some(label),
+                    size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                });
+                let v = t.create_view(&wgpu::TextureViewDescriptor::default());
+                (t, v)
+            };
+            let (normal_tex, normal_view) = make_gbuf("normal-gbuffer", &self.device);
+            let (albedo_tex, albedo_view) = make_gbuf("albedo-gbuffer", &self.device);
+            self.normal_gbuffer_tex = Some(normal_tex);
+            self.normal_gbuffer_view = Some(normal_view);
+            self.albedo_gbuffer_tex = Some(albedo_tex);
+            self.albedo_gbuffer_view = Some(albedo_view);
+        }
+
         // Screen-space RTAO targets + bind groups (only when RT is supported). R8 AO at
         // render resolution; rebuilt here because they and their depth/camera bindings
         // track the render size.
@@ -6261,28 +6395,9 @@ impl Renderer {
             };
             let (raw_tex, raw_view) = make_r8("rtao-raw", &self.device);
             let (den_tex, den_view) = make_r8("rtao-denoised", &self.device);
-            let normal_gbuffer = self.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("rtao-normal-gbuffer"),
-                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8Unorm,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
-            });
-            let normal_view = normal_gbuffer.create_view(&wgpu::TextureViewDescriptor::default());
-            let albedo_gbuffer = self.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("rtao-albedo-gbuffer"),
-                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8Unorm,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
-            });
-            let albedo_view = albedo_gbuffer.create_view(&wgpu::TextureViewDescriptor::default());
+            // Created above, outside this block, so SSAO can share them.
+            let normal_view = self.normal_gbuffer_view.clone().expect("normal gbuffer");
+            let albedo_view = self.albedo_gbuffer_view.clone().expect("albedo gbuffer");
             self.rtao_aux_bind_group =
                 Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("rtao-aux-bind-group"),
@@ -6448,10 +6563,6 @@ impl Renderer {
             self.rtao_raw_view = Some(raw_view);
             self.rtao_denoised_tex = Some(den_tex);
             self.rtao_denoised_view = Some(den_view);
-            self.normal_gbuffer_tex = Some(normal_gbuffer);
-            self.normal_gbuffer_view = Some(normal_view);
-            self.albedo_gbuffer_tex = Some(albedo_gbuffer);
-            self.albedo_gbuffer_view = Some(albedo_view);
         }
 
         self.bloom_a_tex = Some(bloom_a);
@@ -6539,6 +6650,12 @@ impl Renderer {
                     wgpu::BindGroupEntry {
                         binding: 2,
                         resource: self.ssao_params_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(
+                            self.normal_gbuffer_view.as_ref().expect("normal gbuffer"),
+                        ),
                     },
                 ],
             }))
@@ -8894,9 +9011,14 @@ impl Renderer {
         // Opaque chunk batches hoisted out of the main-pass block so the RTAO normal
         // pass (which runs AFTER the main pass, where these would be out of scope) can
         // re-draw them. Only populated when the AO normal G-buffer is needed.
-        let want_normal_gbuffer = self.rt_quality >= 1
-            && self.ray_tracer.is_some()
-            && self.normal_solid_pipeline.is_some();
+        // SSAO consumes the same G-buffer as RTAO. Flat (greedy) meshing is
+        // excluded: those pages use `ChunkVertex::greedy_layout()`, whose normal
+        // slot is repurposed for the tile origin, so the `fs_normal` pipeline
+        // cannot read a normal from them at all — SSAO falls back to derived
+        // normals there.
+        let want_normal_gbuffer = self.normal_solid_pipeline.is_some()
+            && !self.flat_meshing
+            && ((self.rt_quality >= 1 && self.ray_tracer.is_some()) || self.ssao_active());
         let mut normal_solid_batches: Vec<PageBatch> = Vec::new();
         let mut normal_cutout_batches: Vec<PageBatch> = Vec::new();
 
@@ -9569,6 +9691,27 @@ impl Renderer {
             } // else (non-panorama sky + world content)
         }
 
+        // Normal G-buffer, ahead of every consumer (RTAO and the raster SSAO).
+        if want_normal_gbuffer {
+            if let (Some(nv), Some(av), Some(nsolid), Some(ncutout)) = (
+                self.normal_gbuffer_view.as_ref(),
+                self.albedo_gbuffer_view.as_ref(),
+                self.normal_solid_pipeline.as_ref(),
+                self.normal_cutout_pipeline.as_ref(),
+            ) {
+                self.render_normal_gbuffer(
+                    &mut encoder,
+                    nv,
+                    av,
+                    nsolid,
+                    ncutout,
+                    &normal_solid_batches,
+                    &normal_cutout_batches,
+                );
+                draw_calls += (normal_solid_batches.len() + normal_cutout_batches.len()) as u32;
+            }
+        }
+
         // Screen-space RTAO: cast occlusion rays into rtao_raw, bilaterally denoise into
         // rtao_denoised, then multiply onto the opaque offscreen scene — before water +
         // the temporal upscale, so the AO noise never reaches TAA/DLSS. Only when RT is
@@ -9584,10 +9727,6 @@ impl Renderer {
                 Some(den_view),
                 Some(apply_pipe),
                 Some(apply_bg),
-                Some(nsolid),
-                Some(ncutout),
-                Some(ngbuf),
-                Some(agbuf),
             ) = (
                 self.ray_tracer.as_ref(),
                 self.rtao_pipeline.as_ref(),
@@ -9598,88 +9737,9 @@ impl Renderer {
                 self.rtao_denoised_view.as_ref(),
                 self.rtao_apply_pipeline.as_ref(),
                 self.rtao_apply_bind_group.as_ref(),
-                self.normal_solid_pipeline.as_ref(),
-                self.normal_cutout_pipeline.as_ref(),
-                self.normal_gbuffer_view.as_ref(),
-                self.albedo_gbuffer_view.as_ref(),
             ) {
-                // 0. Normal G-buffer: re-draw opaque chunks (depth-tested, no write) with
-                //    fs_normal so the AO pass reads an exact, stable per-pixel normal.
-                {
-                    let mut np = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("normal-gbuffer-pass"),
-                        color_attachments: &[
-                            Some(wgpu::RenderPassColorAttachment {
-                                view: ngbuf,
-                                resolve_target: None,
-                                depth_slice: None,
-                                ops: wgpu::Operations {
-                                    // Clear to encoded zero-normal so unwritten pixels
-                                    // (sky / entities) get no GI.
-                                    load: wgpu::LoadOp::Clear(wgpu::Color {
-                                        r: 0.5,
-                                        g: 0.5,
-                                        b: 0.5,
-                                        a: 1.0,
-                                    }),
-                                    store: wgpu::StoreOp::Store,
-                                },
-                            }),
-                            Some(wgpu::RenderPassColorAttachment {
-                                view: agbuf,
-                                resolve_target: None,
-                                depth_slice: None,
-                                ops: wgpu::Operations {
-                                    // Clear albedo to transparent black: rgb 0 → no GI added
-                                    // on unwritten px (RTAO apply uses rgb only), and ALPHA 0
-                                    // marks "no opaque chunk here" so the path-trace denoiser
-                                    // can keep the rasterized entities/hand at those pixels
-                                    // (Color::BLACK has alpha 1, which broke that mask).
-                                    load: wgpu::LoadOp::Clear(wgpu::Color {
-                                        r: 0.0,
-                                        g: 0.0,
-                                        b: 0.0,
-                                        a: 0.0,
-                                    }),
-                                    store: wgpu::StoreOp::Store,
-                                },
-                            }),
-                        ],
-                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                            view: &self.depth_view,
-                            depth_ops: Some(wgpu::Operations {
-                                load: wgpu::LoadOp::Load,
-                                store: wgpu::StoreOp::Store,
-                            }),
-                            stencil_ops: None,
-                        }),
-                        occlusion_query_set: None,
-                        timestamp_writes: None,
-                        multiview_mask: None,
-                    });
-                    np.set_bind_group(0, &self.camera_bind_group, &[]);
-                    np.set_bind_group(1, &self.texture_bind_groups[self.mipmap_levels as usize], &[]);
-                    np.set_bind_group(2, &self.lighting_bind_group, &[]);
-                    let mut draw_layer = |pipe: &wgpu::RenderPipeline,
-                                          batches: &[PageBatch],
-                                          layer: &ChunkLayer| {
-                        np.set_pipeline(pipe);
-                        for batch in batches {
-                            let page = &layer.pages[batch.page];
-                            np.set_vertex_buffer(0, page.vertex_buf.slice(..));
-                            np.set_index_buffer(page.index_buf.slice(..), wgpu::IndexFormat::Uint16);
-                            for c in &batch.cmds {
-                                np.draw_indexed(
-                                    c.first_index..c.first_index + c.index_count,
-                                    c.base_vertex,
-                                    0..1,
-                                );
-                            }
-                        }
-                    };
-                    draw_layer(nsolid, &normal_solid_batches, &self.chunk_solid);
-                    draw_layer(ncutout, &normal_cutout_batches, &self.chunk_cutout);
-                }
+                // Normal G-buffer is now rendered before this block (both RTAO
+                // and the raster SSAO consume it), so there is nothing to do here.
                 let fs_pass =
                     |encoder: &mut wgpu::CommandEncoder,
                      label: &str,
@@ -9724,6 +9784,20 @@ impl Renderer {
         // than carried into the final image.
         if self.ssao_active() {
             if let Some(bind_group) = self.ssao_bind_group.as_ref() {
+                // Whether the G-buffer actually holds normals this frame. Greedy
+                // meshing cannot write it (its vertex format has no normal), so
+                // the shader must fall back to derived normals rather than read
+                // the cleared zero vector everywhere.
+                self.queue.write_buffer(
+                    &self.ssao_params_buffer,
+                    0,
+                    bytemuck::cast_slice(&[
+                        0.55f32,
+                        0.9,
+                        0.03,
+                        if want_normal_gbuffer { 1.0 } else { 0.0 },
+                    ]),
+                );
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("ssao-pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {

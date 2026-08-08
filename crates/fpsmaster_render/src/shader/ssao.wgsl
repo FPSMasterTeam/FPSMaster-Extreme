@@ -6,13 +6,16 @@
 // pass adds that, and deliberately stays subtle so it reads as contact shadow
 // rather than as a second AO layer stacked on the first.
 //
-// Depth is the only input. No normal G-buffer is sampled: that buffer exists but
-// is gated behind hardware ray query, and ungating it costs a full extra
-// geometry pass over all solid + cutout terrain. Normals are instead derived
-// from the reconstructed position and then SNAPPED TO THE NEAREST CARDINAL AXIS.
-// Minecraft geometry is axis-aligned, so the snap is exact for essentially every
-// surface — and it removes the reason the derivative approach was abandoned
-// before, namely that raw ddx/ddy normals shimmer under sub-pixel jitter.
+// Normals come from the G-buffer the chunk shader's `fs_normal` writes — an
+// exact per-pixel geometric normal, which is stable under sub-pixel jitter in a
+// way a depth derivative is not.
+//
+// That buffer is unavailable in one case: greedy (flat) meshing repurposes the
+// vertex normal slot for the tile origin, so `fs_normal` cannot read one. There,
+// and only there, normals fall back to a depth derivative SNAPPED TO THE NEAREST
+// CARDINAL AXIS. Minecraft geometry is axis-aligned, so the snap is exact for
+// essentially every surface and it suppresses the derivative's shimmer.
+// `params.p.w` selects between the two.
 
 struct PostCamera {
     inv_view_proj: mat4x4<f32>,
@@ -21,13 +24,15 @@ struct PostCamera {
 };
 
 struct SsaoParams {
-    // x: world-space radius, y: strength, z: depth bias, w: unused.
+    // x: world-space radius, y: strength, z: depth bias,
+    // w: 1 = sample the normal G-buffer, 0 = derive normals from depth.
     p: vec4<f32>,
 };
 
 @group(0) @binding(0) var depth_tex: texture_2d<f32>;
 @group(0) @binding(1) var<uniform> cam: PostCamera;
 @group(0) @binding(2) var<uniform> params: SsaoParams;
+@group(0) @binding(3) var normal_tex: texture_2d<f32>;
 
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
@@ -93,16 +98,29 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let uv = in.uv;
     let p = world_from_depth(uv, depth);
 
-    // Normal from the reconstructed position, using the CLOSER neighbour on each
-    // axis so a depth discontinuity does not bend the normal across a silhouette.
     let texel = 1.0 / vec2<f32>(dims);
-    let dr = world_from_depth(uv + vec2<f32>(texel.x, 0.0), load_depth(px + vec2<i32>(1, 0), dims));
-    let dl = world_from_depth(uv - vec2<f32>(texel.x, 0.0), load_depth(px - vec2<i32>(1, 0), dims));
-    let dd = world_from_depth(uv + vec2<f32>(0.0, texel.y), load_depth(px + vec2<i32>(0, 1), dims));
-    let du = world_from_depth(uv - vec2<f32>(0.0, texel.y), load_depth(px - vec2<i32>(0, 1), dims));
-    let ddx = select(p - dl, dr - p, length(dr - p) < length(dl - p));
-    let ddy = select(p - du, dd - p, length(dd - p) < length(du - p));
-    let n = snap_axis(normalize(cross(ddx, ddy)));
+    var n: vec3<f32>;
+    if (params.p.w > 0.5) {
+        // Exact geometric normal, written by `fs_normal` as 0.5 + 0.5 * n.
+        let encoded = textureLoad(normal_tex, px, 0).xyz * 2.0 - vec3<f32>(1.0);
+        // The G-buffer is cleared to the encoded zero vector, so pixels no chunk
+        // wrote (entities, the hand) decode to zero — fall back there.
+        if (dot(encoded, encoded) > 0.01) {
+            n = normalize(encoded);
+        } else {
+            n = vec3<f32>(0.0, 1.0, 0.0);
+        }
+    } else {
+        // Derived normal, using the CLOSER neighbour on each axis so a depth
+        // discontinuity does not bend it across a silhouette.
+        let dr = world_from_depth(uv + vec2<f32>(texel.x, 0.0), load_depth(px + vec2<i32>(1, 0), dims));
+        let dl = world_from_depth(uv - vec2<f32>(texel.x, 0.0), load_depth(px - vec2<i32>(1, 0), dims));
+        let dd = world_from_depth(uv + vec2<f32>(0.0, texel.y), load_depth(px + vec2<i32>(0, 1), dims));
+        let du = world_from_depth(uv - vec2<f32>(0.0, texel.y), load_depth(px - vec2<i32>(0, 1), dims));
+        let ddx = select(p - dl, dr - p, length(dr - p) < length(dl - p));
+        let ddy = select(p - du, dd - p, length(dd - p) < length(du - p));
+        n = snap_axis(normalize(cross(ddx, ddy)));
+    }
 
     // World units per pixel at this depth, so a fixed world radius maps to the
     // right screen radius without needing the forward projection matrix.
