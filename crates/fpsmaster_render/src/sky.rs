@@ -56,8 +56,27 @@ pub fn moon_phase(time_ticks: f64) -> u32 {
     (time_ticks.div_euclid(24000.0) as i64).rem_euclid(8) as u32
 }
 
+/// sRGB -> linear, for the vanilla colour constants below.
+///
+/// Vanilla's sky/fog values are authored for a non-sRGB framebuffer — they are the
+/// bytes it puts on screen. Every consumer here (the sky pass, the terrain fog mix,
+/// the HDR clear colour) writes into the LINEAR `Rgba16Float` world target that the
+/// post pass re-encodes to sRGB, so handing them over raw renders them washed out
+/// (vanilla's 0.47 daytime sky blue would display as ~0.71 — pale and milky).
+/// Convert once here, at the boundary, so the whole renderer stays linear.
+fn srgb_to_linear(c: f32) -> f32 {
+    if c <= 0.040_45 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
 /// The full set of time-dependent sky parameters the renderer needs in one
 /// shot, so a frame computes the celestial math once.
+///
+/// All colours are LINEAR (see [`srgb_to_linear`]); the scalars are not colours
+/// and are passed through untouched.
 #[derive(Debug, Clone, Copy)]
 pub struct SkyColors {
     /// Upper-dome color (vanilla `getSkyColor`): deep blue by day, black at night.
@@ -66,7 +85,8 @@ pub struct SkyColors {
     /// near the horizon and the terrain clear color.
     pub horizon: [f32; 3],
     /// Sunrise/sunset glow (vanilla `calcSunriseSunsetColors`): rgb + strength;
-    /// strength is 0 away from dawn/dusk.
+    /// strength is 0 away from dawn/dusk. Only the rgb is linearized — `[3]` is a
+    /// blend weight, not a colour.
     pub sunset: [f32; 4],
     /// Sky-light scale fed to the world lightmap (== `sun_brightness`).
     pub sun_brightness: f32,
@@ -79,17 +99,26 @@ pub fn sky_colors(time_ticks: f64) -> SkyColors {
     // Celestial dimming factor shared by the sky and fog colors.
     let f = ((angle * TAU).cos() * 2.0 + 0.5).clamp(0.0, 1.0);
 
+    // The vanilla math runs in vanilla's own (gamma) space, exactly as written in
+    // `World.getSkyColor` / `getFogColor` — including the dimming factor `f`, which
+    // is a gamma-space multiplier. Only the finished colour is converted to linear.
     let zenith = [BASE_SKY[0] * f, BASE_SKY[1] * f, BASE_SKY[2] * f];
     let horizon = [
         0.752_941_2 * (f * 0.94 + 0.06),
         0.847_058_83 * (f * 0.94 + 0.06),
         1.0 * (f * 0.91 + 0.09),
     ];
+    let sunset = sunrise_sunset_color(angle);
 
     SkyColors {
-        zenith,
-        horizon,
-        sunset: sunrise_sunset_color(angle),
+        zenith: zenith.map(srgb_to_linear),
+        horizon: horizon.map(srgb_to_linear),
+        sunset: [
+            srgb_to_linear(sunset[0]),
+            srgb_to_linear(sunset[1]),
+            srgb_to_linear(sunset[2]),
+            sunset[3],
+        ],
         sun_brightness: sun_brightness(time_ticks),
         star_brightness: star_brightness(time_ticks),
     }

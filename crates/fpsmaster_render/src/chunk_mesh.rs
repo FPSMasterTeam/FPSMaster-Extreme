@@ -1109,6 +1109,17 @@ fn emit_face<S: BlockSource>(
     warn_if_missing(ctx.atlas, block, face_context(face.face), texture);
     let rect = ctx.atlas.tile_rect(texture);
     let front = [nx, ny, nz];
+    // A pane arm running east–west is, in vanilla, the same model rotated 90°
+    // about Y (`glass_pane.json` applies `"y": 90` / `"y": 270`). This client has
+    // no blockstate/model loader, so that rotation has to be reproduced here:
+    // without it the arm's top/bottom faces map u from X and sample the EMPTY
+    // part of `glass_pane_top_*`, which is opaque only in texture columns 7–8 —
+    // painting a transparent (and under the Fast pipeline, black) band along
+    // every east–west arm. Swapping u/v puts the thin axis back on the strip.
+    // The centre post is square in XZ, so it is unaffected either way.
+    let rotate_uv = face.normal[1] != 0
+        && collision::is_pane(block.id)
+        && (mx[0] - mn[0]) > (mx[2] - mn[2]);
     let mut corners = [[0.0f32; 3]; 4];
     let mut uvs = [[0.0f32; 2]; 4];
     let mut colors = [[0.0f32; 4]; 4];
@@ -1119,7 +1130,10 @@ fn emit_face<S: BlockSource>(
         let py = lerp_axis(corner[1], mn[1], mx[1]);
         let pz = lerp_axis(corner[2], mn[2], mx[2]);
         corners[i] = [x as f32 + px, y as f32 + py, z as f32 + pz];
-        let (u, v) = face_uv(face.normal, px, py, pz);
+        let (mut u, mut v) = face_uv(face.normal, px, py, pz);
+        if rotate_uv {
+            std::mem::swap(&mut u, &mut v);
+        }
         local[i] = [u, v];
         uvs[i] = rect_uv(rect, u, v);
         // In flat mode the per-vertex smooth light below is unused (we shade flat).
@@ -2496,6 +2510,83 @@ mod tests {
         // plus pane post + single west arm.
         let pane_vertices = joined.cutout.vertices.len();
         assert_eq!(pane_vertices, 2 * 24);
+    }
+
+    /// Tile-local UV (0..1 within the sprite) of a vertex, undoing `rect_uv`.
+    fn tile_local_uv(v: &ChunkVertex, rect: [f32; 4]) -> [f32; 2] {
+        [
+            (v.uv[0] as f32 / 65535.0 - rect[0]) / rect[2],
+            (v.uv[1] as f32 / 65535.0 - rect[1]) / rect[3],
+        ]
+    }
+
+    /// `glass_pane_top_*` is opaque only in texture columns 7–8; every other
+    /// column is fully transparent. A pane arm's top face must therefore sample
+    /// u within that strip whichever way the arm runs. Vanilla gets this from the
+    /// `"y": 90` rotation in `glass_pane.json`; this client has no blockstate
+    /// loader, so `emit_face` reproduces it by swapping u/v on east–west arms.
+    /// Without that, the arm sampled the empty columns and striped a transparent
+    /// (Fast graphics: black) band along its top.
+    #[test]
+    fn east_west_pane_arms_sample_the_edge_strip() {
+        let atlas = atlas();
+        let rect = atlas.tile_rect(Some("glass_pane_top_red"));
+
+        // Red stained-glass pane (id 160, meta 14) with a single connection, once
+        // running north–south and once east–west.
+        let arm_top_u_range = |neighbor: (i32, i32, i32)| {
+            let mut world = World::new();
+            world.set_block(0, 0, 0, BlockState::new(160, 14));
+            world.set_block(neighbor.0, neighbor.1, neighbor.2, BlockState::STONE);
+            let mesh = build_world_mesh(&world, &atlas, BiomeColors::default(), false, false);
+            let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+            for v in &mesh.transparent.vertices {
+                // +Y faces only — filtering on y == 1.0 would also catch the top
+                // edge of the SIDE faces, which sample a different tile
+                // (`glass_red`) and would map to nonsense through this rect.
+                // Skip the square centre post (0.4375..0.5625 on both horizontal
+                // axes), which samples the strip whichever way it is mapped.
+                let p = vpos(v);
+                let on_post = (0.43..=0.57).contains(&p[0]) && (0.43..=0.57).contains(&p[2]);
+                if v.normal[1] != 127 || on_post {
+                    continue;
+                }
+                let u = tile_local_uv(v, rect)[0];
+                lo = lo.min(u);
+                hi = hi.max(u);
+            }
+            (lo, hi)
+        };
+
+        for (label, neighbor) in [
+            ("north–south", (0, 0, -1)),
+            ("east–west", (-1, 0, 0)),
+        ] {
+            let (lo, hi) = arm_top_u_range(neighbor);
+            assert!(
+                lo >= 7.0 / 16.0 - 0.02 && hi <= 9.0 / 16.0 + 0.02,
+                "{label} arm top face sampled u in {lo:.3}..{hi:.3}, outside the \
+                 opaque 7/16..9/16 strip of glass_pane_top_red"
+            );
+        }
+    }
+
+    #[test]
+    fn stained_glass_keeps_its_texture_alpha() {
+        // Vanilla carries stained glass's translucency entirely in the texture
+        // (body alpha 0.4). A per-block `alpha` override in blocks.json would
+        // double-apply now that the translucent pipeline really alpha-blends, so
+        // the vertex alpha must be a plain 1.0 pass-through.
+        let mut world = World::new();
+        world.set_block(0, 0, 0, BlockState::new(95, 14));
+        let mesh = build_world_mesh(&world, &atlas(), BiomeColors::default(), false, false);
+        assert!(!mesh.transparent.vertices.is_empty(), "glass is translucent");
+        for v in &mesh.transparent.vertices {
+            assert_eq!(
+                v.color[3], 255,
+                "vertex alpha must not scale the texture's own alpha"
+            );
+        }
     }
 
     #[test]

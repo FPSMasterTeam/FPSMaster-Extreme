@@ -2636,12 +2636,21 @@ impl Renderer {
         cache: None,
         multiview_mask: None,
         });
-        // Translucent (water/ice/stained glass): alpha-blended, tested against the
-        // opaque depth buffer but not writing depth (so overlapping translucent
-        // faces blend). Back-face culled like vanilla so a glass/ice cube shows
-        // only the player-facing faces; the mining-crack overlay (drawn with this
-        // pipeline) shares the cube winding, so culling leaves the crack on the
-        // visible faces only.
+        // Translucent (water/ice/stained glass/portal): alpha-blended, tested
+        // against the opaque depth buffer but not writing depth (so overlapping
+        // translucent faces blend). Back-face culled like vanilla so a glass/ice
+        // cube shows only the player-facing faces.
+        //
+        // Vanilla puts ALL of this layer's translucency in the texture alpha
+        // (stained glass 0.40, water 0.68, ice 0.62, portal 0.63, slime 0.74) and
+        // blends SRC_ALPHA / ONE_MINUS_SRC_ALPHA over the scene. This used to be a
+        // MULTIPLY blend running `fs_glass`, which ignored the texel alpha and
+        // folded the face shade into the filter: red glass darkened the view
+        // behind it to ~0.23 instead of vanilla's ~0.47, black stained glass was
+        // effectively opaque, and because a multiply can only ever subtract light,
+        // the pane itself vanished against any dark background. The greedy
+        // (flat-lighting) variant below always used plain alpha blending — this
+        // brings the smooth-lighting path in line with it and with vanilla.
         let transparent_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("chunk-transparent-pipeline"),
             layout: Some(&lit_pipeline_layout),
@@ -2653,24 +2662,14 @@ impl Renderer {
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                // Stained-glass colour filter: MULTIPLY the scene behind by the glass
-                // colour (src * dst) so coloured glass tints the view through it.
-                entry_point: Some("fs_glass"),
+                // Same lit, textured fragment as opaque terrain — the translucency
+                // comes from the texture's alpha via the blend below, exactly as
+                // in vanilla.
+                entry_point: Some("fs_main"),
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
-                    blend: Some(wgpu::BlendState {
-                        color: wgpu::BlendComponent {
-                            src_factor: wgpu::BlendFactor::Dst,
-                            dst_factor: wgpu::BlendFactor::Zero,
-                            operation: wgpu::BlendOperation::Add,
-                        },
-                        alpha: wgpu::BlendComponent {
-                            src_factor: wgpu::BlendFactor::Zero,
-                            dst_factor: wgpu::BlendFactor::One,
-                            operation: wgpu::BlendOperation::Add,
-                        },
-                    }),
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
@@ -2696,6 +2695,10 @@ impl Renderer {
         });
         // Graphics: Fast water/glass — opaque (REPLACE, no blend dst read) and
         // writes depth so it occludes properly. Saves the alpha-blend bandwidth.
+        // `fs_opaque_cutout`, not `fs_main`: REPLACE discards the alpha channel,
+        // so a fully transparent texel would be written as solid black — which is
+        // exactly what the empty part of `glass_pane_top_*` is, and it striped a
+        // black band along every pane arm.
         let water_opaque_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("chunk-water-opaque-pipeline"),
             layout: Some(&lit_pipeline_layout),
@@ -2707,7 +2710,7 @@ impl Renderer {
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: Some("fs_main"),
+                entry_point: Some("fs_opaque_cutout"),
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
@@ -2837,8 +2840,15 @@ impl Renderer {
             Some(wgpu::BlendState::ALPHA_BLENDING),
             false,
         );
-        let greedy_water_pipeline =
-            mk_greedy("greedy-water", "fs_main", Some(wgpu::BlendState::REPLACE), true);
+        // Greedy counterpart of `water_opaque_pipeline`, and alpha-tested for the
+        // same reason: REPLACE drops the alpha, so empty pane-edge texels would
+        // otherwise land as solid black.
+        let greedy_water_pipeline = mk_greedy(
+            "greedy-water",
+            "fs_opaque_cutout",
+            Some(wgpu::BlendState::REPLACE),
+            true,
+        );
         let overlay_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("overlay-pipeline"),
             layout: Some(&pipeline_layout),

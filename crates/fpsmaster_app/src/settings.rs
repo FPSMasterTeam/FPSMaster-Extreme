@@ -184,9 +184,15 @@ impl Default for Settings {
             shaders: false,
             shader_shadows: true,
             shader_specular: true,
-            shader_fog: false,
+            // Vanilla 1.8.9 always fogs terrain toward the horizon colour; without it
+            // the world ends on a hard edge at the render boundary. Despite the
+            // `shader_` prefix this one works with the master shader toggle off (see
+            // `Renderer::set_fog_enabled`), so it defaults on for vanilla parity.
+            shader_fog: true,
             shader_bloom: false,
-            brightness: 0.5,
+            // Vanilla's Brightness slider defaults to 0.0 ("Moody"); 0.5 pre-lifted the
+            // dark end of the lightmap curve and flattened the whole image.
+            brightness: 0.0,
             post_vignette: true,
             post_chromatic: true,
             post_dof: false,
