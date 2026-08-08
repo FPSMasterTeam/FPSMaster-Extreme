@@ -39,10 +39,24 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     return out;
 }
 
+// sRGB -> linear; the same decode `chunk.wgsl` and `ui.wgsl` apply. The entity
+// atlas is `Rgba8UnormSrgb`, so `textureSample` returns linear, while the vertex
+// colour carries vanilla gamma-space multipliers (the per-face model shade and
+// the entity's lightmap). Multiplying them in linear would raise each to ~1/2.2,
+// flattening entity shading exactly as it flattened the terrain.
+fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
+    let low = c / 12.92;
+    let high = pow((c + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4));
+    return select(high, low, c <= vec3<f32>(0.04045));
+}
+
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let texel = textureSample(entity_texture, entity_sampler, input.uv);
-    let result = texel * input.color;
+    let result = vec4<f32>(
+        texel.rgb * srgb_to_linear(input.color.rgb),
+        texel.a * input.color.a,
+    );
     // Discard fully transparent texels so skin overlay gaps don't draw.
     if (result.a < 0.01) {
         discard;

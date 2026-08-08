@@ -506,29 +506,62 @@ struct PageBatch {
     cmds: Vec<IndirectCmd>,
 }
 
+/// Group the visible sections of one layer into per-page indirect-draw batches.
+///
+/// Grouping is by page because a batch binds one vertex/index buffer; the caller
+/// controls whether the *order* of `visible` has to survive that grouping.
+///
+/// `ordered = false` gathers every section of a page into a single batch, which
+/// minimises buffer binds. Correct for the opaque layers, whose front-to-back
+/// order is only an early-z optimisation.
+///
+/// `ordered = true` instead starts a new batch whenever the page changes, so
+/// sections are drawn in exactly the order given. The translucent layers need
+/// this: they are handed a back-to-front list so alpha blends correctly, and
+/// gathering by page silently replaced that with page-allocation order (the old
+/// implementation grouped through a `HashMap` and then sorted by page index,
+/// which discarded the ordering the call site had just computed).
 fn collect_layer_batches(
     layer: &ChunkLayer,
     visible: &[SectionPos],
     chunk_indices: &mut u32,
+    ordered: bool,
 ) -> Vec<PageBatch> {
-    let mut by_page: HashMap<usize, Vec<IndirectCmd>> = HashMap::new();
+    let mut batches: Vec<PageBatch> = Vec::new();
+    // Page -> index into `batches`, for the unordered (gather-all) mode.
+    let mut page_slot: HashMap<usize, usize> = HashMap::new();
     for pos in visible {
-        if let Some(s) = layer.slots.get(pos) {
-            *chunk_indices += s.index_count;
-            by_page.entry(s.page as usize).or_default().push(IndirectCmd {
-                index_count: s.index_count,
-                instance_count: 1,
-                first_index: s.index_offset,
-                base_vertex: s.vertex_offset as i32,
-                first_instance: 0,
-            });
+        let Some(s) = layer.slots.get(pos) else {
+            continue;
+        };
+        *chunk_indices += s.index_count;
+        let cmd = IndirectCmd {
+            index_count: s.index_count,
+            instance_count: 1,
+            first_index: s.index_offset,
+            base_vertex: s.vertex_offset as i32,
+            first_instance: 0,
+        };
+        let page = s.page as usize;
+        // Extend the current batch when it already targets this page: in ordered
+        // mode only the last one may be extended (anything earlier would move the
+        // draw ahead of sections that must precede it), otherwise any batch may.
+        let slot = if ordered {
+            batches.last().filter(|b| b.page == page).map(|_| batches.len() - 1)
+        } else {
+            page_slot.get(&page).copied()
+        };
+        match slot {
+            Some(i) => batches[i].cmds.push(cmd),
+            None => {
+                page_slot.insert(page, batches.len());
+                batches.push(PageBatch { page, cmds: vec![cmd] });
+            }
         }
     }
-    let mut batches: Vec<PageBatch> = by_page
-        .into_iter()
-        .map(|(page, cmds)| PageBatch { page, cmds })
-        .collect();
-    batches.sort_unstable_by_key(|b| b.page);
+    if !ordered {
+        batches.sort_unstable_by_key(|b| b.page);
+    }
     batches
 }
 
@@ -1444,7 +1477,7 @@ impl Renderer {
         // The UI reuses the block atlas (and its name→tile map) for item icons.
         let gui_atlas = GuiAtlas::load(block_image, atlas_uv.clone());
         // Background chunk-meshing pool (built from the shared atlas/biome data).
-        let mesh_worker = MeshWorker::new(atlas_uv.clone(), biome_colors);
+        let mesh_worker = MeshWorker::new(atlas_uv.clone(), biome_colors.clone());
 
         // The chunk shader calls `sun_visibility` / `rt_ao_factor`, supplied by a
         // prepended block: the no-op stub on the default build, the ray-query
@@ -6329,7 +6362,7 @@ impl Renderer {
                 world,
                 pos,
                 &self.atlas_uv,
-                self.biome_colors,
+                &self.biome_colors,
                 !self.fancy_graphics,
                 self.flat_meshing,
             );
@@ -7010,10 +7043,7 @@ impl Renderer {
     pub fn reload_atlas(&mut self, pack_path: Option<std::path::PathBuf>) -> AtlasUv {
         let mut atlas = TextureAtlasImage::load_with_pack(pack_path);
         let animated = std::mem::take(&mut atlas.animated);
-        let biome_colors = BiomeColors {
-            grass: atlas.grass_color,
-            foliage: atlas.foliage_color,
-        };
+        let biome_colors = BiomeColors::new(atlas.biome_colors.clone());
         let atlas_uv = atlas.uv_table();
 
         let mips =
@@ -7177,7 +7207,7 @@ impl Renderer {
         // meshing flags off, so re-apply the current graphics modes — otherwise a
         // reload (e.g. a resource pack at startup) would silently mesh in the wrong
         // mode (flat geometry drawn by the greedy pipeline → garbage UVs).
-        self.mesh_worker = MeshWorker::new(atlas_uv.clone(), self.biome_colors);
+        self.mesh_worker = MeshWorker::new(atlas_uv.clone(), self.biome_colors.clone());
         self.mesh_worker.set_flat(self.flat_meshing);
         self.mesh_worker.set_fast_leaves(!self.fancy_graphics);
 
@@ -8124,7 +8154,23 @@ impl Renderer {
                     on(self.shaders_enabled && self.specular_enabled),
                     1.0 / SHADOW_DIM as f32,
                 ],
-                fog_color: [sky.horizon[0], sky.horizon[1], sky.horizon[2], on(self.pbr_enabled)],
+                // Vanilla's `updateFogColor` blends the sunrise/sunset band into
+                // the fog before the terrain fades into it, which is what turns
+                // the horizon haze orange at dawn and dusk. Feeding only
+                // `sky.horizon` left the sunset confined to the sky dome while
+                // the terrain still faded into a flat daytime blue. The strength
+                // is scaled down because vanilla additionally weights the blend
+                // by how much the view faces the sun; the chunk shader's
+                // `aerial_sky` already applies that directional term.
+                fog_color: {
+                    let s = sky.sunset[3] * 0.6;
+                    [
+                        sky.horizon[0] * (1.0 - s) + sky.sunset[0] * s,
+                        sky.horizon[1] * (1.0 - s) + sky.sunset[1] * s,
+                        sky.horizon[2] * (1.0 - s) + sky.sunset[2] * s,
+                        on(self.pbr_enabled),
+                    ]
+                },
                 fog_params: [
                     // Tie fog to the render-distance boundary so it reaches the
                     // horizon colour just before the square cull — hiding the
@@ -8319,7 +8365,8 @@ impl Renderer {
                 .collect();
             let mut shadow_dummy = 0u32;
             let shadow_solid_batches =
-                collect_layer_batches(&self.chunk_solid, &shadow_solid_visible, &mut shadow_dummy);
+                // Depth-only shadow pass: draw order is irrelevant.
+                collect_layer_batches(&self.chunk_solid, &shadow_solid_visible, &mut shadow_dummy, false);
             for batch in &shadow_solid_batches {
                 let page = &self.chunk_solid.pages[batch.page];
                 sp.set_vertex_buffer(0, page.vertex_buf.slice(..));
@@ -8343,7 +8390,7 @@ impl Renderer {
                 .filter(|pos| section_in_frustum(&light_frustum, *pos))
                 .collect();
             let shadow_cutout_batches =
-                collect_layer_batches(&self.chunk_cutout, &shadow_cutout_visible, &mut shadow_dummy);
+                collect_layer_batches(&self.chunk_cutout, &shadow_cutout_visible, &mut shadow_dummy, false);
             for batch in &shadow_cutout_batches {
                 let page = &self.chunk_cutout.pages[batch.page];
                 sp.set_vertex_buffer(0, page.vertex_buf.slice(..));
@@ -8492,20 +8539,28 @@ impl Renderer {
                 let visible_far: Vec<SectionPos> = visible.iter().rev().copied().collect();
 
                 // Collect per-page indirect commands for each layer.
+                // Opaque layers: front-to-back is only an early-z hint, so they may
+                // be gathered per page for the fewest buffer binds.
                 let solid_batches =
-                    collect_layer_batches(&self.chunk_solid, &visible, &mut chunk_indices);
+                    collect_layer_batches(&self.chunk_solid, &visible, &mut chunk_indices, false);
                 let cutout_batches =
-                    collect_layer_batches(&self.chunk_cutout, &visible, &mut chunk_indices);
+                    collect_layer_batches(&self.chunk_cutout, &visible, &mut chunk_indices, false);
                 if want_normal_gbuffer {
                     normal_solid_batches = solid_batches.clone();
                     normal_cutout_batches = cutout_batches.clone();
                 }
-                let trans_batches =
-                    collect_layer_batches(&self.chunk_transparent, &visible_far, &mut chunk_indices);
+                // Translucent layers: the back-to-front order is a correctness
+                // requirement for alpha blending, so it must survive batching.
+                let trans_batches = collect_layer_batches(
+                    &self.chunk_transparent,
+                    &visible_far,
+                    &mut chunk_indices,
+                    true,
+                );
                 // Water is drawn in its own later pass (SSR), not via the shared
                 // indirect buffer — capture its draws here.
                 let water_batches =
-                    collect_layer_batches(&self.chunk_water, &visible_far, &mut chunk_indices);
+                    collect_layer_batches(&self.chunk_water, &visible_far, &mut chunk_indices, true);
                 for b in &water_batches {
                     for c in &b.cmds {
                         water_draws.push((b.page, *c));
@@ -10092,7 +10147,77 @@ impl Renderer {
 
 #[cfg(test)]
 mod tests {
-    use super::{glint_scroll, halton};
+    use super::{collect_layer_batches, glint_scroll, halton, ChunkLayer, LayerSlot};
+    use fpsmaster_core::SectionPos;
+
+    /// A layer whose sections land on the given pages. `index_offset` doubles as
+    /// each section's identity so the emitted draw order can be read back.
+    fn layer_with_pages(pages: &[u16]) -> (ChunkLayer, Vec<SectionPos>) {
+        let mut layer = ChunkLayer::new("test");
+        let mut visible = Vec::new();
+        for (i, &page) in pages.iter().enumerate() {
+            let pos = SectionPos::new(i as i32, 0, 0);
+            layer.slots.insert(
+                pos,
+                LayerSlot {
+                    page,
+                    vertex_offset: 0,
+                    vertex_alloc: 0,
+                    index_offset: i as u32,
+                    index_alloc: 0,
+                    index_count: 1,
+                },
+            );
+            visible.push(pos);
+        }
+        (layer, visible)
+    }
+
+    /// Alpha blending is order-dependent, so the back-to-front section list the
+    /// caller builds must survive batching. Gathering every section of a page
+    /// into one batch (correct for the opaque layers) silently reorders them.
+    #[test]
+    fn ordered_batching_preserves_the_back_to_front_sequence() {
+        // Pages interleaved so page-gathering and draw order genuinely disagree.
+        let (layer, visible) = layer_with_pages(&[0, 1, 0, 1, 2]);
+        let mut indices = 0;
+        let batches = collect_layer_batches(&layer, &visible, &mut indices, true);
+
+        let order: Vec<u32> = batches
+            .iter()
+            .flat_map(|b| b.cmds.iter().map(|c| c.first_index))
+            .collect();
+        assert_eq!(order, vec![0, 1, 2, 3, 4], "draw order must match `visible`");
+        assert_eq!(
+            batches.iter().map(|b| b.page).collect::<Vec<_>>(),
+            vec![0, 1, 0, 1, 2],
+            "a page change starts a new batch instead of merging backwards"
+        );
+        assert_eq!(indices, 5);
+    }
+
+    /// Consecutive sections on the same page still share one batch, so ordering
+    /// does not cost a bind per section.
+    #[test]
+    fn ordered_batching_still_merges_consecutive_same_page_sections() {
+        let (layer, visible) = layer_with_pages(&[0, 0, 0, 1, 1]);
+        let mut indices = 0;
+        let batches = collect_layer_batches(&layer, &visible, &mut indices, true);
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].cmds.len(), 3);
+        assert_eq!(batches[1].cmds.len(), 2);
+    }
+
+    /// The opaque layers keep the cheaper gather-by-page behaviour.
+    #[test]
+    fn unordered_batching_gathers_each_page_once() {
+        let (layer, visible) = layer_with_pages(&[0, 1, 0, 1, 2]);
+        let mut indices = 0;
+        let batches = collect_layer_batches(&layer, &visible, &mut indices, false);
+        assert_eq!(batches.len(), 3, "one batch per page");
+        assert_eq!(batches.iter().map(|b| b.page).collect::<Vec<_>>(), vec![0, 1, 2]);
+        assert_eq!(batches[0].cmds.len(), 2);
+    }
 
     #[test]
     fn halton_matches_known_radical_inverse() {

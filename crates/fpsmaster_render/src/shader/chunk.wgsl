@@ -126,18 +126,38 @@ fn light_level(l: f32) -> f32 {
     return l / (4.0 - 3.0 * clamp(l, 0.0, 1.0));
 }
 
-// Vanilla-style coloured light map: day/night-scaled sky light (cool at night,
-// white by day) combined with a warm torch/block-light glow, with the steep
-// per-level falloff and vanilla's final lightmap lift (`* 0.96 + 0.03`,
-// EntityRenderer.updateLightmap) so nothing is pure black.
+// Vanilla's torch flicker: `updateTorchFlicker` runs a damped random walk around
+// 0 and feeds it in as `torchFlickerX * 0.1 + 1.5`. A random walk can't be
+// reproduced per-fragment, so this is a cheap smooth stand-in with the same tiny
+// amplitude — the point is only that torch-lit surfaces breathe.
+fn torch_gain() -> f32 {
+    let t = camera.time;
+    let flicker = sin(t * 3.1) * 0.6 + sin(t * 7.7) * 0.3 + sin(t * 13.3) * 0.15;
+    return flicker * 0.1 + 1.5;
+}
+
+// Vanilla's coloured light map, ported from `EntityRenderer.updateLightmap`.
+//
+// The sky and block terms are read through the vanilla brightness table, tinted
+// separately, then SUMMED. This used to be a `max()`, which meant a torch could
+// never brighten a surface the sky already lit — indoor/outdoor transitions came
+// out flat and daylight swallowed torchlight entirely. The `* 1.5` block gain
+// was also missing, leaving lit interiors about a third too dim.
 fn vanilla_lightmap(light: vec2<f32>) -> vec3<f32> {
-    let day = camera.sky_brightness;
-    let sky = light_level(light.x);
-    let block = light_level(light.y);
-    let sky_tint = mix(vec3<f32>(0.18, 0.22, 0.34), vec3<f32>(1.0, 1.0, 0.99), day);
-    let sky_term = sky_tint * (sky * day);
-    let block_term = vec3<f32>(1.0, 0.60, 0.30) * block; // warm torch glow
-    return max(sky_term, block_term) * 0.96 + vec3<f32>(0.03);
+    let sun = camera.sky_brightness;
+    let sky = light_level(light.x) * (sun * 0.95 + 0.05);
+    let block = light_level(light.y) * torch_gain();
+    // Sky: red and green are damped by the day factor while blue is left alone,
+    // which is what makes vanilla's night read cold blue rather than plain grey.
+    let sky_rg = sky * (sun * 0.65 + 0.35);
+    // Block: red passes through, green and blue are progressively damped, so a
+    // torch is orange where it is dim and washes toward white where it is bright
+    // (the old fixed `(1.0, 0.60, 0.30)` made every block-lit surface equally
+    // orange no matter the level).
+    let block_g = block * ((block * 0.6 + 0.4) * 0.6 + 0.4);
+    let block_b = block * (block * block * 0.6 + 0.4);
+    let rgb = vec3<f32>(sky_rg + block, sky_rg + block_g, sky + block_b);
+    return clamp(rgb * 0.96 + vec3<f32>(0.03), vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
 // Fraction of the sun visible at this world position (1 = lit, 0 = shadowed),
@@ -173,6 +193,14 @@ fn light_curve(light: vec3<f32>, brightness: f32) -> vec3<f32> {
     let lifted = vec3<f32>(1.0) - inv * inv * inv * inv;
     let high = max(light - vec3<f32>(1.0), vec3<f32>(0.0));
     return mix(low, lifted, brightness) + high;
+}
+
+// Vanilla applies the brightness gamma to the clamped lightmap and then repeats
+// the `* 0.96 + 0.03` lift before writing the lightmap texture. `vanilla_lightmap`
+// already clamps to 0..1, so `light_curve`'s HDR passthrough stays inert here.
+fn vanilla_lightmap_graded(light: vec2<f32>, gamma: f32) -> vec3<f32> {
+    let lit = light_curve(vanilla_lightmap(light), gamma);
+    return clamp(lit * 0.96 + vec3<f32>(0.03), vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
 // GGX normal distribution function.
@@ -230,11 +258,10 @@ fn apply_lighting(albedo: vec3<f32>, in: VertexOutput) -> vec3<f32> {
     // gamma blend: 0 = Moody base curve, 1 = fully lifted (Bright).
     let gamma = lighting.fog_params.w;
     if (lighting.flags.x < 0.5) {
-        // Vanilla path: coloured light map (warm block light + day/night sky) with
-        // the steep per-level falloff, then the brightness gamma. The lightmap is a
-        // vanilla gamma-space multiplier like the vertex colour, so it is decoded
-        // before it scales the linear albedo (see `srgb_to_linear`).
-        return albedo * srgb_to_linear(light_curve(vanilla_lightmap(in.light), gamma));
+        // Vanilla path: the coloured light map, then the brightness gamma. The
+        // lightmap is a vanilla gamma-space multiplier like the vertex colour, so
+        // it is decoded before it scales the linear albedo (see `srgb_to_linear`).
+        return albedo * srgb_to_linear(vanilla_lightmap_graded(in.light, gamma));
     }
     let geo_n = normalize(in.normal);
     let pbr_on = lighting.fog_color.w > 0.5;

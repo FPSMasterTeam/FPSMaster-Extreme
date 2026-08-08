@@ -1,4 +1,6 @@
 use bytemuck::{Pod, Zeroable};
+use std::collections::HashMap;
+
 use fpsmaster_core::{
     collision, door_box, BlockFace, BlockState, Chunk, ChunkPos, RenderLayer, RenderShape,
     SectionPos, Tint, World,
@@ -203,28 +205,53 @@ fn encode_chunk_vertex(
 
 /// Per-biome tint colors (0..1) applied to grass and foliage, which ship as
 /// grayscale textures in vanilla and must be colored at runtime.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct BiomeColors {
-    pub grass: [f32; 3],
-    pub foliage: [f32; 3],
+    table: std::sync::Arc<crate::biome::BiomeColorTable>,
 }
 
-impl Default for BiomeColors {
-    fn default() -> Self {
+impl BiomeColors {
+    pub fn new(table: crate::biome::BiomeColorTable) -> Self {
         Self {
-            grass: [0.569, 0.741, 0.349],
-            foliage: [0.467, 0.671, 0.184],
+            table: std::sync::Arc::new(table),
         }
+    }
+
+    /// Vanilla grass colour for one biome id, as a 0..1 multiplier.
+    pub fn grass(&self, biome: u8) -> [f32; 3] {
+        u8_to_unit(self.table.grass(biome))
+    }
+
+    /// Vanilla foliage (leaves / vines) colour for one biome id.
+    pub fn foliage(&self, biome: u8) -> [f32; 3] {
+        u8_to_unit(self.table.foliage(biome))
+    }
+
+    /// `BiomeGenBase.waterColorMultiplier` — white everywhere but swamp.
+    pub fn water(&self, biome: u8) -> [f32; 3] {
+        u8_to_unit(self.table.water(biome))
     }
 }
 
-/// Water color multiplier. Vanilla 1.8.9 `water_still.png` is already blue, and
-/// `BlockLiquid.colorMultiplier` returns the biome water color, which defaults
-/// to `waterColorMultiplier = 0xFFFFFF` (white — no tint) for every biome except
-/// swamp. So the multiplier is white: tinting the already-blue texture with a
-/// second blue is what turned water near-black. Per-biome water tint (swamp)
-/// isn't modeled yet; this is the default-biome value.
-const WATER_COLOR: [f32; 3] = [1.0, 1.0, 1.0];
+impl Default for BiomeColors {
+    /// No colormap available: every biome resolves to the vanilla plains colour,
+    /// which is what the renderer used for the whole world before biomes were
+    /// plumbed through.
+    fn default() -> Self {
+        Self::new(crate::biome::BiomeColorTable::fallback(
+            [0x91, 0xBD, 0x59],
+            [0x77, 0xAB, 0x2F],
+        ))
+    }
+}
+
+fn u8_to_unit(c: [u8; 3]) -> [f32; 3] {
+    [
+        c[0] as f32 / 255.0,
+        c[1] as f32 / 255.0,
+        c[2] as f32 / 255.0,
+    ]
+}
 
 /// Read-only block/light source the mesher walks. Implemented by the live
 /// `World` (synchronous path) and by a self-contained `ChunkNeighborhood`
@@ -232,6 +259,8 @@ const WATER_COLOR: [f32; 3] = [1.0, 1.0, 1.0];
 pub trait BlockSource {
     fn block_at(&self, x: i32, y: i32, z: i32) -> BlockState;
     fn light_at(&self, x: i32, y: i32, z: i32) -> (u8, u8);
+    /// Biome id at a world column, for grass/foliage/water tinting.
+    fn biome_at(&self, x: i32, z: i32) -> u8;
 }
 
 impl BlockSource for World {
@@ -240,6 +269,9 @@ impl BlockSource for World {
     }
     fn light_at(&self, x: i32, y: i32, z: i32) -> (u8, u8) {
         World::light_at(self, x, y, z)
+    }
+    fn biome_at(&self, x: i32, z: i32) -> u8 {
+        World::biome_at(self, x, z)
     }
 }
 
@@ -310,7 +342,15 @@ impl BlockSource for ChunkNeighborhood {
     fn light_at(&self, x: i32, y: i32, z: i32) -> (u8, u8) {
         match self.chunk_for(x.div_euclid(16), z.div_euclid(16)) {
             Some(chunk) => chunk.light_at(x.rem_euclid(16) as u8, y, z.rem_euclid(16) as u8),
-            None => (0, 15),
+            // Unloaded neighbour: take the centre column's dimension, so a Nether
+            // chunk edge does not read as open sky.
+            None => (0, self.center.sky_light_fallback()),
+        }
+    }
+    fn biome_at(&self, x: i32, z: i32) -> u8 {
+        match self.chunk_for(x.div_euclid(16), z.div_euclid(16)) {
+            Some(chunk) => chunk.biome_at(x.rem_euclid(16) as u8, z.rem_euclid(16) as u8),
+            None => fpsmaster_core::chunk::DEFAULT_BIOME,
         }
     }
 }
@@ -442,7 +482,7 @@ const FACES: [Face; 6] = [
 pub fn build_world_mesh(
     world: &World,
     atlas: &AtlasUv,
-    biome: BiomeColors,
+    biome: &BiomeColors,
     fast_leaves: bool,
     flat: bool,
 ) -> ChunkMesh {
@@ -461,7 +501,7 @@ pub fn build_section_mesh(
     world: &World,
     pos: SectionPos,
     atlas: &AtlasUv,
-    biome: BiomeColors,
+    biome: &BiomeColors,
     fast_leaves: bool,
     flat: bool,
 ) -> ChunkMesh {
@@ -481,7 +521,7 @@ pub fn build_section_mesh_neighborhood(
     neighborhood: &ChunkNeighborhood,
     section_y: i32,
     atlas: &AtlasUv,
-    biome: BiomeColors,
+    biome: &BiomeColors,
     fast_leaves: bool,
     flat: bool,
 ) -> ChunkMesh {
@@ -504,7 +544,7 @@ fn append_chunk_mesh<S: BlockSource>(
     chunk: &Chunk,
     mesh: &mut ChunkMesh,
     atlas: &AtlasUv,
-    biome: BiomeColors,
+    biome: &BiomeColors,
     fast_leaves: bool,
     flat: bool,
 ) {
@@ -520,7 +560,7 @@ fn append_section_mesh<S: BlockSource>(
     section_y: i32,
     mesh: &mut ChunkMesh,
     atlas: &AtlasUv,
-    biome: BiomeColors,
+    biome: &BiomeColors,
     fast_leaves: bool,
     flat: bool,
 ) {
@@ -557,6 +597,7 @@ fn append_section_mesh<S: BlockSource>(
                     continue;
                 }
                 let ctx = BlockCtx {
+                    blend_cache: Default::default(),
                     source,
                     chunk,
                     base_x,
@@ -578,7 +619,11 @@ struct BlockCtx<'a, S: BlockSource> {
     base_x: i32,
     base_z: i32,
     atlas: &'a AtlasUv,
-    biome: BiomeColors,
+    biome: &'a BiomeColors,
+    /// Memo of the 3×3 biome blend per column, keyed by world (x, z). Vanilla
+    /// averages nine biomes for every tinted face; without this a solid chunk of
+    /// grass would redo the same nine lookups for all four of a block's faces.
+    blend_cache: std::cell::RefCell<HashMap<(i32, i32), BlendedTint>>,
     /// Fast graphics: merge adjacent same-id leaf faces (canopy shell only).
     fast_leaves: bool,
     /// Flat (greedy) mode: non-cube shapes emit greedy-format vertices (per-block
@@ -586,12 +631,100 @@ struct BlockCtx<'a, S: BlockSource> {
     flat: bool,
 }
 
+/// The three biome-dependent tints for one column, already blended.
+#[derive(Clone, Copy)]
+struct BlendedTint {
+    grass: [f32; 3],
+    foliage: [f32; 3],
+    water: [f32; 3],
+}
+
 impl<S: BlockSource> BlockCtx<'_, S> {
     /// Resolve a face tint: a `setBlockTint` override wins, else the block's
-    /// vanilla biome/constant tint.
-    fn tint(&self, block: BlockState, face: BlockFace) -> [f32; 3] {
-        block_tint(block).unwrap_or_else(|| tint_color(block.tint(face), self.biome))
+    /// vanilla biome/constant tint at this column.
+    fn tint(&self, block: BlockState, face: BlockFace, x: i32, z: i32) -> [f32; 3] {
+        if let Some(over) = block_tint(block) {
+            return over;
+        }
+        match block.tint(face) {
+            Tint::None => [1.0, 1.0, 1.0],
+            Tint::Rgb(rgb) => rgb,
+            Tint::Grass => self.blended(x, z).grass,
+            Tint::Foliage => self.blended(x, z).foliage,
+            Tint::Water => self.blended(x, z).water,
+        }
     }
+
+    /// Vanilla `BiomeColorHelper.getColorAtPos`: average the biome colour over
+    /// the 3×3 columns centred on this one, which is what smooths the hard biome
+    /// borders a per-block lookup would otherwise show.
+    fn blended(&self, x: i32, z: i32) -> BlendedTint {
+        if let Some(hit) = self.blend_cache.borrow().get(&(x, z)) {
+            return *hit;
+        }
+        let blended = blend_biome_tint(self.source, self.biome, x, z);
+        self.blend_cache.borrow_mut().insert((x, z), blended);
+        blended
+    }
+}
+
+/// Vanilla `BiomeColorHelper.getColorAtPos`: the biome colour averaged over the
+/// 3×3 columns centred on `(x, z)`, which is what softens biome borders.
+fn blend_biome_tint<S: BlockSource>(
+    source: &S,
+    colors: &BiomeColors,
+    x: i32,
+    z: i32,
+) -> BlendedTint {
+    let (mut grass, mut foliage, mut water) = ([0.0f32; 3], [0.0f32; 3], [0.0f32; 3]);
+    for dz in -1..=1 {
+        for dx in -1..=1 {
+            let biome = source.biome_at(x + dx, z + dz);
+            let (g, f, w) = (
+                colors.grass(biome),
+                colors.foliage(biome),
+                colors.water(biome),
+            );
+            for c in 0..3 {
+                grass[c] += g[c];
+                foliage[c] += f[c];
+                water[c] += w[c];
+            }
+        }
+    }
+    BlendedTint {
+        grass: grass.map(|c| c / 9.0),
+        foliage: foliage.map(|c| c / 9.0),
+        water: water.map(|c| c / 9.0),
+    }
+}
+
+/// Resolve a greedy face's tint into the 8-bit form stored in [`GreedyKey`].
+/// The greedy path has no per-section memo, but it also runs only when smooth
+/// lighting is off, where a little extra work per masked face is acceptable.
+fn greedy_tint<S: BlockSource>(
+    source: &S,
+    colors: &BiomeColors,
+    x: i32,
+    z: i32,
+    face: BlockFace,
+    block: BlockState,
+) -> [u8; 3] {
+    let rgb = match block_tint(block) {
+        Some(over) => over,
+        None => match block.tint(face) {
+            Tint::None => [1.0, 1.0, 1.0],
+            Tint::Rgb(rgb) => rgb,
+            Tint::Grass => blend_biome_tint(source, colors, x, z).grass,
+            Tint::Foliage => blend_biome_tint(source, colors, x, z).foliage,
+            Tint::Water => blend_biome_tint(source, colors, x, z).water,
+        },
+    };
+    [
+        (rgb[0] * 255.0).round().clamp(0.0, 255.0) as u8,
+        (rgb[1] * 255.0).round().clamp(0.0, 255.0) as u8,
+        (rgb[2] * 255.0).round().clamp(0.0, 255.0) as u8,
+    ]
 }
 
 fn append_block<S: BlockSource>(
@@ -682,7 +815,7 @@ fn append_bed<S: BlockSource>(
         if n == open_normal { continue; } // open seam side — not rendered
         let texture = if n == end_normal { end_tex } else { side_tex };
         let (nx, ny, nz) = (x + n[0], y + n[1], z + n[2]);
-        emit_face(buffer, ctx, face, x, y, z, mn, mx, texture, block, alpha, nx, ny, nz);
+        emit_face(buffer, ctx, face, x, y, z, mn, mx, texture, block, alpha, nx, ny, nz, None);
     }
 
     // Top face with facing-dependent 90° UV rotation.
@@ -723,7 +856,7 @@ fn append_bed<S: BlockSource>(
         let face = &FACES[3]; // DOWN face ([0,-1,0])
         let pmn = [0.0f32, 3.0 / 16.0, 0.0];
         let pmx = [1.0f32, 3.0 / 16.0, 1.0];
-        emit_face(buffer, ctx, face, x, y, z, pmn, pmx, Some("planks_oak"), block, alpha, x, y - 1, z);
+        emit_face(buffer, ctx, face, x, y, z, pmn, pmx, Some("planks_oak"), block, alpha, x, y - 1, z, None);
     }
 }
 
@@ -897,7 +1030,8 @@ fn append_fluid<S: BlockSource>(
             nx,
             ny,
             nz,
-        );
+        None,
+    );
     }
 }
 
@@ -934,6 +1068,8 @@ fn append_cube<S: BlockSource>(
     block: BlockState,
 ) {
     let alpha = block.render_alpha();
+    // Grass sides need a second, biome-tinted quad (see `GRASS_SIDE_OVERLAY_NUDGE`).
+    let mut grass_overlay_faces: Vec<(&Face, i32, i32, i32)> = Vec::new();
     let buffer = buffer_for(mesh, block);
     for face in &FACES {
         let (nx, ny, nz) = (x + face.normal[0], y + face.normal[1], z + face.normal[2]);
@@ -962,8 +1098,86 @@ fn append_cube<S: BlockSource>(
             nx,
             ny,
             nz,
-        );
+        None,
+    );
+        if block.id == GRASS_BLOCK_ID && face.face == BlockFace::Side {
+            grass_overlay_faces.push((face, nx, ny, nz));
+        }
     }
+    for (face, nx, ny, nz) in grass_overlay_faces {
+        emit_grass_side_overlay(mesh, ctx, face, x, y, z, nx, ny, nz);
+    }
+}
+
+/// Grass block id — the one block whose sides carry a separately tinted overlay.
+const GRASS_BLOCK_ID: u16 = 2;
+
+/// How far the grass side overlay sits proud of the block face, in blocks.
+///
+/// Vanilla's `block/grass.json` puts the overlay on a second element exactly
+/// coincident with the first and relies on GL's `LEQUAL` depth test to let the
+/// later one through. This renderer depth-tests with `Less`, so a coincident
+/// quad is rejected outright and the overlay would simply never appear.
+///
+/// 1/64 is the *smallest offset that survives*: vertex positions are stored as
+/// ×64 fixed-point (see `encode_vertex`), so anything finer quantises back to
+/// zero and silently restores the coincident case. The face is only emitted
+/// where it is exposed to air, so poking out a quarter of a texel is harmless.
+const GRASS_SIDE_OVERLAY_NUDGE: f32 = 1.0 / 64.0;
+
+/// Emit the biome-tinted half of a grass block's side.
+///
+/// `grass_side.png` has a fixed green band baked into it and is drawn untinted;
+/// `grass_side_overlay.png` is a greyscale mask over that band which vanilla
+/// tints per biome. The overlay used to be composited into the atlas at load
+/// time with a single plains colour, which is why grass could not follow the
+/// biome. It goes in the CUTOUT buffer because it is transparent below the band.
+#[allow(clippy::too_many_arguments)]
+fn emit_grass_side_overlay<S: BlockSource>(
+    mesh: &mut ChunkMesh,
+    ctx: &BlockCtx<S>,
+    face: &Face,
+    x: i32,
+    y: i32,
+    z: i32,
+    nx: i32,
+    ny: i32,
+    nz: i32,
+) {
+    let n = GRASS_SIDE_OVERLAY_NUDGE;
+    let (mut mn, mut mx) = ([0.0f32; 3], [1.0f32; 3]);
+    for axis in 0..3 {
+        match face.normal[axis] {
+            1 => mn[axis] = 1.0 + n,
+            -1 => mx[axis] = -n,
+            _ => {}
+        }
+    }
+    // A degenerate-on-the-normal-axis box: both extents sit on the nudged plane.
+    for axis in 0..3 {
+        if face.normal[axis] == 1 {
+            mx[axis] = mn[axis];
+        } else if face.normal[axis] == -1 {
+            mn[axis] = mx[axis];
+        }
+    }
+    emit_face(
+        &mut mesh.cutout,
+        ctx,
+        face,
+        x,
+        y,
+        z,
+        mn,
+        mx,
+        Some("grass_side_overlay"),
+        BlockState::new(GRASS_BLOCK_ID, 0),
+        1.0,
+        nx,
+        ny,
+        nz,
+        Some(ctx.blended(x, z).grass),
+    );
 }
 
 /// Partial-shape block (slab/stairs/snow/fence/pane/…): render each shape
@@ -981,7 +1195,7 @@ fn append_boxes<S: BlockSource>(
     let boxes = shape_boxes(ctx, x, y, z, block);
     let pane_edge = pane_edge_texture(block);
     let buffer = buffer_for(mesh, block);
-    for shape_box in &boxes {
+    for (i, shape_box) in boxes.iter().enumerate() {
         let mn = [
             shape_box[0] as f32,
             shape_box[1] as f32,
@@ -993,6 +1207,17 @@ fn append_boxes<S: BlockSource>(
             shape_box[5] as f32,
         ];
         for face in &FACES {
+            // Drop faces buried inside the block's own shape. A pane is a centre
+            // post plus arms that butt against it, and every box used to emit all
+            // six faces, so the junction carried a quad vanilla's model does not
+            // have. Back-face culling keeps only one of each coincident pair, so
+            // this never showed as z-fighting — but on the now alpha-blended
+            // translucent layer that surviving quad is a visible extra layer of
+            // glass down the seam. Opaque shapes (stairs, fences, slabs) just
+            // shed hidden triangles.
+            if face_is_interior(&boxes, i, face.normal) {
+                continue;
+            }
             let (nx, ny, nz) = (x + face.normal[0], y + face.normal[1], z + face.normal[2]);
             // Pane top/bottom faces use the dedicated edge texture (vanilla
             // glass_pane_top); everything else follows the data file.
@@ -1002,9 +1227,56 @@ fn append_boxes<S: BlockSource>(
             };
             emit_face(
                 buffer, ctx, face, x, y, z, mn, mx, texture, block, alpha, nx, ny, nz,
-            );
+        None,
+    );
         }
     }
+}
+
+/// Whether face `normal` of `boxes[i]` is sealed by another box of the same
+/// block, and so can never be seen.
+///
+/// True only when some other box starts exactly where this face sits and fully
+/// covers it on the other two axes — a deliberately conservative test, since a
+/// partial overlap still leaves visible slivers. Coordinates come from
+/// [`shape_boxes`] as exact sixteenths, so comparing them directly is safe.
+fn face_is_interior(boxes: &[[f64; 6]], i: usize, normal: [i32; 3]) -> bool {
+    // The axis the face faces along, and the two it spans.
+    let axis = if normal[0] != 0 {
+        0
+    } else if normal[1] != 0 {
+        1
+    } else {
+        2
+    };
+    let (a, b) = match axis {
+        0 => (1, 2),
+        1 => (0, 2),
+        _ => (0, 1),
+    };
+    let positive = normal[axis] > 0;
+    let this = boxes[i];
+    // Where the face sits, and which extent of a neighbouring box must meet it.
+    let plane = if positive { this[3 + axis] } else { this[axis] };
+    for (j, other) in boxes.iter().enumerate() {
+        if j == i {
+            continue;
+        }
+        let touches = if positive {
+            other[axis] == plane
+        } else {
+            other[3 + axis] == plane
+        };
+        if touches
+            && other[a] <= this[a]
+            && other[3 + a] >= this[3 + a]
+            && other[b] <= this[b]
+            && other[3 + b] >= this[3 + b]
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Unit-space `[x0, y0, z0, x1, y1, z1]` boxes for a partial block, using the
@@ -1104,8 +1376,12 @@ fn emit_face<S: BlockSource>(
     nx: i32,
     ny: i32,
     nz: i32,
+    // Overrides the block's own face tint. Only the grass side overlay uses it:
+    // it needs the biome grass colour, while the `grass_side` face it sits on
+    // must stay untinted (its green is baked into the texture).
+    tint_override: Option<[f32; 3]>,
 ) {
-    let tint = ctx.tint(block, face.face);
+    let tint = tint_override.unwrap_or_else(|| ctx.tint(block, face.face, x, z));
     warn_if_missing(ctx.atlas, block, face_context(face.face), texture);
     let rect = ctx.atlas.tile_rect(texture);
     let front = [nx, ny, nz];
@@ -1241,7 +1517,7 @@ fn append_cross<S: BlockSource>(
     block: BlockState,
 ) {
     let light = face_light(ctx, x, y, z);
-    let tint = ctx.tint(block, BlockFace::Side);
+    let tint = ctx.tint(block, BlockFace::Side, x, z);
     let color = [tint[0], tint[1], tint[2], block.render_alpha()];
     let texture = block.texture_name(BlockFace::Side);
     warn_if_missing(ctx.atlas, block, "its cross texture", texture);
@@ -1331,7 +1607,7 @@ fn append_rail<S: BlockSource>(
         block.meta & 0x7
     };
     let light = face_light(ctx, x, y + 1, z);
-    let tint = ctx.tint(block, BlockFace::Top);
+    let tint = ctx.tint(block, BlockFace::Top, x, z);
     let color = [tint[0], tint[1], tint[2], block.render_alpha()];
 
     let (fx, fy, fz) = (x as f32, y as f32, z as f32);
@@ -1471,7 +1747,7 @@ fn append_ladder<S: BlockSource>(
 ) {
     let (corners, sample) = ladder_quad(x, y, z, block.meta);
     let light = face_light(ctx, x + sample[0], y + sample[1], z + sample[2]);
-    let tint = ctx.tint(block, BlockFace::Side);
+    let tint = ctx.tint(block, BlockFace::Side, x, z);
     let color = [tint[0], tint[1], tint[2], block.render_alpha()];
     let texture = block.texture_name(BlockFace::Side);
     warn_if_missing(ctx.atlas, block, "its ladder texture", texture);
@@ -1577,7 +1853,8 @@ fn append_door<S: BlockSource>(
         let (nx, ny, nz) = (x + face.normal[0], y + face.normal[1], z + face.normal[2]);
         emit_face(
             buffer, ctx, face, x, y, z, mn, mx, texture, block, alpha, nx, ny, nz,
-        );
+        None,
+    );
     }
 }
 
@@ -1633,7 +1910,8 @@ fn append_piston<S: BlockSource>(
             nx,
             ny,
             nz,
-        );
+        None,
+    );
     }
 }
 
@@ -1688,7 +1966,8 @@ fn append_piston_head<S: BlockSource>(
             };
             emit_face(
                 buffer, ctx, face, x, y, z, mn, mx, texture, block, alpha, nx, ny, nz,
-            );
+        None,
+    );
         }
     }
 }
@@ -1701,16 +1980,6 @@ fn axis_box(axis: usize, lo: f64, hi: f64, cross_lo: f64, cross_hi: f64) -> [f64
     mn[axis] = lo;
     mx[axis] = hi;
     [mn[0], mn[1], mn[2], mx[0], mx[1], mx[2]]
-}
-
-fn tint_color(tint: Tint, biome: BiomeColors) -> [f32; 3] {
-    match tint {
-        Tint::None => [1.0, 1.0, 1.0],
-        Tint::Grass => biome.grass,
-        Tint::Foliage => biome.foliage,
-        Tint::Water => WATER_COLOR,
-        Tint::Rgb(rgb) => rgb,
-    }
 }
 
 /// Static per-block tint overrides populated by the extension preset
@@ -1993,6 +2262,10 @@ struct GreedyKey {
     block: BlockState,
     sky: u8,
     block_light: u8,
+    /// The column's blended biome tint, quantised to 8 bits per channel.
+    /// Part of the key so a merged run never spans a biome border — the whole
+    /// quad carries one tint, so merging across one would smear it.
+    tint: [u8; 3],
 }
 
 /// Greedy mesh of the full-cube blocks of one 16³ section: for each of the 6 face
@@ -2007,7 +2280,7 @@ pub fn greedy_cube_mesh<S: BlockSource>(
     base_y: i32,
     base_z: i32,
     atlas: &AtlasUv,
-    biome: BiomeColors,
+    biome: &BiomeColors,
     fast_leaves: bool,
     mesh: &mut ChunkMesh,
 ) {
@@ -2053,7 +2326,16 @@ pub fn greedy_cube_mesh<S: BlockSource>(
                     // light_at returns (block_light, sky_light) — keep that order.
                     let (block_light, sky) =
                         source.light_at(base_x + nb[0], base_y + nb[1], base_z + nb[2]);
-                    mask[(a * 16 + b) as usize] = Some(GreedyKey { block, sky, block_light });
+                    let tint = greedy_tint(
+                        source,
+                        biome,
+                        base_x + local[0],
+                        base_z + local[2],
+                        face.face,
+                        block,
+                    );
+                    mask[(a * 16 + b) as usize] =
+                        Some(GreedyKey { block, sky, block_light, tint });
                 }
             }
             // Greedy maximal-rectangle merge over the mask.
@@ -2084,7 +2366,7 @@ pub fn greedy_cube_mesh<S: BlockSource>(
                     }
                     emit_greedy_quad(
                         base_x, base_y, base_z, n_axis, a_axis, b_axis, slice, a, b, h, w, &key,
-                        face, &uv01, atlas, biome, mesh,
+                        face, &uv01, atlas, mesh,
                     );
                     b += w;
                 }
@@ -2110,7 +2392,6 @@ fn emit_greedy_quad(
     face: &Face,
     uv01: &[[f32; 2]; 4],
     atlas: &AtlasUv,
-    biome: BiomeColors,
     mesh: &mut ChunkMesh,
 ) {
     // Box in block units: 1 thick on the normal axis, h×w in plane.
@@ -2128,8 +2409,12 @@ fn emit_greedy_quad(
         0 => (w as f32, h as f32),
         _ => (h as f32, w as f32),
     };
-    let tint =
-        block_tint(key.block).unwrap_or_else(|| tint_color(key.block.tint(face.face), biome));
+    // Resolved during mask construction (it is part of the merge key).
+    let tint = [
+        key.tint[0] as f32 / 255.0,
+        key.tint[1] as f32 / 255.0,
+        key.tint[2] as f32 / 255.0,
+    ];
     let shade = face.light;
     let color = [
         tint[0] * shade,
@@ -2202,9 +2487,9 @@ mod tests {
         world.set_block(0, 0, 0, BlockState::STONE);
         // The block lives in section 0; section 0 has its six faces, every other
         // section is empty.
-        let s0 = build_section_mesh(&world, SectionPos::new(0, 0, 0), &atlas(), BiomeColors::default(), false, false);
+        let s0 = build_section_mesh(&world, SectionPos::new(0, 0, 0), &atlas(), &BiomeColors::default(), false, false);
         assert_eq!(s0.solid.indices.len(), 36);
-        let s1 = build_section_mesh(&world, SectionPos::new(0, 1, 0), &atlas(), BiomeColors::default(), false, false);
+        let s1 = build_section_mesh(&world, SectionPos::new(0, 1, 0), &atlas(), &BiomeColors::default(), false, false);
         assert!(s1.is_empty());
     }
 
@@ -2219,7 +2504,7 @@ mod tests {
             }
         }
         let mut mesh = ChunkMesh::default();
-        greedy_cube_mesh(&world, 0, 0, 0, &atlas(), BiomeColors::default(), false, &mut mesh);
+        greedy_cube_mesh(&world, 0, 0, 0, &atlas(), &BiomeColors::default(), false, &mut mesh);
         // A solid 16³ block shows only its six outer faces; greedy collapses each
         // into one quad → 6 quads = 24 verts / 36 indices (per-block would be
         // 6×256 quads). Interior faces are culled against opaque neighbours.
@@ -2244,7 +2529,7 @@ mod tests {
                 }
             }
             let mut mesh = ChunkMesh::default();
-            greedy_cube_mesh(&world, 0, 0, 0, &atlas(), BiomeColors::default(), false, &mut mesh);
+            greedy_cube_mesh(&world, 0, 0, 0, &atlas(), &BiomeColors::default(), false, &mut mesh);
             mesh.solid.vertices.len() / 4
         };
         // Splitting the floor into two materials forces the top/bottom faces into
@@ -2262,10 +2547,10 @@ mod tests {
         let mut world = World::new();
         world.set_block(1, 2, 3, BlockState::STONE); // section 0
         world.set_block(4, 40, 5, BlockState::STONE); // section 2
-        let column = build_world_mesh(&world, &atlas(), BiomeColors::default(), false, false);
+        let column = build_world_mesh(&world, &atlas(), &BiomeColors::default(), false, false);
         let mut total = 0;
         for sy in 0..16 {
-            total += build_section_mesh(&world, SectionPos::new(0, sy, 0), &atlas(), BiomeColors::default(), false, false)
+            total += build_section_mesh(&world, SectionPos::new(0, sy, 0), &atlas(), &BiomeColors::default(), false, false)
                 .solid
                 .indices
                 .len();
@@ -2282,8 +2567,8 @@ mod tests {
         let mut world = World::new();
         world.set_block(0, 15, 0, BlockState::STONE);
         world.set_block(0, 16, 0, BlockState::STONE);
-        let s0 = build_section_mesh(&world, SectionPos::new(0, 0, 0), &atlas(), BiomeColors::default(), false, false);
-        let s1 = build_section_mesh(&world, SectionPos::new(0, 1, 0), &atlas(), BiomeColors::default(), false, false);
+        let s0 = build_section_mesh(&world, SectionPos::new(0, 0, 0), &atlas(), &BiomeColors::default(), false, false);
+        let s1 = build_section_mesh(&world, SectionPos::new(0, 1, 0), &atlas(), &BiomeColors::default(), false, false);
         assert_eq!(s0.solid.indices.len(), 5 * 6, "y=15 block's top face culled");
         assert_eq!(s1.solid.indices.len(), 5 * 6, "y=16 block's bottom face culled");
     }
@@ -2296,9 +2581,9 @@ mod tests {
         let mut world = World::new();
         world.set_block(0, 15, 0, BlockState::STONE);
         world.set_block(0, 16, 0, BlockState::STONE);
-        let sync = build_section_mesh(&world, SectionPos::new(0, 1, 0), &atlas(), BiomeColors::default(), false, false);
+        let sync = build_section_mesh(&world, SectionPos::new(0, 1, 0), &atlas(), &BiomeColors::default(), false, false);
         let neighborhood = ChunkNeighborhood::snapshot(&world, ChunkPos::new(0, 0)).unwrap();
-        let async_mesh = build_section_mesh_neighborhood(&neighborhood, 1, &atlas(), BiomeColors::default(), false, false);
+        let async_mesh = build_section_mesh_neighborhood(&neighborhood, 1, &atlas(), &BiomeColors::default(), false, false);
         assert_eq!(sync.solid.vertices.len(), async_mesh.solid.vertices.len());
         assert_eq!(sync.solid.indices.len(), async_mesh.solid.indices.len());
         assert_eq!(async_mesh.solid.indices.len(), 5 * 6);
@@ -2308,7 +2593,7 @@ mod tests {
     fn single_block_has_six_faces() {
         let mut world = World::new();
         world.set_block(0, 0, 0, BlockState::STONE);
-        let mesh = build_world_mesh(&world, &atlas(), BiomeColors::default(), false, false);
+        let mesh = build_world_mesh(&world, &atlas(), &BiomeColors::default(), false, false);
         assert_eq!(mesh.solid.vertices.len(), 24);
         assert_eq!(mesh.solid.indices.len(), 36);
     }
@@ -2317,7 +2602,7 @@ mod tests {
     fn smooth_lighting_is_flat_on_an_unoccluded_block() {
         let mut world = World::new();
         world.set_block(0, 0, 0, BlockState::STONE);
-        let mesh = build_world_mesh(&world, &atlas(), BiomeColors::default(), false, false);
+        let mesh = build_world_mesh(&world, &atlas(), &BiomeColors::default(), false, false);
         for quad in mesh.solid.vertices.chunks(4) {
             let c0 = quad[0].color;
             assert!(
@@ -2332,7 +2617,7 @@ mod tests {
         let mut world = World::new();
         world.set_block(0, 0, 0, BlockState::STONE);
         world.set_block(1, 1, 0, BlockState::STONE);
-        let mesh = build_world_mesh(&world, &atlas(), BiomeColors::default(), false, false);
+        let mesh = build_world_mesh(&world, &atlas(), &BiomeColors::default(), false, false);
         let pos = |v: &ChunkVertex, axis: usize| v.pos_light[axis] as f32 / 64.0;
         let span = |q: &[ChunkVertex], axis: usize| {
             let lo = q.iter().map(|v| pos(v, axis)).fold(f32::MAX, f32::min);
@@ -2363,7 +2648,7 @@ mod tests {
         let mut world = World::new();
         world.set_block(0, 0, 0, BlockState::STONE);
         world.set_block(1, 0, 0, BlockState::STONE);
-        let mesh = build_world_mesh(&world, &atlas(), BiomeColors::default(), false, false);
+        let mesh = build_world_mesh(&world, &atlas(), &BiomeColors::default(), false, false);
         assert_eq!(mesh.solid.indices.len(), 60);
     }
 
@@ -2371,7 +2656,7 @@ mod tests {
     fn leaves_go_to_cutout_buffer_and_stay_opaque() {
         let mut world = World::new();
         world.set_block(0, 0, 0, BlockState::new(18, 0));
-        let mesh = build_world_mesh(&world, &atlas(), BiomeColors::default(), false, false);
+        let mesh = build_world_mesh(&world, &atlas(), &BiomeColors::default(), false, false);
         assert!(mesh.solid.is_empty());
         assert!(mesh.transparent.is_empty());
         assert_eq!(mesh.cutout.indices.len(), 36);
@@ -2390,7 +2675,7 @@ mod tests {
         let mut world = World::new();
         world.set_block(0, 0, 0, BlockState::new(18, 0));
         world.set_block(1, 0, 0, BlockState::new(18, 0));
-        let mesh = build_world_mesh(&world, &atlas(), BiomeColors::default(), false, false);
+        let mesh = build_world_mesh(&world, &atlas(), &BiomeColors::default(), false, false);
         assert_eq!(mesh.cutout.indices.len(), 2 * 36, "leaves keep their shared faces");
     }
 
@@ -2398,7 +2683,7 @@ mod tests {
     fn tall_grass_renders_as_cross() {
         let mut world = World::new();
         world.set_block(0, 0, 0, BlockState::new(31, 1));
-        let mesh = build_world_mesh(&world, &atlas(), BiomeColors::default(), false, false);
+        let mesh = build_world_mesh(&world, &atlas(), &BiomeColors::default(), false, false);
         // Two planes, each emitted double-sided (front + back) for back-face
         // culling → 4 quads = 16 vertices, 24 indices, in the cutout pass.
         assert!(mesh.solid.is_empty());
@@ -2410,7 +2695,7 @@ mod tests {
     fn bottom_slab_is_half_height() {
         let mut world = World::new();
         world.set_block(0, 0, 0, BlockState::new(44, 0));
-        let mesh = build_world_mesh(&world, &atlas(), BiomeColors::default(), false, false);
+        let mesh = build_world_mesh(&world, &atlas(), &BiomeColors::default(), false, false);
         let max_y = mesh
             .solid
             .vertices
@@ -2455,7 +2740,7 @@ mod tests {
     fn barrier_renders_no_geometry() {
         let mut world = World::new();
         world.set_block(0, 0, 0, BlockState::new(166, 0));
-        let mesh = build_world_mesh(&world, &atlas(), BiomeColors::default(), false, false);
+        let mesh = build_world_mesh(&world, &atlas(), &BiomeColors::default(), false, false);
         assert!(mesh.is_empty());
         assert_eq!(BlockState::new(166, 0).render_shape(), RenderShape::None);
         assert!(!BlockState::new(166, 0).is_opaque_cube());
@@ -2465,8 +2750,11 @@ mod tests {
     fn stairs_render_base_plus_quarter() {
         let mut world = World::new();
         world.set_block(0, 0, 0, BlockState::new(53, 0));
-        let mesh = build_world_mesh(&world, &atlas(), BiomeColors::default(), false, false);
-        assert_eq!(mesh.solid.vertices.len(), 48);
+        let mesh = build_world_mesh(&world, &atlas(), &BiomeColors::default(), false, false);
+        // Base slab + quarter step = 12 faces, less the step's underside, which
+        // the full-width slab beneath seals (`face_is_interior`). The slab's own
+        // top survives: the step covers only half its depth.
+        assert_eq!(mesh.solid.vertices.len(), 11 * 4);
         let max_y = mesh
             .solid
             .vertices
@@ -2486,30 +2774,178 @@ mod tests {
     fn lone_fence_is_a_post_and_neighbours_grow_arm_bars() {
         let mut world = World::new();
         world.set_block(0, 0, 0, BlockState::new(85, 0));
-        let lone = build_world_mesh(&world, &atlas(), BiomeColors::default(), false, false);
+        let lone = build_world_mesh(&world, &atlas(), &BiomeColors::default(), false, false);
         assert_eq!(lone.solid.vertices.len(), 24, "post only");
 
         world.set_block(0, 0, -1, BlockState::STONE);
-        let joined = build_world_mesh(&world, &atlas(), BiomeColors::default(), false, false);
-        // Post + two north bars (3 boxes) for the fence, 6 faces for the stone.
+        let joined = build_world_mesh(&world, &atlas(), &BiomeColors::default(), false, false);
+        // Post + two north bars (3 boxes = 18 faces) for the fence, 6 for the
+        // stone. Each bar loses the end butted against the post; the post keeps
+        // its north face, since a bar spans only part of its height.
         let fence_vertices = joined.solid.vertices.len() as i32 - 24;
-        assert_eq!(fence_vertices, 3 * 24);
+        assert_eq!(fence_vertices, 16 * 4);
     }
 
     #[test]
     fn lone_pane_is_a_cross_and_connections_drop_to_arms() {
         let mut world = World::new();
         world.set_block(0, 0, 0, BlockState::new(102, 0));
-        let lone = build_world_mesh(&world, &atlas(), BiomeColors::default(), false, false);
-        // Post + 4 arm panels.
-        assert_eq!(lone.cutout.vertices.len(), 5 * 24);
+        let lone = build_world_mesh(&world, &atlas(), &BiomeColors::default(), false, false);
+        // Post + 4 arm panels = 30 faces, less the 8 that seal the junctions:
+        // each arm's inward end and each of the post's four sides. Vanilla's
+        // model has no geometry there either.
+        assert_eq!(lone.cutout.vertices.len(), 22 * 4);
 
         world.set_block(-1, 0, 0, BlockState::STONE);
-        let joined = build_world_mesh(&world, &atlas(), BiomeColors::default(), false, false);
-        // Stone cube (5 visible faces x 4 = 20... full 6 since pane isn't opaque)
-        // plus pane post + single west arm.
+        let joined = build_world_mesh(&world, &atlas(), &BiomeColors::default(), false, false);
+        // One connection drops the pane to post + west arm (2 boxes = 12 faces),
+        // less the two that seal their shared junction.
         let pane_vertices = joined.cutout.vertices.len();
-        assert_eq!(pane_vertices, 2 * 24);
+        assert_eq!(pane_vertices, 10 * 4);
+    }
+
+    /// Grass top vertices carry the biome tint; this pulls the colour back out.
+    fn grass_top_tint(mesh: &ChunkMesh) -> [u8; 3] {
+        let v = mesh
+            .solid
+            .vertices
+            .iter()
+            .find(|v| v.normal[1] == 127)
+            .expect("grass has a top face");
+        // Vertex colour is tint x face shade x AO; the top face's shade is 1.0
+        // and an unoccluded corner's AO is 1.0, so this is the tint itself.
+        [v.color[0], v.color[1], v.color[2]]
+    }
+
+    #[test]
+    fn grass_takes_its_colour_from_the_biome() {
+        let atlas = atlas();
+        let colors = BiomeColors::default();
+        let sample = |biome: u8| {
+            let mut world = World::new();
+            world.set_block(8, 0, 8, BlockState::GRASS);
+            world.set_biomes(0, 0, &[biome; 256]);
+            let mesh = build_world_mesh(&world, &atlas, &colors, false, false);
+            grass_top_tint(&mesh)
+        };
+        // `BiomeColors::default()` is the no-colormap fallback: every biome
+        // collapses to plains, which is exactly the old global-constant look.
+        assert_eq!(sample(1), sample(5), "fallback table is biome-independent");
+
+        // With a real colormap the climates must diverge.
+        let table = crate::biome::BiomeColorTable::build(
+            &crate::biome::Colormap::new(
+                (0..256 * 256)
+                    .map(|i| [(i % 256) as u8, (i / 256) as u8, 0])
+                    .collect(),
+                256,
+                256,
+            ),
+            &crate::biome::Colormap::new(vec![[0, 0, 0]; 256 * 256], 256, 256),
+        );
+        let colors = BiomeColors::new(table);
+        let sample = |biome: u8| {
+            let mut world = World::new();
+            world.set_block(8, 0, 8, BlockState::GRASS);
+            world.set_biomes(0, 0, &[biome; 256]);
+            let mesh = build_world_mesh(&world, &atlas, &colors, false, false);
+            grass_top_tint(&mesh)
+        };
+        let plains = sample(1);
+        assert_ne!(plains, sample(5), "taiga differs from plains");
+        assert_ne!(plains, sample(2), "desert differs from plains");
+        assert_eq!(sample(37), sample(39), "mesa variants share a fixed colour");
+    }
+
+    #[test]
+    fn biome_tint_is_blended_across_the_border() {
+        let atlas = atlas();
+        let table = crate::biome::BiomeColorTable::build(
+            &crate::biome::Colormap::new(
+                (0..256 * 256)
+                    .map(|i| [(i % 256) as u8, (i / 256) as u8, 0])
+                    .collect(),
+                256,
+                256,
+            ),
+            &crate::biome::Colormap::new(vec![[0, 0, 0]; 256 * 256], 256, 256),
+        );
+        let colors = BiomeColors::new(table);
+
+        // Two columns of one biome, the rest another, with the sampled block
+        // sitting right on the seam so its 3x3 window straddles it.
+        let mut biomes = [1u8; 256];
+        for z in 0..16 {
+            for x in 0..8 {
+                biomes[z * 16 + x] = 5;
+            }
+        }
+        let mut world = World::new();
+        world.set_block(8, 0, 8, BlockState::GRASS);
+        world.set_biomes(0, 0, &biomes);
+        let blended = grass_top_tint(&build_world_mesh(&world, &atlas, &colors, false, false));
+
+        let pure = |biome: u8| {
+            let mut w = World::new();
+            w.set_block(8, 0, 8, BlockState::GRASS);
+            w.set_biomes(0, 0, &[biome; 256]);
+            grass_top_tint(&build_world_mesh(&w, &atlas, &colors, false, false))
+        };
+        let (a, b) = (pure(1), pure(5));
+        let lo = a[0].min(b[0]);
+        let hi = a[0].max(b[0]);
+        assert!(
+            blended[0] > lo && blended[0] < hi,
+            "seam tint {blended:?} should sit between {a:?} and {b:?}, not snap to one"
+        );
+    }
+
+    #[test]
+    fn grass_sides_get_a_separate_tinted_overlay_quad() {
+        let mut world = World::new();
+        world.set_block(8, 0, 8, BlockState::GRASS);
+        let mesh = build_world_mesh(&world, &atlas(), &BiomeColors::default(), false, false);
+        // Four side faces of the overlay land in the cutout buffer; vanilla draws
+        // them as a second element over `grass_side`.
+        assert_eq!(
+            mesh.cutout.vertices.len(),
+            4 * 4,
+            "one tinted overlay quad per side"
+        );
+        // And they sit proud of the block so the `Less` depth test lets them through.
+        let xs: Vec<f32> = mesh.cutout.vertices.iter().map(|v| vpos(v)[0]).collect();
+        assert!(
+            xs.iter().any(|&x| x > 9.0) && xs.iter().any(|&x| x < 8.0),
+            "overlay is nudged outward on both sides: {xs:?}"
+        );
+    }
+
+    #[test]
+    fn interior_face_culling_only_fires_on_full_coverage() {
+        // A pane's centre post and its north arm, butted at z = 0.4375.
+        let post = [0.4375, 0.0, 0.4375, 0.5625, 1.0, 0.5625];
+        let north_arm = [0.4375, 0.0, 0.0, 0.5625, 1.0, 0.4375];
+        let boxes = [post, north_arm];
+        // Each seals the other's face at the shared plane.
+        assert!(face_is_interior(&boxes, 0, [0, 0, -1]), "post's -Z is sealed");
+        assert!(face_is_interior(&boxes, 1, [0, 0, 1]), "arm's +Z is sealed");
+        // Nothing sits above or below either box.
+        assert!(!face_is_interior(&boxes, 0, [0, 1, 0]));
+        assert!(!face_is_interior(&boxes, 1, [0, -1, 0]));
+
+        // A fence bar spans only part of the post's height, so it must NOT cull
+        // the post's face — a partial overlap would leave visible slivers.
+        let bar = [0.4375, 0.375, 0.0, 0.5625, 0.5625, 0.4375];
+        let fence = [post, bar];
+        assert!(
+            !face_is_interior(&fence, 0, [0, 0, -1]),
+            "partial coverage must not cull"
+        );
+        assert!(face_is_interior(&fence, 1, [0, 0, 1]), "but the bar's end is sealed");
+
+        // A box that merely touches on an edge, not a face, seals nothing.
+        let diagonal = [0.5625, 0.0, 0.0, 1.0, 1.0, 0.4375];
+        assert!(!face_is_interior(&[post, diagonal], 0, [0, 0, -1]));
     }
 
     /// Tile-local UV (0..1 within the sprite) of a vertex, undoing `rect_uv`.
@@ -2538,7 +2974,7 @@ mod tests {
             let mut world = World::new();
             world.set_block(0, 0, 0, BlockState::new(160, 14));
             world.set_block(neighbor.0, neighbor.1, neighbor.2, BlockState::STONE);
-            let mesh = build_world_mesh(&world, &atlas, BiomeColors::default(), false, false);
+            let mesh = build_world_mesh(&world, &atlas, &BiomeColors::default(), false, false);
             let (mut lo, mut hi) = (f32::MAX, f32::MIN);
             for v in &mesh.transparent.vertices {
                 // +Y faces only — filtering on y == 1.0 would also catch the top
@@ -2579,7 +3015,7 @@ mod tests {
         // the vertex alpha must be a plain 1.0 pass-through.
         let mut world = World::new();
         world.set_block(0, 0, 0, BlockState::new(95, 14));
-        let mesh = build_world_mesh(&world, &atlas(), BiomeColors::default(), false, false);
+        let mesh = build_world_mesh(&world, &atlas(), &BiomeColors::default(), false, false);
         assert!(!mesh.transparent.vertices.is_empty(), "glass is translucent");
         for v in &mesh.transparent.vertices {
             assert_eq!(
@@ -2594,7 +3030,7 @@ mod tests {
         let mut world = World::new();
         world.set_block(0, 0, 0, BlockState::new(66, 0));
         world.set_block(1, 0, 0, BlockState::new(66, 2));
-        let mesh = build_world_mesh(&world, &atlas(), BiomeColors::default(), false, false);
+        let mesh = build_world_mesh(&world, &atlas(), &BiomeColors::default(), false, false);
         assert_eq!(mesh.cutout.vertices.len(), 16, "one double-sided quad per rail");
         let max_y = mesh
             .cutout
@@ -2612,7 +3048,7 @@ mod tests {
     fn cross_plants_are_inset_from_the_corners() {
         let mut world = World::new();
         world.set_block(0, 0, 0, BlockState::new(38, 0));
-        let mesh = build_world_mesh(&world, &atlas(), BiomeColors::default(), false, false);
+        let mesh = build_world_mesh(&world, &atlas(), &BiomeColors::default(), false, false);
         // The flower carries a vanilla XZ position offset, so check the inset
         // against the offset model origin rather than the raw block corner.
         let (ox, _, oz) = cross_plant_offset(38, 0, 0);
@@ -2632,7 +3068,7 @@ mod tests {
         let uv = atlas();
         let mut world = World::new();
         world.set_block(0, 0, 0, BlockState::new(31, 1)); // tall grass
-        let mesh = build_world_mesh(&world, &uv, BiomeColors::default(), false, false);
+        let mesh = build_world_mesh(&world, &uv, &BiomeColors::default(), false, false);
         let rect = uv.tile_rect(BlockState::new(31, 1).texture_name(BlockFace::Side));
         let (half_u, half_v) = (rect[2] / 32.0, rect[3] / 32.0);
         assert!(!mesh.cutout.vertices.is_empty());
@@ -2658,7 +3094,7 @@ mod tests {
         let uv = atlas();
         let mut world = World::new();
         world.set_block(0, 0, 0, BlockState::new(1, 0)); // stone: all six faces exposed
-        let mesh = build_world_mesh(&world, &uv, BiomeColors::default(), false, false);
+        let mesh = build_world_mesh(&world, &uv, &BiomeColors::default(), false, false);
         let rect = uv.tile_rect(BlockState::new(1, 0).texture_name(BlockFace::Side));
         let (half_u, half_v) = (rect[2] / 32.0, rect[3] / 32.0);
         assert!(!mesh.solid.vertices.is_empty());
@@ -2703,7 +3139,7 @@ mod tests {
     fn slab_side_faces_crop_the_texture_vertically() {
         let mut world = World::new();
         world.set_block(0, 0, 0, BlockState::new(44, 0));
-        let mesh = build_world_mesh(&world, &atlas(), BiomeColors::default(), false, false);
+        let mesh = build_world_mesh(&world, &atlas(), &BiomeColors::default(), false, false);
         let uv = atlas();
         let rect = uv.tile_rect(BlockState::new(44, 0).texture_name(BlockFace::Side));
         let mut checked = 0;
@@ -2732,7 +3168,7 @@ mod tests {
     fn closed_door_is_a_thin_panel_on_the_facing_edge() {
         let mut world = World::new();
         world.set_block(0, 0, 0, BlockState::new(64, 1));
-        let mesh = build_world_mesh(&world, &atlas(), BiomeColors::default(), false, false);
+        let mesh = build_world_mesh(&world, &atlas(), &BiomeColors::default(), false, false);
         assert_eq!(mesh.cutout.vertices.len(), 24);
         let max_z = mesh
             .cutout
@@ -2747,7 +3183,7 @@ mod tests {
     fn opening_a_door_swings_the_panel_to_an_adjacent_edge() {
         let mut world = World::new();
         world.set_block(0, 0, 0, BlockState::new(64, 1 | 4));
-        let mesh = build_world_mesh(&world, &atlas(), BiomeColors::default(), false, false);
+        let mesh = build_world_mesh(&world, &atlas(), &BiomeColors::default(), false, false);
         let min_x = mesh
             .cutout
             .vertices
@@ -2761,12 +3197,12 @@ mod tests {
     fn piston_is_a_full_cube_and_head_is_plate_plus_arm() {
         let mut world = World::new();
         world.set_block(0, 0, 0, BlockState::new(33, 1));
-        let mesh = build_world_mesh(&world, &atlas(), BiomeColors::default(), false, false);
+        let mesh = build_world_mesh(&world, &atlas(), &BiomeColors::default(), false, false);
         assert_eq!(mesh.solid.vertices.len(), 24, "piston body is a full cube");
 
         let mut world = World::new();
         world.set_block(0, 0, 0, BlockState::new(34, 1));
-        let mesh = build_world_mesh(&world, &atlas(), BiomeColors::default(), false, false);
+        let mesh = build_world_mesh(&world, &atlas(), &BiomeColors::default(), false, false);
         assert_eq!(mesh.solid.vertices.len(), 48);
         let max_y = mesh
             .solid

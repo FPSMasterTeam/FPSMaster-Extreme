@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::{BlockState, Chunk, ChunkPos, EntityId, EntityState, SectionPos};
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct World {
     chunks: HashMap<ChunkPos, Chunk>,
     entities: HashMap<EntityId, EntityState>,
@@ -11,6 +11,23 @@ pub struct World {
     /// Lets the renderer enumerate the handful of block-entities directly each
     /// frame instead of brute-force scanning every loaded section's full 16³.
     block_entities: HashMap<[i32; 3], BlockState>,
+    /// Whether the current dimension has sky light; stamped onto every chunk so
+    /// an absent section reads as dark in the Nether/End instead of full sky.
+    has_sky_light: bool,
+}
+
+impl Default for World {
+    /// `has_sky_light` must default to TRUE — a derived `Default` would make it
+    /// false and darken the Overworld, since every world starts before any
+    /// JoinGame/Respawn has set the dimension.
+    fn default() -> Self {
+        Self {
+            chunks: HashMap::new(),
+            entities: HashMap::new(),
+            block_entities: HashMap::new(),
+            has_sky_light: true,
+        }
+    }
 }
 
 /// Block ids that carry a client-rendered block-entity (vanilla TileEntity):
@@ -125,8 +142,27 @@ impl World {
         }
     }
 
+    /// Set the dimension's sky-light availability (Overworld true, Nether/End
+    /// false). Applies to chunks already loaded as well as future ones, so a
+    /// dimension change does not leave stale columns reading full sky light.
+    pub fn set_has_sky_light(&mut self, has_sky_light: bool) {
+        self.has_sky_light = has_sky_light;
+        for chunk in self.chunks.values_mut() {
+            chunk.set_has_sky_light(has_sky_light);
+        }
+    }
+
+    pub fn has_sky_light(&self) -> bool {
+        self.has_sky_light
+    }
+
     pub fn chunk_mut_or_insert(&mut self, pos: ChunkPos) -> &mut Chunk {
-        self.chunks.entry(pos).or_insert_with(|| Chunk::new(pos))
+        let has_sky_light = self.has_sky_light;
+        self.chunks.entry(pos).or_insert_with(|| {
+            let mut chunk = Chunk::new(pos);
+            chunk.set_has_sky_light(has_sky_light);
+            chunk
+        })
     }
 
     /// Load a fully-decoded chunk section in one shot. `section_y` is 0..16.
@@ -191,11 +227,28 @@ impl World {
     pub fn light_at(&self, x: i32, y: i32, z: i32) -> (u8, u8) {
         let pos = ChunkPos::new(div_floor(x, 16), div_floor(z, 16));
         let Some(chunk) = self.chunk(pos) else {
-            return (0, 15);
+            return (0, if self.has_sky_light { 15 } else { 0 });
         };
         let local_x = mod_floor(x, 16) as u8;
         let local_z = mod_floor(z, 16) as u8;
         chunk.light_at(local_x, y, local_z)
+    }
+
+    /// Store a column's biome array (the 256 trailing bytes of a ground-up 1.8
+    /// chunk packet).
+    pub fn set_biomes(&mut self, chunk_x: i32, chunk_z: i32, biomes: &[u8]) {
+        self.chunk_mut_or_insert(ChunkPos::new(chunk_x, chunk_z))
+            .set_biomes(biomes);
+    }
+
+    /// Biome id at a world (x, z), or [`crate::chunk::DEFAULT_BIOME`] where the
+    /// chunk is absent or carries no biome data.
+    pub fn biome_at(&self, x: i32, z: i32) -> u8 {
+        let pos = ChunkPos::new(div_floor(x, 16), div_floor(z, 16));
+        match self.chunk(pos) {
+            Some(chunk) => chunk.biome_at(mod_floor(x, 16) as u8, mod_floor(z, 16) as u8),
+            None => crate::chunk::DEFAULT_BIOME,
+        }
     }
 
     /// Recompute sky-light for all loaded columns: per-column vertical cast
@@ -1115,6 +1168,36 @@ mod tests {
                 world.set_block(cx * 16 + lx, 64, cz * 16 + lz, BlockState::STONE);
             }
         }
+    }
+
+    #[test]
+    fn missing_sections_are_dark_in_a_dimension_without_sky() {
+        // Overworld: an absent section is open air above the terrain.
+        let mut world = World::new();
+        assert!(world.has_sky_light(), "worlds start in the Overworld");
+        world.set_block(0, 8, 0, BlockState::STONE);
+        assert_eq!(world.light_at(0, 200, 0).1, 15, "air above terrain is sky-lit");
+        assert_eq!(world.light_at(500, 8, 500).1, 15, "so is an unloaded column");
+
+        // Nether/End: no sky light on the wire, so an absent section is dark.
+        world.set_has_sky_light(false);
+        assert_eq!(
+            world.light_at(0, 200, 0).1,
+            0,
+            "an absent section must not read as open sky in the Nether"
+        );
+        assert_eq!(world.light_at(500, 8, 500).1, 0, "nor an unloaded column");
+
+        // The flag reaches columns loaded BEFORE the dimension change, not just
+        // ones created after it.
+        assert_eq!(
+            world.chunk(ChunkPos::new(0, 0)).unwrap().sky_light_fallback(),
+            0
+        );
+
+        // And going back restores it.
+        world.set_has_sky_light(true);
+        assert_eq!(world.light_at(0, 200, 0).1, 15);
     }
 
     #[test]

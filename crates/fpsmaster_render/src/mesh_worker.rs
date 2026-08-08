@@ -53,6 +53,9 @@ impl MeshWorker {
             let job_rx = Arc::clone(&job_rx);
             let result_tx = result_tx.clone();
             let atlas = Arc::clone(&atlas);
+            // `BiomeColors` is Arc-backed, so each worker gets a cheap handle to
+            // the same resolved colour table.
+            let biome = biome.clone();
             let fast_leaves = Arc::clone(&fast_leaves);
             let flat = Arc::clone(&flat);
             let _ = thread::Builder::new()
@@ -71,7 +74,7 @@ impl MeshWorker {
                             &job.neighborhood,
                             job.section_y,
                             &atlas,
-                            biome,
+                            &biome,
                             fast_leaves.load(Ordering::Relaxed),
                             flat.load(Ordering::Relaxed),
                         );
