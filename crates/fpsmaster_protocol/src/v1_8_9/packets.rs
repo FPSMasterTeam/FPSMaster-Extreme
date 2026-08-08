@@ -701,6 +701,27 @@ pub enum ClientboundPlayPacket {
         volume: f32,
         pitch: u8,
     },
+    /// S2B ChangeGameState — a grab-bag of one-off world events keyed by
+    /// `reason`. The weather ones are 1 (stop raining), 2 (start raining) and
+    /// 7 (rain strength, `value` in 0..=1); 8 is thunder strength. The rest
+    /// (game-mode change, credits, demo prompts, the arrow-hit sound) are passed
+    /// through verbatim for the caller to match on.
+    ///
+    /// A server may drive weather purely with 1/2 and let the client ramp, or
+    /// send explicit 7/8 levels, so a client has to handle both.
+    ChangeGameState {
+        reason: u8,
+        value: f32,
+    },
+    /// S2C SpawnGlobalEntity — vanilla only ever sends this for a lightning bolt
+    /// (`kind` 1). Position is the usual fixed-point (÷32).
+    SpawnGlobalEntity {
+        entity_id: i32,
+        kind: u8,
+        x: f64,
+        y: f64,
+        z: f64,
+    },
     /// S24 BlockAction — a transient block animation/sound (note-block pluck,
     /// piston extend/retract, chest lid). `action_id` and `action_param` are
     /// block-type-specific (for a note block: instrument and note); `block_type`
@@ -1564,6 +1585,17 @@ impl ClientboundPlayPacket {
                 z: body.read_i32()? as f64 / 8.0,
                 volume: body.read_f32()?,
                 pitch: body.read_u8()?,
+            }),
+            0x2B => Ok(Self::ChangeGameState {
+                reason: body.read_u8()?,
+                value: body.read_f32()?,
+            }),
+            0x2C => Ok(Self::SpawnGlobalEntity {
+                entity_id: body.read_var_i32()?,
+                kind: body.read_u8()?,
+                x: body.read_i32()? as f64 / 32.0,
+                y: body.read_i32()? as f64 / 32.0,
+                z: body.read_i32()? as f64 / 32.0,
             }),
             0x24 => {
                 let (x, y, z) = read_block_pos(&mut body)?;
@@ -2610,6 +2642,69 @@ mod tests {
                 entity_id: 5,
                 vehicle_id: -1,
                 leash: false,
+            }
+        );
+    }
+
+    #[test]
+    fn change_game_state_decodes_weather_reasons() {
+        let decode = |reason: u8, value: f32| {
+            let mut body = PacketWriter::new();
+            body.write_u8(reason);
+            body.write_f32(value);
+            ClientboundPlayPacket::from_frame(PacketFrame::new(0x2b, body.into_inner())).unwrap()
+        };
+        // 2 = begin raining, 1 = end raining (value unused).
+        assert_eq!(
+            decode(2, 0.0),
+            ClientboundPlayPacket::ChangeGameState {
+                reason: 2,
+                value: 0.0
+            }
+        );
+        assert_eq!(
+            decode(1, 0.0),
+            ClientboundPlayPacket::ChangeGameState {
+                reason: 1,
+                value: 0.0
+            }
+        );
+        // 7 = explicit rain strength, 8 = thunder strength.
+        assert_eq!(
+            decode(7, 0.75),
+            ClientboundPlayPacket::ChangeGameState {
+                reason: 7,
+                value: 0.75
+            }
+        );
+        assert_eq!(
+            decode(8, 1.0),
+            ClientboundPlayPacket::ChangeGameState {
+                reason: 8,
+                value: 1.0
+            }
+        );
+    }
+
+    #[test]
+    fn spawn_global_entity_decodes_a_lightning_bolt() {
+        let mut body = PacketWriter::new();
+        body.write_var_i32(42);
+        body.write_u8(1); // thunderbolt
+        // Fixed-point /32: 100.5, 64.0, -20.25.
+        body.write_i32(3216);
+        body.write_i32(2048);
+        body.write_i32(-648);
+        let packet =
+            ClientboundPlayPacket::from_frame(PacketFrame::new(0x2c, body.into_inner())).unwrap();
+        assert_eq!(
+            packet,
+            ClientboundPlayPacket::SpawnGlobalEntity {
+                entity_id: 42,
+                kind: 1,
+                x: 100.5,
+                y: 64.0,
+                z: -20.25,
             }
         );
     }

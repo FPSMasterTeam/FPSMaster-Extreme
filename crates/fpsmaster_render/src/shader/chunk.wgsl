@@ -71,6 +71,8 @@ struct VertexOutput {
     // bit 16 of pos_light.w by the mesher — the only reliable emitter marker (the
     // voxel block-light is also high on lit NEIGHBOURS, which caused glow rings).
     @location(5) emissive: f32,
+    // 1.0 where the biome gets snow rather than rain (bit 17).
+    @location(6) snowy: f32,
 };
 
 @vertex
@@ -86,6 +88,7 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     let w_bits = u32(input.pos_light.w) & 0xFFFFu;
     out.light = vec2<f32>(f32((w_bits >> 8u) & 0xFFu) / 255.0, f32(w_bits & 0xFFu) / 255.0);
     out.emissive = f32((u32(input.pos_light.w) >> 16u) & 1u);
+    out.snowy = f32((u32(input.pos_light.w) >> 17u) & 1u);
     out.world_pos = world_pos;
     out.normal = input.normal.xyz;
     return out;
@@ -158,6 +161,146 @@ fn vanilla_lightmap(light: vec2<f32>) -> vec3<f32> {
     let block_b = block * (block * block * 0.6 + 0.4);
     let rgb = vec3<f32>(sky_rg + block, sky_rg + block_g, sky + block_b);
     return clamp(rgb * 0.96 + vec3<f32>(0.03), vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
+/// Absolute world position from the camera-relative one the vertex stage emits.
+///
+/// `VertexOutput.world_pos` is RELATIVE to the render origin (the camera's block
+/// position), which is what keeps f32 precise far from spawn. Anything anchored
+/// to the world — noise fields, plane intersections — must add the origin back,
+/// or it drifts with the player: the puddle field slid across the ground every
+/// time the origin stepped.
+fn absolute_pos(world_pos: vec3<f32>) -> vec3<f32> {
+    return world_pos + vec3<f32>(camera.origin.xyz);
+}
+
+// --- Cloud shadows ------------------------------------------------------
+//
+// Dappled light moving across the ground is most of what makes an outdoor scene
+// feel alive rather than a static diorama.
+//
+// This uses its own cheap value noise rather than sampling the sky pass's 3D
+// cloud texture, which is bound to a different pipeline: reaching it from here
+// would mean widening the lit bind-group layout that every world pipeline
+// shares. The shadow field therefore does NOT correspond texel-for-texel to the
+// clouds actually drawn overhead — but it runs at the same world scale and wind
+// speed, and with the deck at y=220 a cloud's shadow lands far from the cloud
+// anyway, so the mismatch is not perceivable from the ground. Most shader packs
+// make the same trade.
+fn cloud_hash(p: vec2<f32>) -> f32 {
+    return fract(sin(dot(p, vec2<f32>(127.1, 311.7))) * 43758.5453);
+}
+
+fn cloud_noise(p: vec2<f32>) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let u = f * f * (3.0 - 2.0 * f);
+    return mix(
+        mix(cloud_hash(i), cloud_hash(i + vec2<f32>(1.0, 0.0)), u.x),
+        mix(cloud_hash(i + vec2<f32>(0.0, 1.0)), cloud_hash(i + vec2<f32>(1.0, 1.0)), u.x),
+        u.y,
+    );
+}
+
+/// Fraction of sunlight reaching `world_pos` through the cloud deck.
+fn cloud_shadow(rel_pos: vec3<f32>, overcast: f32) -> f32 {
+    let world_pos = absolute_pos(rel_pos);
+    let dir = lighting.sun_dir.xyz;
+    // A sun near the horizon casts a near-infinite ray through the deck; there is
+    // no meaningful cloud shadow left to compute.
+    if (dir.y < 0.08) {
+        return 1.0;
+    }
+    // Same plane height, wind and world scale as the drawn clouds (sky.wgsl).
+    let t = (220.0 - world_pos.y) / dir.y;
+    let wind = vec2<f32>(camera.time * 1.5, camera.time * 0.5);
+    let uv = (world_pos.xz + dir.xz * t + wind) * 0.0016;
+    let n = cloud_noise(uv) * 0.65 + cloud_noise(uv * 2.7) * 0.35;
+    // Matches the sky pass's coverage ramp so the deck thickens with the weather.
+    let coverage = 0.5 + 0.25 * overcast;
+    let d = smoothstep(1.0 - coverage - 0.18, 1.0 - coverage + 0.12, n);
+    // Clouds scatter a lot of light through, so a shadow never goes fully dark.
+    return 1.0 - d * 0.55;
+}
+
+// --- Rain wetness, puddles and ripples ----------------------------------
+//
+// Naive "wetness" (darken everything by a constant) reads as a grey wash. The
+// techniques below are what shader packs have converged on, and each is
+// standard real-time practice rather than anything Minecraft-specific:
+//
+//  * POROSITY drives the response. A porous surface (dirt, wool) soaks water
+//    up: it darkens a lot and stays rough. A dense one (stone, glass) barely
+//    darkens but turns glossy. One flat darkening for every block is the single
+//    biggest reason a wet effect looks fake.
+//  * PUDDLES are a low-frequency world-space noise field thresholded against
+//    the wetness level, so they spread as the storm sets in — gated to surfaces
+//    the sky actually reaches, and to up-facing faces.
+//  * Water's Fresnel F0 is ~0.02: a puddle is nearly invisible head-on and
+//    almost a mirror at grazing angles. That ramp IS the look; a constant
+//    reflection strength gets it wrong at both ends.
+//  * RIPPLES perturb the puddle's normal with expanding rings on a jittered
+//    grid, which is what makes rain read as actively falling rather than as a
+//    static gloss coat someone painted on.
+
+/// Where standing water has collected, 0..1.
+fn puddle_mask(rel_pos: vec3<f32>, sky: f32, up: f32, wetness: f32) -> f32 {
+    if (wetness < 0.001) {
+        return 0.0;
+    }
+    let world_pos = absolute_pos(rel_pos);
+    // Scale matters more than anything else here. `cloud_noise` is an infinite
+    // lattice value noise, so one unit of input is one cell; a tiling noise
+    // TEXTURE (what shader packs sample) repeats every 64-256 texels and carries
+    // far higher frequency at the same multiplier. Copying their multipliers
+    // gave 40- and 160-block cells, which put the whole visible scene inside a
+    // single cell — the mask came out constant and the ground just uniformly
+    // darkened, with no puddle shapes at all.
+    //
+    // Pools want to be a handful of blocks across, with a finer octave breaking
+    // up the edges.
+    let p = world_pos.xz;
+    // Three octaves: the finest one breaks up the outline so a pool has a ragged
+    // edge instead of a clean contour.
+    var n = cloud_noise(p * 0.9) * 0.15
+        + cloud_noise(p * 0.33) * 0.3
+        + cloud_noise(p * 0.08) * 0.55;
+    // Driven by accumulated standing water, NOT the rain strength: pools should
+    // fill over tens of seconds, not snap in with the weather change.
+    n = n + wetness * 0.42 - 0.34;
+    // A wide threshold window: a narrow one cut a hard shoreline between wet and
+    // dry, which is the one thing a puddle never has.
+    var puddles = smoothstep(0.20, 0.80, n);
+    // Near-max skylight only: ground under a tree or against a wall stays dry.
+    puddles = puddles * clamp(sky * 8.0 - 7.0, 0.0, 1.0) * clamp(up, 0.0, 1.0);
+    return puddles;
+}
+
+/// One ripple field sample — expanding rings on a jittered grid, each cell
+/// firing on its own phase so they do not pulse in unison.
+fn ripple_height(rel_pos: vec3<f32>, offset: vec2<f32>) -> f32 {
+    let p = absolute_pos(rel_pos).xz + offset;
+    let cell = floor(p);
+    let f = fract(p);
+    let seed = cloud_hash(cell);
+    let t = camera.time * 1.7 + seed;
+    let phase = fract(t);
+    let centre = vec2<f32>(cloud_hash(cell + 1.7), cloud_hash(cell + 3.1)) * 0.5 + 0.25;
+    var r = clamp(1.0 - 4.0 * length(f - centre), 0.0, 1.0);
+    // Ring expands over the cell's phase, then fades.
+    r = clamp(r + phase - 1.0, 0.0, 1.0);
+    return sin(min(r * 6.0 * 3.14159, 3.0 * 3.14159)) * pow(1.0 - phase, 2.0);
+}
+
+/// Slope of the ripple field, as an xz normal perturbation (4-tap finite
+/// difference — the standard way to get a normal out of a height function).
+fn ripple_slope(world_pos: vec3<f32>) -> vec2<f32> {
+    let e = 0.15;
+    let h1 = ripple_height(world_pos, vec2<f32>(e, 0.0));
+    let h2 = ripple_height(world_pos, vec2<f32>(-e, 0.0));
+    let h3 = ripple_height(world_pos, vec2<f32>(0.0, e));
+    let h4 = ripple_height(world_pos, vec2<f32>(0.0, -e));
+    return vec2<f32>((h2 - h1) / e, (h4 - h3) / e) * 0.35;
 }
 
 // Fraction of the sun visible at this world position (1 = lit, 0 = shadowed),
@@ -271,28 +414,114 @@ fn apply_lighting(albedo: vec3<f32>, in: VertexOutput) -> vec3<f32> {
     // or hardware ray-traced (sharp/soft) when ray tracing is active. The two
     // variants are supplied by the prepended rt_stub.wgsl / rt_common.wgsl.
     // `in.clip_position.xy` is the framebuffer pixel coord, used to seed the RT noise.
-    let shadow = sun_visibility(in.world_pos, geo_n, ndotl, in.clip_position.xy);
+    // Overcast dissolves the sun's shadow: with the sky as one big area light
+    // there is no sharp shadow to cast, and leaving the shadow map at full
+    // strength during rain drew knife-edged shadows under a sunless sky.
+    let overcast = lighting.extra.y;
+    let shadow = mix(
+        sun_visibility(in.world_pos, geo_n, ndotl, in.clip_position.xy),
+        1.0,
+        overcast,
+    );
     let sky = in.light.x;
     let block = in.light.y;
     let day = max(camera.sky_brightness, 0.04);
     // Ambient term. The sky-dependent part is scaled down when the ray-traced sky GI
     // is active (it adds the directional sky lighting additively afterward); a small
     // base is always kept. With RT off, gi_ambient_scale() = 1 (unchanged).
-    let ambient = lighting.ambient.rgb * (0.08 + 0.92 * sky * day * gi_ambient_scale());
+    //
+    // Sky light is a HEMISPHERE, not a uniform glow: it arrives from above, so an
+    // up-facing surface sees the whole sky, a wall sees half of it, and an
+    // overhang sees only bounce off the ground. This used to be one flat term
+    // applied to every face, which was survivable while the sun supplied the
+    // directional cue — but once overcast removes the sun there is nothing left,
+    // and the whole scene flattens into a single tone.
+    let hemi = mix(0.6, 1.2, geo_n.y * 0.5 + 0.5);
+    // Tint the up-facing half toward the sky's own colour. Luma-normalised, so
+    // this shifts hue only and cannot change the overall exposure — ambient then
+    // tracks the time of day and the weather instead of being a fixed grey-blue.
+    let sky_luma = max(dot(lighting.fog_color.rgb, vec3<f32>(0.2126, 0.7152, 0.0722)), 1e-4);
+    let sky_hue = lighting.fog_color.rgb / sky_luma;
+    let ambient_tint = mix(vec3<f32>(1.0), sky_hue, 0.35 * max(geo_n.y, 0.0));
+    let ambient = lighting.ambient.rgb
+        * hemi
+        * ambient_tint
+        * (0.08 + 0.92 * sky * day * gi_ambient_scale());
     // Block (torch/lava) light: the smooth voxel block-light, scaled down when RT point
     // lights are active, PLUS the ray-traced point lights (sharp, shadowed, coloured).
     // In the non-RT build torch_voxel_scale()=1 and block_lights()=0 (unchanged look).
     let torch = vec3<f32>(1.0, 0.82, 0.55) * block * torch_voxel_scale()
         + block_lights(in.world_pos, geo_n, in.clip_position.xy);
+    let cloud_shade = cloud_shadow(in.world_pos, overcast);
+    // Wetness. Only where the sky can actually reach the surface — the underside
+    // of an overhang and anything indoors stays dry — and biased to up-facing
+    // faces, since that is where water collects.
+    // Exposure to the weather, before deciding what form it takes.
+    let exposure = overcast * clamp(sky * 1.2, 0.0, 1.0) * mix(0.3, 1.0, max(geo_n.y, 0.0));
+    // Snow does not wet anything: below freezing the water arrives as a solid
+    // and settles on top instead of soaking in or pooling. Driving wetness from
+    // the weather alone gave snowfields puddles and a wet sheen.
+    // `/weather snow` overrides the biome so snow is reachable in a local world,
+    // where every column is the default plains biome.
+    let snowy = max(in.snowy, lighting.extra.w);
+    let wetness = exposure * (1.0 - snowy);
+    // Snow settles on surfaces the sky reaches and that face up, deepening with
+    // the same accumulator the puddles use — it is the same "how long has this
+    // been going on" quantity.
+    // Capped at half. A full blend replaces the block texture outright, which
+    // reads as the terrain having been repainted rather than dusted — at 0.5 the
+    // surface underneath still shows through.
+    let snow_max = 0.5;
+    let snow_cover = snowy
+        * lighting.extra.z
+        * clamp(sky * 8.0 - 7.0, 0.0, 1.0)
+        * smoothstep(0.35, 0.85, geo_n.y)
+        * (0.55 + 0.45 * cloud_noise(absolute_pos(in.world_pos).xz * 0.6))
+        * snow_max;
+    // The accumulator gates the mask; `wetness` only says the surface is exposed.
+    let puddles = puddle_mask(in.world_pos, sky, geo_n.y, lighting.extra.z * step(0.01, wetness));
+    // Porosity. The vanilla path has no per-material data, so this takes the mid
+    // value a pack-less surface falls back to; with a resource pack's specular
+    // map it would come from there (rough => porous). It drives BOTH halves of
+    // the response, which is what keeps wet stone and wet dirt from looking the
+    // same: darkening scales with porosity, gloss scales against it.
+    // Fresh snow is a very high-albedo, slightly blue-white diffuser. Mixing the
+    // albedo toward it (rather than adding light) keeps it reading as a surface.
+    let snow_albedo = vec3<f32>(0.90, 0.93, 0.98);
+    let porosity = 0.5;
+    // Damp ground darkens a little; standing water darkens a lot more. Driving
+    // both from `max(wetness, puddles)` — as this first did — made them
+    // IDENTICAL: on open ground wetness is already 1.0, so the puddle mask had
+    // no effect on albedo at all, and a puddle differed from wet ground only by
+    // its Fresnel term.
+    let damp_darkening = 0.18 * wetness;
+    let puddle_darkening = (0.26 * porosity + 0.08) * puddles;
+    let wet_albedo = 1.0 - clamp(damp_darkening + puddle_darkening, 0.0, 0.75);
+    let snow_mix = clamp(snow_cover, 0.0, 1.0);
 
     if (pbr_on) {
         let view_dir = normalize(lighting.camera_pos.xyz - in.world_pos);
         let spec_tex = textureSample(specular_atlas, pbr_sampler, in.uv);
-        let smoothness = spec_tex.r;
+        let smoothness_tex = spec_tex.r;
         let metallic = spec_tex.g;
         let emissive = spec_tex.b;
+        // Wetness, the PBR way: standing water raises smoothness toward a
+        // mirror and pins the base reflectance at water's F0 of 0.02, while the
+        // albedo darkens. The whole block used to sit in the non-PBR branch
+        // BELOW an early `return`, so installing a PBR resource pack made
+        // puddles vanish entirely.
+        //
+        // With a specular map there is real per-material porosity to work from
+        // (rough => porous), so wet dirt drinks the light and stays matte while
+        // wet stone barely darkens and turns glossy — the material variation the
+        // vanilla path has to fake with a constant.
+        let porosity_pbr = 0.5 - 0.5 * smoothness_tex;
+        let wet_albedo_pbr =
+            1.0 - clamp(0.18 * wetness + (0.26 * porosity_pbr + 0.08) * puddles, 0.0, 0.6);
+        let albedo_wet = mix(albedo * wet_albedo_pbr, snow_albedo, snow_mix);
+        let smoothness = mix(smoothness_tex, 1.0, puddles * sqrt(1.0 - 0.75 * porosity_pbr));
         let roughness = max((1.0 - smoothness) * (1.0 - smoothness), 0.04);
-        let f0 = mix(vec3<f32>(0.04), albedo, metallic);
+        let f0 = max(mix(vec3<f32>(0.04), albedo_wet, metallic), vec3<f32>(puddles * 0.02));
         let half_dir = normalize(lighting.sun_dir.xyz + view_dir);
         let ndotv = max(dot(n, view_dir), 0.001);
         let ndoth = max(dot(n, half_dir), 0.0);
@@ -302,10 +531,11 @@ fn apply_lighting(albedo: vec3<f32>, in: VertexOutput) -> vec3<f32> {
         let F = fresnel_schlick(vdoth, f0);
         let spec_brdf = (D * G * F) / max(4.0 * ndotv * ndotl, 0.001);
         let kd = (vec3<f32>(1.0) - F) * (1.0 - metallic);
-        let sun_light = lighting.sun_color.rgb * (ndotl * shadow * sun_sky_gate(sky, in.world_pos));
+        let sun_light = lighting.sun_color.rgb
+            * (ndotl * shadow * cloud_shade * sun_sky_gate(sky, in.world_pos));
         let ao = clamp(dot(n, geo_n), 0.3, 1.0);
-        var lit = (kd * albedo + spec_brdf) * sun_light
-            + albedo * light_curve(ambient * ao + torch, gamma);
+        var lit = (kd * albedo_wet + spec_brdf) * sun_light
+            + albedo_wet * light_curve(ambient * ao + torch, gamma);
         let env_spec = f0 * smoothness * smoothness * ambient * ao * sky * 0.5;
         lit = lit + env_spec;
         // Hardware ray-traced reflection (a == 0 in non-RT builds → no change). Reflect
@@ -323,17 +553,52 @@ fn apply_lighting(albedo: vec3<f32>, in: VertexOutput) -> vec3<f32> {
             let fres = fresnel_schlick(max(dot(n, view_dir), 0.0), f0);
             lit = lit + rt_refl.rgb * fres * smoothness * rt_refl.a;
         }
-        lit = lit + albedo * emissive * 3.0;
+        lit = lit + albedo_wet * emissive * 3.0;
         return lit;
     }
 
-    let sun = lighting.sun_color.rgb * (ndotl * shadow * sun_sky_gate(sky, in.world_pos));
-    var lit = albedo * light_curve(ambient + sun + torch, gamma);
+    let sun = lighting.sun_color.rgb
+        * (ndotl * shadow * cloud_shade * sun_sky_gate(sky, in.world_pos));
+    let surface = mix(albedo * wet_albedo, snow_albedo, snow_mix);
+    var lit = surface * light_curve(ambient + sun + torch, gamma);
     if (lighting.flags.z > 0.5) {
         let view_dir = normalize(lighting.camera_pos.xyz - in.world_pos);
         let half_dir = normalize(lighting.sun_dir.xyz + view_dir);
         let spec = pow(max(dot(n, half_dir), 0.0), 48.0);
         lit = lit + lighting.sun_color.rgb * (spec * shadow * sky * 0.25);
+    }
+    // Wet sheen: a rained-on surface reflects the SKY, not the sun (under an
+    // overcast there is no sun left to reflect). This is the cue that actually
+    // connects the rain to the world instead of leaving it painted on top.
+    if (wetness > 0.0) {
+        let view_dir = normalize(lighting.camera_pos.xyz - in.world_pos);
+        // Ripples only disturb standing water, not a merely damp surface.
+        var wet_n = n;
+        if (puddles > 0.001) {
+            let slope = ripple_slope(in.world_pos) * puddles;
+            wet_n = normalize(n + vec3<f32>(slope.x, 0.0, slope.y));
+        }
+        // Schlick against water's F0 of 0.02: almost nothing head-on, almost a
+        // mirror at grazing. A flat strength gets both ends wrong.
+        let cos_v = max(dot(wet_n, view_dir), 0.0);
+        let fres = 0.02 + 0.98 * pow(1.0 - cos_v, 5.0);
+        // Water is SMOOTH, so a puddle mirrors the sky well before the view goes
+        // grazing. Strict Schlick against F0 = 0.02 only reaches a few percent
+        // until then — at the 45-80 degrees a standing player actually views the
+        // ground it is 2%, which is why the puddles were invisible. Standing
+        // water therefore gets a reflectance FLOOR: a deliberate departure from
+        // pure Fresnel, in exchange for reading as water from where the player
+        // stands. Damp ground keeps the physical falloff.
+        let gloss = mix(fres * wetness * 0.3, max(fres, 0.12), puddles)
+            * (1.0 - porosity * 0.5);
+        // MIX, not add. Water covers what is beneath it: at grazing angles you
+        // see the sky instead of the ground, not the sky on top of it. Adding
+        // instead caps the effect at however bright the overcast sky is, which
+        // under a storm is dim enough to disappear.
+        // No boost: the sky's own radiance is what a puddle reflects. The 1.6x
+        // lift here blew the highlights out to white.
+        let sky_refl = lighting.fog_color.rgb;
+        lit = mix(lit, sky_refl, clamp(gloss, 0.0, 1.0));
     }
     // Self-emissive glow: surfaces of an actual emitter block (per-block flag from the
     // mesher) are pushed to HDR so they overflow into bloom. Using the flag — not a

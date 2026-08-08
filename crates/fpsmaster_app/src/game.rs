@@ -584,6 +584,15 @@ pub struct GameState {
     previous_player_position: DVec3,
     physics: PlayerPhysics,
     has_sky_light: bool,
+    /// Rain/thunder state and its vanilla ramp. See [`Weather`].
+    weather: Weather,
+    /// Lightning bolts currently being drawn; each lives a few ticks.
+    lightning_bolts: Vec<LightningBolt>,
+    /// Bumped per strike so two bolts at the same spot get different shapes.
+    lightning_seq: u32,
+    /// Vanilla `EntityRenderer.rainSoundCounter`: gates how often the ambient
+    /// rain sound fires relative to how many splashes landed.
+    rain_sound_counter: i32,
     /// World time of day in ticks (0..24000), driving the day/night sky and
     /// lightmap. Advanced locally each tick and resynced by S03 TimeUpdate;
     /// starts at noon until the server reports otherwise.
@@ -1172,6 +1181,10 @@ impl GameState {
             player,
             physics: PlayerPhysics::default(),
             has_sky_light: true,
+            weather: Weather::default(),
+            lightning_bolts: Vec::new(),
+            lightning_seq: 0,
+            rain_sound_counter: 0,
             world_time: 6000,
             daylight_cycle: true,
             time_rate: 1,
@@ -1449,8 +1462,265 @@ impl GameState {
                 Err(_) => "Usage: /time rate <ticks-per-tick>".to_owned(),
             },
             ["time", ..] => "Usage: /time set|add <…> or /time rate <n>".to_owned(),
+            // Local weather control. A server drives weather over S2B, but demo
+            // and single-player worlds have no server, so this is the only way to
+            // see rain/snow/thunder there.
+            ["weather", kind] => match *kind {
+                "clear" => {
+                    self.weather.set_force_snow(false);
+                    self.weather.set_raining(false);
+                    "Weather set to clear".to_owned()
+                }
+                "rain" => {
+                    self.weather.set_force_snow(false);
+                    self.weather.set_raining(true);
+                    "Weather set to rain".to_owned()
+                }
+                "snow" => {
+                    self.weather.set_force_snow(true);
+                    "Weather set to snow".to_owned()
+                }
+                "thunder" => {
+                    self.weather.set_thundering(true);
+                    "Weather set to thunder".to_owned()
+                }
+                // Lightning normally arrives from the server as S2C
+                // SpawnGlobalEntity, so without one there is no way to see a
+                // bolt at all. Strike ahead of the player so it lands in view.
+                "strike" => {
+                    // Reuse the camera's own forward vector rather than
+                    // re-deriving Minecraft's yaw convention here — flattened to
+                    // the horizontal so looking up or down does not move the
+                    // strike closer.
+                    let eye = self.camera.position;
+                    let dir = self.camera.direction();
+                    let flat = glam::Vec2::new(dir.x, dir.z).normalize_or_zero();
+                    let (x, z) = (
+                        (eye.x + flat.x * 12.0).floor() as i32,
+                        (eye.z + flat.y * 12.0).floor() as i32,
+                    );
+                    // An unloaded column has no surface to strike; scanning it
+                    // would return 0 and drop the bolt at bedrock, far below the
+                    // camera and invisible.
+                    let y = if self.world.is_block_column_loaded(x, z) {
+                        self.precipitation_height(x, z)
+                    } else {
+                        eye.y.floor() as i32
+                    };
+                    self.handle_lightning_bolt(x as f64 + 0.5, y as f64, z as f64 + 0.5);
+                    format!("Lightning strikes at {x}, {y}, {z}")
+                }
+                _ => "Usage: /weather clear|rain|snow|thunder|strike".to_owned(),
+            },
+            ["weather", ..] => "Usage: /weather clear|rain|snow|thunder|strike".to_owned(),
             _ => format!("Unknown command: /{cmd}"),
         }
+    }
+
+    /// Current weather, for the renderer's sky/fog/curtain.
+    pub fn weather(&self) -> &Weather {
+        &self.weather
+    }
+
+    /// Columns of precipitation to draw around the camera this frame, in
+    /// vanilla's `renderRainSnow` layout: a square of columns within `radius`,
+    /// each running from its precipitation height up through the camera band.
+    ///
+    /// Returns nothing at all when it is not raining, so a clear sky costs one
+    /// branch rather than a world scan.
+    pub fn precipitation_columns(
+        &self,
+        tick_alpha: f32,
+        radius: i32,
+    ) -> Vec<fpsmaster_render::weather::PrecipColumn> {
+        if self.weather.rain_strength(tick_alpha) <= 0.0 || !self.has_sky_light {
+            return Vec::new();
+        }
+        let eye = self.camera.position;
+        let (cx, cy, cz) = (
+            eye.x.floor() as i32,
+            eye.y.floor() as i32,
+            eye.z.floor() as i32,
+        );
+        let mut columns = Vec::new();
+        for z in (cz - radius)..=(cz + radius) {
+            for x in (cx - radius)..=(cx + radius) {
+                if !self.world.is_block_column_loaded(x, z) {
+                    continue;
+                }
+                let ground = self.precipitation_height(x, z);
+                let biome = self.world.biome_at(x, z);
+                let Some(natural_snow) =
+                    fpsmaster_render::weather::column_precipitation(biome, ground)
+                else {
+                    continue;
+                };
+                let snow = natural_snow || self.weather.force_snow();
+                // Vanilla clamps the camera-centred band up to the ground, so the
+                // curtain never draws below the surface.
+                let y_min = (cy - radius).max(ground);
+                let y_max = (cy + radius).max(ground);
+                if y_min >= y_max {
+                    continue;
+                }
+                let (block_l, sky_l) = self.world.light_at(x, y_min, z);
+                columns.push(fpsmaster_render::weather::PrecipColumn {
+                    x,
+                    z,
+                    y_min,
+                    y_max,
+                    snow,
+                    light: [sky_l as f32 / 15.0, block_l as f32 / 15.0],
+                });
+            }
+        }
+        columns
+    }
+
+    /// Vanilla `EntityRenderer.addRainParticles`: splash droplets on whatever
+    /// surface the rain is landing on, near the player.
+    ///
+    /// The count is `100 * strength²` per tick, so it ramps in quadratically
+    /// with the storm and costs nothing in light drizzle. Vanilla additionally
+    /// halves it on Fast graphics; here that is left to `ParticleSystem`'s
+    /// `density`, which the host already drives from the graphics settings —
+    /// applying it in both places would scale it twice.
+    ///
+    /// Only rain splashes: snow columns and dry biomes are skipped, and lava
+    /// gets smoke instead of a droplet.
+    fn spawn_rain_particles(&mut self) {
+        let strength = self.weather.rain_strength(1.0);
+        if strength <= 0.0 || !self.has_sky_light {
+            return;
+        }
+        let count = (100.0 * strength * strength) as i32;
+        if count <= 0 {
+            return;
+        }
+        const SPREAD: i32 = 10;
+        let mut landed = 0i32;
+        let mut last_splash = None;
+        let eye = self.camera.position;
+        let (ex, ey, ez) = (
+            eye.x.floor() as i32,
+            eye.y.floor() as i32,
+            eye.z.floor() as i32,
+        );
+        for i in 0..count {
+            let h = hash2d(ex.wrapping_add(i), ez, self.hud_update_counter as u32 ^ 0x5BD1);
+            // Vanilla picks the column as `nextInt(10) - nextInt(10)`: a
+            // TRIANGULAR distribution peaked at the player, not a uniform square.
+            // Sampling uniformly over ±10 (as this first did) spreads the same
+            // number of splashes evenly over 441 columns instead of concentrating
+            // them around your feet, so the rain reads as sparse and even.
+            let dx = (h % SPREAD as u32) as i32 - ((h >> 5) % SPREAD as u32) as i32;
+            let dz = ((h >> 10) % SPREAD as u32) as i32 - ((h >> 15) % SPREAD as u32) as i32;
+            let (x, z) = (ex + dx, ez + dz);
+            if !self.world.is_block_column_loaded(x, z) {
+                continue;
+            }
+            let top = self.precipitation_height(x, z);
+            // Vanilla only splashes within ±10 of the player's own height, so
+            // rain on a distant mountain does not spray at your feet.
+            if top > ey + SPREAD || top < ey - SPREAD {
+                continue;
+            }
+            let biome = self.world.biome_at(x, z);
+            if self.weather.force_snow()
+                || fpsmaster_render::weather::column_precipitation(biome, top) != Some(false)
+            {
+                continue; // dry biome, or snowing — no splash
+            }
+            let below = self.world.block_at(x, top - 1, z);
+            if below.is_air() {
+                continue;
+            }
+            let jitter = |bits: u32| ((h >> bits) & 0xFF) as f32 / 255.0;
+            let pos = Vec3::new(
+                x as f32 + jitter(20),
+                top as f32 + 0.1,
+                z as f32 + jitter(24),
+            );
+            // Lava hisses instead of splashing (vanilla spawns SMOKE_NORMAL).
+            if matches!(below.id, 10 | 11) {
+                self.particles.spawn(11, pos, Vec3::ZERO, 0.0, 1, &[]);
+            } else {
+                // The surface it landed on is its floor, so it can die on contact.
+                self.particles.spawn_rain_splash(pos, top as f32);
+            }
+            landed += 1;
+            last_splash = Some(pos);
+        }
+
+        // Vanilla plays the ambient loop at one of the splash points, gated so it
+        // fires more often the more rain is actually landing near you.
+        if let Some(pos) = last_splash {
+            self.rain_sound_counter += 1;
+            if landed > 0 && (hash2d(landed, self.hud_update_counter as i32, 0x9E3D) % 3) < self.rain_sound_counter as u32 {
+                self.rain_sound_counter = 0;
+                // Rain heard from under a roof is quieter and pitched down.
+                let (volume, pitch) = if pos.y > eye.y + 1.0 {
+                    (0.1, 0.5)
+                } else {
+                    (0.2, 1.0)
+                };
+                self.queue_sound("ambient.weather.rain", pos, volume, pitch);
+            }
+        }
+    }
+
+    /// Free-running tick counter plus the frame fraction, driving the curtain's
+    /// scroll phase only (vanilla's `rendererUpdateCount + partialTicks`).
+    pub fn weather_animation_time(&self, tick_alpha: f32) -> f32 {
+        self.hud_update_counter as f32 + tick_alpha
+    }
+
+    /// Vanilla `World.getPrecipitationHeight`: one above the topmost block that
+    /// blocks movement or is a liquid — i.e. the surface rain lands on.
+    fn precipitation_height(&self, x: i32, z: i32) -> i32 {
+        for y in (0..256).rev() {
+            let block = self.world.block_at(x, y, z);
+            if !block.is_air() {
+                return y + 1;
+            }
+        }
+        0
+    }
+
+    /// S2B ChangeGameState. Only the weather reasons are acted on here; the
+    /// others (game-mode change, credits, demo prompts) are handled elsewhere or
+    /// not at all, and are ignored rather than treated as errors.
+    fn handle_change_game_state(&mut self, reason: u8, value: f32) -> bool {
+        match reason {
+            1 => self.weather.set_raining(false),
+            2 => self.weather.set_raining(true),
+            // 7/8 set the level outright instead of letting the client ramp.
+            7 => self.weather.set_rain_level(value),
+            8 => self.weather.set_thunder_level(value),
+            _ => {}
+        }
+        false
+    }
+
+    /// S2C SpawnGlobalEntity with kind 1: a lightning bolt. Vanilla lights the
+    /// whole sky for two ticks (`World.lastLightningBolt`) regardless of where
+    /// the bolt struck.
+    fn handle_lightning_bolt(&mut self, x: f64, y: f64, z: f64) {
+        self.weather.flash();
+        self.lightning_seq = self.lightning_seq.wrapping_add(1);
+        let seed = hash2d(x.floor() as i32, z.floor() as i32, self.lightning_seq);
+        self.lightning_bolts.push(LightningBolt::new(x, y, z, seed));
+        self.queue_sound(
+            "ambient.weather.thunder",
+            Vec3::new(x as f32, y as f32, z as f32),
+            10000.0,
+            0.8,
+        );
+    }
+
+    /// Bolts still being drawn, for the renderer.
+    pub fn lightning_bolts(&self) -> &[LightningBolt] {
+        &self.lightning_bolts
     }
 
     pub fn world_time(&self, tick_alpha: f32) -> f64 {
@@ -2406,6 +2676,13 @@ impl GameState {
         if self.daylight_cycle {
             self.world_time += self.time_rate;
         }
+        self.weather.tick();
+        self.spawn_rain_particles();
+        // Age out finished bolts (vanilla's EntityLightningBolt removes itself).
+        self.lightning_bolts.retain_mut(|bolt| {
+            bolt.life = bolt.life.saturating_sub(1);
+            bolt.life > 0
+        });
         // Advance particle effects once per tick (before any early return), so
         // smoke/flame age and move at the vanilla 20 Hz.
         self.particles.tick();
@@ -2750,7 +3027,11 @@ impl GameState {
     ) {
         mesh.clear();
         glint.clear();
-        let sun_b = fpsmaster_render::sky::sun_brightness(self.world_time(tick_alpha));
+        let sun_b = fpsmaster_render::sky::sun_brightness(
+            self.world_time(tick_alpha),
+            self.weather.rain_strength(tick_alpha),
+            self.weather.thunder_strength(tick_alpha),
+        );
         // Cull entities outside the view frustum up front: most mobs in a loaded
         // world are off-screen at any moment, and building each one's articulated
         // mesh is the dominant per-frame cost in entity-dense scenes.
@@ -2915,7 +3196,11 @@ impl GameState {
         brightness: f32,
     ) {
         mesh.clear();
-        let sun_b = fpsmaster_render::sky::sun_brightness(self.world_time(tick_alpha));
+        let sun_b = fpsmaster_render::sky::sun_brightness(
+            self.world_time(tick_alpha),
+            self.weather.rain_strength(tick_alpha),
+            self.weather.thunder_strength(tick_alpha),
+        );
         // Walk cycle (limb_swing) is driven by the caller from movement; swing/sneak come
         // from the player state; the head turns toward the look relative to the body yaw.
         let net_head_yaw = wrap_degrees(look_yaw - body_yaw).clamp(-75.0, 75.0);
@@ -2969,7 +3254,11 @@ impl GameState {
         tick_alpha: f32,
         max_dist_sq: f64,
     ) {
-        let sun_b = fpsmaster_render::sky::sun_brightness(self.world_time(tick_alpha));
+        let sun_b = fpsmaster_render::sky::sun_brightness(
+            self.world_time(tick_alpha),
+            self.weather.rain_strength(tick_alpha),
+            self.weather.thunder_strength(tick_alpha),
+        );
         let frustum = self.camera.frustum();
         let cam = self.camera.position;
 
@@ -3066,7 +3355,11 @@ impl GameState {
         max_dist_sq: f64,
     ) -> Vec<SignTextDraw> {
         let time = self.world_time(tick_alpha) as f32;
-        let sun_b = fpsmaster_render::sky::sun_brightness(self.world_time(tick_alpha));
+        let sun_b = fpsmaster_render::sky::sun_brightness(
+            self.world_time(tick_alpha),
+            self.weather.rain_strength(tick_alpha),
+            self.weather.thunder_strength(tick_alpha),
+        );
         let frustum = self.camera.frustum();
         let cam = self.camera.position;
         let mut sign_texts = Vec::new();
@@ -3155,7 +3448,11 @@ impl GameState {
     /// first-person hand sit at the terrain's brightness AND tint (warm near a
     /// torch, blue at night) rather than just its overall level.
     pub fn world_light_factor(&self, pos: Vec3, brightness: f32, tick_alpha: f32) -> [f32; 3] {
-        let sun_b = fpsmaster_render::sky::sun_brightness(self.world_time(tick_alpha));
+        let sun_b = fpsmaster_render::sky::sun_brightness(
+            self.world_time(tick_alpha),
+            self.weather.rain_strength(tick_alpha),
+            self.weather.thunder_strength(tick_alpha),
+        );
         entity_light(&self.world, pos, sun_b, brightness)
     }
 
@@ -3448,7 +3745,11 @@ impl GameState {
         mix(qa(c.yaw));
         mix(qa(c.pitch));
         // Day/night + brightness gamma fold into every entity's lighting.
-        let sun_b = fpsmaster_render::sky::sun_brightness(self.world_time(tick_alpha));
+        let sun_b = fpsmaster_render::sky::sun_brightness(
+            self.world_time(tick_alpha),
+            self.weather.rain_strength(tick_alpha),
+            self.weather.thunder_strength(tick_alpha),
+        );
         mix((sun_b * 1024.0) as u64);
         mix(brightness.to_bits() as u64);
         mix(hud_visible as u64);
@@ -4786,6 +5087,16 @@ impl GameState {
                 volume,
                 pitch,
             } => self.handle_sound_effect(name, x, y, z, volume, pitch),
+            ClientboundPlayPacket::ChangeGameState { reason, value } => {
+                self.handle_change_game_state(reason, value)
+            }
+            ClientboundPlayPacket::SpawnGlobalEntity { kind, x, y, z, .. } => {
+                // Vanilla only ever sends kind 1, a lightning bolt.
+                if kind == 1 {
+                    self.handle_lightning_bolt(x, y, z);
+                }
+                false
+            }
             ClientboundPlayPacket::Effect {
                 effect_id,
                 x,
@@ -6003,6 +6314,213 @@ fn entity_dist_sq(entity: &EntityState, camera: &Camera, tick_alpha: f32) -> f64
 /// stood on: no warm torch tint, no blue night tint, different falloff.
 ///
 /// Returned in GAMMA space, like the shader's; `model.wgsl` decodes it.
+/// A lightning bolt spawned by S2C SpawnGlobalEntity.
+///
+/// Vanilla's `EntityLightningBolt` picks a random `boltVertex` seed once and
+/// renders a forked polyline from it for a handful of ticks, re-randomising the
+/// shape a couple of times mid-life. The seed is kept here so the geometry is a
+/// pure function of the bolt — no per-frame randomness, so it does not flicker
+/// between frames within a tick.
+#[derive(Debug, Clone, Copy)]
+pub struct LightningBolt {
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+    pub seed: u32,
+    /// Ticks left to live; vanilla renders a bolt for a few ticks only.
+    life: u32,
+}
+
+impl LightningBolt {
+    /// Vanilla's bolt is visible for `rand.nextInt(3) + 1` "living" ticks on top
+    /// of its two-tick strike, so 4 is the top of that range.
+    const LIFE_TICKS: u32 = 4;
+
+    fn new(x: f64, y: f64, z: f64, seed: u32) -> Self {
+        Self {
+            x,
+            y,
+            z,
+            seed,
+            life: Self::LIFE_TICKS,
+        }
+    }
+
+    /// 1.0 at the strike, falling to 0 as the bolt fades.
+    pub fn brightness(&self) -> f32 {
+        self.life as f32 / Self::LIFE_TICKS as f32
+    }
+}
+
+/// Client-side weather, ported from `World.updateWeatherBody` and
+/// `getRainStrength` / `getThunderStrength`.
+///
+/// The server sends only "it is / is not raining" (S2B reasons 1 and 2, or an
+/// explicit level via reason 7/8); the client ramps toward that target by 0.01
+/// per tick, which is why vanilla weather fades in over ~5 seconds instead of
+/// popping. `prev_*` holds last tick's value so a frame can interpolate, like
+/// every other per-tick quantity here.
+///
+/// Thunder is layered on top of rain, not an alternative to it: a thunderstorm
+/// is `raining && thundering`, and both strengths ramp independently.
+#[derive(Debug, Clone, Copy)]
+pub struct Weather {
+    raining: bool,
+    thundering: bool,
+    rain: f32,
+    prev_rain: f32,
+    thunder: f32,
+    prev_thunder: f32,
+    /// Ticks left on the lightning flash (vanilla `World.lastLightningBolt`,
+    /// set to 2 when a bolt spawns and counted down each tick). While it is
+    /// non-zero the lightmap's sky term is forced to full.
+    lightning_flash: u32,
+    /// Standing water, 0..=1 — how much has actually POOLED, as opposed to how
+    /// hard it is currently raining.
+    ///
+    /// Kept separate from `rain` because the two move at very different speeds:
+    /// rain reaches full in 5 seconds, but puddles that appear that fast read as
+    /// a switch being flipped. This fills over ~20 seconds and drains over ~40,
+    /// so pools build up during a downpour and linger after it passes.
+    puddle: f32,
+    prev_puddle: f32,
+    /// Force every column to snow regardless of biome.
+    ///
+    /// Snow is normally a property of the biome, and every locally generated
+    /// world uses the default plains biome — so without this there is no way to
+    /// see snow at all outside a cold-biome server. Test affordance, same as
+    /// `/weather strike`.
+    force_snow: bool,
+}
+
+impl Default for Weather {
+    fn default() -> Self {
+        Self {
+            raining: false,
+            thundering: false,
+            rain: 0.0,
+            prev_rain: 0.0,
+            thunder: 0.0,
+            prev_thunder: 0.0,
+            lightning_flash: 0,
+            puddle: 0.0,
+            prev_puddle: 0.0,
+            force_snow: false,
+        }
+    }
+}
+
+impl Weather {
+    /// Vanilla ramp rate: 0.01 per tick, so a full fade takes 100 ticks (5 s).
+    const RAMP: f32 = 0.01;
+    /// Puddles fill over ~20 s and drain over ~40 s. Not a vanilla quantity —
+    /// vanilla has no puddles — but tying them to the rain ramp made them snap
+    /// into existence the moment the weather changed.
+    const PUDDLE_FILL: f32 = 0.0025;
+    const PUDDLE_DRAIN: f32 = 0.00125;
+
+    /// Whether every column is being forced to snow.
+    pub fn force_snow(&self) -> bool {
+        self.force_snow
+    }
+
+    pub fn set_force_snow(&mut self, force: bool) {
+        self.force_snow = force;
+        if force {
+            self.raining = true;
+        }
+    }
+
+    pub fn set_raining(&mut self, raining: bool) {
+        self.raining = raining;
+        // Vanilla clears thunder along with rain — a thunderstorm cannot outlive
+        // the rain it rides on.
+        if !raining {
+            self.thundering = false;
+        }
+    }
+
+    pub fn set_thundering(&mut self, thundering: bool) {
+        self.thundering = thundering;
+        if thundering {
+            self.raining = true;
+        }
+    }
+
+    /// S2B reason 7: the server dictating the rain level outright, bypassing the
+    /// ramp. Vanilla assigns `rainingStrength` directly here.
+    pub fn set_rain_level(&mut self, level: f32) {
+        self.rain = level.clamp(0.0, 1.0);
+        self.prev_rain = self.rain;
+        self.raining = self.rain > 0.0;
+    }
+
+    /// S2B reason 8: the server dictating the thunder level outright.
+    pub fn set_thunder_level(&mut self, level: f32) {
+        self.thunder = level.clamp(0.0, 1.0);
+        self.prev_thunder = self.thunder;
+        self.thundering = self.thunder > 0.0;
+    }
+
+    /// Start the two-tick full-brightness flash a lightning bolt causes.
+    pub fn flash(&mut self) {
+        self.lightning_flash = 2;
+    }
+
+    pub fn tick(&mut self) {
+        self.prev_rain = self.rain;
+        self.prev_thunder = self.thunder;
+        let step = |current: f32, on: bool| {
+            (current + if on { Self::RAMP } else { -Self::RAMP }).clamp(0.0, 1.0)
+        };
+        self.rain = step(self.rain, self.raining);
+        self.thunder = step(self.thunder, self.thundering);
+        self.prev_puddle = self.puddle;
+        // Pools follow the rain that is actually falling, not the target state,
+        // so a brief shower leaves only a trace.
+        let delta = if self.raining {
+            Self::PUDDLE_FILL * self.rain
+        } else {
+            -Self::PUDDLE_DRAIN
+        };
+        self.puddle = (self.puddle + delta).clamp(0.0, 1.0);
+        self.lightning_flash = self.lightning_flash.saturating_sub(1);
+    }
+
+    /// Rain strength interpolated across the current tick, 0..=1.
+    pub fn rain_strength(&self, tick_alpha: f32) -> f32 {
+        self.prev_rain + (self.rain - self.prev_rain) * tick_alpha
+    }
+
+    /// Thunder strength interpolated across the current tick, 0..=1.
+    ///
+    /// Vanilla gates thunder by the rain level (`getThunderStrength` returns
+    /// `thunderingStrength * rainingStrength`), so thunder can never darken a
+    /// sky that is not already raining.
+    pub fn thunder_strength(&self, tick_alpha: f32) -> f32 {
+        let thunder = self.prev_thunder + (self.thunder - self.prev_thunder) * tick_alpha;
+        thunder * self.rain_strength(tick_alpha)
+    }
+
+    /// Standing water level for this frame, 0..=1. See [`Self::puddle`].
+    pub fn puddle_level(&self, tick_alpha: f32) -> f32 {
+        self.prev_puddle + (self.puddle - self.prev_puddle) * tick_alpha
+    }
+
+    /// Whether a lightning flash is lighting the sky this tick.
+    pub fn lightning_flash(&self) -> bool {
+        self.lightning_flash > 0
+    }
+
+    pub fn is_raining(&self) -> bool {
+        self.raining
+    }
+
+    pub fn is_thundering(&self) -> bool {
+        self.thundering
+    }
+}
+
 fn entity_light(world: &World, pos: Vec3, sun_brightness: f32, brightness: f32) -> [f32; 3] {
     let (block_l, sky_l) = world.light_at(
         pos.x.floor() as i32,
@@ -9078,3 +9596,164 @@ mod interaction_tests {
     }
 }
 
+
+#[cfg(test)]
+mod weather_tests {
+    use super::*;
+
+    fn run(weather: &mut Weather, ticks: usize) {
+        for _ in 0..ticks {
+            weather.tick();
+        }
+    }
+
+    #[test]
+    fn weather_ramps_instead_of_popping() {
+        let mut w = Weather::default();
+        assert_eq!(w.rain_strength(1.0), 0.0);
+
+        w.set_raining(true);
+        run(&mut w, 50);
+        let half = w.rain_strength(1.0);
+        assert!(
+            (half - 0.5).abs() < 0.02,
+            "0.01/tick puts 50 ticks at ~half: {half}"
+        );
+
+        // Vanilla takes 100 ticks (5 s) to reach full, then clamps.
+        run(&mut w, 60);
+        assert_eq!(w.rain_strength(1.0), 1.0);
+
+        w.set_raining(false);
+        run(&mut w, 110);
+        assert_eq!(w.rain_strength(1.0), 0.0, "and fades back out");
+    }
+
+    #[test]
+    fn thunder_implies_rain_and_clearing_rain_clears_thunder() {
+        let mut w = Weather::default();
+        w.set_thundering(true);
+        assert!(w.is_raining(), "a thunderstorm is rain plus thunder");
+
+        // 0.01 accumulated in f32 lands a hair under 1.0 at exactly 100 ticks,
+        // so the clamp has not fired yet — compare with a tolerance rather than
+        // pretending the ramp is exact.
+        run(&mut w, 100);
+        assert!((w.rain_strength(1.0) - 1.0).abs() < 1e-4);
+        assert!((w.thunder_strength(1.0) - 1.0).abs() < 1e-4);
+
+        w.set_raining(false);
+        assert!(!w.is_thundering(), "thunder cannot outlive its rain");
+        run(&mut w, 100);
+        assert!(w.thunder_strength(1.0) < 1e-4);
+    }
+
+    #[test]
+    fn thunder_is_gated_by_the_rain_level() {
+        // Vanilla getThunderStrength multiplies by the rain strength, so thunder
+        // can never darken a sky that is not already overcast.
+        let mut w = Weather::default();
+        w.set_thundering(true);
+        run(&mut w, 20);
+        let rain = w.rain_strength(1.0);
+        assert!(w.thunder_strength(1.0) <= rain + 1e-6);
+        assert!(w.thunder_strength(1.0) < 0.05, "still barely thundering");
+    }
+
+    #[test]
+    fn explicit_levels_bypass_the_ramp() {
+        // S2B reason 7/8 set the level outright; no interpolation artefact.
+        let mut w = Weather::default();
+        w.set_rain_level(0.75);
+        assert_eq!(w.rain_strength(0.0), 0.75);
+        assert_eq!(w.rain_strength(1.0), 0.75);
+        w.set_thunder_level(1.0);
+        assert_eq!(w.thunder_strength(1.0), 0.75, "gated by rain");
+    }
+
+    #[test]
+    fn lightning_flash_lasts_two_ticks() {
+        let mut w = Weather::default();
+        assert!(!w.lightning_flash());
+        w.flash();
+        assert!(w.lightning_flash());
+        w.tick();
+        assert!(w.lightning_flash(), "still lit on the second tick");
+        w.tick();
+        assert!(!w.lightning_flash());
+    }
+}
+
+#[cfg(test)]
+mod snow_weather_tests {
+    use super::*;
+
+    #[test]
+    fn snow_forces_rain_on_and_clear_cancels_it() {
+        let mut w = Weather::default();
+        assert!(!w.force_snow());
+        w.set_force_snow(true);
+        assert!(w.is_raining(), "snow is precipitation, so it must be raining");
+        assert!(w.force_snow());
+        w.set_force_snow(false);
+        w.set_raining(false);
+        assert!(!w.force_snow());
+    }
+
+    #[test]
+    fn puddles_fill_far_slower_than_rain_and_drain_slower_still() {
+        let mut w = Weather::default();
+        w.set_raining(true);
+        // Rain is full in 100 ticks; puddles must be nowhere near it, or they
+        // snap in with the weather change instead of pooling.
+        for _ in 0..100 {
+            w.tick();
+        }
+        assert!((w.rain_strength(1.0) - 1.0).abs() < 1e-3);
+        let after_5s = w.puddle_level(1.0);
+        assert!(
+            after_5s < 0.3,
+            "puddles barely started after 5s of rain: {after_5s}"
+        );
+
+        // Not full at 20s: the fill rate scales with the rain actually falling,
+        // so the 5-second ramp-up only contributes at half rate. Full lands
+        // nearer 22s.
+        for _ in 0..300 {
+            w.tick();
+        }
+        let at_20s = w.puddle_level(1.0);
+        assert!((0.8..1.0).contains(&at_20s), "{at_20s}");
+        for _ in 0..100 {
+            w.tick();
+        }
+        assert!((w.puddle_level(1.0) - 1.0).abs() < 1e-3, "full by ~25s");
+
+        // Draining is slower than filling, so pools linger after the rain stops.
+        w.set_raining(false);
+        for _ in 0..200 {
+            w.tick();
+        }
+        let left = w.puddle_level(1.0);
+        assert!(
+            left > 0.5,
+            "10s after the rain stops most water is still there: {left}"
+        );
+    }
+
+    #[test]
+    fn a_brief_shower_leaves_only_a_trace() {
+        // Fill rate scales with the rain actually falling, so weather that ramps
+        // up and straight back down should not pool.
+        let mut w = Weather::default();
+        w.set_raining(true);
+        for _ in 0..40 {
+            w.tick();
+        }
+        w.set_raining(false);
+        for _ in 0..40 {
+            w.tick();
+        }
+        assert!(w.puddle_level(1.0) < 0.1, "{}", w.puddle_level(1.0));
+    }
+}

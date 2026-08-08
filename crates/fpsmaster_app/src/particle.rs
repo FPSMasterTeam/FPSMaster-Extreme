@@ -48,6 +48,13 @@ struct Particle {
     drag: f32,
     /// `motionY += rise` before drag (smoke/cloud rise, bubbles float up).
     rise: f32,
+    /// Y below which this particle counts as having landed, or -inf if it never
+    /// does. Every particle here is no-clip (no world access in this module), so
+    /// a rain splash instead remembers the surface it was spawned onto — that is
+    /// enough to reproduce vanilla's `if (onGround)` branch, which is what makes
+    /// splashes short-lived: they get a 50% chance to die on every tick after
+    /// they touch down, rather than living out the full 8..40-tick age.
+    floor_y: f32,
     /// Base sprite tile index into `particles.png` (column = i%16, row = i/16).
     tex_index: i32,
     /// When set, the tile walks `7 - age*8/max_age` along row 0 over the
@@ -141,6 +148,18 @@ impl ParticleSystem {
             p.vel.y -= 0.04 * p.gravity;
             p.pos += p.vel;
             p.vel *= p.drag;
+            // Vanilla EntityRainFX.onUpdate: once it is on the ground, kill it
+            // half the time and damp the slide. Without this a splash runs its
+            // whole 8..40-tick life and the ground looks like it is boiling.
+            if p.pos.y <= p.floor_y {
+                p.pos.y = p.floor_y;
+                p.vel.x *= 0.7;
+                p.vel.z *= 0.7;
+                p.vel.y = 0.0;
+                if self.rng.next_f32() < 0.5 {
+                    p.age = p.max_age;
+                }
+            }
         }
         self.particles.retain(|p| p.age < p.max_age);
         // Block-break debris: vanilla EntityDiggingFX physics (gravity 0.04,
@@ -206,6 +225,29 @@ impl ParticleSystem {
             let particle = self.make_particle(type_id, p_pos, p_vel, offset);
             self.particles.push(particle);
         }
+    }
+
+    /// Spawn one rain splash on the surface at `floor_y`, after vanilla's
+    /// `EntityRainFX`.
+    ///
+    /// Kept separate from [`Self::spawn`] because the droplet's motion is not
+    /// the packet's symmetric `speed * gaussian` box: it pops UPWARD
+    /// (`motionY = random * 0.2 + 0.1`) with only a small horizontal scatter, so
+    /// it arcs and lands rather than drifting. Spawning it through the generic
+    /// path with speed 0 — as this first did — gives a droplet no motion at all,
+    /// and it just sinks through the floor.
+    pub fn spawn_rain_splash(&mut self, pos: Vec3, floor_y: f32) {
+        if self.density <= 0.0 {
+            return;
+        }
+        let vel = Vec3::new(
+            (self.rng.next_f32() * 2.0 - 1.0) * 0.4 * 0.3,
+            self.rng.next_f32() * 0.2 + 0.1,
+            (self.rng.next_f32() * 2.0 - 1.0) * 0.4 * 0.3,
+        );
+        let mut p = self.make_particle(39, pos, vel, Vec3::ZERO);
+        p.floor_y = floor_y;
+        self.particles.push(p);
     }
 
     /// Spawn a burst of block-texture debris when `block` is fully mined
@@ -303,6 +345,7 @@ impl ParticleSystem {
             age: 0,
             max_age: max_age.max(1),
             gravity: 0.0,
+            floor_y: f32::NEG_INFINITY,
             drag: 0.98,
             rise: 0.0,
             tex_index: 0,
@@ -375,9 +418,25 @@ impl ParticleSystem {
                 p.grows_then = GrowKind::Lava;
             }
             // SPLASH(5) / WAKE(6) / DROPLET(39): tex 19 + rand(0..4), gravity.
-            5 | 6 | 39 => {
+            //
+            // `EntityRainFX` — which `EntitySplashFX` extends — OVERRIDES
+            // `onUpdate` and applies `particleGravity` undivided
+            // (`motionY -= gravity`), where the base `EntityFX` scales it by
+            // 0.04. Taking the raw 0.04/0.06 at face value therefore made these
+            // fall 25x too slowly, so a splash hung in the air for its whole
+            // 8..40-tick life instead of arcing and landing. They are expressed
+            // in the base formula's units here so the shared tick stays simple:
+            // 0.04 * 1.0 == vanilla's 0.04, 0.04 * 1.5 == vanilla's 0.06.
+            // `EntityFishWakeFX` (6) is a plain EntityFX and keeps the scaling.
+            5 | 39 => {
                 p.tex_index = 19 + (self.rng.next_f32() * 4.0) as i32;
-                p.gravity = if type_id == 5 { 0.04 } else { 0.06 };
+                p.gravity = if type_id == 5 { 1.0 } else { 1.5 };
+                p.scale *= 0.5;
+                p.max_age = (8.0 / (self.rng.next_f32() * 0.8 + 0.2)) as i32;
+            }
+            6 => {
+                p.tex_index = 19 + (self.rng.next_f32() * 4.0) as i32;
+                p.gravity = 0.06;
                 p.scale *= 0.5;
                 p.max_age = (8.0 / (self.rng.next_f32() * 0.8 + 0.2)) as i32;
             }
@@ -685,5 +744,56 @@ mod tests {
         let mut sys = ParticleSystem::new();
         sys.spawn(999, Vec3::ZERO, Vec3::ZERO, 0.0, 3, &[]);
         assert_eq!(sys.particles.len(), 3);
+    }
+
+    /// The bug: a splash spawned through the generic path got zero velocity, so
+    /// it never arced — it just sank. Vanilla's droplet pops upward.
+    #[test]
+    fn a_rain_splash_starts_moving_upward() {
+        let mut sys = ParticleSystem::new();
+        sys.spawn_rain_splash(Vec3::new(0.0, 64.0, 0.0), 64.0);
+        assert_eq!(sys.particles.len(), 1);
+        let p = &sys.particles[0];
+        assert!(
+            p.vel.y >= 0.1 && p.vel.y <= 0.3,
+            "vanilla motionY = random*0.2 + 0.1, got {}",
+            p.vel.y
+        );
+        // Only a small horizontal scatter, well under the vertical pop.
+        assert!(p.vel.x.abs() <= 0.13 && p.vel.z.abs() <= 0.13);
+    }
+
+    /// The bug: with no collision the droplet lived its full 8..40-tick life, so
+    /// the ground looked like it was boiling. Vanilla kills it on contact, half
+    /// the time per tick.
+    #[test]
+    fn splashes_die_soon_after_landing() {
+        let mut sys = ParticleSystem::new();
+        for _ in 0..200 {
+            sys.spawn_rain_splash(Vec3::new(0.0, 64.0, 0.0), 64.0);
+        }
+        // Long enough to arc up and come back down, plus a few ticks on the
+        // floor: a 50%/tick death makes survival past that vanishingly likely.
+        for _ in 0..24 {
+            sys.tick();
+        }
+        assert!(
+            sys.particles.len() < 10,
+            "expected almost all 200 splashes gone, {} left",
+            sys.particles.len()
+        );
+    }
+
+    /// A splash must not sink through the surface it landed on.
+    #[test]
+    fn splashes_rest_on_their_floor() {
+        let mut sys = ParticleSystem::new();
+        sys.spawn_rain_splash(Vec3::new(0.0, 64.0, 0.0), 64.0);
+        for _ in 0..6 {
+            sys.tick();
+            for p in &sys.particles {
+                assert!(p.pos.y >= 64.0 - 1e-6, "sank to {}", p.pos.y);
+            }
+        }
     }
 }

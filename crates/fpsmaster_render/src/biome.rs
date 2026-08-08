@@ -84,6 +84,35 @@ const fn roofed_forest() -> BiomeInfo {
     }
 }
 
+/// Whether a biome gets weather at all.
+///
+/// Vanilla tracks this as `enableRain`, cleared by `setDisableRain()` on desert,
+/// savanna, mesa, the Nether and the End — which is exactly the set whose
+/// rainfall is 0. Deriving it from the climate table avoids maintaining a second
+/// hand-written list that could drift out of step with the first.
+pub fn precipitates(id: u8) -> bool {
+    biome_info(id).downfall > 0.0
+}
+
+/// Vanilla `BiomeGenBase.getFloatTemperature`: above y=64 the temperature falls
+/// off with altitude, which is what puts snow on mountain tops inside an
+/// otherwise rainy biome.
+///
+/// Vanilla adds a noise term to blur the snow line; this is the deterministic
+/// part only, so the transition is a clean contour rather than a ragged one.
+pub fn temperature_at(id: u8, y: i32) -> f32 {
+    let base = biome_info(id).temperature;
+    if y > 64 {
+        base - (y - 64) as f32 * 0.05 / 30.0
+    } else {
+        base
+    }
+}
+
+/// Below this temperature a column gets snow instead of rain
+/// (`renderRainSnow`'s `>= 0.15F` test).
+pub const SNOW_TEMPERATURE: f32 = 0.15;
+
 /// Climate for a 1.8.9 biome id. Ids the client does not know fall back to
 /// plains, matching how vanilla resolves an unregistered biome.
 pub fn biome_info(id: u8) -> BiomeInfo {

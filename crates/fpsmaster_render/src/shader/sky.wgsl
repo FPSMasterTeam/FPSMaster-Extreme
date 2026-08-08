@@ -45,6 +45,18 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     return out;
 }
 
+// sRGB -> linear. The cloud colours below are authored the way they look on
+// screen, but this pass writes into the LINEAR HDR target that the post chain
+// re-encodes — so handing them over raw renders them far brighter than intended
+// (a 0.875 gamma value displays at 0.947). The sky dome behind them is already
+// converted on the CPU side; the clouds were the one thing left out, which is
+// why they read as blown-out white against a correctly-exposed sky.
+fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
+    let low = c / 12.92;
+    let high = pow((c + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4));
+    return select(high, low, c <= vec3<f32>(0.04045));
+}
+
 // Cloud coverage 0..1 at a point on the cloud plane (noise-space uv).
 fn cloud_density(uv: vec2<f32>) -> f32 {
     let base = textureSampleLevel(noise_tex, noise_sampler, vec3<f32>(uv, 0.25), 0.0).r;
@@ -82,9 +94,15 @@ fn clouds(dir: vec3<f32>) -> vec4<f32> {
     let shadow_col = mix(vec3<f32>(0.34, 0.36, 0.42), vec3<f32>(0.60, 0.63, 0.70), day);
     let lit_col = mix(vec3<f32>(0.5, 0.5, 0.55), vec3<f32>(1.0, 0.98, 0.93), day);
     var col = mix(shadow_col, lit_col, smoothstep(-0.15, 0.25, relief));
-    // Warm silver lining on sun-facing edges.
-    col = col + vec3<f32>(1.0, 0.95, 0.82) * max(relief, 0.0) * 1.3 * day;
-    return vec4<f32>(col, d * fade);
+    // Warm silver lining on sun-facing edges — but only while there is a sun to
+    // catch: an overcast deck has no lit rim.
+    let overcast = sky.zenith.w;
+    col = col + vec3<f32>(1.0, 0.95, 0.82) * max(relief, 0.0) * 1.3 * day * (1.0 - overcast);
+    // A rain deck seen from BELOW is its shadowed underside — grey, not white.
+    // The day factor alone only takes it to ~0.87 in a storm, which still reads
+    // as fair-weather cumulus.
+    col = col * mix(1.0, 0.45, overcast);
+    return vec4<f32>(srgb_to_linear(col), d * fade);
 }
 
 @fragment
@@ -108,7 +126,14 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     // by the day factor so it fades out at night.
     let to_sun = max(dot(dir, sky.sun_dir.xyz), 0.0);
     let day = max(sky.cloud_params.w, 0.0);
-    color += vec3<f32>(1.0, 0.96, 0.86) * (pow(to_sun, 350.0) * 8.0 + pow(to_sun, 22.0) * 0.5) * day;
+    // Scaled by the day factor AND by how clear the sky is: an overcast deck has
+    // no visible sun, so its halo must go too — otherwise the bloom still paints
+    // a brilliant disc through the storm.
+    let clear_sky = 1.0 - sky.zenith.w;
+    color += vec3<f32>(1.0, 0.96, 0.86)
+        * (pow(to_sun, 350.0) * 8.0 + pow(to_sun, 22.0) * 0.5)
+        * day
+        * clear_sky;
 
     if (sky.cloud_params.x > 0.5) {
         let c = clouds(dir);
