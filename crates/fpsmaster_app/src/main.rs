@@ -2461,9 +2461,9 @@ fn render_frame(
                 let arm_index_start = app.entity_model.indices.len() as u32;
                 ItemRenderer::render_arm(&mut app.entity_model, &app.game.camera, &first_person);
                 for v in &mut app.entity_model.vertices[arm_start..] {
-                    v.color[0] *= hand_light;
-                    v.color[1] *= hand_light;
-                    v.color[2] *= hand_light;
+                    v.color[0] *= hand_light[0];
+                    v.color[1] *= hand_light[1];
+                    v.color[2] *= hand_light[2];
                 }
                 // The first-person arm is screen-locked: flag it for zero motion
                 // so TAA doesn't reproject (and smear) it on camera movement.
@@ -2476,9 +2476,9 @@ fn render_frame(
                     app.settings.old_animations,
                 );
                 for v in &mut held.vertices {
-                    v.color[0] *= hand_light;
-                    v.color[1] *= hand_light;
-                    v.color[2] *= hand_light;
+                    v.color[0] *= hand_light[0];
+                    v.color[1] *= hand_light[1];
+                    v.color[2] *= hand_light[2];
                 }
                 renderer.set_first_person_item(&held.vertices, &held.indices);
                 renderer

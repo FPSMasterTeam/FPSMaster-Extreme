@@ -200,11 +200,14 @@ pub(crate) fn face_uv(normal: [i32; 3], px: f32, py: f32, pz: f32) -> (f32, f32)
     }
 }
 
+/// Inventory/held items have no world column, so they take the default biome's
+/// colour — which is what vanilla shows for an item stack too.
 fn tint3(tint: Tint, biome: &BiomeColors) -> [f32; 3] {
+    let default_biome = fpsmaster_core::chunk::DEFAULT_BIOME;
     match tint {
         Tint::None => [1.0, 1.0, 1.0],
-        Tint::Grass => biome.grass,
-        Tint::Foliage => biome.foliage,
+        Tint::Grass => biome.grass(default_biome),
+        Tint::Foliage => biome.foliage(default_biome),
         // Vanilla water multiplier is 0xFFFFFF (white); the texture is already blue.
         Tint::Water => [1.0, 1.0, 1.0],
         Tint::Rgb(rgb) => rgb,

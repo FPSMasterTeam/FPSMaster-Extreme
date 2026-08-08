@@ -64,12 +64,53 @@ pub fn moon_phase(time_ticks: f64) -> u32 {
 /// post pass re-encodes to sRGB, so handing them over raw renders them washed out
 /// (vanilla's 0.47 daytime sky blue would display as ~0.71 — pale and milky).
 /// Convert once here, at the boundary, so the whole renderer stays linear.
-fn srgb_to_linear(c: f32) -> f32 {
+pub fn srgb_to_linear(c: f32) -> f32 {
     if c <= 0.040_45 {
         c / 12.92
     } else {
         ((c + 0.055) / 1.055).powf(2.4)
     }
+}
+
+/// Vanilla's per-level brightness table (`WorldProvider.lightBrightnessTable`
+/// with ambient 0): `l / (4 - 3l)`. The same curve `chunk.wgsl`'s `light_level`
+/// applies per fragment.
+fn light_level(level: f32) -> f32 {
+    let l = level.clamp(0.0, 1.0);
+    l / (4.0 - 3.0 * l)
+}
+
+/// Vanilla's coloured light map for one (sky, block) light pair, 0..15 each —
+/// the CPU twin of `chunk.wgsl`'s `vanilla_lightmap` + `light_curve`, ported
+/// from `EntityRenderer.updateLightmap`.
+///
+/// Entities need the identical result: vanilla samples one lightmap texel per
+/// entity, so a mob standing on a torch-lit floor must take the same warm colour
+/// as the floor. Anything else and mobs visibly disagree with the block they are
+/// standing on.
+///
+/// Returns a GAMMA-space multiplier, exactly like the shader's — the caller
+/// converts to linear before it scales a linear texel.
+pub fn vanilla_lightmap(sky_level: u8, block_level: u8, sun_brightness: f32, gamma: f32) -> [f32; 3] {
+    let sun = sun_brightness;
+    let sky = light_level(sky_level as f32 / 15.0) * (sun * 0.95 + 0.05);
+    // The block term's `* 1.5` gain is vanilla's torch-flicker base; the flicker
+    // itself is a per-frame random walk the shader fakes, and an entity taking
+    // the un-flickered mean is imperceptible.
+    let block = light_level(block_level as f32 / 15.0) * 1.5;
+    let sky_rg = sky * (sun * 0.65 + 0.35);
+    let block_g = block * ((block * 0.6 + 0.4) * 0.6 + 0.4);
+    let block_b = block * (block * block * 0.6 + 0.4);
+    let mut rgb = [sky_rg + block, sky_rg + block_g, sky + block_b];
+    for c in rgb.iter_mut() {
+        *c = (*c * 0.96 + 0.03).clamp(0.0, 1.0);
+        // Brightness gamma: blend toward the lifted curve, then vanilla repeats
+        // the lift before writing the lightmap texture.
+        let lifted = 1.0 - (1.0 - *c).powi(4);
+        *c = *c * (1.0 - gamma) + lifted * gamma;
+        *c = (*c * 0.96 + 0.03).clamp(0.0, 1.0);
+    }
+    rgb
 }
 
 /// The full set of time-dependent sky parameters the renderer needs in one
@@ -144,4 +185,57 @@ fn sunrise_sunset_color(angle: f32) -> [f32; 4] {
 pub fn celestial_rotation(time_ticks: f64) -> Mat4 {
     let angle = celestial_angle(time_ticks);
     Mat4::from_rotation_y(-FRAC_PI_2) * Mat4::from_rotation_x(angle * TAU)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn approx(got: [f32; 3], want: [f32; 3]) {
+        for c in 0..3 {
+            assert!(
+                (got[c] - want[c]).abs() < 0.002,
+                "channel {c}: got {got:?}, want {want:?}"
+            );
+        }
+    }
+
+    /// These are the values `chunk.wgsl`'s `vanilla_lightmap_graded` produces for
+    /// the same inputs. Entities are lit by this CPU copy and terrain by the
+    /// shader, so the two must not drift apart.
+    #[test]
+    fn cpu_lightmap_matches_the_shader_formula() {
+        // Noon under open sky: essentially full white.
+        approx(vanilla_lightmap(15, 0, 1.0, 0.0), [0.980, 0.980, 0.980]);
+        // Indoors by a dim torch: warm, red > green > blue.
+        approx(vanilla_lightmap(0, 7, 1.0, 0.0), [0.307, 0.242, 0.169]);
+        // Midnight under open sky: dim and distinctly blue.
+        approx(vanilla_lightmap(15, 0, 0.2, 0.0), [0.165, 0.165, 0.280]);
+        // Unlit cave: vanilla's floor, not pure black.
+        approx(vanilla_lightmap(0, 0, 1.0, 0.0), [0.059, 0.059, 0.059]);
+    }
+
+    #[test]
+    fn torch_light_is_warm_at_low_levels_and_whitens_near_the_source() {
+        let dim = vanilla_lightmap(0, 5, 1.0, 0.0);
+        assert!(dim[0] > dim[1] && dim[1] > dim[2], "dim torch is orange: {dim:?}");
+        let close = vanilla_lightmap(0, 15, 1.0, 0.0);
+        assert!(
+            (close[0] - close[2]).abs() < 0.01,
+            "right at the source it washes to white: {close:?}"
+        );
+    }
+
+    #[test]
+    fn brightness_gamma_only_lifts_the_dark_end() {
+        let moody = vanilla_lightmap(4, 0, 1.0, 0.0);
+        let bright = vanilla_lightmap(4, 0, 1.0, 1.0);
+        assert!(bright[0] > moody[0], "Bright lifts a dim sample");
+        let noon_moody = vanilla_lightmap(15, 0, 1.0, 0.0);
+        let noon_bright = vanilla_lightmap(15, 0, 1.0, 1.0);
+        assert!(
+            noon_bright[0] >= noon_moody[0] - 0.001,
+            "and never darkens a bright one"
+        );
+    }
 }

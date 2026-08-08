@@ -708,8 +708,10 @@ fn tint3(tint: Tint) -> [f32; 3] {
     let biome = BiomeColors::default();
     match tint {
         Tint::None => [1.0, 1.0, 1.0],
-        Tint::Grass => biome.grass,
-        Tint::Foliage => biome.foliage,
+        // A held/dropped item has no world column: use the default biome, which
+        // is what vanilla shows for an item stack.
+        Tint::Grass => biome.grass(fpsmaster_core::chunk::DEFAULT_BIOME),
+        Tint::Foliage => biome.foliage(fpsmaster_core::chunk::DEFAULT_BIOME),
         // Vanilla water multiplier is 0xFFFFFF (white); the texture is already blue.
         Tint::Water => [1.0, 1.0, 1.0],
         Tint::Rgb(rgb) => rgb,

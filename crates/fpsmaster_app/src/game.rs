@@ -2876,9 +2876,9 @@ impl GameState {
             // death animation, so the corpse stays red.
             let hurt = entity.hurt_time > 0 || entity.death_time > 0;
             for v in &mut mesh.vertices[start..] {
-                v.color[0] *= factor;
-                v.color[1] *= factor;
-                v.color[2] *= factor;
+                v.color[0] *= factor[0];
+                v.color[1] *= factor[1];
+                v.color[2] *= factor[2];
                 if hurt {
                     v.color[0] = v.color[0] * 0.7 + 0.3;
                     v.color[1] *= 0.7;
@@ -2934,9 +2934,9 @@ impl GameState {
         let center = Vec3::new(feet.x, feet.y + 0.9, feet.z);
         let factor = entity_light(&self.world, center, sun_b, brightness);
         for v in &mut mesh.vertices {
-            v.color[0] *= factor;
-            v.color[1] *= factor;
-            v.color[2] *= factor;
+            v.color[0] *= factor[0];
+            v.color[1] *= factor[1];
+            v.color[2] *= factor[2];
         }
     }
 
@@ -3044,9 +3044,9 @@ impl GameState {
                 brightness,
             );
             for v in &mut mesh.vertices[start..] {
-                v.color[0] *= factor;
-                v.color[1] *= factor;
-                v.color[2] *= factor;
+                v.color[0] *= factor[0];
+                v.color[1] *= factor[1];
+                v.color[2] *= factor[2];
             }
         }
     }
@@ -3123,9 +3123,9 @@ impl GameState {
                 _ => unreachable!(),
             }
             for v in &mut mesh.vertices[start..] {
-                v.color[0] *= factor;
-                v.color[1] *= factor;
-                v.color[2] *= factor;
+                v.color[0] *= factor[0];
+                v.color[1] *= factor[1];
+                v.color[2] *= factor[2];
             }
         }
         sign_texts
@@ -3150,10 +3150,11 @@ impl GameState {
         self.chest_open_targets.retain(|_, t| *t > 0.0);
     }
 
-    /// World-light factor (0..1) for a model drawn at `pos`, matching the chunk
-    /// shader's day/night + block-light + brightness-gamma so entities and the
-    /// first-person hand sit at the same brightness as the terrain around them.
-    pub fn world_light_factor(&self, pos: Vec3, brightness: f32, tick_alpha: f32) -> f32 {
+    /// World-light multiplier for a model drawn at `pos` — the same coloured
+    /// vanilla lightmap the chunk shader applies, so entities and the
+    /// first-person hand sit at the terrain's brightness AND tint (warm near a
+    /// torch, blue at night) rather than just its overall level.
+    pub fn world_light_factor(&self, pos: Vec3, brightness: f32, tick_alpha: f32) -> [f32; 3] {
         let sun_b = fpsmaster_render::sky::sun_brightness(self.world_time(tick_alpha));
         entity_light(&self.world, pos, sun_b, brightness)
     }
@@ -5117,8 +5118,12 @@ impl GameState {
         let pos = ChunkPos::new(x, z);
         // A ground-up packet (biomes present) is the authoritative full column;
         // drop stale sections first so removed terrain doesn't linger.
-        if column.biomes.is_some() {
+        if let Some(biomes) = &column.biomes {
             self.world.remove_chunk(pos);
+            // Keep the biome array — the mesher colours grass/foliage/water from
+            // it. `remove_chunk` cleared the column, so this re-creates it before
+            // the sections land.
+            self.world.set_biomes(x, z, biomes);
         }
         for section in &column.sections {
             self.world.load_section(
@@ -5242,6 +5247,8 @@ impl GameState {
     fn handle_join_game(&mut self, entity_id: i32, game_mode: u8, dimension: i8) -> bool {
         self.player.id = EntityId(entity_id);
         self.has_sky_light = dimension == 0;
+        // Drives what an absent section reads as (see `Chunk::sky_light_fallback`).
+        self.world.set_has_sky_light(self.has_sky_light);
         self.dimension = dimension;
         // Low 3 bits are the gamemode; bit 3 is the hardcore flag.
         self.creative = (game_mode & 0x7) == 1;
@@ -5294,6 +5301,8 @@ impl GameState {
         // respawn point; wait for that position before reporting movement
         // again so we don't send a stale (death-location) position.
         self.has_sky_light = dimension == 0;
+        // Drives what an absent section reads as (see `Chunk::sky_light_fallback`).
+        self.world.set_has_sky_light(self.has_sky_light);
         self.dimension = dimension as i8;
         self.creative = (game_mode & 0x7) == 1;
         self.needs_respawn = false;
@@ -5983,17 +5992,24 @@ fn entity_dist_sq(entity: &EntityState, camera: &Camera, tick_alpha: f32) -> f64
     dx * dx + dy * dy + dz * dz
 }
 
-fn entity_light(world: &World, pos: Vec3, sun_brightness: f32, brightness: f32) -> f32 {
+/// The world lightmap at an entity's position, as a per-channel multiplier for
+/// its model vertices.
+///
+/// Vanilla samples one lightmap texel per entity, so this has to be the exact
+/// same function the terrain uses — `fpsmaster_render::sky::vanilla_lightmap`,
+/// which both this and `chunk.wgsl` are now driven by. It previously used a
+/// private curve (`max(sky, block)` raised to a brightness-derived power) that
+/// shared nothing with the terrain's, so a mob never quite matched the block it
+/// stood on: no warm torch tint, no blue night tint, different falloff.
+///
+/// Returned in GAMMA space, like the shader's; `model.wgsl` decodes it.
+fn entity_light(world: &World, pos: Vec3, sun_brightness: f32, brightness: f32) -> [f32; 3] {
     let (block_l, sky_l) = world.light_at(
         pos.x.floor() as i32,
         pos.y.floor() as i32,
         pos.z.floor() as i32,
     );
-    let level = (sky_l as f32 / 15.0 * sun_brightness)
-        .max(block_l as f32 / 15.0)
-        .max(0.05);
-    let gamma = 1.0 + (1.0 - brightness) * 1.5;
-    level.powf(gamma)
+    fpsmaster_render::sky::vanilla_lightmap(sky_l, block_l, sun_brightness, brightness)
 }
 
 fn lerp(a: f32, b: f32, t: f32) -> f32 {

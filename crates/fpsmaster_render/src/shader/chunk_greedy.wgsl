@@ -71,16 +71,24 @@ fn light_level(l: f32) -> f32 {
     return l / (4.0 - 3.0 * clamp(l, 0.0, 1.0));
 }
 
-// Vanilla-style coloured light map (matches chunk.wgsl's shaders-off path),
-// with vanilla's final lightmap lift (`* 0.96 + 0.03`).
+// Vanilla's torch flicker stand-in; see chunk.wgsl's `torch_gain`.
+fn torch_gain() -> f32 {
+    let t = camera.time;
+    let flicker = sin(t * 3.1) * 0.6 + sin(t * 7.7) * 0.3 + sin(t * 13.3) * 0.15;
+    return flicker * 0.1 + 1.5;
+}
+
+// Vanilla's coloured light map (matches chunk.wgsl's shaders-off path): sky and
+// block terms tinted separately then SUMMED, per `EntityRenderer.updateLightmap`.
 fn vanilla_lightmap(light: vec2<f32>) -> vec3<f32> {
-    let day = camera.sky_brightness;
-    let sky = light_level(light.x);
-    let block = light_level(light.y);
-    let sky_tint = mix(vec3<f32>(0.18, 0.22, 0.34), vec3<f32>(1.0, 1.0, 0.99), day);
-    let sky_term = sky_tint * (sky * day);
-    let block_term = vec3<f32>(1.0, 0.60, 0.30) * block;
-    return max(sky_term, block_term) * 0.96 + vec3<f32>(0.03);
+    let sun = camera.sky_brightness;
+    let sky = light_level(light.x) * (sun * 0.95 + 0.05);
+    let block = light_level(light.y) * torch_gain();
+    let sky_rg = sky * (sun * 0.65 + 0.35);
+    let block_g = block * ((block * 0.6 + 0.4) * 0.6 + 0.4);
+    let block_b = block * (block * block * 0.6 + 0.4);
+    let rgb = vec3<f32>(sky_rg + block, sky_rg + block_g, sky + block_b);
+    return clamp(rgb * 0.96 + vec3<f32>(0.03), vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
 // Vanilla brightness blend (matches chunk.wgsl's light_curve): 0 = Moody base,
@@ -91,6 +99,12 @@ fn light_curve(light: vec3<f32>, brightness: f32) -> vec3<f32> {
     let lifted = vec3<f32>(1.0) - inv * inv * inv * inv;
     let high = max(light - vec3<f32>(1.0), vec3<f32>(0.0));
     return mix(low, lifted, brightness) + high;
+}
+
+// Vanilla repeats the `* 0.96 + 0.03` lift after the gamma blend; see chunk.wgsl.
+fn vanilla_lightmap_graded(light: vec2<f32>, gamma: f32) -> vec3<f32> {
+    let lit = light_curve(vanilla_lightmap(light), gamma);
+    return clamp(lit * 0.96 + vec3<f32>(0.03), vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
 fn apply_fog(color: vec3<f32>, world_pos: vec3<f32>) -> vec3<f32> {
@@ -130,7 +144,7 @@ fn shade(in: VsOut, texel: vec4<f32>) -> vec3<f32> {
     let albedo = texel.rgb * srgb_to_linear(in.color.rgb);
     // Fullbright preset: skip the lightmap darkening (keep baked AO/face shade).
     let lit = select(
-        albedo * srgb_to_linear(light_curve(vanilla_lightmap(in.light), gamma)),
+        albedo * srgb_to_linear(vanilla_lightmap_graded(in.light, gamma)),
         albedo,
         lighting.extra.x > 0.5,
     );

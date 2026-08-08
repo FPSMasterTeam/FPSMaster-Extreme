@@ -9,6 +9,8 @@ use std::{
 
 use image::{imageops::FilterType, DynamicImage, GenericImage, Rgba, RgbaImage};
 use fpsmaster_core::registry;
+
+use crate::biome::{BiomeColorTable, Colormap};
 use zip::ZipArchive;
 
 pub const TILE_SIZE: u32 = 16;
@@ -28,8 +30,6 @@ const PLAINS_DOWNFALL: f64 = 0.4;
 const DEFAULT_GRASS: [u8; 3] = [0x91, 0xBD, 0x59];
 const DEFAULT_FOLIAGE: [u8; 3] = [0x77, 0xAB, 0x2F];
 
-const GRASS_SIDE_OVERLAY: &str = "assets/minecraft/textures/blocks/grass_side_overlay.png";
-const GRASS_SIDE_OVERLAY_1_13: &str = "assets/minecraft/textures/block/grass_block_side_overlay.png";
 const GRASS_COLORMAP: &str = "assets/minecraft/textures/colormap/grass.png";
 const FOLIAGE_COLORMAP: &str = "assets/minecraft/textures/colormap/foliage.png";
 
@@ -472,6 +472,8 @@ pub struct TextureAtlasImage {
     pub source: TextureAtlasSource,
     pub grass_color: [f32; 3],
     pub foliage_color: [f32; 3],
+    /// Per-biome grass / foliage / water colours resolved from the colormaps.
+    pub biome_colors: BiomeColorTable,
     name_to_index: HashMap<String, u32>,
     rows: u32,
     /// Tile indices left as magenta placeholders (texture file not found).
@@ -523,6 +525,12 @@ impl TextureAtlasImage {
         for color in STAINED_COLORS {
             names.push(format!("glass_pane_top_{color}"));
         }
+        // Grass side overlay: vanilla draws this greyscale mask as a SECOND,
+        // biome-tinted quad over `grass_side` (whose own green band is baked in
+        // and always covered by it). It used to be composited into `grass_side`
+        // at load time with a single plains tint, which made per-biome grass
+        // impossible — the top would recolour and the side would not.
+        names.push("grass_side_overlay".to_owned());
         // The recessed front face of an extended piston body (the mesher draws it
         // directly; it is not a per-face entry in any block def).
         names.push("piston_inner".to_owned());
@@ -620,6 +628,12 @@ impl TextureAtlasImage {
         for color in STAINED_COLORS {
             names.push(format!("glass_pane_top_{color}"));
         }
+        // Grass side overlay: vanilla draws this greyscale mask as a SECOND,
+        // biome-tinted quad over `grass_side` (whose own green band is baked in
+        // and always covered by it). It used to be composited into `grass_side`
+        // at load time with a single plains tint, which made per-biome grass
+        // impossible — the top would recolour and the side would not.
+        names.push("grass_side_overlay".to_owned());
         names.push("piston_inner".to_owned());
         let mut seen = std::collections::HashSet::new();
         for id in (256..432).chain(2256..2268) {
@@ -762,6 +776,7 @@ impl TextureAtlasImage {
             source,
             grass_color: built.grass_color,
             foliage_color: built.foliage_color,
+            biome_colors: built.biome_colors,
             name_to_index: built.name_to_index,
             rows: built.rows,
             missing_indices: built.missing_indices,
@@ -777,6 +792,7 @@ struct BuiltAtlas {
     rows: u32,
     grass_color: [f32; 3],
     foliage_color: [f32; 3],
+    biome_colors: BiomeColorTable,
     missing_indices: Vec<u32>,
     animated: Vec<AnimatedTile>,
 }
@@ -847,16 +863,23 @@ fn build_atlas(
         }
     }
 
-    let grass = read(GRASS_COLORMAP)
-        .map(|img| sample_plains_color(&img))
+    // Keep the whole colormap, not just the plains texel: the mesher indexes it
+    // per biome. When a pack ships no colormap every biome collapses to the old
+    // hard-coded plains colour, which is exactly the previous behaviour.
+    let grass_map = read(GRASS_COLORMAP).map(decode_colormap);
+    let foliage_map = read(FOLIAGE_COLORMAP).map(decode_colormap);
+    let grass = grass_map
+        .as_ref()
+        .map(|m| m.sample(PLAINS_TEMPERATURE as f32, PLAINS_DOWNFALL as f32))
         .unwrap_or(DEFAULT_GRASS);
-    let foliage = read(FOLIAGE_COLORMAP)
-        .map(|img| sample_plains_color(&img))
+    let foliage = foliage_map
+        .as_ref()
+        .map(|m| m.sample(PLAINS_TEMPERATURE as f32, PLAINS_DOWNFALL as f32))
         .unwrap_or(DEFAULT_FOLIAGE);
-    let overlay = read(GRASS_SIDE_OVERLAY).or_else(|| read(GRASS_SIDE_OVERLAY_1_13));
-    if let (Some(&index), Some(overlay)) = (name_to_index.get("grass_side"), overlay) {
-        composite_grass_side(&mut image, index, &overlay, grass);
-    }
+    let biome_colors = match (&grass_map, &foliage_map) {
+        (Some(g), Some(f)) => BiomeColorTable::build(g, f),
+        _ => BiomeColorTable::fallback(grass, foliage),
+    };
 
     (
         BuiltAtlas {
@@ -865,6 +888,7 @@ fn build_atlas(
             rows,
             grass_color: u8_to_unit(grass),
             foliage_color: u8_to_unit(foliage),
+            biome_colors,
             missing_indices,
             animated,
         },
@@ -1210,40 +1234,15 @@ fn u8_to_unit(rgb: [u8; 3]) -> [f32; 3] {
     ]
 }
 
-fn sample_plains_color(colormap: &DynamicImage) -> [u8; 3] {
-    let image = colormap.to_rgba8();
-    let (width, height) = image.dimensions();
-    let rain = PLAINS_DOWNFALL * PLAINS_TEMPERATURE;
-    let x = (((1.0 - PLAINS_TEMPERATURE) * 255.0) as u32).min(width.saturating_sub(1));
-    let y = (((1.0 - rain) * 255.0) as u32).min(height.saturating_sub(1));
-    let pixel = image.get_pixel(x, y);
-    [pixel[0], pixel[1], pixel[2]]
-}
-
-fn composite_grass_side(atlas: &mut RgbaImage, index: u32, overlay: &DynamicImage, grass: [u8; 3]) {
-    let overlay = overlay
-        .resize_exact(TILE_SIZE, TILE_SIZE, FilterType::Nearest)
-        .to_rgba8();
-    let (x0, y0) = tile_origin(index);
-    for ty in 0..TILE_SIZE {
-        for tx in 0..TILE_SIZE {
-            let over = overlay.get_pixel(tx, ty);
-            let alpha = over[3] as f32 / 255.0;
-            if alpha <= 0.0 {
-                continue;
-            }
-            let base = atlas.get_pixel(x0 + tx, y0 + ty).0;
-            let mut out = [0u8; 4];
-            for c in 0..3 {
-                let tinted = grass[c] as f32 * (over[c] as f32 / 255.0);
-                out[c] = (base[c] as f32 * (1.0 - alpha) + tinted * alpha)
-                    .round()
-                    .clamp(0.0, 255.0) as u8;
-            }
-            out[3] = 255;
-            atlas.put_pixel(x0 + tx, y0 + ty, Rgba(out));
-        }
-    }
+/// Decode a `colormap/*.png` into the flat RGB table the biome lookup indexes.
+fn decode_colormap(image: DynamicImage) -> Colormap {
+    let rgba = image.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    let pixels = rgba
+        .pixels()
+        .map(|p| [p[0], p[1], p[2]])
+        .collect::<Vec<_>>();
+    Colormap::new(pixels, width, height)
 }
 
 /// Load a single GUI texture (e.g. "widgets", "icons") from any asset source.

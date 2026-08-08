@@ -1221,10 +1221,7 @@ pub(super) fn create_texture_bind_group(
 ) {
     let mut atlas = TextureAtlasImage::load_default();
     let animated = std::mem::take(&mut atlas.animated);
-    let biome_colors = BiomeColors {
-        grass: atlas.grass_color,
-        foliage: atlas.foliage_color,
-    };
+    let biome_colors = BiomeColors::new(atlas.biome_colors.clone());
     let atlas_uv = atlas.uv_table();
     match &atlas.source {
         TextureAtlasSource::Directory(path) => {

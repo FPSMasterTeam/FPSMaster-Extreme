@@ -1,3 +1,4 @@
+pub mod biome;
 pub mod camera;
 pub mod chunk_mesh;
 /// NVIDIA DLSS upscaler (Vulkan + RTX only). Compiled only with `--features dlss`
@@ -16,6 +17,7 @@ pub mod sky;
 pub mod texture;
 pub mod ui;
 
+pub use biome::{biome_info, BiomeColorTable, Colormap};
 pub use camera::{Camera, Frustum};
 pub use chunk_mesh::{
     block_tint, build_section_mesh, build_world_mesh, set_block_tints, BiomeColors, ChunkMesh,

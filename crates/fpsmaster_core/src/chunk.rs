@@ -117,12 +117,29 @@ impl ChunkSection {
 /// Number of 16-block-tall sections in a 0..256 column.
 pub const SECTION_COUNT: usize = 16;
 
+/// Biome id used when a column carries no biome data — a chunk the server sent
+/// as a partial update, or a locally generated world. 1 is `plains`, whose
+/// colormap point is what the renderer used to hard-code for the whole world.
+pub const DEFAULT_BIOME: u8 = 1;
+
 #[derive(Debug, Clone)]
 pub struct Chunk {
     pub position: ChunkPos,
     // Direct-indexed by section_y (0..16). Indexing beats the old linear Vec
     // scan, which was a hot path: meshing does ~6 neighbour lookups per block.
     sections: [Option<Box<ChunkSection>>; SECTION_COUNT],
+    /// One biome id per (x, z) in `z * 16 + x` order — the wire layout of the
+    /// 1.8 chunk packet's trailing 256-byte biome array. `None` until a
+    /// ground-up packet supplies it.
+    biomes: Option<Box<[u8; 256]>>,
+    /// Whether this column's dimension has sky light at all.
+    ///
+    /// Decides what an *absent* section reads as. In the Overworld a missing
+    /// section is open air above the terrain, so sky 15 is right. The Nether and
+    /// End send no sky-light array at all (see the protocol decoder), and their
+    /// unallocated sections are equally absent — so the same fallback rendered
+    /// those dimensions fully sky-lit and washed out.
+    has_sky_light: bool,
 }
 
 impl Chunk {
@@ -130,7 +147,45 @@ impl Chunk {
         Self {
             position,
             sections: std::array::from_fn(|_| None),
+            biomes: None,
+            has_sky_light: true,
         }
+    }
+
+    /// Set whether this column's dimension has sky light; see [`Self::has_sky_light`].
+    pub fn set_has_sky_light(&mut self, has_sky_light: bool) {
+        self.has_sky_light = has_sky_light;
+    }
+
+    /// What sky light an absent section reads as: 15 with a sky, 0 without.
+    pub fn sky_light_fallback(&self) -> u8 {
+        if self.has_sky_light {
+            15
+        } else {
+            0
+        }
+    }
+
+    /// Store the column's biome array (the 256 trailing bytes of a ground-up
+    /// chunk packet). Ignores a wrongly-sized slice rather than panicking on
+    /// malformed server data.
+    pub fn set_biomes(&mut self, biomes: &[u8]) {
+        if let Ok(array) = <[u8; 256]>::try_from(biomes) {
+            self.biomes = Some(Box::new(array));
+        }
+    }
+
+    /// Biome id at a column-local (x, z), or [`DEFAULT_BIOME`] when this chunk
+    /// never received biome data.
+    pub fn biome_at(&self, x: u8, z: u8) -> u8 {
+        match &self.biomes {
+            Some(biomes) => biomes[(z as usize & 15) * 16 + (x as usize & 15)],
+            None => DEFAULT_BIOME,
+        }
+    }
+
+    pub fn has_biomes(&self) -> bool {
+        self.biomes.is_some()
     }
 
     pub fn sections(&self) -> impl Iterator<Item = &ChunkSection> {
@@ -177,7 +232,7 @@ impl Chunk {
 
     pub fn light_at(&self, x: u8, y: i32, z: u8) -> (u8, u8) {
         if !(0..256).contains(&y) {
-            return (0, 15);
+            return (0, self.sky_light_fallback());
         }
         let section_y = y >> 4;
         let local_y = (y & 15) as u8;
@@ -188,7 +243,7 @@ impl Chunk {
                     section.sky_light(x, local_y, z),
                 )
             })
-            .unwrap_or((0, 15))
+            .unwrap_or((0, self.sky_light_fallback()))
     }
 
     pub fn set_light(&mut self, x: u8, y: i32, z: u8, block_light: u8, sky_light: u8) {
