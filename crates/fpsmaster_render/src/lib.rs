@@ -16,6 +16,7 @@ pub mod renderer;
 pub mod sky;
 pub mod texture;
 pub mod ui;
+pub mod weather;
 
 pub use biome::{biome_info, BiomeColorTable, Colormap};
 pub use camera::{Camera, Frustum};

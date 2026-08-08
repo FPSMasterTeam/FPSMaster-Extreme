@@ -800,6 +800,26 @@ pub struct Renderer {
     /// World time in ticks (drives the day/night cycle); 6000 (noon) until the
     /// server sends a time update.
     world_time: f64,
+    /// Rain/snow curtain: one dynamic mesh per frame, drawn in two ranges
+    /// (rain indices first, then snow) so each half gets its own texture.
+    weather_mesh: Option<DynamicMesh>,
+    weather_rain_indices: u32,
+    weather_pipeline: wgpu::RenderPipeline,
+    lightning_mesh: Option<DynamicMesh>,
+    lightning_pipeline: wgpu::RenderPipeline,
+    lightning_bind_group: wgpu::BindGroup,
+    rain_bind_group: wgpu::BindGroup,
+    snow_bind_group: wgpu::BindGroup,
+    /// Interpolated rain / thunder strength (0..=1), pushed each frame by the
+    /// host. Drives the sky/fog colour, the lightmap's day factor, and the
+    /// rain curtain's density.
+    weather: [f32; 2],
+    /// Set while a lightning strike is flashing the sky; see `set_lightning_flash`.
+    lightning_flash: bool,
+    /// Standing water 0..=1; drives the puddle mask independently of rain.
+    puddle_level: f32,
+    /// Debug/test override: treat every column as snowy.
+    force_snow: bool,
     ui_pipeline: wgpu::RenderPipeline,
     /// Same shader/layout as `ui_pipeline` but with the vanilla crosshair
     /// inversion blend (`ONE_MINUS_DST_COLOR`/`ONE_MINUS_SRC_COLOR`).
@@ -2927,6 +2947,128 @@ impl Renderer {
             label: Some("model-shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("../shader/model.wgsl").into()),
         });
+        let weather_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("weather-shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../shader/weather.wgsl").into()),
+        });
+        let weather_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("weather-pipeline-layout"),
+                bind_group_layouts: &[Some(&camera_layout), Some(&entity_texture_layout)],
+                ..Default::default()
+            });
+        let weather_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("weather-pipeline"),
+            layout: Some(&weather_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &weather_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[Vertex::layout()],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &weather_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                // Two-sided: a curtain quad is edge-on to the player and gets
+                // seen from either side as the camera turns.
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                // Occluded by terrain, but never occludes anything itself.
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            cache: None,
+            multiview_mask: None,
+        });
+        let rain_bind_group = gpu::create_weather_bind_group(
+            &device,
+            &queue,
+            &entity_texture_layout,
+            Some("assets/minecraft/textures/environment/rain.png"),
+            "rain-texture",
+        );
+        let snow_bind_group = gpu::create_weather_bind_group(
+            &device,
+            &queue,
+            &entity_texture_layout,
+            Some("assets/minecraft/textures/environment/snow.png"),
+            "snow-texture",
+        );
+        let lightning_bind_group = gpu::create_weather_bind_group(
+            &device,
+            &queue,
+            &entity_texture_layout,
+            None,
+            "lightning-white",
+        );
+        // Vanilla draws the bolt additively over the scene (SRC_ALPHA, ONE) with
+        // no texture, which is what makes it read as light rather than a solid
+        // white ribbon.
+        let lightning_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("lightning-pipeline"),
+            layout: Some(&weather_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &weather_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[Vertex::layout()],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &weather_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::SrcAlpha,
+                            dst_factor: wgpu::BlendFactor::One,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                        alpha: wgpu::BlendComponent::OVER,
+                    }),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            cache: None,
+            multiview_mask: None,
+        });
         let model_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("model-pipeline-layout"),
@@ -4935,6 +5077,18 @@ impl Renderer {
             celestial_mesh: None,
             star_quads,
             world_time: 6000.0,
+            weather: [0.0, 0.0],
+            lightning_flash: false,
+            puddle_level: 0.0,
+            force_snow: false,
+            weather_mesh: None,
+            weather_rain_indices: 0,
+            weather_pipeline,
+            lightning_mesh: None,
+            lightning_pipeline,
+            lightning_bind_group,
+            rain_bind_group,
+            snow_bind_group,
             ui_pipeline,
             crosshair_pipeline,
             ui_bind_group_layout,
@@ -6269,8 +6423,12 @@ impl Renderer {
             1.0 / w as f32,
             1.0 / h as f32,
             0.85,
-            1.07,
-            1.1,
+            // Saturation and contrast. Minecraft's palette is already highly
+            // saturated, and stacking a boost on top of ACES turned grass
+            // fluorescent; these now sit at (or barely above) neutral and leave
+            // the grading to the tone map.
+            1.0,
+            1.02,
             on(self.bloom_enabled, 1.0),
             on(self.vignette_enabled, 0.45),
             on(self.chromatic_enabled, 0.004),
@@ -7331,6 +7489,60 @@ impl Renderer {
     /// Set the world time in ticks (vanilla 0..24000 per day), which drives the
     /// day/night sky and the world lightmap. Called each frame with partial-tick
     /// interpolation; until the server sends a time update it stays at noon.
+    /// Upload this frame's rain/snow curtain. Pass an empty mesh to clear it.
+    pub fn set_weather_mesh(&mut self, mesh: &crate::weather::WeatherMesh) {
+        self.weather_rain_indices = mesh.rain_indices;
+        gpu::fill_dynamic_mesh(
+            &self.device,
+            &self.queue,
+            &mut self.weather_mesh,
+            bytemuck::cast_slice(&mesh.vertices),
+            bytemuck::cast_slice(&mesh.indices),
+            mesh.indices.len() as u32,
+            "weather",
+        );
+    }
+
+    /// Rain and thunder strength (0..=1) for this frame, already interpolated
+    /// across the tick by the caller.
+    pub fn set_weather(&mut self, rain: f32, thunder: f32) {
+        self.weather = [rain.clamp(0.0, 1.0), thunder.clamp(0.0, 1.0)];
+    }
+
+    /// Standing-water level (0..=1), which accumulates far slower than the rain
+    /// itself — see `Weather::puddle`.
+    pub fn set_puddle_level(&mut self, level: f32) {
+        self.puddle_level = level.clamp(0.0, 1.0);
+    }
+
+    /// Force snow accumulation everywhere, overriding the per-vertex biome flag.
+    pub fn set_force_snow(&mut self, force: bool) {
+        self.force_snow = force;
+    }
+
+    /// Upload this frame's lightning bolt geometry (empty clears it).
+    pub fn set_lightning_mesh(&mut self, mesh: &crate::weather::WeatherMesh) {
+        gpu::fill_dynamic_mesh(
+            &self.device,
+            &self.queue,
+            &mut self.lightning_mesh,
+            bytemuck::cast_slice(&mesh.vertices),
+            bytemuck::cast_slice(&mesh.indices),
+            mesh.indices.len() as u32,
+            "lightning",
+        );
+    }
+
+    /// Whether a lightning bolt is lighting the sky this frame.
+    ///
+    /// Vanilla's `updateLightmap` drops the weather dimming from the sky term
+    /// entirely while `lastLightningBolt > 0`, which is what makes a strike
+    /// flash the whole world bright for a moment — not just the bolt's
+    /// surroundings.
+    pub fn set_lightning_flash(&mut self, flash: bool) {
+        self.lightning_flash = flash;
+    }
+
     pub fn set_world_time(&mut self, ticks: f64) {
         self.world_time = ticks;
     }
@@ -7340,6 +7552,7 @@ impl Renderer {
     /// the render pass so the buffers are ready when the sky/celestial passes
     /// draw.
     fn prepare_sky(&mut self, camera: &Camera, sky: &crate::sky::SkyColors) {
+        let overcast_now = self.weather[0].max(self.weather[1]).clamp(0.0, 1.0);
         // Rotation-only view-projection: sun/moon/stars sit at infinity, so the
         // sky wheels as the camera turns but does not translate with the player.
         let proj = Mat4::perspective_rh(
@@ -7361,7 +7574,8 @@ impl Renderer {
             bytemuck::bytes_of(&SkyUniform {
                 inv_view_proj: inv.to_cols_array_2d(),
                 horizon: [sky.horizon[0], sky.horizon[1], sky.horizon[2], 1.0],
-                zenith: [sky.zenith[0], sky.zenith[1], sky.zenith[2], 1.0],
+                // w carries the overcast level for the cloud shading.
+                zenith: [sky.zenith[0], sky.zenith[1], sky.zenith[2], overcast_now],
                 sun_dir: [sun_dir.x, sun_dir.y, sun_dir.z, sky.sunset[3]],
                 // rgb = sunset glow colour; w carries the user Brightness slider (the glow
                 // STRENGTH already lives in sun_dir.w), read by the path tracer to scale
@@ -7375,8 +7589,22 @@ impl Renderer {
                 ],
                 cloud_params: [
                     if self.shaders_enabled && self.clouds_enabled { 1.0 } else { 0.0 },
-                    0.5,                // coverage (fraction of sky filled)
-                    1.0,                // density multiplier
+                    // Coverage tracks the weather, but only within the range the
+                    // cloud shader can still SHAPE. Its density function opens a
+                    // `smoothstep(1-cov-0.18, 1-cov+0.12, base)` window over the
+                    // base noise; push coverage near 1 and that window slides
+                    // below the noise floor, saturating the base layer so the
+                    // only surviving structure is the 3x-frequency detail noise —
+                    // which renders as a repetitive fish-scale pattern, not
+                    // clouds. 0.75 keeps a real gradient in the window.
+                    //
+                    // The overcast *look* comes from the lighting instead: the
+                    // cloud colour already darkens with `cloud_params.w`
+                    // (sun_brightness), which carries the weather dimming.
+                    0.5 + 0.25 * self.weather[0].max(self.weather[1]),
+                    // Density only scales the final alpha, so anything past ~1
+                    // just clips the soft edges flat.
+                    1.0 + 0.15 * self.weather[0].max(self.weather[1]),
                     sky.sun_brightness, // day factor for cloud lighting
                 ],
             }),
@@ -7390,7 +7618,12 @@ impl Renderer {
         );
 
         let (vertices, indices) =
-            sky_geometry::build_mesh(self.world_time, &self.star_quads, sky.star_brightness);
+            sky_geometry::build_mesh(
+                self.world_time,
+                &self.star_quads,
+                sky.star_brightness,
+                1.0 - overcast_now,
+            );
         fill_dynamic_mesh(
             &self.device,
             &self.queue,
@@ -7935,7 +8168,12 @@ impl Renderer {
         // Time-of-day sky/lighting: one celestial-math evaluation drives the
         // chunk lightmap (sky_brightness), the sky-gradient colors and the
         // sun/moon/star geometry.
-        let sky = crate::sky::sky_colors(self.world_time);
+        let sky = if self.lightning_flash {
+            // The strike overrides the storm's dimming for a couple of ticks.
+            crate::sky::sky_colors(self.world_time, 0.0, 0.0)
+        } else {
+            crate::sky::sky_colors(self.world_time, self.weather[0], self.weather[1])
+        };
         // Absolute view-projection: kept for CPU frustum culling (tested against
         // absolute section AABBs) and for the motion-blur reprojection below.
         let view_proj = camera.view_projection();
@@ -8057,6 +8295,49 @@ impl Renderer {
         // now produce.
         let cam = cam_rel;
         let on = |b: bool| if b { 1.0 } else { 0.0 };
+        let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t;
+        // Thunder implies rain, so the heavier of the two sets the overcast.
+        let overcast = self.weather[0].max(self.weather[1]).clamp(0.0, 1.0);
+        // Sun colour across the day. A low sun shines through far more
+        // atmosphere, which scatters the blue out and leaves the warm dawn/dusk
+        // light; overhead it is near white. This was a fixed hue before, so noon
+        // and sunset lit the world identically — the single biggest reason the
+        // lighting read as monotone. Cubed, so the warmth only bites near the
+        // horizon rather than tinting the whole afternoon.
+        const SUN_NOON: [f32; 3] = [1.0, 0.96, 0.88];
+        const SUN_HORIZON: [f32; 3] = [1.0, 0.48, 0.22];
+        let elevation = sun_dir.y.clamp(0.0, 1.0);
+        let warmth = (1.0 - elevation).powi(3);
+        let sun_rgb = [
+            lerp(SUN_NOON[0], SUN_HORIZON[0], warmth),
+            lerp(SUN_NOON[1], SUN_HORIZON[1], warmth),
+            lerp(SUN_NOON[2], SUN_HORIZON[2], warmth),
+        ];
+        // Weather colour unification. Rain scatters light through a deep column
+        // of water droplets, which washes out the source's own hue: everything
+        // converges on one cool overcast tone. Standard shader-pack practice is
+        // to drive each light colour toward `luma(colour) * weatherTint` by the
+        // rain strength — keeping the brightness but discarding the hue — and it
+        // is most of why a rainy scene reads as coherent instead of "sunny
+        // lighting with rain drawn over it".
+        const WEATHER_TINT: [f32; 3] = [0.69, 0.88, 1.0];
+        let unify = |c: [f32; 3], amount: f32| {
+            let luma = c[0] * 0.299 + c[1] * 0.587 + c[2] * 0.114;
+            [
+                lerp(c[0], luma * WEATHER_TINT[0], amount),
+                lerp(c[1], luma * WEATHER_TINT[1], amount),
+                lerp(c[2], luma * WEATHER_TINT[2], amount),
+            ]
+        };
+        let sun_rgb = unify(sun_rgb, overcast);
+        let ambient_rgb = unify(
+            [
+                lerp(0.50, 0.66, overcast),
+                lerp(0.52, 0.67, overcast),
+                lerp(0.57, 0.70, overcast),
+            ],
+            overcast,
+        );
         let shadows_on = self.shaders_enabled && self.shadows_enabled;
         // Volumetric light reads the shadow map too, so render it whenever either
         // terrain shadows or the volumetric pass is active.
@@ -8145,13 +8426,25 @@ impl Renderer {
             bytemuck::bytes_of(&LightingUniform {
                 light_view_proj: light_view_proj.to_cols_array_2d(),
                 sun_dir: [sun_dir.x, sun_dir.y, sun_dir.z, 0.0],
-                sun_color: [1.0 * sb, 0.96 * sb, 0.88 * sb, 0.0],
-                ambient: [0.45, 0.48, 0.55, 0.0],
+                // Weather drives the whole directional-light budget. An overcast
+                // sky has no direct sun at all — it is one big area light — so
+                // the sun term fades out entirely and the ambient takes over,
+                // brighter and near-neutral instead of the clear-sky blue. Left
+                // at clear-sky values a storm rendered with full-strength sun and
+                // razor-sharp shadows, which is what made rain look wrong.
+                sun_color: [
+                    sun_rgb[0] * sb * (1.0 - overcast),
+                    sun_rgb[1] * sb * (1.0 - overcast),
+                    sun_rgb[2] * sb * (1.0 - overcast),
+                    0.0,
+                ],
+                ambient: [ambient_rgb[0], ambient_rgb[1], ambient_rgb[2], 0.0],
                 camera_pos: [cam.x, cam.y, cam.z, 0.0],
                 flags: [
                     on(self.shaders_enabled),
                     on(shadows_on),
-                    on(self.shaders_enabled && self.specular_enabled),
+                    // A wet overcast surface has no sun to glint off.
+                    on(self.shaders_enabled && self.specular_enabled) * (1.0 - overcast),
                     1.0 / SHADOW_DIM as f32,
                 ],
                 // Vanilla's `updateFogColor` blends the sunrise/sunset band into
@@ -8176,12 +8469,22 @@ impl Renderer {
                     // horizon colour just before the square cull — hiding the
                     // pop-in and letting a low render distance look acceptable.
                     // Independent of the master shader toggle (works shaders-off).
-                    self.render_distance as f32 * 16.0 * 0.55,
-                    self.render_distance as f32 * 16.0 * 0.90,
+                    // Rain thickens the air. Pulling the fog in is what turns
+                    // "clear view with rain streaks" into actual murk, and it is
+                    // the cheapest depth cue a storm has.
+                    self.render_distance as f32 * 16.0 * lerp(0.55, 0.22, overcast),
+                    self.render_distance as f32 * 16.0 * lerp(0.90, 0.62, overcast),
                     on(self.fog_enabled),
                     self.brightness,
                 ],
-                extra: [on(self.fullbright), 0.0, 0.0, 0.0],
+                // y: overcast 0..1 — how far the shader should dissolve the
+                // sun's hard shadow toward fully-lit.
+                extra: [
+                    on(self.fullbright),
+                    overcast,
+                    self.puddle_level,
+                    on(self.force_snow),
+                ],
             }),
         );
 
@@ -8196,7 +8499,7 @@ impl Renderer {
                 inv_view_proj: view_proj_rel.inverse().to_cols_array_2d(),
                 light_view_proj: light_view_proj.to_cols_array_2d(),
                 sun_dir: [sun_dir.x, sun_dir.y, sun_dir.z, 0.0],
-                sun_color: [1.0 * sb, 0.96 * sb, 0.88 * sb, 0.0],
+                sun_color: [sun_rgb[0] * sb, sun_rgb[1] * sb, sun_rgb[2] * sb, 0.0],
                 camera_pos: [cam.x, cam.y, cam.z, sb],
                 // density, max march dist, HG forward-scatter g, intensity. Denser +
                 // brighter + more forward-scattering so the shafts read clearly.
@@ -8795,6 +9098,39 @@ impl Renderer {
                         }
                     }
                 }
+            }
+
+            // Rain/snow curtain. After the terrain so it depth-tests against the
+            // world (rain stops at a roof) but before entities and the UI, and it
+            // writes no depth so quads blend through each other.
+            if let Some(mesh) = self.weather_mesh.as_ref().filter(|m| m.index_count > 0) {
+                pass.set_pipeline(&self.weather_pipeline);
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                // Two ranges out of one buffer: rain first, then snow.
+                let rain = self.weather_rain_indices.min(mesh.index_count);
+                if rain > 0 {
+                    pass.set_bind_group(1, &self.rain_bind_group, &[]);
+                    pass.draw_indexed(0..rain, 0, 0..1);
+                    draw_calls += 1;
+                }
+                if mesh.index_count > rain {
+                    pass.set_bind_group(1, &self.snow_bind_group, &[]);
+                    pass.draw_indexed(rain..mesh.index_count, 0, 0..1);
+                    draw_calls += 1;
+                }
+            }
+
+            // Lightning bolts, additive over everything drawn so far.
+            if let Some(mesh) = self.lightning_mesh.as_ref().filter(|m| m.index_count > 0) {
+                pass.set_pipeline(&self.lightning_pipeline);
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                pass.set_bind_group(1, &self.lightning_bind_group, &[]);
+                pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+                draw_calls += 1;
             }
 
             // Mining crack overlay: drawn with the translucent pipeline (alpha

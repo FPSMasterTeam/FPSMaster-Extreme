@@ -30,14 +30,23 @@ pub fn celestial_angle(time_ticks: f64) -> f32 {
     f + (f1 - f) / 3.0
 }
 
-/// Vanilla `World.getSunBrightness` (clear weather): 0.2 at midnight, 1.0 at
-/// noon. Used as the sky-light scale in the lightmap so caves/torch-lit areas
-/// stay lit while open ground darkens at night.
-pub fn sun_brightness(time_ticks: f64) -> f32 {
+/// Vanilla `World.getSunBrightness`: 0.2 at midnight, 1.0 at noon, further
+/// dimmed by rain and thunder. Used as the sky-light scale in the lightmap so
+/// caves/torch-lit areas stay lit while open ground darkens at night — and so
+/// a storm darkens the whole world, which is most of what makes weather read as
+/// weather rather than a particle effect painted over a sunny day.
+///
+/// `rain` and `thunder` are 0..=1 strengths; pass 0 for clear weather.
+pub fn sun_brightness(time_ticks: f64, rain: f32, thunder: f32) -> f32 {
     let angle = celestial_angle(time_ticks);
     let mut f1 = 1.0 - ((angle * TAU).cos() * 2.0 + 0.5);
     f1 = f1.clamp(0.0, 1.0);
     f1 = 1.0 - f1;
+    // The two weather terms this port was missing. Full rain removes 5/16 of the
+    // daylight and a full thunderstorm another 5/16 on top, so a storm at noon
+    // sits near an overcast dusk.
+    f1 *= 1.0 - rain.clamp(0.0, 1.0) * 5.0 / 16.0;
+    f1 *= 1.0 - thunder.clamp(0.0, 1.0) * 5.0 / 16.0;
     f1 * 0.8 + 0.2
 }
 
@@ -135,20 +144,42 @@ pub struct SkyColors {
     pub star_brightness: f32,
 }
 
-pub fn sky_colors(time_ticks: f64) -> SkyColors {
+pub fn sky_colors(time_ticks: f64, rain: f32, thunder: f32) -> SkyColors {
     let angle = celestial_angle(time_ticks);
     // Celestial dimming factor shared by the sky and fog colors.
     let f = ((angle * TAU).cos() * 2.0 + 0.5).clamp(0.0, 1.0);
+    let (rain, thunder) = (rain.clamp(0.0, 1.0), thunder.clamp(0.0, 1.0));
 
     // The vanilla math runs in vanilla's own (gamma) space, exactly as written in
     // `World.getSkyColor` / `getFogColor` — including the dimming factor `f`, which
     // is a gamma-space multiplier. Only the finished colour is converted to linear.
-    let zenith = [BASE_SKY[0] * f, BASE_SKY[1] * f, BASE_SKY[2] * f];
-    let horizon = [
+    let mut zenith = [BASE_SKY[0] * f, BASE_SKY[1] * f, BASE_SKY[2] * f];
+    // `getSkyColor`: rain washes the dome toward 0.6× its own luma, thunder
+    // further toward 0.2×, so a storm sky goes flat grey rather than merely dark.
+    for (strength, luma_scale) in [(rain, 0.6), (thunder, 0.2)] {
+        if strength > 0.0 {
+            let luma =
+                (zenith[0] * 0.3 + zenith[1] * 0.59 + zenith[2] * 0.11) * luma_scale;
+            let keep = 1.0 - strength * 0.75;
+            zenith = zenith.map(|c| c * keep + luma * (1.0 - keep));
+        }
+    }
+
+    let mut horizon = [
         0.752_941_2 * (f * 0.94 + 0.06),
         0.847_058_83 * (f * 0.94 + 0.06),
         1.0 * (f * 0.91 + 0.09),
     ];
+    // `EntityRenderer.updateFogColor`: rain dims red/green harder than blue (so
+    // the haze cools), thunder dims all three equally.
+    if rain > 0.0 {
+        horizon[0] *= 1.0 - rain * 0.5;
+        horizon[1] *= 1.0 - rain * 0.5;
+        horizon[2] *= 1.0 - rain * 0.4;
+    }
+    if thunder > 0.0 {
+        horizon = horizon.map(|c| c * (1.0 - thunder * 0.5));
+    }
     let sunset = sunrise_sunset_color(angle);
 
     SkyColors {
@@ -158,10 +189,12 @@ pub fn sky_colors(time_ticks: f64) -> SkyColors {
             srgb_to_linear(sunset[0]),
             srgb_to_linear(sunset[1]),
             srgb_to_linear(sunset[2]),
-            sunset[3],
+            // A storm has no visible sunrise band; vanilla's glow is drawn only
+            // when `getRainStrength` leaves the sky visible.
+            sunset[3] * (1.0 - rain),
         ],
-        sun_brightness: sun_brightness(time_ticks),
-        star_brightness: star_brightness(time_ticks),
+        sun_brightness: sun_brightness(time_ticks, rain, thunder),
+        star_brightness: star_brightness(time_ticks) * (1.0 - rain),
     }
 }
 
@@ -237,5 +270,66 @@ mod tests {
             noon_bright[0] >= noon_moody[0] - 0.001,
             "and never darkens a bright one"
         );
+    }
+}
+
+#[cfg(test)]
+mod weather_tests {
+    use super::*;
+
+    #[test]
+    fn rain_and_thunder_darken_the_sun() {
+        let noon = 6000.0;
+        let clear = sun_brightness(noon, 0.0, 0.0);
+        let rain = sun_brightness(noon, 1.0, 0.0);
+        let storm = sun_brightness(noon, 1.0, 1.0);
+        assert!(rain < clear, "rain dims daylight: {rain} vs {clear}");
+        assert!(storm < rain, "thunder dims it further: {storm} vs {rain}");
+        // Vanilla: each full term removes 5/16, applied multiplicatively, and the
+        // result is remapped through `* 0.8 + 0.2`.
+        let base = (clear - 0.2) / 0.8;
+        let want_rain = base * (1.0 - 5.0 / 16.0) * 0.8 + 0.2;
+        assert!((rain - want_rain).abs() < 1e-5, "{rain} vs {want_rain}");
+        // Never falls below the 0.2 night floor.
+        assert!(storm >= 0.2);
+    }
+
+    #[test]
+    fn a_storm_greys_the_sky_and_hides_the_stars() {
+        let midday = sky_colors(6000.0, 0.0, 0.0);
+        let stormy = sky_colors(6000.0, 1.0, 1.0);
+        let spread = |c: [f32; 3]| {
+            c.iter().cloned().fold(f32::MIN, f32::max) - c.iter().cloned().fold(f32::MAX, f32::min)
+        };
+        assert!(
+            spread(stormy.zenith) < spread(midday.zenith),
+            "storm desaturates the dome: {:?} vs {:?}",
+            stormy.zenith,
+            midday.zenith
+        );
+        assert!(
+            stormy.horizon.iter().sum::<f32>() < midday.horizon.iter().sum::<f32>(),
+            "and darkens the horizon"
+        );
+
+        // Stars and the sunrise band are hidden behind full overcast.
+        let night_clear = sky_colors(18000.0, 0.0, 0.0);
+        let night_rain = sky_colors(18000.0, 1.0, 0.0);
+        assert!(night_clear.star_brightness > 0.0);
+        assert_eq!(night_rain.star_brightness, 0.0);
+        let dusk_clear = sky_colors(12500.0, 0.0, 0.0);
+        let dusk_rain = sky_colors(12500.0, 1.0, 0.0);
+        assert!(dusk_clear.sunset[3] > 0.0, "clear dusk has a glow band");
+        assert_eq!(dusk_rain.sunset[3], 0.0, "overcast dusk does not");
+    }
+
+    #[test]
+    fn clear_weather_is_unchanged() {
+        // The weather terms must be inert at 0 so existing behaviour is intact.
+        for t in [0.0, 6000.0, 13000.0, 18000.0] {
+            let base = (1.0 - ((celestial_angle(t) * TAU).cos() * 2.0 + 0.5)).clamp(0.0, 1.0);
+            let want = (1.0 - base) * 0.8 + 0.2;
+            assert!((sun_brightness(t, 0.0, 0.0) - want).abs() < 1e-6);
+        }
     }
 }

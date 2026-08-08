@@ -183,11 +183,15 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         // than a straight linear stretch — deepens shadows + lifts highlights cinematically.
         let cc = clamp((color - 0.5) * params.q.z + 0.5, vec3<f32>(0.0), vec3<f32>(1.0));
         let s = cc * cc * cc * (cc * (cc * 6.0 - 15.0) + 10.0);
-        color = mix(cc, s, 0.35);
+        // A light touch: at 0.35 this S-curve crushed shadows into hard black
+        // wedges on top of everything else the grade was already doing.
+        color = mix(cc, s, 0.12);
         // Subtle cinematic split-tone: cool the shadows, warm the highlights.
         let lg = dot(color, vec3<f32>(0.2126, 0.7152, 0.0722));
-        let cool = vec3<f32>(0.96, 0.99, 1.06);
-        let warm = vec3<f32>(1.06, 1.005, 0.94);
+        // Split-tone, halved: the old strength tinted every shadow visibly blue,
+        // which read as a colour cast rather than a grade.
+        let cool = vec3<f32>(0.98, 0.995, 1.03);
+        let warm = vec3<f32>(1.03, 1.0, 0.97);
         color = clamp(color * mix(cool, warm, smoothstep(0.15, 0.85, lg)), vec3<f32>(0.0), vec3<f32>(1.0));
     }
 

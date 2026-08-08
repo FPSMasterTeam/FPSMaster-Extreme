@@ -2677,6 +2677,49 @@ fn render_frame(
     // Drive the day/night sky and lightmap from the world clock (interpolated
     // for smooth motion between ticks).
     renderer.set_world_time(app.game.world_time(tick_alpha));
+    renderer.set_weather(
+        app.game.weather().rain_strength(tick_alpha),
+        app.game.weather().thunder_strength(tick_alpha),
+    );
+    renderer.set_lightning_flash(app.game.weather().lightning_flash());
+    renderer.set_puddle_level(app.game.weather().puddle_level(tick_alpha));
+    renderer.set_force_snow(app.game.weather().force_snow());
+    // Rain/snow curtain: rebuilt each frame, since the columns follow the camera
+    // and the scroll phase is per-frame anyway.
+    {
+        let radius = fpsmaster_render::weather::curtain_radius(app.settings.fancy_graphics);
+        let columns = app.game.precipitation_columns(tick_alpha, radius);
+        let eye = app.game.camera.position;
+        let mesh = fpsmaster_render::weather::build_mesh(
+            &columns,
+            [eye.x as f64, eye.y as f64, eye.z as f64],
+            app.game.weather_animation_time(tick_alpha),
+            app.game.weather().rain_strength(tick_alpha),
+            radius,
+        );
+        renderer.set_weather_mesh(&mesh);
+
+        // Lightning bolts: merged into one mesh, since there are rarely more
+        // than one or two alive at a time.
+        let mut bolts = fpsmaster_render::weather::WeatherMesh {
+            vertices: Vec::new(),
+            indices: Vec::new(),
+            rain_indices: 0,
+        };
+        for bolt in app.game.lightning_bolts() {
+            let part = fpsmaster_render::weather::build_lightning(
+                bolt.x,
+                bolt.y,
+                bolt.z,
+                bolt.seed,
+                bolt.brightness(),
+            );
+            let base = bolts.vertices.len() as u32;
+            bolts.vertices.extend(part.vertices);
+            bolts.indices.extend(part.indices.into_iter().map(|i| i + base));
+        }
+        renderer.set_lightning_mesh(&bolts);
+    }
     let render_start = Instant::now();
     // Local-player body for ray-traced shadows + reflections (RT-only — never rasterized in
     // first person). Built from the camera each frame so it works in both the game and the

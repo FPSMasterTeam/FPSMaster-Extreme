@@ -98,6 +98,14 @@ pub struct ChunkMeshBuffers {
     /// Transient meshing state: set before emitting an emissive block's faces so each
     /// pushed vertex is flagged (bit 16 of pos_light.w). Not real output data.
     emissive: bool,
+    /// Likewise for bit 17: this column's biome gets snow rather than rain.
+    ///
+    /// Baked per vertex rather than derived in the shader because the shader has
+    /// no biome data at all, and taking it from the camera's biome would make
+    /// the whole world flip between snowy and rainy as the player crosses a
+    /// border. It is a property of the terrain, and the terrain is already
+    /// re-meshed when it loads.
+    snowy: bool,
 }
 
 impl ChunkMeshBuffers {
@@ -144,7 +152,15 @@ impl ChunkMeshBuffers {
             corners.into_iter().zip(uvs).zip(colors).zip(lights)
         {
             self.vertices
-                .push(encode_chunk_vertex(position, color, uv, light, normal, self.emissive));
+                .push(encode_chunk_vertex(
+                    position,
+                    color,
+                    uv,
+                    light,
+                    normal,
+                    self.emissive,
+                    self.snowy,
+                ));
         }
         self.indices
             .extend_from_slice(&[start, start + 1, start + 2, start, start + 2, start + 3]);
@@ -178,6 +194,7 @@ fn encode_chunk_vertex(
     light: [f32; 2],
     normal: [f32; 3],
     emissive: bool,
+    snowy: bool,
 ) -> ChunkVertex {
     let snorm = |x: f32| (x.clamp(-1.0, 1.0) * 127.0).round() as i8;
     let px = (position[0] * 64.0).round() as i32;
@@ -186,7 +203,11 @@ fn encode_chunk_vertex(
     let sky_u8 = (light[0] * 255.0 + 0.5) as u8;
     let block_u8 = (light[1] * 255.0 + 0.5) as u8;
     // bit 16 = self-emissive block flag (read by the shader for the HDR bloom).
-    let w = ((emissive as i32) << 16) | ((sky_u8 as i32) << 8) | (block_u8 as i32);
+    // bit 17 = snowy biome, so weather accumulates as snow instead of puddles.
+    let w = ((snowy as i32) << 17)
+        | ((emissive as i32) << 16)
+        | ((sky_u8 as i32) << 8)
+        | (block_u8 as i32);
     ChunkVertex {
         pos_light: [px, py, pz, w],
         color: [
@@ -743,6 +764,12 @@ fn append_block<S: BlockSource>(
     mesh.cutout.emissive = e;
     mesh.transparent.emissive = e;
     mesh.water.emissive = e;
+    // Snow vs rain is fixed by the column's biome and altitude, so bake it in.
+    let snowy = crate::weather::column_precipitation(ctx.source.biome_at(x, z), y) == Some(true);
+    mesh.solid.snowy = snowy;
+    mesh.cutout.snowy = snowy;
+    mesh.transparent.snowy = snowy;
+    mesh.water.snowy = snowy;
     match block.render_shape() {
         RenderShape::None => {}
         RenderShape::Cube => append_cube(mesh, ctx, x, y, z, block),

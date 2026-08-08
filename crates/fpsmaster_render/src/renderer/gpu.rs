@@ -798,11 +798,20 @@ pub(super) mod sky_geometry {
     /// Build the per-frame celestial mesh (sun, moon, and — when visible — the
     /// stars), rotated for `time_ticks` and with the stars faded by
     /// `star_brightness`.
+    ///
+    /// `sky_visibility` is vanilla's `1 - rainStrength`, which `renderSky` applies
+    /// to the whole celestial group: under a full overcast the sun and moon are
+    /// simply not drawn. Without it a storm still shows a hard, brilliant sun
+    /// disc through the cloud deck.
     pub fn build_mesh(
         time_ticks: f64,
         stars: &[[Vec3; 4]],
         star_brightness: f32,
+        sky_visibility: f32,
     ) -> (Vec<Vertex>, Vec<u32>) {
+        if sky_visibility <= 0.01 {
+            return (Vec::new(), Vec::new());
+        }
         let rot = sky::celestial_rotation(time_ticks);
         let mut vertices = Vec::new();
         let mut indices = Vec::new();
@@ -831,7 +840,7 @@ pub(super) mod sky_geometry {
                 Vec3::new(-s, d, s),
             ],
             [[su0, sv0], [su1, sv0], [su1, sv1], [su0, sv1]],
-            [1.0, 1.0, 1.0, 1.0],
+            [1.0, 1.0, 1.0, sky_visibility],
         );
 
         // Moon: quad at −Y, with the current phase tile (vanilla UV winding).
@@ -845,13 +854,13 @@ pub(super) mod sky_geometry {
                 Vec3::new(-m, -d, -m),
             ],
             [[mu1, mv1], [mu0, mv1], [mu0, mv0], [mu1, mv0]],
-            [1.0, 1.0, 1.0, 1.0],
+            [1.0, 1.0, 1.0, sky_visibility],
         );
 
         // Stars: only when the night sky has faded them in.
         if star_brightness > 0.01 {
             let white = sky_white_uv();
-            let color = [1.0, 1.0, 1.0, star_brightness];
+            let color = [1.0, 1.0, 1.0, star_brightness * sky_visibility];
             for quad in stars {
                 push(*quad, [white; 4], color);
             }
@@ -1605,3 +1614,88 @@ pub(super) fn create_panorama_resources(
     })
 }
 
+
+/// Bind group for one weather curtain texture (`rain.png` / `snow.png`).
+///
+/// The sampler WRAPS on both axes, which is load-bearing: the curtain's V is
+/// `blockY * 0.25 + scroll` and runs far outside 0..1, so clamping would smear
+/// the bottom row of the texture down the whole quad instead of tiling it.
+pub(super) fn create_weather_bind_group(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    layout: &wgpu::BindGroupLayout,
+    asset: Option<&str>,
+    label: &str,
+) -> wgpu::BindGroup {
+    // `None` builds a 1x1 opaque white texel — the lightning pass wants flat
+    // untextured geometry. A missing *asset* instead falls back to a single
+    // TRANSPARENT texel, so a curtain with no texture silently draws nothing
+    // rather than a wall of magenta.
+    let image = asset.and_then(crate::texture::load_asset_image);
+    let (width, height, pixels) = match (asset, image) {
+        (_, Some(img)) => (img.width(), img.height(), img.into_raw()),
+        (None, None) => (1, 1, vec![255u8; 4]),
+        (Some(asset), None) => {
+            log::warn!("weather texture {asset} not found; precipitation will not draw");
+            (1, 1, vec![0u8; 4])
+        }
+    };
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &pixels,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(4 * width),
+            rows_per_image: Some(height),
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some(label),
+        address_mode_u: wgpu::AddressMode::Repeat,
+        address_mode_v: wgpu::AddressMode::Repeat,
+        address_mode_w: wgpu::AddressMode::Repeat,
+        mag_filter: wgpu::FilterMode::Nearest,
+        min_filter: wgpu::FilterMode::Nearest,
+        mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+        ..Default::default()
+    });
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some(label),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(&sampler),
+            },
+        ],
+    })
+}
