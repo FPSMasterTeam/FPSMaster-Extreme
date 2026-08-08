@@ -68,6 +68,7 @@ fpsmaster.shaders.specular=高光
 fpsmaster.shaders.fog=雾
 fpsmaster.shaders.bloom=泛光
 fpsmaster.shaders.volLight=体积光
+fpsmaster.shaders.ssao=环境光遮蔽
 fpsmaster.shaders.vignette=暗角
 fpsmaster.shaders.chroma=色散
 fpsmaster.shaders.dof=景深

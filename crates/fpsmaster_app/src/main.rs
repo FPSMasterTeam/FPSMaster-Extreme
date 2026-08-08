@@ -346,6 +346,7 @@ impl ApplicationHandler for WinitApp {
         renderer.set_shadows_enabled(settings.shader_shadows);
         renderer.set_specular_enabled(settings.shader_specular);
         renderer.set_fog_enabled(settings.shader_fog);
+        renderer.set_ssao_enabled(settings.shaders && settings.shader_ssao);
         renderer.set_bloom_enabled(settings.shader_bloom);
         renderer.set_brightness(settings.brightness);
         renderer.set_vignette_enabled(settings.post_vignette);
@@ -1264,6 +1265,7 @@ fn handle_actions(
             GuiAction::SetResolution => apply_display(window, &app.settings),
             GuiAction::SetFullscreen => apply_display(window, &app.settings),
             GuiAction::SetShaders(on) => {
+                renderer.set_ssao_enabled(on && app.settings.shader_ssao);
                 // Shaders force smooth meshing; if that flips the mesh format
                 // (Smooth Light was off), re-mesh the world so the vertex format
                 // matches the pipeline that will draw it.
@@ -1276,6 +1278,9 @@ fn handle_actions(
             GuiAction::SetShaderShadows(on) => renderer.set_shadows_enabled(on),
             GuiAction::SetShaderSpecular(on) => renderer.set_specular_enabled(on),
             GuiAction::SetShaderFog(on) => renderer.set_fog_enabled(on),
+            GuiAction::SetShaderSsao(on) => {
+                renderer.set_ssao_enabled(app.settings.shaders && on)
+            }
             GuiAction::SetShaderBloom(on) => renderer.set_bloom_enabled(on),
             GuiAction::SetBrightness(v) => renderer.set_brightness(v),
             GuiAction::SetVignette(on) => renderer.set_vignette_enabled(on),

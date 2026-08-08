@@ -182,6 +182,7 @@ pub enum GuiAction {
     SetShaderSpecular(bool),
     SetShaderFog(bool),
     SetShaderBloom(bool),
+    SetShaderSsao(bool),
     SetBrightness(f32),
     SetVignette(bool),
     SetChromatic(bool),
