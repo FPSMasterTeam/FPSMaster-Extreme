@@ -20,6 +20,34 @@ pub const fn is_block_entity(id: u16) -> bool {
     matches!(id, 54 | 63 | 68 | 116 | 119 | 130 | 146)
 }
 
+/// Which of the two light nibbles a flood operates on. `light_at` returns a
+/// `(block, sky)` pair; this selects one half so sky and block light can share
+/// a single BFS instead of two near-identical copies.
+#[derive(Clone, Copy, Debug)]
+enum LightKind {
+    Sky,
+    Block,
+}
+
+impl LightKind {
+    /// This kind's level out of a `(block, sky)` pair.
+    fn get(self, light: (u8, u8)) -> u8 {
+        match self {
+            Self::Sky => light.1,
+            Self::Block => light.0,
+        }
+    }
+
+    /// `light` with this kind's half replaced by `level`, shaped for `set_light`
+    /// so the other half is preserved.
+    fn with(self, light: (u8, u8), level: u8) -> (u8, u8) {
+        match self {
+            Self::Sky => (light.0, level),
+            Self::Block => (level, light.1),
+        }
+    }
+}
+
 impl World {
     pub fn new() -> Self {
         Self::default()
@@ -179,6 +207,183 @@ impl World {
             chunk.recompute_vertical_skylight();
         }
         self.propagate_sky_light();
+    }
+
+    /// Finish lighting a freshly generated column (the single-player world-gen
+    /// path). Returns every section whose light changed, so the caller can
+    /// re-mesh it — including sections in neighbouring columns.
+    ///
+    /// The generator only runs [`Chunk::recompute_vertical_skylight`], which sets
+    /// every cell at or below the column's heightmap to sky-light 0. On its own
+    /// that is a hard black edge with none of vanilla's horizontal bleed, so a
+    /// tree canopy or an overhang leaves the ground under it at 0 (vanilla: ~13).
+    /// This adds the two floods that finish the job:
+    ///
+    /// * **sky light** — relax outward from the cells the vertical cast left lit,
+    ///   with the vanilla `max(1, lightOpacity)` per-block decay;
+    /// * **block light** — seed every emitter in the column at its `luminance()`
+    ///   and flood the same way, so generated lava/glowstone actually glows
+    ///   instead of waiting for the player to re-place it.
+    ///
+    /// Both passes are ADDITION-ONLY, which is sound here: a column is generated
+    /// exactly once, into a slot that was previously unloaded, and light never
+    /// propagates out of an unloaded chunk (see the `is_block_column_loaded`
+    /// guard in [`Self::flood_light`]). So no neighbour can already hold light
+    /// that the new blocks ought to *remove* — only paths that add.
+    ///
+    /// Seeding is bounded to the new column plus the one-block border strip of
+    /// its four neighbours, making the scan O(column) instead of
+    /// [`Self::propagate_sky_light`]'s O(every loaded chunk) — the difference
+    /// between a few thousand cells per generated column and a full-world sweep
+    /// on every streaming step. The floods themselves only visit cells that
+    /// actually brighten and die out after at most 15 steps.
+    pub fn light_generated_column(&mut self, cx: i32, cz: i32) -> Vec<SectionPos> {
+        let mut changed: HashSet<SectionPos> = HashSet::new();
+        // Only allocated sections hold light; the air above the terrain is absent
+        // and reads as sky 15 / block 0, which is already correct.
+        let Some(chunk) = self.chunks.get(&ChunkPos::new(cx, cz)) else {
+            return Vec::new();
+        };
+        let (mut y_min, mut y_max) = (i32::MAX, i32::MIN);
+        for section in chunk.sections() {
+            y_min = y_min.min(section.y() * 16);
+            y_max = y_max.max(section.y() * 16 + 15);
+        }
+        if y_min > y_max {
+            return Vec::new();
+        }
+
+        // Working region: the new column plus the one-block border strip outside
+        // each of its four sides, indexed `[dx][dz]` over `x0-1 + dx`. The strip
+        // lets light flow IN from terrain generated earlier; the outward direction
+        // is covered by the column's own seeds, which the flood pushes across.
+        const W: usize = 18;
+        let (x0, z0) = (cx * 16, cz * 16);
+        let world_x = |dx: usize| x0 - 1 + dx as i32;
+        let world_z = |dz: usize| z0 - 1 + dz as i32;
+
+        // One pass over the region, with the owning chunk hoisted OUT of the y
+        // loop. Resolving it per cell instead (`light_at`/`block_at`) re-hashes
+        // the chunk map ~30k times per generated column and measured as 84% of
+        // the whole pass — this walk is plain array indexing.
+        //
+        // `heights` is the vanilla heightmap (topmost cell with any light
+        // opacity) per column, or `i32::MIN` for a column that is not loaded.
+        let mut heights = [[i32::MIN; W]; W];
+        let mut emitters: Vec<(i32, i32, i32, u8)> = Vec::new();
+        let mut block_queue: VecDeque<(i32, i32, i32)> = VecDeque::new();
+        for (dx, row) in heights.iter_mut().enumerate() {
+            for (dz, slot) in row.iter_mut().enumerate() {
+                let (x, z) = (world_x(dx), world_z(dz));
+                let Some(col) = self
+                    .chunks
+                    .get(&ChunkPos::new(div_floor(x, 16), div_floor(z, 16)))
+                else {
+                    continue;
+                };
+                let (lx, lz) = (mod_floor(x, 16) as u8, mod_floor(z, 16) as u8);
+                let mut height = y_min - 1;
+                for y in (y_min..=y_max).rev() {
+                    let block = col.get_block(lx, y, lz);
+                    if height == y_min - 1 && block.light_opacity() > 0 {
+                        height = y;
+                    }
+                    // Emitters can sit anywhere in the column (buried lava, a
+                    // glowstone vein), so this half genuinely needs the full walk.
+                    let emit = block.luminance();
+                    let block_l = col.light_at(lx, y, lz).0;
+                    if emit > block_l {
+                        emitters.push((x, y, z, emit));
+                    } else if block_l > 0 {
+                        block_queue.push_back((x, y, z));
+                    }
+                }
+                *slot = height;
+            }
+        }
+
+        // Sky seeds. Within a column every cell above its heightmap is already 15
+        // and every cell below is 0, so the only cells with anything to give are:
+        // the one directly above this column's own heightmap (light travels DOWN
+        // through leaves/water, which have opacity but are not opaque), and those
+        // level with a still-dark neighbouring column, up to the tallest of the
+        // four. Seeding the full lit span instead would enqueue ~30 cells per
+        // column whose neighbours are all equally lit — pure flood overhead,
+        // since the BFS only ever enqueues cells it actually brightens and so
+        // cannot route through an already-15 cell.
+        let mut sky_queue: VecDeque<(i32, i32, i32)> = VecDeque::new();
+        // Indexed rather than iterated: each cell reads its four NEIGHBOURS out of
+        // `heights`, which an `iter().enumerate()` borrow would not allow.
+        #[allow(clippy::needless_range_loop)]
+        for dx in 0..W {
+            for dz in 0..W {
+                let height = heights[dx][dz];
+                if height == i32::MIN {
+                    continue;
+                }
+                let mut top = height + 1;
+                for (ndx, ndz) in [
+                    (dx.wrapping_sub(1), dz),
+                    (dx + 1, dz),
+                    (dx, dz.wrapping_sub(1)),
+                    (dx, dz + 1),
+                ] {
+                    if ndx < W && ndz < W && heights[ndx][ndz] != i32::MIN {
+                        top = top.max(heights[ndx][ndz]);
+                    }
+                }
+                let (x, z) = (world_x(dx), world_z(dz));
+                for y in (height + 1).max(y_min)..=top.min(y_max) {
+                    sky_queue.push_back((x, y, z));
+                }
+            }
+        }
+
+        // The generator never writes block light, so an emitter starts at 0.
+        for (x, y, z, emit) in emitters {
+            let sky_l = self.light_at(x, y, z).1;
+            self.set_light(x, y, z, emit, sky_l);
+            insert_section_borders(x, y, z, &mut changed);
+            block_queue.push_back((x, y, z));
+        }
+
+        self.flood_light(sky_queue, LightKind::Sky, &mut changed);
+        self.flood_light(block_queue, LightKind::Block, &mut changed);
+        changed.into_iter().collect()
+    }
+
+    /// Shared addition-only flood used by [`Self::light_generated_column`]: pop a
+    /// lit cell, push its light into any neighbour the vanilla decay can still
+    /// brighten. Never crosses into an unloaded column.
+    fn flood_light(
+        &mut self,
+        mut queue: VecDeque<(i32, i32, i32)>,
+        kind: LightKind,
+        changed: &mut HashSet<SectionPos>,
+    ) {
+        while let Some((cx, cy, cz)) = queue.pop_front() {
+            let level = kind.get(self.light_at(cx, cy, cz));
+            // At level 1 every neighbour would receive 0 — nothing left to give.
+            if level <= 1 {
+                continue;
+            }
+            for (nx, ny, nz) in neighbors(cx, cy, cz) {
+                if !(0..256).contains(&ny) || !self.is_block_column_loaded(nx, nz) {
+                    continue;
+                }
+                let Some(cost) = self.light_cost(nx, ny, nz) else {
+                    continue;
+                };
+                let new_level = level.saturating_sub(cost);
+                let existing = self.light_at(nx, ny, nz);
+                if new_level > kind.get(existing) {
+                    let (block_l, sky_l) = kind.with(existing, new_level);
+                    self.set_light(nx, ny, nz, block_l, sky_l);
+                    insert_section_borders(nx, ny, nz, changed);
+                    queue.push_back((nx, ny, nz));
+                }
+            }
+        }
     }
 
     /// Vanilla propagation cost of light entering the cell at (x,y,z):
@@ -899,6 +1104,131 @@ mod tests {
                 .unwrap()
                 .light_at(15, 64, 15),
             (3, 14)
+        );
+    }
+
+    /// Build a solid ground plane at y=64 across one chunk column, so the
+    /// vertical cast has a heightmap to work from.
+    fn ground_column(world: &mut World, cx: i32, cz: i32) {
+        for lx in 0..16 {
+            for lz in 0..16 {
+                world.set_block(cx * 16 + lx, 64, cz * 16 + lz, BlockState::STONE);
+            }
+        }
+    }
+
+    #[test]
+    fn generated_column_bleeds_sky_light_under_a_canopy() {
+        let mut world = World::new();
+        ground_column(&mut world, 0, 0);
+        // A 5×5 leaf canopy floating two blocks above the ground, like a tree.
+        let leaves = BlockState::new(18, 0);
+        for x in 6..=10 {
+            for z in 6..=10 {
+                world.set_block(x, 67, z, leaves);
+            }
+        }
+        world
+            .chunk_mut_or_insert(ChunkPos::new(0, 0))
+            .recompute_vertical_skylight();
+
+        // The vertical cast alone leaves everything under the canopy pitch black:
+        // this is the bug the flood exists to fix.
+        assert_eq!(
+            world.light_at(8, 65, 8).1,
+            0,
+            "vertical cast alone zeroes the cell under the canopy"
+        );
+
+        let changed = world.light_generated_column(0, 0);
+
+        let under = world.light_at(8, 65, 8).1;
+        assert!(
+            under >= 11,
+            "sky light must bleed in sideways under the canopy (vanilla ~13), got {under}"
+        );
+        // Falls off toward the middle of the canopy rather than jumping to full.
+        let edge = world.light_at(6, 65, 6).1;
+        assert!(edge > under, "the canopy edge stays brighter than its centre");
+        assert_eq!(
+            world.light_at(3, 65, 3).1,
+            15,
+            "open ground beside the tree keeps full daylight"
+        );
+        assert!(
+            !changed.is_empty(),
+            "relit sections are reported so the caller can re-mesh"
+        );
+    }
+
+    #[test]
+    fn generated_column_floods_block_light_from_emitters() {
+        let mut world = World::new();
+        ground_column(&mut world, 0, 0);
+        // Glowstone sunk into the ground plane, as cave generation would leave it.
+        world.set_block(8, 64, 8, BlockState::new(89, 0));
+        world
+            .chunk_mut_or_insert(ChunkPos::new(0, 0))
+            .recompute_vertical_skylight();
+        assert_eq!(
+            world.light_at(8, 65, 8).0,
+            0,
+            "generation writes no block light on its own"
+        );
+
+        world.light_generated_column(0, 0);
+
+        assert_eq!(world.light_at(8, 64, 8).0, 15, "emitter is seeded full bright");
+        assert_eq!(world.light_at(8, 65, 8).0, 14, "one block away = 15-1");
+        assert_eq!(world.light_at(8, 69, 8).0, 10, "five blocks away = 15-5");
+        assert_eq!(
+            world.light_at(8, 65, 8).1,
+            15,
+            "the block-light flood leaves sky light alone"
+        );
+    }
+
+    #[test]
+    fn generated_column_exchanges_light_across_the_chunk_border() {
+        let mut world = World::new();
+        // Column (0,0) generated first, fully roofed so it is dark inside.
+        ground_column(&mut world, 0, 0);
+        for lx in 0..16 {
+            for lz in 0..16 {
+                world.set_block(lx, 70, lz, BlockState::STONE);
+            }
+        }
+        world
+            .chunk_mut_or_insert(ChunkPos::new(0, 0))
+            .recompute_vertical_skylight();
+        world.light_generated_column(0, 0);
+        assert_eq!(
+            world.light_at(15, 67, 8).1,
+            0,
+            "roofed column is dark while its neighbour does not exist yet"
+        );
+
+        // Its open-sky neighbour arrives later; light must flow back across.
+        ground_column(&mut world, 1, 0);
+        world
+            .chunk_mut_or_insert(ChunkPos::new(1, 0))
+            .recompute_vertical_skylight();
+        let changed = world.light_generated_column(1, 0);
+
+        assert_eq!(
+            world.light_at(16, 67, 8).1,
+            15,
+            "the new open column itself is fully lit"
+        );
+        assert_eq!(
+            world.light_at(15, 67, 8).1,
+            14,
+            "light crosses back into the older roofed column"
+        );
+        assert_eq!(world.light_at(14, 67, 8).1, 13, "and keeps decaying inward");
+        assert!(
+            changed.contains(&SectionPos::new(0, 4, 0)),
+            "the older column's touched section is reported dirty so it re-meshes: {changed:?}"
         );
     }
 }

@@ -115,11 +115,25 @@ fn sample_tile(repeat_uv: vec2<f32>, tile_origin: vec2<f32>) -> vec4<f32> {
     return textureSampleGrad(block_atlas, block_sampler, atlas_uv, ddx, ddy);
 }
 
+// sRGB -> linear, matching chunk.wgsl (see the long note there): the vertex colour
+// and the lightmap are vanilla gamma-space multipliers, but the atlas is sampled as
+// Rgba8UnormSrgb (linear) and the swapchain re-encodes, so they have to be decoded
+// before they scale the texel or the whole shading ladder flattens out.
+fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
+    let low = c / 12.92;
+    let high = pow((c + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4));
+    return select(high, low, c <= vec3<f32>(0.04045));
+}
+
 fn shade(in: VsOut, texel: vec4<f32>) -> vec3<f32> {
     let gamma = lighting.fog_params.w;
-    let albedo = texel.rgb * in.color.rgb;
+    let albedo = texel.rgb * srgb_to_linear(in.color.rgb);
     // Fullbright preset: skip the lightmap darkening (keep baked AO/face shade).
-    let lit = select(albedo * light_curve(vanilla_lightmap(in.light), gamma), albedo, lighting.extra.x > 0.5);
+    let lit = select(
+        albedo * srgb_to_linear(light_curve(vanilla_lightmap(in.light), gamma)),
+        albedo,
+        lighting.extra.x > 0.5,
+    );
     return apply_fog(lit, in.world_pos);
 }
 
@@ -133,6 +147,20 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 fn fs_cutout(in: VsOut) -> @location(0) vec4<f32> {
     let texel = sample_tile(in.repeat_uv, in.tile_origin);
     if (texel.a * in.color.a < 0.5) {
+        discard;
+    }
+    return vec4<f32>(shade(in, texel), 1.0);
+}
+
+// Graphics: Fast — the translucent layer drawn opaque. Matches chunk.wgsl's
+// entry of the same name: REPLACE blending throws the alpha away, so a fully
+// transparent texel (the empty part of `glass_pane_top_*`) would be written as
+// solid black unless it is discarded first. The threshold stays well under
+// stained glass's 0.4 body alpha so only genuinely empty texels drop out.
+@fragment
+fn fs_opaque_cutout(in: VsOut) -> @location(0) vec4<f32> {
+    let texel = sample_tile(in.repeat_uv, in.tile_origin);
+    if (texel.a * in.color.a < 0.05) {
         discard;
     }
     return vec4<f32>(shade(in, texel), 1.0);

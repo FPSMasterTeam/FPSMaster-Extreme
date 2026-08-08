@@ -52,8 +52,8 @@ sdk/                                # 可选，随包附带
 
 ```json
 {
-  "versionTag": "0.3.1",
-  "downloadUrl": "https://cdn.fpsmaster.top/extreme/0.3.1/FPSMaster-Extreme-0.3.1-macos-aarch64.tar.gz",
+  "versionTag": "1.0.0",
+  "downloadUrl": "https://cdn.fpsmaster.top/extreme/1.0.0/FPSMaster-Extreme-1.0.0-macos-aarch64.tar.gz",
   "checksum": "<sha256 of tarball>",
   "files": [
     { "path": "fpsmaster_app", "sha1": "..." },
@@ -75,12 +75,12 @@ sdk/                                # 可选，随包附带
 {
   "productCode": "extreme",
   "channelCode": "release",
-  "versionName": "0.3.1",
+  "versionName": "1.0.0",
   "commitHash": "<sha>",
-  "downloadUrl": "https://cdn.fpsmaster.top/extreme/0.3.1/FPSMaster-Extreme-0.3.1-macos-aarch64.tar.gz",
+  "downloadUrl": "https://cdn.fpsmaster.top/extreme/1.0.0/FPSMaster-Extreme-1.0.0-macos-aarch64.tar.gz",
   "checksum": "<sha256>",
   "fileSize": 15728640,
-  "manifestUrl": "https://cdn.fpsmaster.top/extreme/0.3.1/FPSMaster-Extreme-0.3.1-macos-aarch64.manifest.json",
+  "manifestUrl": "https://cdn.fpsmaster.top/extreme/1.0.0/FPSMaster-Extreme-1.0.0-macos-aarch64.manifest.json",
   "minLauncherVersion": "0.3.6",
   "target": "macos-aarch64",
   "enabled": true,

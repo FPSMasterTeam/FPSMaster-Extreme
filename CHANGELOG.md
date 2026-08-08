@@ -6,6 +6,61 @@ All notable changes to fpsmaster are documented here. The format follows
 `fpsmaster_core`, `fpsmaster_protocol`, `fpsmaster_render`, `fpsmaster_ext`,
 `fpsmaster_ext_api`) are versioned in lockstep.
 
+## [1.0.0] - 2026-08-08
+
+First stable release. The version scheme is now plain semver starting at 1.0.0;
+this is a product-version bump only — the client still targets Minecraft Java
+1.8.9 / protocol 47, and the extension API contract stays at `0.3.0`, so mods
+declaring `api = "^0.3"` keep working unchanged.
+
+### Fixed
+
+- **Terrain shading was applied in linear space** — the block atlas is sampled
+  as `Rgba8UnormSrgb` (linear) and the swapchain re-encodes, but the vertex
+  colour (biome tint × face shade × AO) and the lightmap were multiplied in
+  linear anyway. Vanilla has no sRGB framebuffer and applies those in gamma
+  space, so every multiplier was effectively raised to ~1/2.2: the 1.0/0.8/0.6/0.5
+  face-shade ladder rendered as 1.0/0.90/0.79/0.73 and the darkest AO corner as
+  0.67 instead of 0.40, flattening the whole image. The combined multiplier is
+  now decoded once before it scales the linear texel (`chunk.wgsl`,
+  `chunk_greedy.wgsl`), matching what `ui.wgsl` already did. Sky, horizon and
+  sunset colours — vanilla sRGB constants written straight into the linear HDR
+  target — are converted at the same boundary (`sky.rs`).
+- **Grass top and side no longer disagree** — a direct consequence of the above:
+  the top face was tinted in linear while the side overlay is composited into the
+  atlas in gamma space.
+- **Distance fog was off by default**, so terrain ended on a hard edge at the
+  render boundary. Vanilla always fogs toward the horizon colour; `shader_fog`
+  now defaults on (it works with the master shader toggle off).
+- **Brightness defaulted to 0.5**, pre-lifting the dark end of the lightmap
+  curve. Vanilla's slider defaults to 0.0 ("Moody"); it now matches.
+- **Generated single-player worlds had no sky-light bleed** — world-gen only ran
+  the per-column vertical cast, which sets everything at or below the heightmap
+  to sky-light 0 with no horizontal propagation, leaving the ground under a tree
+  canopy at 0 where vanilla has ~13 (a 21× difference on screen). Generation now
+  finishes with bounded sky and block light floods
+  (`World::light_generated_column`), seeded from the new column plus its
+  neighbours' border strip so the cost stays O(column) rather than O(loaded
+  world). Emissive blocks placed by the generator are seeded too, instead of
+  staying dark until re-placed.
+- **Stained glass rendered as a multiply colour filter** — `fs_glass` ignored the
+  texel alpha and folded the face shade into the filter, so red glass darkened
+  the view behind it to ~0.23 instead of vanilla's ~0.47, black stained glass was
+  effectively opaque, and the pane vanished entirely against a dark background (a
+  multiply can only subtract light). The translucent layer now uses vanilla
+  `SRC_ALPHA`/`ONE_MINUS_SRC_ALPHA` blending, matching the greedy path, which
+  already did. This also affects water, ice, portal and slime, which share the
+  layer. The per-block `alpha` overrides in `blocks.json` were removed: vanilla
+  carries translucency entirely in the texture alpha, so they double-applied.
+- **East–west stained-glass pane arms sampled the wrong texture columns** —
+  `glass_pane_top_*` is opaque only in columns 7–8, and without vanilla's `"y":
+  90` blockstate rotation the arm's top/bottom faces sampled the empty part,
+  striping a transparent (Fast graphics: black) band along every arm. The mesher
+  now reproduces the rotation.
+- **Fast graphics wrote empty texels as solid black** — the opaque translucent
+  pipelines use `REPLACE`, which discards alpha, so fully transparent pane-edge
+  texels landed as black. They are alpha-tested now.
+
 ## [0.3.1] - 2026-06-19
 
 ### Fixed
@@ -212,6 +267,7 @@ Initial 1.8.9 client: world/chunk rendering, terrain meshing and lighting,
 player physics and collision, the 1.8.9 protocol (online and offline mode),
 basic entity rendering, and core GUIs.
 
+[1.0.0]: https://github.com/FPSMasterTeam/FPSMaster-Extreme/releases/tag/v1.0.0
 [0.3.1]: https://github.com/FPSMasterTeam/FPSMaster-Extreme/releases/tag/v0.3.1
 [0.3.0]: https://github.com/FPSMasterTeam/FPSMaster-Extreme/releases/tag/v0.3.0
 [0.2.0]: https://github.com/FPSMasterTeam/FPSMaster-Extreme/releases/tag/v0.2.0

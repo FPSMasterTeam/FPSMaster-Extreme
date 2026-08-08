@@ -95,6 +95,31 @@ fn day_night(light: vec2<f32>) -> f32 {
     return max(light_level(light.x) * camera.sky_brightness, light_level(light.y));
 }
 
+// sRGB -> linear (the same curve `ui.wgsl` applies to its vertex colours).
+//
+// Vanilla 1.8.9 uploads its terrain atlas as plain GL_RGBA and never enables
+// GL_FRAMEBUFFER_SRGB, so every shading multiplier it applies — the 1.0/0.8/0.6/0.5
+// face shades, the 1.0/0.8/0.6/0.4 AO ladder, the biome tint, the lightmap — lands
+// on the GAMMA-ENCODED texel. Our atlas is Rgba8UnormSrgb, so `textureSample`
+// returns LINEAR values and the swapchain re-encodes on write. Multiplying a
+// linear texel by those same constants therefore raises each one to ~1/2.2 on
+// screen (a 0.6 side-face shade would show as 0.80, the darkest AO corner 0.4 as
+// 0.67), collapsing the contrast ladder into the flat, washed-out look.
+//
+// So: keep combining the multipliers in vanilla's gamma space, then decode the
+// product once here before it touches the linear texel.
+fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
+    let low = c / 12.92;
+    let high = pow((c + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4));
+    return select(high, low, c <= vec3<f32>(0.04045));
+}
+
+// The vertex colour (biome tint × face shade × AO) is authored by the mesher in
+// vanilla's gamma space, so decode it before it modulates the linear texel.
+fn albedo_of(texel: vec3<f32>, vertex_color: vec3<f32>) -> vec3<f32> {
+    return texel * srgb_to_linear(vertex_color);
+}
+
 // Vanilla per-level brightness curve: light falls off steeply toward the dark
 // end (l=1 -> 1, l=0.5 -> 0.2), giving the moody gradient around light sources.
 fn light_level(l: f32) -> f32 {
@@ -206,8 +231,10 @@ fn apply_lighting(albedo: vec3<f32>, in: VertexOutput) -> vec3<f32> {
     let gamma = lighting.fog_params.w;
     if (lighting.flags.x < 0.5) {
         // Vanilla path: coloured light map (warm block light + day/night sky) with
-        // the steep per-level falloff, then the brightness gamma.
-        return albedo * light_curve(vanilla_lightmap(in.light), gamma);
+        // the steep per-level falloff, then the brightness gamma. The lightmap is a
+        // vanilla gamma-space multiplier like the vertex colour, so it is decoded
+        // before it scales the linear albedo (see `srgb_to_linear`).
+        return albedo * srgb_to_linear(light_curve(vanilla_lightmap(in.light), gamma));
     }
     let geo_n = normalize(in.normal);
     let pbr_on = lighting.fog_color.w > 0.5;
@@ -329,7 +356,7 @@ fn apply_fog(color: vec3<f32>, world_pos: vec3<f32>) -> vec3<f32> {
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let texel = textureSample(block_atlas, block_sampler, input.uv);
-    let rgb = apply_fog(apply_lighting(texel.rgb * input.color.rgb, input), input.world_pos);
+    let rgb = apply_fog(apply_lighting(albedo_of(texel.rgb, input.color.rgb), input), input.world_pos);
     return vec4<f32>(rgb, texel.a * input.color.a);
 }
 
@@ -356,35 +383,30 @@ fn fs_cutout(input: VertexOutput) -> @location(0) vec4<f32> {
     if (texel.a * input.color.a < 0.5) {
         discard;
     }
-    let rgb = apply_fog(apply_lighting(texel.rgb * input.color.rgb, input), input.world_pos);
+    let rgb = apply_fog(apply_lighting(albedo_of(texel.rgb, input.color.rgb), input), input.world_pos);
     return vec4<f32>(rgb, 1.0);
 }
 
-// Stained-glass colour filter. Drawn with MULTIPLY blending (framebuffer = src * dst),
-// so the scene behind the glass is tinted by the glass colour: clear glass (~white)
-// passes light through, coloured glass filters it (white light through red glass → red).
-// A faint sun glint is added on top so the pane still reads as a surface, not a void.
+// Graphics: Fast — the translucent layer (stained glass / ice / water / portal)
+// drawn OPAQUE, skipping the blend's destination read. Alpha still has to be
+// TESTED even though it is not blended: `glass_pane_top_*` is fully transparent
+// outside its two-texel strip, and writing those texels verbatim paints a black
+// band along every pane arm. The threshold sits far below stained glass's 0.4
+// body alpha, so only genuinely empty texels are dropped.
 @fragment
-fn fs_glass(input: VertexOutput) -> @location(0) vec4<f32> {
+fn fs_opaque_cutout(input: VertexOutput) -> @location(0) vec4<f32> {
     let texel = textureSample(block_atlas, block_sampler, input.uv);
-    // The glass colour (stained glass = a coloured texture). MULTIPLY blend tints the
-    // scene behind by this, so use the colour STRONGLY — only a small white floor so a
-    // dark frame doesn't crush to black, and so the saturated channels really filter
-    // (red glass kills green/blue). Clear glass (~white texture) → barely changes.
-    let glass = texel.rgb * input.color.rgb;
-    let tinted = mix(glass, vec3<f32>(1.0), 0.1);
-    // A small additive sun glint so the pane reads as a surface, not air.
-    let geo_n = normalize(input.normal);
-    let view_dir = normalize(lighting.camera_pos.xyz - input.world_pos);
-    let half_dir = normalize(lighting.sun_dir.xyz + view_dir);
-    let glint = pow(max(dot(geo_n, half_dir), 0.0), 120.0) * max(camera.sky_brightness, 0.0);
-    return vec4<f32>(clamp(tinted + glint * 0.4, vec3<f32>(0.0), vec3<f32>(2.0)), 1.0);
+    if (texel.a * input.color.a < 0.05) {
+        discard;
+    }
+    let rgb = apply_fog(apply_lighting(albedo_of(texel.rgb, input.color.rgb), input), input.world_pos);
+    return vec4<f32>(rgb, 1.0);
 }
 
 // Additive glow pass for stained glass: the pane is lit (two-sided) by the ray-traced
 // point lights and tinted by the glass colour, so a light behind it makes the WHOLE
 // pane glow that colour — a backlit stained-glass window. Drawn additively after the
-// multiply filter pass. Only built on the RT path (block_lights_raw is the live one).
+// alpha-blended pass. Only built on the RT path (block_lights_raw is the live one).
 @fragment
 fn fs_glass_glow(input: VertexOutput) -> @location(0) vec4<f32> {
     let texel = textureSample(block_atlas, block_sampler, input.uv);
@@ -411,7 +433,7 @@ fn fs_normal(input: VertexOutput) -> NormalOut {
     let texel = textureSample(block_atlas, block_sampler, input.uv);
     var o: NormalOut;
     o.normal = vec4<f32>(normalize(input.normal) * 0.5 + 0.5, 1.0);
-    o.albedo = vec4<f32>(texel.rgb * input.color.rgb, 1.0);
+    o.albedo = vec4<f32>(albedo_of(texel.rgb, input.color.rgb), 1.0);
     return o;
 }
 
@@ -423,6 +445,6 @@ fn fs_normal_cutout(input: VertexOutput) -> NormalOut {
     }
     var o: NormalOut;
     o.normal = vec4<f32>(normalize(input.normal) * 0.5 + 0.5, 1.0);
-    o.albedo = vec4<f32>(texel.rgb * input.color.rgb, 1.0);
+    o.albedo = vec4<f32>(albedo_of(texel.rgb, input.color.rgb), 1.0);
     return o;
 }

@@ -1054,7 +1054,9 @@ impl GameState {
         const INIT_RADIUS: i32 = 1;
         for cz in -INIT_RADIUS..=INIT_RADIUS {
             for cx in -INIT_RADIUS..=INIT_RADIUS {
-                generator.generate_chunk(&mut world, cx, cz);
+                // The spawn platform is meshed synchronously by `upload_world`
+                // right after this, so the relit sections need no dirty marking.
+                let _ = generator.generate_chunk(&mut world, cx, cz);
             }
         }
         let spawn_h = generator.height(0, 0);
@@ -1112,7 +1114,11 @@ impl GameState {
             }
             missing.sort_by_key(|p| (p.x - px).pow(2) + (p.z - pz).pow(2));
             for pos in missing.into_iter().take(GEN_BUDGET) {
-                generator.generate_chunk(&mut self.world, pos.x, pos.z);
+                // Sky/block light from the new column bleeds into the neighbours
+                // that already exist, so their meshes go stale too — mark exactly
+                // the sections the flood touched.
+                let relit = generator.generate_chunk(&mut self.world, pos.x, pos.z);
+                self.dirty_chunks.extend(relit);
                 // Only the sections that actually got blocks exist; marking the
                 // empty air sections above would just churn the mesher for nothing.
                 let ys: Vec<i32> = self
@@ -6518,11 +6524,16 @@ impl WorldGen {
         terrain_height(x.wrapping_add(ox), z.wrapping_add(oz)).clamp(5, 240)
     }
 
-    /// Generate one 16×16 chunk column into `world`: blocks plus full daylight
-    /// skylight on and above the surface (so the mesher lights it without a
-    /// world-wide skylight recompute). Trees are kept fully inside the column so
-    /// generating one chunk never spawns a partial neighbour.
-    fn generate_chunk(&self, world: &mut World, cx: i32, cz: i32) {
+    /// Generate one 16×16 chunk column into `world`, then light it. Trees are
+    /// kept fully inside the column so generating one chunk never spawns a
+    /// partial neighbour.
+    ///
+    /// Returns every section whose light changed — the column's own, plus any in
+    /// an already-generated neighbour that the flood reached — so the caller can
+    /// mark them dirty. Ignoring the return value leaves stale black meshes on
+    /// the neighbour side of the border.
+    #[must_use]
+    fn generate_chunk(&self, world: &mut World, cx: i32, cz: i32) -> Vec<SectionPos> {
         for lx in 0..16 {
             for lz in 0..16 {
                 let x = cx * 16 + lx;
@@ -6571,6 +6582,10 @@ impl WorldGen {
         world
             .chunk_mut_or_insert(ChunkPos::new(cx, cz))
             .recompute_vertical_skylight();
+        // The cast alone is a hard black edge — it has no horizontal bleed, so the
+        // ground under a canopy or overhang would sit at sky 0 (vanilla: ~13).
+        // Finish with the bounded sky + block light floods.
+        world.light_generated_column(cx, cz)
     }
 }
 
