@@ -26,7 +26,17 @@ pub struct HudState<'a> {
     pub xp_level: i32,
     pub selected_slot: i32,
     pub hotbar: &'a [Option<SlotItem>],
+    /// The held-item name banner above the hotbar (vanilla
+    /// `GuiIngame.renderSelectedItem`): the `§`-coded name and its 0..1 alpha,
+    /// present for 40 ticks after the held stack changes.
+    pub held_item_highlight: Option<(String, f32)>,
+    /// Creative mode: vanilla drops the banner 14 GUI px because there are no
+    /// health/hunger rows above the hotbar to clear.
+    pub creative: bool,
     pub inventory: &'a [Option<SlotItem>],
+    /// Downloaded-skin atlas rows by player UUID, so a player head in a slot
+    /// draws its owner's face instead of the default skin.
+    pub skin_rows: &'a std::collections::HashMap<[u8; 16], u32>,
     /// The open window (player inventory or a server container), whose slot
     /// layout the container screen renders. `None` when no window is open.
     pub container: Option<&'a crate::container::Container>,
@@ -176,6 +186,7 @@ impl GuiIngame {
         draw_chat(ui, width, height, hud, chat_input);
         draw_status_bars(ui, width, height, hud);
         draw_hotbar(ui, width, height, hud);
+        draw_selected_item_name(ui, width, height, hud);
         draw_boss_bar(ui, width, height, hud);
         draw_title(ui, width, height, hud);
         draw_action_bar(ui, width, height, hud);
@@ -335,7 +346,7 @@ fn draw_hotbar(ui: &mut UiFrame, width: i32, height: i32, hud: &HudState) {
                 16 * scale,
                 16 * scale,
             );
-            draw_item_icon(ui, cell, item, scale.max(2), false);
+            draw_item_icon(ui, cell, item, scale.max(2), false, hud.skin_rows);
         }
     }
 
@@ -619,9 +630,14 @@ pub(crate) fn draw_item_icon(
     item: &SlotItem,
     text_scale: i32,
     overlay: bool,
+    skin_rows: &std::collections::HashMap<[u8; 16], u32>,
 ) {
     let block = fpsmaster_render::gui_item::is_block_icon(item.id, item.damage);
-    if let Some((block_id, meta)) = block {
+    if item.id == crate::game::SKULL_ITEM_ID {
+        // Vanilla has no flat sprite for skulls — the head model is the icon.
+        let (kind, owner, _) = crate::game::skull_item_profile(item);
+        ui.skull_item(rect, kind, owner.and_then(|uuid| skin_rows.get(&uuid).copied()));
+    } else if let Some((block_id, meta)) = block {
         ui.block_item(rect, block_id, meta);
     } else if overlay {
         ui.overlay_item_icon(rect, item.id);
@@ -816,6 +832,34 @@ fn draw_title(ui: &mut UiFrame, width: i32, height: i32, hud: &HudState) {
         subtitle_scale,
         color,
         title.subtitle,
+    );
+}
+
+/// Vanilla y of the held-item name banner, measured up from the bottom of the
+/// screen in GUI px (`scaledHeight - 59`), and the creative offset that drops it
+/// into the space the health/hunger rows would occupy (`j += 14`).
+const SELECTED_ITEM_UP_FROM_BOTTOM: i32 = 59;
+const SELECTED_ITEM_CREATIVE_DROP: i32 = 14;
+
+/// The name of the item that was just selected, centered above the hotbar
+/// (vanilla `GuiIngame.renderSelectedItem`): shown for 40 ticks after the held
+/// stack changes, fading out over the last 10. The name carries its own `§`
+/// rarity color, so the draw color only supplies the fade alpha.
+fn draw_selected_item_name(ui: &mut UiFrame, width: i32, height: i32, hud: &HudState) {
+    let Some((name, alpha)) = hud.held_item_highlight.as_ref() else {
+        return;
+    };
+    let scale = gui_scale(width, height);
+    let mut y = height - SELECTED_ITEM_UP_FROM_BOTTOM * scale;
+    if hud.creative {
+        y += SELECTED_ITEM_CREATIVE_DROP * scale;
+    }
+    ui.text_shadowed(
+        (width - text_width(name, scale)) / 2,
+        y,
+        scale,
+        faded_white(*alpha),
+        name,
     );
 }
 
@@ -1099,7 +1143,7 @@ mod tests {
 
         // A plain diamond sword: a flat icon, no glint queued.
         let mut ui = UiFrame::new();
-        draw_item_icon(&mut ui, rect, &SlotItem::new(276, 1, 0), 2, false);
+        draw_item_icon(&mut ui, rect, &SlotItem::new(276, 1, 0), 2, false, &Default::default());
         assert!(ui.glint_items().is_empty(), "unenchanted item must not glint");
 
         // The same sword with a non-empty `ench` tag: a glint overlay is queued.
@@ -1112,7 +1156,7 @@ mod tests {
             NbtTag::List(vec![NbtTag::Compound(ench)]),
         )]));
         let mut ui = UiFrame::new();
-        draw_item_icon(&mut ui, rect, &sword, 2, false);
+        draw_item_icon(&mut ui, rect, &sword, 2, false, &Default::default());
         assert_eq!(ui.glint_items().len(), 1, "enchanted item must queue a glint overlay");
     }
 

@@ -629,6 +629,12 @@ pub struct SignTextDraw {
 pub struct InventoryPreview<'a> {
     /// The posed local-player biped (feet at y=0, +y up, +z front toward viewer).
     pub mesh: &'a ModelMesh,
+    /// Held-item geometry in the same model space, sampling the BLOCK atlas
+    /// rather than the entity atlas the biped uses — so it needs its own vertex
+    /// type and draw. Both streams take the identical projection, so the item
+    /// stays welded to the hand however the model leans.
+    pub item_vertices: &'a [Vertex],
+    pub item_indices: &'a [u32],
     /// Feet anchor in physical px (panel-center x, near the panel bottom).
     pub anchor: [f32; 2],
     /// Physical px per model block (vanilla `scale` × the GUI pixel scale).
@@ -727,6 +733,9 @@ pub struct Renderer {
     /// `surface_format` target (the UI pass writes the swapchain, not HDR).
     inventory_preview_pipeline: wgpu::RenderPipeline,
     inventory_preview_mesh: Option<DynamicMesh>,
+    /// Held-item geometry for the preview (block atlas), projected with the
+    /// same transform as the biped and clipped to the same panel.
+    inventory_preview_item_mesh: Option<DynamicMesh>,
     /// Scissor rect (physical px: x, y, w, h) clipping the preview to its panel.
     inventory_preview_scissor: Option<[u32; 4]>,
     /// First-person held-item geometry (block-atlas textured), per frame.
@@ -847,6 +856,9 @@ pub struct Renderer {
     gui_camera_bind_group: wgpu::BindGroup,
     /// 3D block-icon geometry for this frame (block atlas textured, clip-space).
     gui_item_mesh: Option<DynamicMesh>,
+    /// 3D skull-head item icons (entity atlas), drawn in the UI pass right
+    /// after the block cubes so they share its depth buffer.
+    gui_skull_mesh: Option<DynamicMesh>,
     /// Clip-space glint geometry for enchanted GUI item icons, drawn additively
     /// with the scrolling glint texture over the icons in the UI pass.
     gui_glint_mesh: Option<DynamicMesh>,
@@ -5151,6 +5163,7 @@ impl Renderer {
             debug_tris: None,
             inventory_preview_pipeline,
             inventory_preview_mesh: None,
+            inventory_preview_item_mesh: None,
             inventory_preview_scissor: None,
             first_person_item: None,
             world_items: None,
@@ -5216,6 +5229,7 @@ impl Renderer {
             ui_crosshair,
             gui_camera_bind_group,
             gui_item_mesh: None,
+            gui_skull_mesh: None,
             gui_glint_mesh: None,
             nametag_mesh: None,
             nametag_texture,
@@ -7339,7 +7353,13 @@ impl Renderer {
     pub fn set_inventory_preview(&mut self, preview: Option<&InventoryPreview>) {
         let Some(p) = preview else {
             self.inventory_preview_scissor = None;
-            if let Some(m) = self.inventory_preview_mesh.as_mut() {
+            for m in [
+                self.inventory_preview_mesh.as_mut(),
+                self.inventory_preview_item_mesh.as_mut(),
+            ]
+            .into_iter()
+            .flatten()
+            {
                 m.index_count = 0;
             }
             return;
@@ -7387,6 +7407,25 @@ impl Renderer {
             bytemuck::cast_slice(&p.mesh.indices),
             p.mesh.indices.len() as u32,
             "inventory-preview",
+        );
+        // The held item takes the very same projection, so it tracks the model's
+        // cursor lean instead of sliding off the hand.
+        let item_vertices: Vec<Vertex> = p
+            .item_vertices
+            .iter()
+            .map(|v| Vertex {
+                position: to_clip(v.position),
+                ..*v
+            })
+            .collect();
+        fill_dynamic_mesh(
+            &self.device,
+            &self.queue,
+            &mut self.inventory_preview_item_mesh,
+            bytemuck::cast_slice(&item_vertices),
+            bytemuck::cast_slice(p.item_indices),
+            p.item_indices.len() as u32,
+            "inventory-preview-item",
         );
         self.inventory_preview_scissor = Some(p.scissor);
     }
@@ -10555,6 +10594,19 @@ impl Renderer {
                 up.draw_indexed(0..mesh.index_count, 0, 0..1);
                 draw_calls += 1;
             }
+            // Skull item icons: head models from the entity atlas, drawn with
+            // the preview pipeline (same vertex layout and bind groups) into the
+            // depth the block cubes just wrote, so a skull and a cube in
+            // neighbouring slots occlude their own faces alike.
+            if let Some(mesh) = self.gui_skull_mesh.as_ref().filter(|m| m.index_count > 0) {
+                up.set_pipeline(&self.inventory_preview_pipeline);
+                up.set_bind_group(0, &self.gui_camera_bind_group, &[]);
+                up.set_bind_group(1, &self.entity_bind_group, &[]);
+                up.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                up.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                up.draw_indexed(0..mesh.index_count, 0, 0..1);
+                draw_calls += 1;
+            }
             // Inventory player preview (vanilla `GuiInventory.drawEntityOnScreen`):
             // the local-player biped baked into clip space, scissored to the
             // panel's model box so it never overdraws the rest of the window. The
@@ -10573,8 +10625,28 @@ impl Renderer {
                 up.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                 up.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 up.draw_indexed(0..mesh.index_count, 0, 0..1);
-                up.set_scissor_rect(0, 0, self.config.width, self.config.height);
                 draw_calls += 1;
+                // The held item shares the panel scissor and the pass depth, so
+                // it occludes against the biped it is attached to. Block atlas,
+                // so it takes the GUI cube pipeline rather than the model one.
+                if let Some(item) = self
+                    .inventory_preview_item_mesh
+                    .as_ref()
+                    .filter(|m| m.index_count > 0)
+                {
+                    up.set_pipeline(&self.gui_cube_pipeline);
+                    up.set_bind_group(0, &self.gui_camera_bind_group, &[]);
+                    up.set_bind_group(
+                        1,
+                        &self.texture_bind_groups[self.mipmap_levels as usize],
+                        &[],
+                    );
+                    up.set_vertex_buffer(0, item.vertex_buffer.slice(..));
+                    up.set_index_buffer(item.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    up.draw_indexed(0..item.index_count, 0, 0..1);
+                    draw_calls += 1;
+                }
+                up.set_scissor_rect(0, 0, self.config.width, self.config.height);
             }
             // Enchantment glint over enchanted item icons (block cubes and flat
             // sprites), additive with the scrolling glint texture — drawn under
@@ -10700,6 +10772,30 @@ impl Renderer {
             bytemuck::cast_slice(&indices),
             indices.len() as u32,
             "gui-block-items",
+        );
+
+        // Skull item icons: the same GUI pose, but head geometry sampling the
+        // entity atlas, so they need their own mesh and draw.
+        let mut skull_v: Vec<ModelVertex> = Vec::new();
+        let mut skull_i: Vec<u32> = Vec::new();
+        for item in ui.skull_items() {
+            crate::gui_item::append_skull_icon(
+                &mut skull_v,
+                &mut skull_i,
+                item.kind,
+                item.skin_row,
+                item.dst,
+                surface,
+            );
+        }
+        fill_dynamic_mesh(
+            &self.device,
+            &self.queue,
+            &mut self.gui_skull_mesh,
+            bytemuck::cast_slice(&skull_v),
+            bytemuck::cast_slice(&skull_i),
+            skull_i.len() as u32,
+            "gui-skull-items",
         );
 
         // Enchanted item icons: a clip-space glint overlay per slot — the cube

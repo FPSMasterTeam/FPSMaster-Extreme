@@ -2063,6 +2063,133 @@ fn wall_sign_yaw(meta: u8) -> f32 {
     }
 }
 
+// ─── Skull block-entity ────────────────────────────────────────────────────────
+
+/// Which head a skull draws — vanilla's `SkullType` NBT byte (block 144's
+/// block-entity, and the damage value of item 397). Each samples a different
+/// entity texture, and only the player head carries a hat layer: vanilla gives
+/// it `ModelHumanoidHead` while the rest use the bare `ModelSkeletonHead`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkullKind {
+    Skeleton,
+    WitherSkeleton,
+    Zombie,
+    Player,
+    Creeper,
+}
+
+impl SkullKind {
+    /// The kind for a `SkullType` value; unknown types fall back to the
+    /// skeleton skull, as vanilla's `default` branch does.
+    pub fn from_type(skull_type: i32) -> Self {
+        match skull_type {
+            1 => Self::WitherSkeleton,
+            2 => Self::Zombie,
+            3 => Self::Player,
+            4 => Self::Creeper,
+            _ => Self::Skeleton,
+        }
+    }
+
+    /// The entity-atlas slot whose head region this skull samples.
+    fn slot(self) -> EntitySlot {
+        match self {
+            Self::Skeleton => EntitySlot::Skeleton,
+            Self::WitherSkeleton => EntitySlot::SkeletonWither,
+            Self::Zombie => EntitySlot::Zombie,
+            Self::Player => EntitySlot::Player,
+            Self::Creeper => EntitySlot::Creeper,
+        }
+    }
+
+    /// Whether the skin's hat overlay layers over the head box.
+    fn has_hat(self) -> bool {
+        matches!(self, Self::Player)
+    }
+}
+
+/// The block metadata of a floor-mounted skull (`EnumFacing.UP`) — the form the
+/// item icon and a worn head draw, and the only one that honours `Rot`.
+pub const SKULL_META_FLOOR: u8 = 1;
+
+/// The `Rot` step an item-form skull is drawn at, so its face points at the
+/// viewer. Vanilla stacks two half turns here — `RenderItem.renderItem` turns
+/// every builtin-entity model 180° about Y, and `TileEntityItemStackRenderer`
+/// then calls `renderSkull(.., 180.0F, ..)` — and the pair cancels, landing on
+/// the same orientation `Rot` 0 gives a placed skull.
+pub const SKULL_ITEM_ROTATION: u8 = 0;
+
+/// How much bigger a skull worn on the head is than the head it covers
+/// (vanilla `LayerCustomHead`'s `f1 = 1.1875`), applied about the neck pivot so
+/// the two boxes share a bottom plane and the skull encloses the wearer's head.
+const WORN_SKULL_SCALE: f32 = 1.1875;
+
+/// The humanoid head's rotation point in engine model px — where a worn skull
+/// hangs from, and the pivot of `humanoid_poses`' head entry.
+const HUMANOID_HEAD_PIVOT_Y: f32 = 24.0;
+
+/// The two head layers of a skull, as engine [`Part`]s: vanilla
+/// `ModelSkeletonHead`'s 8³ box at tex (0,0), then `ModelHumanoidHead`'s
+/// 0.25-grown hat at (32,0) (drawn for player heads only). The box hangs above
+/// the pivot — `scale` grows it about that pivot (1 as a block, `WORN_SKULL_SCALE`
+/// worn on a head) and `pivot_y` lifts it into the target frame.
+fn skull_parts(scale: f32, pivot_y: f32) -> [Part; 2] {
+    let layer = |grow: f32, tex: [f32; 2]| -> Part {
+        // `grow` is vanilla's `addBox` inflation, in model px before the scale.
+        let lo = Vec3::new(-4.0 - grow, -grow, -4.0 - grow) * scale;
+        let hi = Vec3::new(4.0 + grow, 8.0 + grow, 4.0 + grow) * scale;
+        let up = Vec3::new(0.0, pivot_y, 0.0);
+        (
+            (lo + up).to_array(),
+            (hi + up).to_array(),
+            box_region(tex[0], tex[1], 8.0, 8.0, 8.0),
+        )
+    };
+    [layer(0.0, [0.0, 0.0]), layer(0.25, [32.0, 0.0])]
+}
+
+/// The atlas slot a skull samples: a player head takes its owner's downloaded
+/// skin row when one is resolved, everything else its kind's fixed slot.
+fn skull_slot(kind: SkullKind, skin_row: Option<u32>) -> u32 {
+    match (kind, skin_row) {
+        (SkullKind::Player, Some(row)) => PLAYER_SKIN_BASE_ROW + row,
+        _ => kind.slot() as u32,
+    }
+}
+
+/// How many of [`skull_parts`]' layers this kind draws (the hat is player-only).
+fn skull_layer_count(kind: SkullKind) -> usize {
+    if kind.has_hat() {
+        2
+    } else {
+        1
+    }
+}
+
+/// A floor skull's model yaw for its 0..15 block-entity `Rot` (vanilla
+/// `TileEntitySkullRenderer`: `skullRotation * 360 / 16`).
+fn skull_rotation_degrees(rotation: u8) -> f32 {
+    (rotation & 15) as f32 * 360.0 / 16.0
+}
+
+/// A skull's offset inside its cell and its model yaw in degrees, porting the
+/// facing switch in `TileEntitySkullRenderer.renderSkull`. The metadata is an
+/// `EnumFacing` index: 1 (UP) stands the head on the floor and keeps the
+/// block-entity's own rotation, while 2..5 hang it at mid-height on a wall and
+/// override the rotation so the face points out of that wall. NORTH is the one
+/// wall facing vanilla's switch does *not* override — harmless, since wall
+/// skulls carry `Rot` 0. Metadata 0 (DOWN) never occurs on a placed skull and
+/// falls through to the EAST branch, matching vanilla's `default`.
+fn skull_placement(meta: u8, rotation_deg: f32) -> (Vec3, f32) {
+    match meta & 7 {
+        1 => (Vec3::new(0.5, 0.0, 0.5), rotation_deg),
+        2 => (Vec3::new(0.5, 0.25, 0.74), rotation_deg),
+        3 => (Vec3::new(0.5, 0.25, 0.26), 180.0),
+        4 => (Vec3::new(0.74, 0.25, 0.5), 270.0),
+        _ => (Vec3::new(0.26, 0.25, 0.5), 90.0),
+    }
+}
+
 impl ModelMesh {
     /// Append a sign block-entity (vanilla `ModelSign` + `TileEntitySignRenderer`)
     /// at world cell `cell`, oriented by its block `meta`. Standing signs sit on a
@@ -2152,6 +2279,104 @@ impl ModelMesh {
             right_vec.length(),
             up_vec.length(),
         )
+    }
+
+    /// Append a skull block-entity (vanilla `ModelSkeletonHead` /
+    /// `ModelHumanoidHead` via `TileEntitySkullRenderer`) at world cell `cell`.
+    /// `meta` is the block metadata (an `EnumFacing` index: 1 stands on the
+    /// floor, 2..5 hang on a wall), `rotation` the block-entity's 0..15 `Rot`
+    /// (floor skulls only), and `skin_row` the owner's downloaded skin row for a
+    /// player head. Samples the head region of the matching entity texture.
+    pub fn push_skull(
+        &mut self,
+        cell: [i32; 3],
+        meta: u8,
+        rotation: u8,
+        kind: SkullKind,
+        skin_row: Option<u32>,
+    ) {
+        let (offset, model_yaw) = skull_placement(meta, skull_rotation_degrees(rotation));
+        // `renderSkull`'s `scale(-1,-1,1)` is the standard entity flip
+        // (`diag(1,-1,-1)`, what `vbox` bakes into every mob part) composed with
+        // a half turn about Y. Folding the flip into the box bounds therefore
+        // leaves a plain yaw of `model_yaw + 180` — which is why a floor skull
+        // faces back at the player who placed it rather than away.
+        let yaw = (model_yaw + 180.0).to_radians();
+        let (sy, cy) = yaw.sin_cos();
+        let base = Vec3::new(cell[0] as f32, cell[1] as f32, cell[2] as f32) + offset;
+
+        let (ox, oy) = slot_grid_origin(skull_slot(kind, skin_row));
+        let origin = [ox as f32, oy as f32];
+
+        let layers = skull_parts(1.0, 0.0);
+        for (min_px, max_px, region) in &layers[..skull_layer_count(kind)] {
+            self.push_textured_box(
+                Vec3::from(*min_px),
+                Vec3::from(*max_px),
+                region,
+                origin,
+                1.0,
+                &|p| base + rotate_y(p * MODEL_SCALE, sy, cy),
+            );
+        }
+    }
+
+    /// Append a skull worn in the head slot (vanilla `LayerCustomHead`), riding
+    /// the wearer's head through the same pose the helmet layer uses. Vanilla
+    /// composes `scale(1.1875, -1.1875, -1.1875)` with `renderSkull`'s own
+    /// `scale(-1,-1,1)` and its 180° item turn; those cancel to a plain 1.1875×
+    /// growth about the neck pivot, which is why a worn head faces the same way
+    /// the wearer does and shares the head box's bottom plane.
+    pub fn push_worn_skull(
+        &mut self,
+        kind: SkullKind,
+        skin_row: Option<u32>,
+        anim: &EntityAnim,
+        feet: Vec3,
+        yaw_degrees: f32,
+    ) {
+        self.death_roll = anim.death_roll;
+        let head_pose = humanoid_poses(anim)[5];
+        let layers = skull_parts(WORN_SKULL_SCALE, HUMANOID_HEAD_PIVOT_Y);
+        let count = skull_layer_count(kind);
+        self.push_parts(
+            &layers[..count],
+            &[head_pose; 2][..count],
+            skull_slot(kind, skin_row),
+            feet,
+            yaw_degrees,
+        );
+        self.death_roll = 0.0;
+    }
+
+    /// Append a skull item's head model through an arbitrary `transform`, which
+    /// maps a point in the skull's own block-local space (an upright floor skull
+    /// in `[0,1]³`, as [`push_skull`] builds at a cell origin) to world space.
+    /// The first-person hand and dropped-item passes use this to put the head
+    /// where their item transform chains say the item goes.
+    pub fn push_skull_item(
+        &mut self,
+        kind: SkullKind,
+        skin_row: Option<u32>,
+        rotation: u8,
+        transform: &dyn Fn(Vec3) -> Vec3,
+    ) {
+        let (offset, model_yaw) = skull_placement(SKULL_META_FLOOR, skull_rotation_degrees(rotation));
+        let (sy, cy) = (model_yaw + 180.0).to_radians().sin_cos();
+        let (ox, oy) = slot_grid_origin(skull_slot(kind, skin_row));
+        let origin = [ox as f32, oy as f32];
+
+        let layers = skull_parts(1.0, 0.0);
+        for (min_px, max_px, region) in &layers[..skull_layer_count(kind)] {
+            self.push_textured_box(
+                Vec3::from(*min_px),
+                Vec3::from(*max_px),
+                region,
+                origin,
+                1.0,
+                &|p| transform(offset + rotate_y(p * MODEL_SCALE, sy, cy)),
+            );
+        }
     }
 
     /// Append the floating enchanting-table book (vanilla `ModelBook` via
@@ -3107,5 +3332,261 @@ mod tests {
             .map(|v| (v.uv[1] * ENTITY_ATLAS_HEIGHT as f32 - oy as f32).round())
             .collect();
         assert!(vs.contains(&0.0) && vs.contains(&10.0), "cover front spans the full rect height upright");
+    }
+
+    /// The four corners of one face of the first box in a mesh.
+    /// `push_textured_box` emits faces in `FACES` order, four verts each, so
+    /// index 3 is the box's local +z face — the one `box_region` paints with the
+    /// head's face texture.
+    fn skull_box(mesh: &ModelMesh, box_index: usize) -> &[ModelVertex] {
+        &mesh.vertices[box_index * 24..box_index * 24 + 24]
+    }
+
+    fn centroid(verts: &[ModelVertex]) -> Vec3 {
+        verts.iter().fold(Vec3::ZERO, |a, v| a + Vec3::from(v.position)) / verts.len() as f32
+    }
+
+    /// Which way the head's face points: the local +z quad's centroid relative
+    /// to the head box's centre, normalized.
+    fn face_direction(mesh: &ModelMesh) -> Vec3 {
+        let head = skull_box(mesh, 0);
+        (centroid(&head[12..16]) - centroid(head)).normalize()
+    }
+
+    fn skull(meta: u8, rotation: u8, kind: SkullKind) -> ModelMesh {
+        let mut mesh = ModelMesh::new();
+        mesh.push_skull([4, 70, -9], meta, rotation, kind, None);
+        mesh
+    }
+
+    #[test]
+    fn a_floor_skull_fills_the_collision_box_it_already_had() {
+        // Block 144's floor collision is (0.25, 0, 0.25)..(0.75, 0.5, 0.75) —
+        // the 8px head at 1/16 scale, standing on the cell floor. The model was
+        // missing entirely, so the box was there to walk into but nothing drew.
+        let mesh = skull(1, 0, SkullKind::Skeleton);
+        assert_well_formed(&mesh);
+        let head = skull_box(&mesh, 0);
+        let lo = head.iter().fold(Vec3::splat(f32::MAX), |a, v| a.min(Vec3::from(v.position)));
+        let hi = head.iter().fold(Vec3::splat(f32::MIN), |a, v| a.max(Vec3::from(v.position)));
+        let cell = Vec3::new(4.0, 70.0, -9.0);
+        assert!((lo - (cell + Vec3::new(0.25, 0.0, 0.25))).length() < 1e-5, "{lo:?}");
+        assert!((hi - (cell + Vec3::new(0.75, 0.5, 0.75))).length() < 1e-5, "{hi:?}");
+    }
+
+    #[test]
+    fn a_floor_skull_turns_to_face_the_player_who_placed_it() {
+        // `Rot` is the placer's yaw quantized to 16ths, and vanilla's
+        // `scale(-1,-1,1)` adds the half turn that points the face back at them:
+        // a player looking south (yaw 0 → Rot 0) gets a head looking north.
+        // Each of the 16 steps is 22.5°, and the head always ends up looking
+        // back down the placer's line of sight: yaw 0 (south) → Rot 0 → north,
+        // yaw 90 (west) → Rot 4 → east, and so on around the compass.
+        for (rot, placer_facing, head_facing) in [
+            (0u8, Vec3::new(0.0, 0.0, 1.0), Vec3::new(0.0, 0.0, -1.0)),
+            (4, Vec3::new(-1.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0)),
+            (8, Vec3::new(0.0, 0.0, -1.0), Vec3::new(0.0, 0.0, 1.0)),
+            (12, Vec3::new(1.0, 0.0, 0.0), Vec3::new(-1.0, 0.0, 0.0)),
+        ] {
+            let dir = face_direction(&skull(1, rot, SkullKind::Skeleton));
+            assert!((dir - head_facing).length() < 1e-5, "Rot {rot}: {dir:?}");
+            assert!((dir + placer_facing).length() < 1e-5, "Rot {rot} must face the placer");
+        }
+    }
+
+    #[test]
+    fn wall_skulls_hang_where_their_collision_box_is_and_look_out_of_the_wall() {
+        // Metadata 2..5 is an EnumFacing index. Each hangs at y 0.25..0.75 and
+        // looks out along its facing, matching BlockSkull's per-facing bounds.
+        let cell = Vec3::new(4.0, 70.0, -9.0);
+        for (meta, centre, facing) in [
+            (2u8, Vec3::new(0.5, 0.5, 0.74), Vec3::new(0.0, 0.0, -1.0)),
+            (3, Vec3::new(0.5, 0.5, 0.26), Vec3::new(0.0, 0.0, 1.0)),
+            (4, Vec3::new(0.74, 0.5, 0.5), Vec3::new(-1.0, 0.0, 0.0)),
+            (5, Vec3::new(0.26, 0.5, 0.5), Vec3::new(1.0, 0.0, 0.0)),
+        ] {
+            let mesh = skull(meta, 0, SkullKind::Skeleton);
+            assert_well_formed(&mesh);
+            let mid = centroid(skull_box(&mesh, 0));
+            assert!((mid - (cell + centre)).length() < 1e-5, "meta {meta}: {mid:?}");
+            let dir = face_direction(&mesh);
+            assert!((dir - facing).length() < 1e-5, "meta {meta}: {dir:?}");
+        }
+    }
+
+    #[test]
+    fn each_skull_type_samples_its_own_texture_and_only_players_wear_a_hat() {
+        for (kind, slot) in [
+            (SkullKind::Skeleton, EntitySlot::Skeleton),
+            (SkullKind::WitherSkeleton, EntitySlot::SkeletonWither),
+            (SkullKind::Zombie, EntitySlot::Zombie),
+            (SkullKind::Creeper, EntitySlot::Creeper),
+            (SkullKind::Player, EntitySlot::Player),
+        ] {
+            let mesh = skull(1, 0, kind);
+            assert_well_formed(&mesh);
+            // Check both axes: the atlas is two slots wide, so a V-only bound
+            // would also accept the neighbouring slot in the same row.
+            let (ox, _) = entity_slot_origin(slot);
+            let (u0, u1) = (
+                ox as f32 / ENTITY_ATLAS_WIDTH as f32,
+                (ox + ENTITY_SLOT_PX) as f32 / ENTITY_ATLAS_WIDTH as f32,
+            );
+            let (v0, v1) = slot_v_range(slot);
+            assert!(
+                mesh.vertices
+                    .iter()
+                    .all(|v| (u0..=u1).contains(&v.uv[0]) && (v0..=v1).contains(&v.uv[1])),
+                "{kind:?} sampled outside its slot"
+            );
+            // One box (6 faces × 4 verts), plus the hat layer for player heads.
+            let expected = if matches!(kind, SkullKind::Player) { 48 } else { 24 };
+            assert_eq!(mesh.vertices.len(), expected, "{kind:?}");
+        }
+        // The hat is the same box grown 0.25px, sampling the (32,0) overlay rect.
+        let player = skull(1, 0, SkullKind::Player);
+        let head_lo = skull_box(&player, 0)
+            .iter()
+            .fold(Vec3::splat(f32::MAX), |a, v| a.min(Vec3::from(v.position)));
+        let hat_lo = skull_box(&player, 1)
+            .iter()
+            .fold(Vec3::splat(f32::MAX), |a, v| a.min(Vec3::from(v.position)));
+        assert!(hat_lo.x < head_lo.x && hat_lo.y < head_lo.y, "hat must enclose the head");
+        let head_us: Vec<f32> = skull_box(&player, 0).iter().map(|v| v.uv[0]).collect();
+        let hat_us: Vec<f32> = skull_box(&player, 1).iter().map(|v| v.uv[0]).collect();
+        assert_ne!(head_us, hat_us, "the hat samples its own UV region");
+    }
+
+    #[test]
+    fn the_face_quad_samples_the_skins_face_rect() {
+        // The head's front face must land on texture (8,8)..(16,16) — the face
+        // in every 1.8 skin/mob head layout. A mis-derived flip would paint an
+        // ear or the back of the head there instead.
+        let mesh = skull(1, 0, SkullKind::Skeleton);
+        let (ox, oy) = entity_slot_origin(EntitySlot::Skeleton);
+        for v in &skull_box(&mesh, 0)[12..16] {
+            let upx = v.uv[0] * ENTITY_ATLAS_WIDTH as f32 - ox as f32;
+            let vpx = v.uv[1] * ENTITY_ATLAS_HEIGHT as f32 - oy as f32;
+            assert!(
+                (8.0..=16.0).contains(&upx) && (8.0..=16.0).contains(&vpx),
+                "face quad sampled ({upx},{vpx}), want the (8,8)..(16,16) face rect"
+            );
+        }
+    }
+
+    #[test]
+    fn the_item_form_lands_in_block_local_space_for_its_caller_to_place() {
+        // `push_skull_item` hands its caller the same [0,1]³ block-local frame a
+        // block icon works in, so the GUI / hand / dropped-item transforms can be
+        // shared — except in y, where the head stands on the model origin.
+        let mut mesh = ModelMesh::new();
+        mesh.push_skull_item(SkullKind::Skeleton, None, SKULL_ITEM_ROTATION, &|p| p);
+        let (lo, hi) = mesh.vertices.iter().fold(
+            (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)),
+            |(l, h), v| (l.min(Vec3::from(v.position)), h.max(Vec3::from(v.position))),
+        );
+        assert!((lo - Vec3::new(0.25, 0.0, 0.25)).length() < 1e-5, "{lo:?}");
+        assert!((hi - Vec3::new(0.75, 0.5, 0.75)).length() < 1e-5, "{hi:?}");
+
+        // The transform is applied to every vertex.
+        let mut moved = ModelMesh::new();
+        moved.push_skull_item(SkullKind::Skeleton, None, SKULL_ITEM_ROTATION, &|p| {
+            p + Vec3::new(10.0, 0.0, 0.0)
+        });
+        for (a, b) in mesh.vertices.iter().zip(&moved.vertices) {
+            assert!((b.position[0] - a.position[0] - 10.0).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn a_worn_skull_encloses_the_wearers_head() {
+        // Vanilla's 1.1875× growth is about the neck pivot, so the worn skull
+        // shares the head box's bottom plane and wraps it on the other five
+        // sides — not a head-sized box z-fighting with the player's own.
+        let mut worn = ModelMesh::new();
+        worn.push_worn_skull(
+            SkullKind::Skeleton,
+            None,
+            &EntityAnim::default(),
+            Vec3::new(2.0, 70.0, 3.0),
+            0.0,
+        );
+        assert_eq!(worn.vertices.len(), 24);
+
+        let mut player = ModelMesh::new();
+        player.push_entity(
+            EntityKind::RemotePlayer,
+            Vec3::new(2.0, 70.0, 3.0),
+            0.0,
+            &EntityAnim::default(),
+            None,
+        );
+        // The player's own head is box 5 of the seven humanoid parts.
+        let head = &player.vertices[120..144];
+        let bounds = |vs: &[ModelVertex]| {
+            vs.iter().fold(
+                (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)),
+                |(lo, hi), v| (lo.min(Vec3::from(v.position)), hi.max(Vec3::from(v.position))),
+            )
+        };
+        let (hlo, hhi) = bounds(head);
+        let (slo, shi) = bounds(&worn.vertices);
+        assert!((slo.y - hlo.y).abs() < 1e-5, "shares the neck plane: {slo:?} vs {hlo:?}");
+        assert!(slo.x < hlo.x && slo.z < hlo.z, "wraps the head: {slo:?} vs {hlo:?}");
+        assert!(shi.x > hhi.x && shi.y > hhi.y && shi.z > hhi.z, "{shi:?} vs {hhi:?}");
+        // 1.1875× an 8px head is 9.5px = 0.59375 blocks tall.
+        assert!(((shi.y - slo.y) - 9.5 / 16.0).abs() < 1e-5, "{}", shi.y - slo.y);
+    }
+
+    #[test]
+    fn a_worn_skull_turns_and_tilts_with_the_head() {
+        // It rides the head pose, so a look-up/left turn moves it exactly as the
+        // helmet layer moves — otherwise the head would float off the shoulders.
+        let anim = EntityAnim { net_head_yaw: 40.0, head_pitch: -25.0, ..Default::default() };
+        let mut turned = ModelMesh::new();
+        turned.push_worn_skull(SkullKind::Zombie, None, &anim, Vec3::ZERO, 0.0);
+        let mut still = ModelMesh::new();
+        still.push_worn_skull(SkullKind::Zombie, None, &EntityAnim::default(), Vec3::ZERO, 0.0);
+        assert_ne!(
+            turned.vertices.iter().map(|v| v.position).collect::<Vec<_>>(),
+            still.vertices.iter().map(|v| v.position).collect::<Vec<_>>(),
+        );
+        // The wearer's body yaw turns it too.
+        let mut yawed = ModelMesh::new();
+        yawed.push_worn_skull(SkullKind::Zombie, None, &EntityAnim::default(), Vec3::ZERO, 90.0);
+        assert_ne!(
+            yawed.vertices.iter().map(|v| v.position).collect::<Vec<_>>(),
+            still.vertices.iter().map(|v| v.position).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn a_worn_player_head_adds_the_hat_and_takes_the_owner_skin() {
+        let mut mesh = ModelMesh::new();
+        mesh.push_worn_skull(SkullKind::Player, Some(1), &EntityAnim::default(), Vec3::ZERO, 0.0);
+        assert_eq!(mesh.vertices.len(), 48, "head + hat");
+        let (_, oy) = slot_grid_origin(PLAYER_SKIN_BASE_ROW + 1);
+        let v0 = oy as f32 / ENTITY_ATLAS_HEIGHT as f32;
+        let v1 = (oy + ENTITY_SLOT_PX) as f32 / ENTITY_ATLAS_HEIGHT as f32;
+        assert!(mesh.vertices.iter().all(|v| (v0..=v1).contains(&v.uv[1])));
+    }
+
+    #[test]
+    fn a_player_skull_with_a_resolved_owner_samples_that_skin_row() {
+        let mut mesh = ModelMesh::new();
+        mesh.push_skull([0, 0, 0], 1, 0, SkullKind::Player, Some(3));
+        let (_, oy) = slot_grid_origin(PLAYER_SKIN_BASE_ROW + 3);
+        let v0 = oy as f32 / ENTITY_ATLAS_HEIGHT as f32;
+        let v1 = (oy + ENTITY_SLOT_PX) as f32 / ENTITY_ATLAS_HEIGHT as f32;
+        assert!(mesh.vertices.iter().all(|v| (v0..=v1).contains(&v.uv[1])));
+    }
+
+    #[test]
+    fn unknown_skull_types_fall_back_to_the_skeleton_skull() {
+        assert_eq!(SkullKind::from_type(0), SkullKind::Skeleton);
+        assert_eq!(SkullKind::from_type(1), SkullKind::WitherSkeleton);
+        assert_eq!(SkullKind::from_type(3), SkullKind::Player);
+        assert_eq!(SkullKind::from_type(9), SkullKind::Skeleton);
+        assert_eq!(SkullKind::from_type(-1), SkullKind::Skeleton);
     }
 }

@@ -576,6 +576,90 @@ pub enum MovingSoundCommand {
     Stop { id: u64 },
 }
 
+/// Parse the dashed UUID string a profile compound stores in `Id` into the raw
+/// 16 bytes the skin cache is keyed by. Returns `None` for anything that is not
+/// 32 hex digits once the dashes are stripped.
+fn parse_dashed_uuid(text: &str) -> Option<[u8; 16]> {
+    let hex: String = text.chars().filter(|c| *c != '-').collect();
+    if hex.len() != 32 {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(out)
+}
+
+/// The base64 `textures` property of a GameProfile compound
+/// (`Properties.textures[0].Value`), which the skin downloader decodes into a
+/// skin URL. `None` when the profile carries no skin.
+fn skin_texture_property(profile: &fpsmaster_protocol::nbt::NbtCompound) -> Option<String> {
+    profile
+        .get("Properties")
+        .and_then(|t| t.as_compound())?
+        .get("textures")
+        .and_then(|t| t.as_list())?
+        .iter()
+        .find_map(|entry| {
+            entry
+                .as_compound()?
+                .get("Value")
+                .and_then(|t| t.as_str())
+                .map(str::to_owned)
+        })
+}
+
+/// Vanilla item id of a skull stack; its damage value is the `SkullType`.
+pub const SKULL_ITEM_ID: i16 = 397;
+
+/// Edge of a dropped item's model in blocks (vanilla `RenderEntityItem`'s 0.25).
+const DROPPED_ITEM_SCALE: f32 = 0.25;
+
+/// The 0..15 `Rot` a floor-mounted skull takes from the placer's yaw (vanilla
+/// `ItemSkull.onItemUse`: `floor(yaw * 16 / 360 + 0.5) & 15`), which is why a
+/// placed head ends up looking back at whoever put it down.
+fn skull_rotation_from_yaw(yaw: f32) -> u8 {
+    ((yaw as f64 * 16.0 / 360.0 + 0.5).floor() as i32 & 15) as u8
+}
+
+/// The head a skull *item* stack draws and the owner UUID of a player head.
+/// The item form keeps the profile under `SkullOwner` (the block-entity uses
+/// `Owner`) and allows a bare name string, which carries no texture to fetch —
+/// such a head falls back to the default skin.
+pub fn skull_item_profile(
+    item: &SlotItem,
+) -> (fpsmaster_render::SkullKind, Option<[u8; 16]>, Option<String>) {
+    let kind = fpsmaster_render::SkullKind::from_type(item.damage.max(0) as i32);
+    let owner = item
+        .nbt
+        .as_ref()
+        .and_then(|nbt| nbt.get("SkullOwner"))
+        .and_then(|t| t.as_compound());
+    let Some(owner) = owner else {
+        return (kind, None, None);
+    };
+    let uuid = owner
+        .get("Id")
+        .and_then(|t| t.as_str())
+        .and_then(parse_dashed_uuid);
+    (kind, uuid, skin_texture_property(owner))
+}
+
+/// A skull block-entity's rendered state (vanilla `TileEntitySkull`), decoded
+/// from the S35 UpdateBlockEntity NBT. Block 144's metadata only says which way
+/// the head is mounted, so everything else — which head, how far a floor skull
+/// is turned, and the owner of a player head — has to come from here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkullState {
+    pub kind: fpsmaster_render::SkullKind,
+    /// Vanilla `Rot`: sixteenths of a turn, floor-mounted skulls only.
+    pub rotation: u8,
+    /// The owner's UUID for a player head, once the profile carried a skin the
+    /// skin manager could fetch. `None` leaves the head on the default skin.
+    pub owner: Option<[u8; 16]>,
+}
+
 pub struct GameState {
     pub world: World,
     pub input: InputState,
@@ -644,6 +728,12 @@ pub struct GameState {
     /// Vanilla `GuiIngame.lastPlayerHealth` (`j`): the health snapshot drawn in the
     /// highlight frame while the row blinks after a health change.
     last_player_health: i32,
+    /// Vanilla `GuiIngame.highlightingItemStack`: the held stack as of the last
+    /// tick, compared each tick to decide whether the name banner re-triggers.
+    highlighting_item: Option<SlotItem>,
+    /// Vanilla `GuiIngame.remainingHighlightTicks`: counts down from 40 after the
+    /// held stack changes; the hotbar name banner draws while it is positive.
+    remaining_highlight_ticks: i32,
     /// Experience bar fill (0..1) and level, from SetExperience.
     xp_bar: f32,
     xp_level: i32,
@@ -727,6 +817,15 @@ pub struct GameState {
     /// Sign block-entity text, keyed by world block position: the four lines
     /// flattened from their chat-JSON (S33 UpdateSign).
     signs: std::collections::HashMap<[i32; 3], [String; 4]>,
+    /// Skull block-entity state, keyed by world block position (S35
+    /// UpdateBlockEntity action 4). The block metadata only carries the facing —
+    /// which head it is, how a floor skull is turned, and whose skin a player
+    /// head wears all live here.
+    skulls: std::collections::HashMap<[i32; 3], SkullState>,
+    /// Owner UUID → base64 `textures` property for every player skull seen, so
+    /// the host can download skins for heads whose owner never joined the
+    /// server (and so is absent from the tab-list roster).
+    skull_skin_profiles: std::collections::HashMap<[u8; 16], String>,
     // Smoothed 0..1 view-state amounts, advanced once per physics tick so the
     // sneak camera dip and sprint FOV widen ease in/out instead of snapping.
     sneak_amount: f32,
@@ -1033,6 +1132,12 @@ impl GameState {
         for (i, id) in hotbar.into_iter().enumerate() {
             state.inventory[36 + i] = Some(SlotItem::new(id, 64, 0));
         }
+        // Three skull types in the free slots: heads are the one item that is
+        // both a block-entity and a builtin item model, so having them to hand
+        // makes the world / held / icon paths easy to eyeball in the demo.
+        for (i, skull_type) in [0i16, 3, 4].into_iter().enumerate() {
+            state.inventory[42 + i] = Some(SlotItem::new(397, 1, skull_type));
+        }
         state
     }
 
@@ -1202,6 +1307,8 @@ impl GameState {
             hud_update_counter: 0,
             health_update_counter: 0,
             last_player_health: 20,
+            highlighting_item: None,
+            remaining_highlight_ticks: 0,
             xp_bar: 0.0,
             xp_level: 0,
             is_dead: false,
@@ -1230,6 +1337,8 @@ impl GameState {
             chest_lid_angles: std::collections::HashMap::new(),
             chest_open_targets: std::collections::HashMap::new(),
             signs: std::collections::HashMap::new(),
+            skulls: std::collections::HashMap::new(),
+            skull_skin_profiles: std::collections::HashMap::new(),
             sneak_amount: 0.0,
             previous_sneak_amount: 0.0,
             sprint_amount: 0.0,
@@ -1770,6 +1879,12 @@ impl GameState {
             .iter()
             .map(|(id, e)| (*id, e.amplifier, e.duration))
             .collect()
+    }
+
+    /// Whether any potion effect is active — the cheap check the inventory
+    /// layout needs (the window shifts right to clear the effect panel).
+    pub fn has_active_effects(&self) -> bool {
+        !self.effects.is_empty()
     }
 
     pub fn title_overlay(&self, partial_ticks: f32) -> Option<TitleOverlay<'_>> {
@@ -2692,6 +2807,13 @@ impl GameState {
         // Vanilla GuiIngame.updateTick: a free-running tick counter that drives the
         // heart-shake RNG and the heart/hunger blink timing.
         self.hud_update_counter = self.hud_update_counter.wrapping_add(1);
+        self.update_held_item_highlight();
+        self.register_skull_item_owners();
+        // Every 5s: cheap next to the per-tick work, and the maps only grow by
+        // the handful of block-entities a player can walk past in that window.
+        if self.hud_update_counter % 100 == 0 {
+            self.prune_block_entity_state();
+        }
         self.title.tick();
         // Advance the day/night clock one tick (vanilla ticks world time forward
         // locally between server updates), unless daylight cycle is off.
@@ -3164,6 +3286,19 @@ impl GameState {
                             glint.push_armor_glint(&ids, &enchanted, &anim, feet, body_yaw);
                         }
                     }
+                    // A skull worn in the head slot (vanilla `LayerCustomHead`).
+                    // It is not armor, so `push_armor` above skips it — the two
+                    // never both draw on the same head.
+                    if let Some(head) = slots[4].as_ref().filter(|s| s.id == SKULL_ITEM_ID) {
+                        let (kind, owner, _) = skull_item_profile(head);
+                        mesh.push_worn_skull(
+                            kind,
+                            owner.and_then(|uuid| skin_rows.get(&uuid).copied()),
+                            &anim,
+                            feet,
+                            body_yaw,
+                        );
+                    }
                 }
             }
             // Light the entity by the world lightmap at its body centre (vanilla
@@ -3375,6 +3510,7 @@ impl GameState {
         brightness: f32,
         tick_alpha: f32,
         max_dist_sq: f64,
+        skin_rows: &std::collections::HashMap<[u8; 16], u32>,
     ) -> Vec<SignTextDraw> {
         let time = self.world_time(tick_alpha) as f32;
         let sun_b = fpsmaster_render::sky::sun_brightness(
@@ -3387,9 +3523,10 @@ impl GameState {
         let mut sign_texts = Vec::new();
 
         for (&[wx, wy, wz], block) in self.world.block_entities() {
-            // Signs (63 standing, 68 wall), enchanting table (116) and end
-            // portal (119); chests share the index but render in build_chest_models.
-            if !matches!(block.id, 63 | 68 | 116 | 119) {
+            // Signs (63 standing, 68 wall), enchanting table (116), end portal
+            // (119) and skulls (144); chests share the index but render in
+            // build_chest_models.
+            if !matches!(block.id, 63 | 68 | 116 | 119 | 144) {
                 continue;
             }
             let cx = wx as f64 + 0.5;
@@ -3435,6 +3572,18 @@ impl GameState {
                 }
                 116 => mesh.push_book(cell, time),
                 119 => mesh.push_end_portal(cell),
+                // A skull whose S35 payload has not arrived yet still draws —
+                // as the default skeleton head, facing whichever way its block
+                // metadata mounts it — rather than staying invisible.
+                144 => {
+                    let state = self.skulls.get(&cell);
+                    let kind = state.map_or(fpsmaster_render::SkullKind::Skeleton, |s| s.kind);
+                    let rotation = state.map_or(0, |s| s.rotation);
+                    let skin_row = state
+                        .and_then(|s| s.owner)
+                        .and_then(|uuid| skin_rows.get(&uuid).copied());
+                    mesh.push_skull(cell, block.meta, rotation, kind, skin_row);
+                }
                 _ => unreachable!(),
             }
             for v in &mut mesh.vertices[start..] {
@@ -3444,6 +3593,48 @@ impl GameState {
             }
         }
         sign_texts
+    }
+
+    /// Append the head model for every dropped skull stack to the entity model.
+    /// Skulls sample the entity atlas, so they cannot ride the block-atlas
+    /// world-item pass the other dropped items use; they bob and spin on the
+    /// same vanilla `RenderEntityItem` curves, and are lit by the world lightmap
+    /// like the other block-entity models in this pass.
+    pub fn build_dropped_skull_models(
+        &self,
+        mesh: &mut ModelMesh,
+        items: &[crate::item_renderer::DroppedItem],
+        brightness: f32,
+        tick_alpha: f32,
+        skin_rows: &std::collections::HashMap<[u8; 16], u32>,
+    ) {
+        let sun_b = fpsmaster_render::sky::sun_brightness(
+            self.world_time(tick_alpha),
+            self.weather.rain_strength(tick_alpha),
+            self.weather.thunder_strength(tick_alpha),
+        );
+        for d in items.iter().filter(|d| d.item.id == SKULL_ITEM_ID) {
+            let (kind, owner, _) = skull_item_profile(&d.item);
+            let skin_row = owner.and_then(|uuid| skin_rows.get(&uuid).copied());
+            // Vanilla `RenderEntityItem`: hover on a sine, spin about Y, drawn at
+            // quarter scale — the same curves `build_world_items` uses.
+            let bob = (d.phase * 0.1).sin() * 0.1 + 0.1;
+            let base = d.pos + Vec3::new(0.0, 0.25 + bob, 0.0);
+            let (s, c) = (d.phase * 0.05).sin_cos();
+            let start = mesh.vertices.len();
+            mesh.push_skull_item(kind, skin_row, fpsmaster_render::model::SKULL_ITEM_ROTATION, &|corner| {
+                // The head stands on the model origin rather than being centred,
+                // so only x/z recentre before the spin (see `push_skull_item`).
+                let p = (corner - Vec3::new(0.5, 0.0, 0.5)) * DROPPED_ITEM_SCALE;
+                base + Vec3::new(p.x * c - p.z * s, p.y, p.x * s + p.z * c)
+            });
+            let factor = entity_light(&self.world, base, sun_b, brightness);
+            for v in &mut mesh.vertices[start..] {
+                v.color[0] *= factor[0];
+                v.color[1] *= factor[1];
+                v.color[2] *= factor[2];
+            }
+        }
     }
 
     /// Ease each tracked chest lid toward its target (1 = open while viewers > 0,
@@ -3874,6 +4065,40 @@ impl GameState {
             sign_acc ^= s;
         }
         mix(sign_acc);
+        // Skull block-entity state (order-independent): the head type, rotation
+        // and resolved owner skin, so an S35 arriving after the block — or a
+        // just-downloaded owner skin — re-triggers the rebuild instead of
+        // leaving the cached default head on screen.
+        let mut skull_acc: u64 = 0;
+        for (&[x, y, z], state) in &self.skulls {
+            let owner_row = state
+                .owner
+                .and_then(|uuid| skin_rows.get(&uuid))
+                .map(|r| *r as u64 + 1)
+                .unwrap_or(0);
+            skull_acc ^= ((x as u32 as u64) ^ ((z as u32 as u64) << 21) ^ ((y as u64) << 42))
+                .wrapping_mul(0x9e37_79b9)
+                ^ (state.kind as u64) << 4
+                ^ (state.rotation as u64) << 8
+                ^ owner_row << 12;
+        }
+        mix(skull_acc);
+        // Dropped skull items ride this mesh (they sample the entity atlas, not
+        // the block atlas the other dropped items use) and bob/spin every frame,
+        // so their phase has to defeat the cache the way the hand pose does.
+        // Costs nothing while no head is lying on the ground.
+        let mut dropped_skull_acc: u64 = 0;
+        for e in self.world.entities() {
+            if e.kind != EntityKind::Object(2) {
+                continue;
+            }
+            if self.entity_items.get(&e.id).is_none_or(|i| i.id != SKULL_ITEM_ID) {
+                continue;
+            }
+            let phase = e.age as f32 + tick_alpha + (e.id.0 as f32) * 0.5;
+            dropped_skull_acc ^= (e.id.0 as u32 as u64) ^ ((qa(phase)) << 20);
+        }
+        mix(dropped_skull_acc);
         // Coarse book-hover timer (world time advances ~20/sec): quantized to a
         // few steps per second so the floating book animates without forcing a
         // per-frame rebuild. Idle scenes with a frozen sky still update slowly.
@@ -3992,6 +4217,63 @@ impl GameState {
             use_action: self.use_action,
             use_ticks: self.use_item_ticks as f32 + partial,
         }
+    }
+
+    /// Vanilla `GuiIngame.updateTick`'s held-item half: when the selected stack
+    /// differs from last tick the name banner re-arms for 40 ticks, otherwise it
+    /// counts down; an empty hand clears it outright. Two stacks count as the
+    /// same when their id, NBT and metadata match — except on damageable items,
+    /// whose metadata is wear, so a pickaxe losing durability mid-swing must not
+    /// keep re-triggering the banner.
+    fn update_held_item_highlight(&mut self) {
+        let current = self.held_item().cloned();
+        match (&current, &self.highlighting_item) {
+            (None, _) => self.remaining_highlight_ticks = 0,
+            (Some(now), Some(before))
+                if now.id == before.id
+                    && now.nbt == before.nbt
+                    && (fpsmaster_render::is_damageable(now.id)
+                        || now.damage == before.damage) =>
+            {
+                self.remaining_highlight_ticks = (self.remaining_highlight_ticks - 1).max(0);
+            }
+            _ => self.remaining_highlight_ticks = 40,
+        }
+        self.highlighting_item = current;
+    }
+
+    /// The held-item name banner above the hotbar (vanilla
+    /// `GuiIngame.renderSelectedItem`): the `§`-coded display name and its 0..1
+    /// alpha, or `None` once the 40-tick window has run out. Vanilla's alpha is
+    /// `ticks * 256 / 10` clamped to 255, so the name holds solid for 30 ticks
+    /// and fades over the last 10.
+    pub fn held_item_highlight(&self) -> Option<(String, f32)> {
+        if self.remaining_highlight_ticks <= 0 {
+            return None;
+        }
+        let item = self.highlighting_item.as_ref()?;
+        let alpha = (self.remaining_highlight_ticks as f32 * 256.0 / 10.0).min(255.0);
+        if alpha <= 0.0 {
+            return None;
+        }
+        Some((fpsmaster_render::stack_display_name(item), alpha / 255.0))
+    }
+
+    /// The local player's right-arm hold state (vanilla `ModelBiped`'s
+    /// `heldItemRight`: 0 empty, 1 holding, 3 blocking), so a preview of the
+    /// local player lowers its arm exactly like the in-world model does.
+    pub fn local_held_item_arm_state(&self) -> u8 {
+        held_item_right_state(self.held_item(), self.is_using_item())
+    }
+
+    /// The local player's worn armor, in the 1.8 EntityEquipment slot layout the
+    /// model code expects (0 held — always `None` here, 1 boots, 2 leggings,
+    /// 3 chestplate, 4 helmet). The player window lays its four armor slots out
+    /// top-to-bottom as inventory indices 5..8, i.e. helmet first — the reverse
+    /// of the equipment numbering.
+    pub fn local_armor(&self) -> [Option<&SlotItem>; 5] {
+        let slot = |i: usize| self.inventory.get(i).and_then(|s| s.as_ref());
+        [None, slot(8), slot(7), slot(6), slot(5)]
     }
 
     /// The item in the selected hotbar slot, if any.
@@ -4536,6 +4818,19 @@ impl GameState {
         if self.world.set_block_if_chunk_loaded(px, py, pz, state) {
             self.mark_block_dirty_urgent(px, py, pz);
             self.relight_after_edit(px, py, pz, old);
+            // Predict the skull block-entity too, or the head would draw as the
+            // default skeleton until the server's S35 arrives (and forever in a
+            // server-less demo world). Vanilla `ItemSkull.onItemUse` only gives
+            // a floor-mounted skull a rotation, quantized from the placer's yaw.
+            if item.id == SKULL_ITEM_ID {
+                let (kind, owner, _) = skull_item_profile(item);
+                let rotation = if face == 1 {
+                    skull_rotation_from_yaw(self.player.yaw)
+                } else {
+                    0
+                };
+                self.skulls.insert([px, py, pz], SkullState { kind, rotation, owner });
+            }
             // No client-side place sound: vanilla's `ItemBlock.onItemUse` plays it
             // via `World.playSoundEffect`, but on the client that hits the empty
             // `RenderGlobal.playSound` (a no-op). The audible place sound comes
@@ -5013,6 +5308,9 @@ impl GameState {
             }
             ClientboundPlayPacket::UpdateSign { x, y, z, lines } => {
                 self.handle_update_sign(x, y, z, lines)
+            }
+            ClientboundPlayPacket::UpdateBlockEntity { x, y, z, action, nbt } => {
+                self.handle_update_block_entity(x, y, z, action, nbt)
             }
             ClientboundPlayPacket::ScoreboardObjective {
                 name,
@@ -6030,12 +6328,110 @@ impl GameState {
         false
     }
 
+    /// Drop block-entity state whose block is no longer there — broken,
+    /// replaced, or carried off with an unloaded chunk. Both maps are keyed by
+    /// world position and were previously only ever inserted into, so a long
+    /// session accumulated an entry for every sign and skull it had ever seen.
+    /// Vanilla ties a TileEntity's lifetime to its block; this applies the same
+    /// rule on a timer rather than at each edit, which also covers chunk
+    /// unloads (no block-change packet is sent for those).
+    ///
+    /// Safe against a payload arriving before its block only because 1.8.9
+    /// always sends the block first — chunk data before its tile entities,
+    /// S23 BlockChange before S35 — so a live entry is never mid-flight here.
+    fn prune_block_entity_state(&mut self) {
+        let world = &self.world;
+        self.signs
+            .retain(|&[x, y, z], _| matches!(world.block_at(x, y, z).id, 63 | 68));
+        self.skulls
+            .retain(|&[x, y, z], _| world.block_at(x, y, z).id == 144);
+        // Owner profiles are keyed by UUID, not position, and are bounded by the
+        // number of distinct head owners seen; they stay.
+    }
+
     fn handle_update_sign(&mut self, x: i32, y: i32, z: i32, lines: [String; 4]) -> bool {
         // Store the four lines flattened from chat-JSON, keyed by block
         // position; the sign block-entity renderer draws them in world.
         let text = lines.map(|line| chat::flatten_chat_json(&line));
         self.signs.insert([x, y, z], text);
         false
+    }
+
+    /// S35 UpdateBlockEntity. Only the skull payload (action 4) is modelled:
+    /// it carries everything block 144's metadata cannot — which head it is,
+    /// how a floor-mounted one is turned, and the owning profile of a player
+    /// head. An absent compound means the server dropped the block-entity, so
+    /// the stored state goes with it.
+    fn handle_update_block_entity(
+        &mut self,
+        x: i32,
+        y: i32,
+        z: i32,
+        action: u8,
+        nbt: Option<fpsmaster_protocol::nbt::NbtCompound>,
+    ) -> bool {
+        const SKULL_ACTION: u8 = 4;
+        if action != SKULL_ACTION {
+            return false;
+        }
+        let cell = [x, y, z];
+        let Some(nbt) = nbt else {
+            self.skulls.remove(&cell);
+            return false;
+        };
+        let skull_type = nbt.get("SkullType").and_then(|t| t.as_byte()).unwrap_or(0);
+        let rotation = nbt.get("Rot").and_then(|t| t.as_byte()).unwrap_or(0);
+        let owner = nbt.get("Owner").and_then(|t| t.as_compound());
+        // Queue the owner's skin download; the head falls back to the default
+        // skin until it lands (and stays there if the profile carried none).
+        let owner_uuid = owner.and_then(|o| {
+            let uuid = parse_dashed_uuid(o.get("Id").and_then(|t| t.as_str())?)?;
+            if let Some(property) = skin_texture_property(o) {
+                self.skull_skin_profiles.entry(uuid).or_insert(property);
+            }
+            Some(uuid)
+        });
+        self.skulls.insert(
+            cell,
+            SkullState {
+                kind: fpsmaster_render::SkullKind::from_type(skull_type as i32),
+                rotation: (rotation & 15) as u8,
+                owner: owner_uuid,
+            },
+        );
+        false
+    }
+
+    /// Queue skin downloads for the owners of any player heads carried in the
+    /// inventory or the open window, or worn on another player's head, so they
+    /// show the right face instead of the default skin. Run once per tick over
+    /// the ~45 player slots, the open window and the tracked equipment — cheap,
+    /// and it covers every route a stack can arrive by (SetSlot, WindowItems,
+    /// EntityEquipment, a predicted click) without hooking each one.
+    fn register_skull_item_owners(&mut self) {
+        let profiles: Vec<([u8; 16], String)> = self
+            .inventory
+            .iter()
+            .chain(self.open_container.iter().flat_map(|c| c.container_items()))
+            .chain(self.entity_equipment.values().map(|slots| &slots[4]))
+            .flatten()
+            .filter(|item| item.id == SKULL_ITEM_ID)
+            .filter_map(|item| match skull_item_profile(item) {
+                (_, Some(uuid), Some(property)) => Some((uuid, property)),
+                _ => None,
+            })
+            .collect();
+        for (uuid, property) in profiles {
+            self.skull_skin_profiles.entry(uuid).or_insert(property);
+        }
+    }
+
+    /// Owner profiles seen on player skulls that carry a skin texture, for the
+    /// host to hand to the skin downloader (the same route the tab-list roster
+    /// takes). Skulls can name players who were never in the player list, so
+    /// they need their own source of profiles.
+    pub fn skull_skin_profiles(&self) -> impl Iterator<Item = (&[u8; 16], &String)> {
+        self.skull_skin_profiles.iter()
     }
 
     fn handle_player_list_header_footer(&mut self, header: String, footer: String) -> bool {
@@ -6842,6 +7238,12 @@ fn is_interactable(block: BlockState) -> bool {
 /// waits for the server rather than risk a wrong phantom.
 fn placement_block_state(item: &SlotItem, face: u8, yaw: f32, cursor_y: u8) -> Option<BlockState> {
     let raw = item.id;
+    // Skulls are the one item outside the block-id range that places a block:
+    // vanilla `ItemSkull.onItemUse` sets block 144 with the clicked face as its
+    // metadata, and refuses the underside (a skull has nothing to hang from).
+    if raw == SKULL_ITEM_ID {
+        return (face != 0).then(|| BlockState::new(144, face));
+    }
     if !(1..=255).contains(&raw) {
         return None;
     }
@@ -8374,6 +8776,72 @@ mod interaction_tests {
     }
 
     #[test]
+    fn switching_the_held_item_re_arms_the_name_banner() {
+        let mut gs = GameState::empty_for_server(1.0);
+        gs.selected_slot = 0;
+        gs.inventory[36] = Some(SlotItem::new(1, 64, 0)); // stone
+        gs.inventory[37] = Some(SlotItem::new(2, 64, 0)); // grass
+
+        gs.update_held_item_highlight();
+        assert_eq!(gs.remaining_highlight_ticks, 40);
+        let (name, alpha) = gs.held_item_highlight().expect("banner armed");
+        assert!(name.contains("Stone"), "{name}");
+        assert_eq!(alpha, 1.0, "solid while above 10 ticks left");
+
+        // Holding the same stack counts down; the last 10 ticks fade.
+        for _ in 0..30 {
+            gs.update_held_item_highlight();
+        }
+        assert_eq!(gs.remaining_highlight_ticks, 10);
+        assert_eq!(gs.held_item_highlight().map(|(_, a)| a), Some(1.0));
+        gs.update_held_item_highlight();
+        let alpha = gs.held_item_highlight().expect("still visible").1;
+        assert!(alpha > 0.0 && alpha < 1.0, "fading, got {alpha}");
+
+        // ...and runs out.
+        for _ in 0..9 {
+            gs.update_held_item_highlight();
+        }
+        assert_eq!(gs.remaining_highlight_ticks, 0);
+        assert!(gs.held_item_highlight().is_none());
+
+        // Selecting a different slot re-arms it with the new item's name.
+        gs.selected_slot = 1;
+        gs.update_held_item_highlight();
+        assert_eq!(gs.remaining_highlight_ticks, 40);
+        assert!(gs.held_item_highlight().unwrap().0.contains("Grass"));
+
+        // An empty hand clears it outright rather than showing a stale name.
+        gs.selected_slot = 2;
+        gs.update_held_item_highlight();
+        assert_eq!(gs.remaining_highlight_ticks, 0);
+        assert!(gs.held_item_highlight().is_none());
+    }
+
+    #[test]
+    fn a_tool_losing_durability_does_not_re_trigger_the_name_banner() {
+        // Vanilla ignores metadata on damageable items, so mining (which bumps
+        // the pickaxe's damage every block) must not keep re-showing its name —
+        // while a plain metadata variant swap (wool colour) still does.
+        let mut gs = GameState::empty_for_server(1.0);
+        gs.selected_slot = 0;
+        gs.inventory[36] = Some(SlotItem::new(257, 1, 0)); // iron pickaxe
+        gs.update_held_item_highlight();
+        assert_eq!(gs.remaining_highlight_ticks, 40);
+
+        gs.inventory[36] = Some(SlotItem::new(257, 1, 1)); // one use of wear
+        gs.update_held_item_highlight();
+        assert_eq!(gs.remaining_highlight_ticks, 39, "wear is not a new item");
+
+        gs.inventory[36] = Some(SlotItem::new(35, 1, 0)); // white wool
+        gs.update_held_item_highlight();
+        gs.remaining_highlight_ticks = 5;
+        gs.inventory[36] = Some(SlotItem::new(35, 1, 14)); // red wool
+        gs.update_held_item_highlight();
+        assert_eq!(gs.remaining_highlight_ticks, 40, "a variant is a new item");
+    }
+
+    #[test]
     fn use_block_predicts_placement_and_sends_held_item() {
         let mut gs = looking_along_x();
         gs.world.set_block(3, 0, 0, BlockState::STONE);
@@ -9618,6 +10086,408 @@ mod interaction_tests {
     }
 }
 
+
+#[cfg(test)]
+mod skull_tests {
+    use super::*;
+    use fpsmaster_protocol::nbt::{NbtCompound, NbtTag};
+    use fpsmaster_render::SkullKind;
+
+    fn compound(entries: &[(&str, NbtTag)]) -> NbtCompound {
+        entries
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), v.clone()))
+            .collect()
+    }
+
+    /// An `Owner` profile compound with an id and a base64 textures property.
+    fn owner(id: &str, texture: &str) -> NbtTag {
+        NbtTag::Compound(compound(&[
+            ("Id", NbtTag::String(id.to_owned())),
+            (
+                "Properties",
+                NbtTag::Compound(compound(&[(
+                    "textures",
+                    NbtTag::List(vec![NbtTag::Compound(compound(&[(
+                        "Value",
+                        NbtTag::String(texture.to_owned()),
+                    )]))]),
+                )])),
+            ),
+        ]))
+    }
+
+    #[test]
+    fn a_skull_payload_sets_the_head_type_and_rotation() {
+        let mut gs = GameState::empty_for_server(1.0);
+        gs.handle_update_block_entity(
+            3,
+            64,
+            -8,
+            4,
+            Some(compound(&[
+                ("SkullType", NbtTag::Byte(1)),
+                ("Rot", NbtTag::Byte(6)),
+            ])),
+        );
+        assert_eq!(
+            gs.skulls.get(&[3, 64, -8]),
+            Some(&SkullState { kind: SkullKind::WitherSkeleton, rotation: 6, owner: None }),
+        );
+    }
+
+    #[test]
+    fn a_cleared_block_entity_forgets_the_skull() {
+        let mut gs = GameState::empty_for_server(1.0);
+        let cell = [0, 0, 0];
+        gs.handle_update_block_entity(0, 0, 0, 4, Some(compound(&[("SkullType", NbtTag::Byte(2))])));
+        assert!(gs.skulls.contains_key(&cell));
+        gs.handle_update_block_entity(0, 0, 0, 4, None);
+        assert!(!gs.skulls.contains_key(&cell));
+    }
+
+    #[test]
+    fn other_block_entity_actions_are_ignored() {
+        // Actions 1/2/3/5/6 (spawner, command block, beacon, flower pot,
+        // banner) share the packet; none of them may land in the skull map.
+        let mut gs = GameState::empty_for_server(1.0);
+        for action in [1u8, 2, 3, 5, 6] {
+            gs.handle_update_block_entity(1, 2, 3, action, Some(compound(&[])));
+        }
+        assert!(gs.skulls.is_empty());
+    }
+
+    #[test]
+    fn a_player_head_queues_its_owners_skin() {
+        let mut gs = GameState::empty_for_server(1.0);
+        gs.handle_update_block_entity(
+            5,
+            5,
+            5,
+            4,
+            Some(compound(&[
+                ("SkullType", NbtTag::Byte(3)),
+                ("Owner", owner("069a79f4-44e9-4726-a5be-fca90e38aaf5", "eyJ0ZXh0dXJlcyI6e319")),
+            ])),
+        );
+        let state = gs.skulls.get(&[5, 5, 5]).expect("skull stored");
+        assert_eq!(state.kind, SkullKind::Player);
+        let uuid = state.owner.expect("owner parsed");
+        assert_eq!(uuid[0], 0x06);
+        assert_eq!(uuid[15], 0xf5);
+        assert_eq!(
+            gs.skull_skin_profiles().collect::<Vec<_>>(),
+            vec![(&uuid, &"eyJ0ZXh0dXJlcyI6e319".to_owned())],
+        );
+    }
+
+    #[test]
+    fn an_owner_without_a_skin_still_renders_the_default_head() {
+        // A head placed by name only (no Properties) must not be dropped —
+        // it just stays on the default skin.
+        let mut gs = GameState::empty_for_server(1.0);
+        gs.handle_update_block_entity(
+            1,
+            1,
+            1,
+            4,
+            Some(compound(&[
+                ("SkullType", NbtTag::Byte(3)),
+                (
+                    "Owner",
+                    NbtTag::Compound(compound(&[(
+                        "Id",
+                        NbtTag::String("069a79f4-44e9-4726-a5be-fca90e38aaf5".to_owned()),
+                    )])),
+                ),
+            ])),
+        );
+        assert!(gs.skulls[&[1, 1, 1]].owner.is_some());
+        assert_eq!(gs.skull_skin_profiles().count(), 0);
+    }
+
+    /// A camera at the origin looking down +x, with a skull placed in view.
+    fn world_with_a_skull(meta: u8) -> GameState {
+        let mut gs = GameState::empty_for_server(1.0);
+        gs.camera.position = Vec3::new(0.5, 0.5, 0.5);
+        gs.camera.yaw = -90.0;
+        gs.camera.pitch = 0.0;
+        gs.world.set_block(3, 0, 0, BlockState::new(144, meta));
+        gs
+    }
+
+    fn skull_mesh(gs: &GameState) -> ModelMesh {
+        let mut mesh = ModelMesh::new();
+        gs.build_block_entity_models(&mut mesh, 1.0, 0.0, 4096.0, &std::collections::HashMap::new());
+        mesh
+    }
+
+    #[test]
+    fn a_skull_block_in_the_world_reaches_the_entity_mesh() {
+        // The end-to-end path the bug report was about: block 144 is indexed as
+        // a block-entity, survives the per-kind filter, and emits real geometry.
+        // Before this it had collision but drew nothing at all.
+        let gs = world_with_a_skull(1);
+        let mesh = skull_mesh(&gs);
+        assert_eq!(mesh.vertices.len(), 24, "one 6-face head box");
+        let lo = mesh
+            .vertices
+            .iter()
+            .fold(Vec3::splat(f32::MAX), |a, v| a.min(Vec3::from(v.position)));
+        let hi = mesh
+            .vertices
+            .iter()
+            .fold(Vec3::splat(f32::MIN), |a, v| a.max(Vec3::from(v.position)));
+        assert!((lo - Vec3::new(3.25, 0.0, 0.25)).length() < 1e-4, "{lo:?}");
+        assert!((hi - Vec3::new(3.75, 0.5, 0.75)).length() < 1e-4, "{hi:?}");
+    }
+
+    #[test]
+    fn the_block_entity_payload_changes_which_head_the_world_draws() {
+        // Same block, different S35 payload → a different texture slot. This is
+        // the half the block metadata cannot carry.
+        let mut gs = world_with_a_skull(1);
+        let plain = skull_mesh(&gs);
+        gs.handle_update_block_entity(3, 0, 0, 4, Some(compound(&[("SkullType", NbtTag::Byte(4))])));
+        let creeper = skull_mesh(&gs);
+        assert_eq!(plain.vertices.len(), creeper.vertices.len());
+        // Compare the full UVs, not just V: the atlas is two slots wide, so
+        // neighbouring slots share a row and differ only in U.
+        let uvs = |m: &ModelMesh| m.vertices.iter().map(|v| v.uv).collect::<Vec<_>>();
+        assert_ne!(uvs(&plain), uvs(&creeper), "a creeper head must sample its own texture");
+
+        // A player head adds the hat layer.
+        gs.handle_update_block_entity(3, 0, 0, 4, Some(compound(&[("SkullType", NbtTag::Byte(3))])));
+        assert_eq!(skull_mesh(&gs).vertices.len(), 48);
+    }
+
+    #[test]
+    fn a_wall_skull_hangs_off_the_cell_floor() {
+        // Metadata 5 (EAST) mounts at x 0.26 and y 0.25..0.75, not on the floor.
+        let gs = world_with_a_skull(5);
+        let mesh = skull_mesh(&gs);
+        let lo = mesh
+            .vertices
+            .iter()
+            .fold(Vec3::splat(f32::MAX), |a, v| a.min(Vec3::from(v.position)));
+        assert!((lo.y - 0.25).abs() < 1e-4, "wall skulls hang at y 0.25, got {}", lo.y);
+        assert!((lo.x - 3.01).abs() < 1e-4, "mounted on the -x wall, got {}", lo.x);
+    }
+
+    #[test]
+    fn placing_a_skull_predicts_both_the_block_and_its_head() {
+        // Right-clicking the top of a block places a floor skull that shows the
+        // stack's head type immediately — without the local block-entity guess
+        // it would draw as the default skeleton until the server's S35 (and
+        // forever in the server-less demo world).
+        let mut gs = GameState::empty_for_server(1.0);
+        gs.camera.position = Vec3::new(0.5, 0.5, 0.5);
+        gs.camera.yaw = -90.0;
+        gs.player.yaw = 0.0;
+        gs.world.set_block(3, 0, 0, BlockState::STONE);
+        gs.selected_slot = 0;
+        gs.inventory[36] = Some(SlotItem::new(SKULL_ITEM_ID, 1, 4)); // creeper head
+
+        let item = gs.held_item().cloned().unwrap();
+        assert!(gs.predict_placement(3, 0, 0, 1, 8, Some(&item)), "placement predicted");
+        assert_eq!(gs.world.block_at(3, 1, 0), BlockState::new(144, 1));
+        assert_eq!(
+            gs.skulls.get(&[3, 1, 0]),
+            Some(&SkullState { kind: SkullKind::Creeper, rotation: 0, owner: None }),
+        );
+    }
+
+    #[test]
+    fn a_skull_takes_the_clicked_face_and_never_the_underside() {
+        let skull = SlotItem::new(SKULL_ITEM_ID, 1, 0);
+        // Face 0 is DOWN — vanilla refuses it, so no phantom block is predicted.
+        assert_eq!(placement_block_state(&skull, 0, 0.0, 8), None);
+        // Every other face becomes the metadata verbatim (an EnumFacing index).
+        for face in 1u8..=5 {
+            assert_eq!(
+                placement_block_state(&skull, face, 0.0, 8),
+                Some(BlockState::new(144, face)),
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_floor_skull_takes_the_placers_yaw() {
+        let mut gs = GameState::empty_for_server(1.0);
+        gs.camera.position = Vec3::new(0.5, 0.5, 0.5);
+        gs.camera.yaw = -90.0;
+        gs.world.set_block(3, 0, 0, BlockState::STONE);
+        gs.world.set_block(3, 2, 0, BlockState::STONE);
+        let item = SlotItem::new(SKULL_ITEM_ID, 1, 0);
+
+        // Facing west (yaw 90) → Rot 4 of the 16 steps.
+        gs.player.yaw = 90.0;
+        assert!(gs.predict_placement(3, 0, 0, 1, 8, Some(&item)));
+        assert_eq!(gs.skulls[&[3, 1, 0]].rotation, 4);
+
+        // A wall skull's facing already comes from the metadata, so vanilla
+        // leaves its rotation at 0. (Face 3 is SOUTH, keeping the target cell in
+        // the one loaded chunk.)
+        assert!(gs.predict_placement(3, 2, 0, 3, 8, Some(&item)));
+        assert_eq!(gs.world.block_at(3, 2, 1), BlockState::new(144, 3));
+        assert_eq!(gs.skulls[&[3, 2, 1]].rotation, 0);
+
+        assert_eq!(skull_rotation_from_yaw(0.0), 0);
+        assert_eq!(skull_rotation_from_yaw(180.0), 8);
+        assert_eq!(skull_rotation_from_yaw(-90.0), 12, "negative yaw wraps");
+    }
+
+    fn dropped(item: SlotItem, phase: f32) -> crate::item_renderer::DroppedItem {
+        crate::item_renderer::DroppedItem {
+            item,
+            pos: Vec3::new(4.0, 65.0, -2.0),
+            phase,
+            light: [1.0, 1.0],
+        }
+    }
+
+    #[test]
+    fn a_dropped_skull_draws_as_a_head_and_keeps_bobbing() {
+        let gs = GameState::empty_for_server(1.0);
+        let rows = std::collections::HashMap::new();
+        let build = |phase: f32| {
+            let mut mesh = ModelMesh::new();
+            gs.build_dropped_skull_models(
+                &mut mesh,
+                &[dropped(SlotItem::new(SKULL_ITEM_ID, 1, 2), phase)],
+                1.0,
+                0.0,
+                &rows,
+            );
+            mesh
+        };
+        let a = build(0.0);
+        assert_eq!(a.vertices.len(), 24, "one head box, quarter scale");
+        // Quarter-scale: the 0.5-block head model becomes 0.125 blocks.
+        let (lo, hi) = a.vertices.iter().fold(
+            (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)),
+            |(l, h), v| (l.min(Vec3::from(v.position)), h.max(Vec3::from(v.position))),
+        );
+        assert!(((hi.y - lo.y) - 0.125).abs() < 1e-5, "height {}", hi.y - lo.y);
+
+        // The bob and spin must actually advance with the phase — this is the
+        // half that the cached entity mesh would otherwise freeze.
+        let b = build(9.0);
+        assert_ne!(
+            a.vertices.iter().map(|v| v.position).collect::<Vec<_>>(),
+            b.vertices.iter().map(|v| v.position).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn only_skull_stacks_reach_the_dropped_head_pass() {
+        // Every other dropped item belongs to the block-atlas world-item pass.
+        let gs = GameState::empty_for_server(1.0);
+        let mut mesh = ModelMesh::new();
+        gs.build_dropped_skull_models(
+            &mut mesh,
+            &[
+                dropped(SlotItem::new(1, 1, 0), 0.0),   // stone
+                dropped(SlotItem::new(276, 1, 0), 0.0), // diamond sword
+            ],
+            1.0,
+            0.0,
+            &std::collections::HashMap::new(),
+        );
+        assert!(mesh.is_empty());
+    }
+
+    #[test]
+    fn a_dropped_skull_keeps_the_entity_mesh_rebuilding() {
+        // The entity mesh is cached behind a fingerprint. Dropped skulls live in
+        // that mesh and animate every frame, so the key must move with them —
+        // otherwise the head would hang frozen in mid-air.
+        let mut gs = GameState::empty_for_server(1.0);
+        let rows = std::collections::HashMap::new();
+        let key = |gs: &GameState, alpha: f32| gs.entity_render_fingerprint(alpha, 1.0, true, &rows, 4096.0);
+
+        // With nothing on the ground the key is stable across a tick's frames,
+        // so idle scenes still get the cache.
+        assert_eq!(key(&gs, 0.1), key(&gs, 0.9), "an idle scene must stay cached");
+
+        let id = EntityId(77);
+        gs.world.upsert_entity(EntityState::new_remote(
+            id,
+            EntityKind::Object(2),
+            DVec3::new(4.0, 65.0, -2.0),
+            0.0,
+            0.0,
+        ));
+        gs.entity_items.insert(id, SlotItem::new(SKULL_ITEM_ID, 1, 0));
+        assert_ne!(key(&gs, 0.1), key(&gs, 0.9), "a dropped head must re-trigger");
+    }
+
+    #[test]
+    fn block_entity_state_is_dropped_when_its_block_goes() {
+        // The maps are keyed by position and only ever inserted into, so without
+        // pruning a long session keeps an entry for every sign and skull it ever
+        // saw. Breaking, replacing or unloading the block must clear it.
+        let mut gs = GameState::empty_for_server(1.0);
+        gs.world.set_block(1, 1, 1, BlockState::new(144, 1));
+        gs.world.set_block(2, 1, 1, BlockState::new(63, 0));
+        gs.handle_update_block_entity(1, 1, 1, 4, Some(compound(&[("SkullType", NbtTag::Byte(1))])));
+        gs.handle_update_sign(2, 1, 1, std::array::from_fn(|_| String::new()));
+        // Never-placed positions: state that arrived for blocks we do not have.
+        gs.handle_update_block_entity(9, 9, 9, 4, Some(compound(&[])));
+
+        gs.prune_block_entity_state();
+        assert!(gs.skulls.contains_key(&[1, 1, 1]), "a live skull survives");
+        assert!(gs.signs.contains_key(&[2, 1, 1]), "a live sign survives");
+        assert!(!gs.skulls.contains_key(&[9, 9, 9]), "a blockless entry is dropped");
+
+        // Break the skull and replace the sign with stone.
+        gs.world.set_block(1, 1, 1, BlockState::AIR);
+        gs.world.set_block(2, 1, 1, BlockState::STONE);
+        gs.prune_block_entity_state();
+        assert!(gs.skulls.is_empty(), "broken skull state must go");
+        assert!(gs.signs.is_empty(), "replaced sign state must go");
+    }
+
+    #[test]
+    fn the_prune_runs_on_a_timer_without_dropping_fresh_state() {
+        // The prune is on a 5s tick so it costs nothing per frame; a skull placed
+        // between two runs must still be there when the next one comes round.
+        let mut gs = GameState::empty_for_server(1.0);
+        gs.world.set_block(0, 1, 0, BlockState::new(144, 1));
+        gs.handle_update_block_entity(0, 1, 0, 4, Some(compound(&[])));
+        for _ in 0..250 {
+            gs.tick(0.05);
+        }
+        assert!(gs.skulls.contains_key(&[0, 1, 0]), "a standing skull survives the timer");
+    }
+
+    #[test]
+    fn the_preview_reads_armor_in_equipment_slot_order() {
+        // The player window lists armor helmet-first (inventory 5..8) while the
+        // model code numbers it boots-first, so a swapped mapping would put a
+        // helmet on the feet.
+        let mut gs = GameState::empty_for_server(1.0);
+        gs.inventory[5] = Some(SlotItem::new(310, 1, 0)); // diamond helmet
+        gs.inventory[6] = Some(SlotItem::new(311, 1, 0)); // diamond chestplate
+        gs.inventory[7] = Some(SlotItem::new(312, 1, 0)); // diamond leggings
+        gs.inventory[8] = Some(SlotItem::new(313, 1, 0)); // diamond boots
+        let armor = gs.local_armor();
+        assert!(armor[0].is_none(), "slot 0 is the held slot, not armor");
+        assert_eq!(armor[1].map(|s| s.id), Some(313), "1 = boots");
+        assert_eq!(armor[2].map(|s| s.id), Some(312), "2 = leggings");
+        assert_eq!(armor[3].map(|s| s.id), Some(311), "3 = chestplate");
+        assert_eq!(armor[4].map(|s| s.id), Some(310), "4 = helmet");
+    }
+
+    #[test]
+    fn malformed_uuids_are_rejected_rather_than_mis_keyed() {
+        assert!(parse_dashed_uuid("069a79f4-44e9-4726-a5be-fca90e38aaf5").is_some());
+        assert!(parse_dashed_uuid("069a79f444e94726a5befca90e38aaf5").is_some(), "dashless is fine");
+        assert!(parse_dashed_uuid("").is_none());
+        assert!(parse_dashed_uuid("069a79f4-44e9-4726-a5be-fca90e38aa").is_none(), "too short");
+        assert!(parse_dashed_uuid("069a79f4-44e9-4726-a5be-fca90e38aazz").is_none(), "not hex");
+    }
+}
 
 #[cfg(test)]
 mod weather_tests {

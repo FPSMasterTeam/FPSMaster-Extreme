@@ -295,6 +295,12 @@ impl Container {
         &self.slots
     }
 
+    /// The window's own inventory (empty for the player window, whose slots all
+    /// map into the shared player inventory).
+    pub fn container_items(&self) -> &[Option<SlotItem>] {
+        &self.container_inv
+    }
+
     /// The villager trade offers (empty until `MC|TrList` arrives).
     pub fn trades(&self) -> &[MerchantRecipe] {
         &self.trades

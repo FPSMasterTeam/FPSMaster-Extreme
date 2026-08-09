@@ -273,6 +273,18 @@ pub struct GuiBlockItem {
     pub meta: u8,
 }
 
+/// A skull item (397) rendered as its 3D block-entity head into a slot rect.
+/// Vanilla ships no flat sprite for it — the head model IS the icon — so it
+/// needs its own list: it samples the entity atlas rather than the block atlas
+/// the cube pass is bound to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuiSkullItem {
+    pub dst: UiRect,
+    pub kind: crate::SkullKind,
+    /// The owner's downloaded skin row for a player head, if one is resolved.
+    pub skin_row: Option<u32>,
+}
+
 /// An enchanted item icon to overlay with the scrolling glint: a 3D block-icon
 /// cube (`block` set) shimmers over its cube geometry, anything else as a flat
 /// quad over its slot rect. Built into a clip-space glint mesh by the renderer.
@@ -293,6 +305,9 @@ pub struct UiFrame {
     overlay: Vec<UiCommand>,
     /// 3D block icons, rendered by the GPU cube pass between the two layers.
     block_items: Vec<GuiBlockItem>,
+    /// 3D skull-head icons, drawn alongside the block icons but from the entity
+    /// atlas (see [`GuiSkullItem`]).
+    skull_items: Vec<GuiSkullItem>,
     /// Enchanted item icons to overlay with the scrolling glint (drawn over the
     /// icons in the UI pass, additively, like the held/world item glint).
     glint_items: Vec<GuiGlintItem>,
@@ -311,6 +326,7 @@ impl UiFrame {
         self.commands.is_empty()
             && self.overlay.is_empty()
             && self.block_items.is_empty()
+            && self.skull_items.is_empty()
             && self.glint_items.is_empty()
             && self.crosshair.is_empty()
     }
@@ -326,6 +342,10 @@ impl UiFrame {
 
     pub fn block_items(&self) -> &[GuiBlockItem] {
         &self.block_items
+    }
+
+    pub fn skull_items(&self) -> &[GuiSkullItem] {
+        &self.skull_items
     }
 
     pub fn glint_items(&self) -> &[GuiGlintItem] {
@@ -367,6 +387,12 @@ impl UiFrame {
             block_id,
             meta,
         });
+    }
+
+    /// Queue a 3D skull-head icon (item 397). Drawn in the same pass as the
+    /// block cubes, from the entity atlas.
+    pub fn skull_item(&mut self, dst: UiRect, kind: crate::SkullKind, skin_row: Option<u32>) {
+        self.skull_items.push(GuiSkullItem { dst, kind, skin_row });
     }
 
     /// Overlay-layer variants (drawn over the 3D block icons).

@@ -32,9 +32,11 @@ impl Default for World {
 
 /// Block ids that carry a client-rendered block-entity (vanilla TileEntity):
 /// chest/trapped/ender (54/146/130), standing/wall sign (63/68), enchanting
-/// table (116) and end portal (119).
+/// table (116), end portal (119) and skull (144). These render no terrain
+/// geometry of their own (shape `none`), so a block missing from this list
+/// draws nothing at all.
 pub const fn is_block_entity(id: u16) -> bool {
-    matches!(id, 54 | 63 | 68 | 116 | 119 | 130 | 146)
+    matches!(id, 54 | 63 | 68 | 116 | 119 | 130 | 144 | 146)
 }
 
 /// Which of the two light nibbles a flood operates on. `light_at` returns a

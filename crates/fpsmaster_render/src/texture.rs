@@ -1765,7 +1765,7 @@ pub const ENTITY_SLOT_PX: u32 = 128;
 
 /// Number of fixed slots stacked at the top of the entity atlas (one per
 /// [`EntitySlot`], including the trailing guaranteed-white slot).
-pub const ENTITY_SLOT_COUNT: u32 = 50;
+pub const ENTITY_SLOT_COUNT: u32 = 51;
 
 /// Extra 64x64 rows reserved below the fixed slots for per-player downloaded
 /// skins, allocated at runtime by the skin loader.
@@ -1887,8 +1887,11 @@ pub enum EntitySlot {
     EnchantBook = 47,
     /// Arrow projectile (entity/arrow.png, 32x32).
     Arrow = 48,
+    /// Wither skeleton (skeleton/wither_skeleton.png, 64x32) — only its head
+    /// region is sampled, by the wither-skeleton skull block-entity.
+    SkeletonWither = 49,
     /// Guaranteed opaque-white slot sampled by solid-color geometry.
-    White = 49,
+    White = 50,
 }
 
 /// Pixel origin (top-left corner) of an entity atlas slot.
@@ -1911,7 +1914,7 @@ pub const ENTITY_WHITE_UV: [f32; 2] = {
 /// The 1.8 entity textures loaded into each mob slot, plus the procedural
 /// fallback tint used when the asset is missing. The player slot is handled
 /// separately (normalize_skin / procedural_skin).
-const MOB_SLOT_ASSETS: [(EntitySlot, &str, [u8; 3]); 38] = [
+const MOB_SLOT_ASSETS: [(EntitySlot, &str, [u8; 3]); 39] = [
     (EntitySlot::ArmorStand, "armorstand/wood", [150, 120, 75]),
     (EntitySlot::ChestNormal, "chest/normal", [162, 114, 51]),
     (EntitySlot::ChestTrapped, "chest/trapped", [162, 80, 51]),
@@ -1922,6 +1925,7 @@ const MOB_SLOT_ASSETS: [(EntitySlot, &str, [u8; 3]); 38] = [
     (EntitySlot::EnchantBook, "enchanting_table_book", [120, 30, 30]),
     (EntitySlot::Zombie, "zombie/zombie", [88, 124, 80]),
     (EntitySlot::Skeleton, "skeleton/skeleton", [192, 192, 192]),
+    (EntitySlot::SkeletonWither, "skeleton/wither_skeleton", [50, 50, 50]),
     (EntitySlot::Creeper, "creeper/creeper", [86, 170, 70]),
     (EntitySlot::Pig, "pig/pig", [238, 158, 158]),
     (EntitySlot::Cow, "cow/cow", [108, 80, 58]),
@@ -2601,6 +2605,7 @@ mod tests {
             EntitySlot::Sign,
             EntitySlot::EnchantBook,
             EntitySlot::Arrow,
+            EntitySlot::SkeletonWither,
             EntitySlot::White,
         ];
         let mut seen = std::collections::HashSet::new();

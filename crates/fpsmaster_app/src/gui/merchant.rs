@@ -72,7 +72,16 @@ pub fn button_at(
 /// Draw the selected offer's preview items, the `< >` buttons, and (when the
 /// offer is locked out) the deprecated overlay. The interactive slots below are
 /// drawn separately by the container renderer.
-pub fn draw_offer(ui: &mut UiFrame, container: &Container, px: i32, py: i32, scale: i32, mouse: (f64, f64)) {
+#[allow(clippy::too_many_arguments)]
+pub fn draw_offer(
+    ui: &mut UiFrame,
+    container: &Container,
+    px: i32,
+    py: i32,
+    scale: i32,
+    mouse: (f64, f64),
+    skin_rows: &std::collections::HashMap<[u8; 16], u32>,
+) {
     let Some(recipe) = container.trades().get(container.selected_trade()) else {
         return;
     };
@@ -96,7 +105,7 @@ pub fn draw_offer(ui: &mut UiFrame, container: &Container, px: i32, py: i32, sca
     let icon = 16 * scale;
     let mut preview = |pos: (i32, i32), item: &fpsmaster_protocol::v1_8_9::packets::SlotItem| {
         let cell = UiRect::new(px + pos.0 * scale, py + pos.1 * scale, icon, icon);
-        draw_item_icon(ui, cell, item, scale.max(2), false);
+        draw_item_icon(ui, cell, item, scale.max(2), false, skin_rows);
     };
     preview(BUY1, &recipe.buy);
     if let Some(ref buy2) = recipe.buy_secondary {

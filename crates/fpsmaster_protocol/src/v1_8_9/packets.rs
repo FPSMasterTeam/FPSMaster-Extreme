@@ -757,6 +757,17 @@ pub enum ClientboundPlayPacket {
         z: i32,
         lines: [String; 4],
     },
+    /// S35 UpdateBlockEntity — one block-entity's client-visible NBT at its
+    /// block position. `action` names the payload (1 spawner, 2 command block,
+    /// 3 beacon, 4 skull, 5 flower pot, 6 banner); the compound is absent when
+    /// the server clears the block-entity, encoded as a bare TAG_End.
+    UpdateBlockEntity {
+        x: i32,
+        y: i32,
+        z: i32,
+        action: u8,
+        nbt: Option<crate::nbt::NbtCompound>,
+    },
     /// S3F PluginMessage — a custom-payload channel and its raw bytes (e.g.
     /// `MC|TrList` for villager trade offers, `MC|Brand` for the server brand).
     PluginMessage {
@@ -1646,6 +1657,14 @@ impl ClientboundPlayPacket {
                 ];
                 Ok(Self::UpdateSign { x, y, z, lines })
             }
+            0x35 => {
+                let (x, y, z) = read_block_pos(&mut body)?;
+                let action = body.read_u8()?;
+                // The NBT field uses the Slot encoding: a leading TAG_End (0)
+                // means "no compound" rather than an empty one.
+                let nbt = crate::nbt::read_slot_nbt(&mut body)?;
+                Ok(Self::UpdateBlockEntity { x, y, z, action, nbt })
+            }
             0x3f => {
                 let channel = body.read_string(32767)?;
                 let data = body.read_remaining().to_vec();
@@ -1983,6 +2002,48 @@ mod tests {
                     "{\"text\":\"line3\"}".to_owned(),
                 ],
             }
+        );
+    }
+
+    #[test]
+    fn update_block_entity_decodes_a_skull_compound() {
+        // A wither-skeleton skull (SkullType 1) turned to rotation 6.
+        let mut body = PacketWriter::new();
+        body.write_bytes(&encoded_block_pos(12, 70, -40));
+        body.write_u8(4); // action 4 = skull
+        let mut nbt = vec![0x0a, 0x00, 0x00]; // TAG_Compound "" {
+        nbt.extend_from_slice(&[0x01, 0x00, 0x09]);
+        nbt.extend_from_slice(b"SkullType");
+        nbt.push(0x01); // Byte SkullType: 1
+        nbt.extend_from_slice(&[0x01, 0x00, 0x03]);
+        nbt.extend_from_slice(b"Rot");
+        nbt.push(0x06); // Byte Rot: 6
+        nbt.push(0x00); // TAG_End }
+        body.write_bytes(&nbt);
+
+        let packet =
+            ClientboundPlayPacket::from_frame(PacketFrame::new(0x35, body.into_inner())).unwrap();
+        let ClientboundPlayPacket::UpdateBlockEntity { x, y, z, action, nbt } = packet else {
+            panic!("got {packet:?}");
+        };
+        assert_eq!((x, y, z, action), (12, 70, -40, 4));
+        let nbt = nbt.expect("compound present");
+        assert_eq!(nbt.get("SkullType").and_then(|t| t.as_byte()), Some(1));
+        assert_eq!(nbt.get("Rot").and_then(|t| t.as_byte()), Some(6));
+    }
+
+    #[test]
+    fn update_block_entity_decodes_an_absent_compound() {
+        // A bare TAG_End means the server cleared the block-entity.
+        let mut body = PacketWriter::new();
+        body.write_bytes(&encoded_block_pos(0, 1, 2));
+        body.write_u8(4);
+        body.write_u8(0);
+        let packet =
+            ClientboundPlayPacket::from_frame(PacketFrame::new(0x35, body.into_inner())).unwrap();
+        assert_eq!(
+            packet,
+            ClientboundPlayPacket::UpdateBlockEntity { x: 0, y: 1, z: 2, action: 4, nbt: None }
         );
     }
 

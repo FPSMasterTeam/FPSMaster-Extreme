@@ -40,7 +40,17 @@
 ## 近似项分类（精确化分属其他任务）
 
 - **附着/朝向类**（拉杆、红石火把、可可、按 meta 朝向）→ 见 **T25** 火把/附着方块。
-- **block-entity 特殊渲染**（附魔台、酿造台、末地/地狱传送门、告示牌、旗帜、头颅、箱子）→ 见 **T3 / T16 / T17 / T28**。
+- **block-entity 特殊渲染**（附魔台、酿造台、末地/地狱传送门、告示牌、旗帜、箱子）→ 见 **T3 / T16 / T17 / T28**。
+  - 头颅（144 / 物品 397）已完整实现，5 种头（骷髅/凋灵骷髅/僵尸/玩家/苦力怕）共用
+    `skull_parts` 的头+帽两层，玩家头按 `Owner`/`SkullOwner` 档案下载真皮肤：
+    - **世界方块** `ModelMesh::push_skull`：落地/贴墙 5 种朝向 + `Rot` 16 档转向，
+      类型与转向来自 S35 UpdateBlockEntity（action 4）。
+    - **物品栏图标** `gui_item::append_skull_icon`：原版无 `textures/items` 贴图，
+      走 `TileEntityItemStackRenderer` 的 3D 头模型，采样实体图集的独立 GUI pass。
+    - **戴在头上** `push_worn_skull`（`LayerCustomHead`）：绕颈部枢轴放大 1.1875 倍。
+    - **手持/掉落物** `push_skull_item` + `ItemRenderer::build_held_skull` /
+      `GameState::build_dropped_skull_models`：走模型 pass 而非方块图集物品 pass。
+    - **本地放置预测**：`ItemSkull.onItemUse` 的朝向/转向规则，连 block-entity 一起预测。
 - **平铺红石元件连接纹理**（红石线 0/15 连接、中继器/比较器朝向）→ 后续可加专用 flat-decal 形状。
 - **流体不完整方块/斜面**（水/岩浆 8 级高度）→ 见 **T24**。
 

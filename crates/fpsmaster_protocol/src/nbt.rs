@@ -42,6 +42,16 @@ impl NbtTag {
         }
     }
 
+    /// The payload of a TAG_Byte. Block-entity NBT stores its small enums this
+    /// way (a skull's `SkullType` / `Rot`), which `as_i32` deliberately does not
+    /// widen into.
+    pub fn as_byte(&self) -> Option<i8> {
+        match self {
+            NbtTag::Byte(v) => Some(*v),
+            _ => None,
+        }
+    }
+
     pub fn as_short(&self) -> Option<i16> {
         match self {
             NbtTag::Short(v) => Some(*v),
