@@ -7,8 +7,9 @@
 use glam::{Mat3, Vec3};
 use fpsmaster_core::{BlockFace, BlockState, Tint};
 
+use crate::model::SKULL_ITEM_ROTATION;
 use crate::ui::UiRect;
-use crate::{AtlasUv, BiomeColors, Vertex, FULLBRIGHT};
+use crate::{AtlasUv, BiomeColors, ModelMesh, ModelVertex, SkullKind, Vertex, FULLBRIGHT};
 
 /// One visible face of the unit cube: outward normal, the four `0/1` corners,
 /// the texture face it samples and the vanilla baked diffuse shade.
@@ -141,6 +142,53 @@ pub fn append_block_icon(
     }
 }
 
+/// Append a skull item's 3D icon geometry for slot `rect` — clip-space
+/// `ModelVertex`es sampling the ENTITY atlas, so these draw in their own pass
+/// rather than with the block cubes. Vanilla has no `textures/items` sprite for
+/// item 397; it routes the stack through `TileEntityItemStackRenderer`, which
+/// calls `renderSkull(-0.5, 0, -0.5, UP, 180)` under the same GUI pose a 3D
+/// block icon gets. `skin_row` dresses a player head in a downloaded skin.
+pub fn append_skull_icon(
+    vertices: &mut Vec<ModelVertex>,
+    indices: &mut Vec<u32>,
+    kind: SkullKind,
+    skin_row: Option<u32>,
+    rect: UiRect,
+    surface: (f32, f32),
+) {
+    let rot = gui_rotation();
+    // The unit cube edge in physical px (vanilla scales the 16px model by 0.625).
+    let edge = rect.width as f32 * 0.625;
+    let center = (
+        rect.x as f32 + rect.width as f32 * 0.5,
+        rect.y as f32 + rect.height as f32 * 0.5,
+    );
+    // `push_skull` lays a floor-mounted head out in block-local [0,1] space, so
+    // this shares the block icon's mapping — except in y: vanilla's item form
+    // puts the head's BASE on the model origin (`renderSkull(.., y = 0, ..)`,
+    // not -0.5), which lifts it into the upper half of the item box.
+    let to_clip = |p: Vec3| {
+        let r = rot * (p - Vec3::new(0.5, 0.0, 0.5));
+        let sx = center.0 + r.x * edge;
+        let sy = center.1 - r.y * edge;
+        [
+            sx / surface.0 * 2.0 - 1.0,
+            1.0 - sy / surface.1 * 2.0,
+            (0.5 + r.z * 0.5).clamp(0.0, 1.0),
+        ]
+    };
+
+    let mut mesh = ModelMesh::new();
+    mesh.push_skull_item(kind, skin_row, SKULL_ITEM_ROTATION, &|p| p);
+    let base = vertices.len() as u32;
+    vertices.extend(mesh.vertices.iter().map(|v| ModelVertex {
+        position: to_clip(Vec3::from(v.position)),
+        color: v.color,
+        uv: v.uv,
+    }));
+    indices.extend(mesh.indices.iter().map(|i| i + base));
+}
+
 /// Append a flat item-icon's glint quad (clip-space `Vertex`es) for slot `rect`:
 /// an axis-aligned quad covering the slot, textured with the item sprite's
 /// block-atlas tile so the glint shader's alpha cutout masks the shimmer to the
@@ -239,6 +287,78 @@ mod tests {
             assert!((-1.0..=1.0).contains(&vert.position[0]), "{:?}", vert.position);
             assert!((-1.0..=1.0).contains(&vert.position[1]), "{:?}", vert.position);
         }
+    }
+
+    #[test]
+    fn a_skull_item_icon_is_a_head_model_inside_its_slot() {
+        // Item 397 has no `textures/items` sprite in vanilla, so `is_block_icon`
+        // rejects it (block 144 renders no boxes) and the flat path has nothing
+        // to draw — the head model is the icon.
+        assert!(is_block_icon(144, 0).is_none());
+        assert!(crate::texture::item_texture_name(397).is_none());
+
+        let (surface, rect) = ((800.0, 600.0), UiRect::new(100, 100, 32, 32));
+        let (mut v, mut i) = (Vec::new(), Vec::new());
+        append_skull_icon(&mut v, &mut i, SkullKind::Skeleton, None, rect, surface);
+        assert_eq!(v.len(), 24, "one head box");
+        assert_eq!(i.len(), 36);
+
+        // Every vertex lands in clip space, inside the slot rect it was given.
+        let clip_x = |px: f32| px / surface.0 * 2.0 - 1.0;
+        let clip_y = |px: f32| 1.0 - px / surface.1 * 2.0;
+        for vert in &v {
+            let [x, y, z] = vert.position;
+            assert!((clip_x(100.0)..=clip_x(132.0)).contains(&x), "{x} outside the slot");
+            assert!((clip_y(132.0)..=clip_y(100.0)).contains(&y), "{y} outside the slot");
+            assert!((0.0..=1.0).contains(&z), "depth {z} out of range");
+        }
+    }
+
+    #[test]
+    fn the_skull_icon_shows_the_face_not_the_back_of_the_head() {
+        // The whole point of a 3D head icon is telling a Steve head from a
+        // creeper head at a glance, so the face quad must be the front-most of
+        // the six. Getting the item rotation wrong turns the head 180° and
+        // shows the back — which looks plausible until you compare two types.
+        let (mut v, mut i) = (Vec::new(), Vec::new());
+        let rect = UiRect::new(0, 0, 32, 32);
+        append_skull_icon(&mut v, &mut i, SkullKind::Player, None, rect, (800.0, 600.0));
+        // `push_textured_box` emits faces in `FACES` order; index 3 is the +z
+        // face, which `box_region` paints with the skin's face rect.
+        let depth = |face: usize| {
+            v[face * 4..face * 4 + 4].iter().map(|x| x.position[2]).sum::<f32>() / 4.0
+        };
+        let face_depth = depth(3);
+        // Strictly in front of the back of the head — this is the assertion the
+        // 180°-flipped orientation fails.
+        assert!(face_depth < depth(2), "face {face_depth} vs back {}", depth(2));
+        // And front-most overall. The isometric pose shows two sides equally, so
+        // the -x quad ties with the face rather than losing to it.
+        for other in [0, 1, 2, 4, 5] {
+            assert!(
+                face_depth <= depth(other),
+                "face quad (depth {face_depth}) sits behind face {other} (depth {})",
+                depth(other),
+            );
+        }
+    }
+
+    #[test]
+    fn a_player_head_icon_wears_its_owners_skin_row() {
+        let rect = UiRect::new(0, 0, 32, 32);
+        let mut plain = (Vec::new(), Vec::new());
+        let mut owned = (Vec::new(), Vec::new());
+        append_skull_icon(&mut plain.0, &mut plain.1, SkullKind::Player, None, rect, (800.0, 600.0));
+        append_skull_icon(&mut owned.0, &mut owned.1, SkullKind::Player, Some(2), rect, (800.0, 600.0));
+        // Player heads carry the hat layer, and a resolved owner moves the whole
+        // icon onto that player's atlas row.
+        assert_eq!(plain.0.len(), 48, "head + hat");
+        let plain_uvs: Vec<_> = plain.0.iter().map(|v| v.uv).collect();
+        let owned_uvs: Vec<_> = owned.0.iter().map(|v| v.uv).collect();
+        assert_ne!(plain_uvs, owned_uvs);
+        // Geometry is identical; only the sampled region moved.
+        let pos = |vs: &[ModelVertex]| vs.iter().map(|v| v.position).collect::<Vec<_>>();
+        assert_eq!(pos(&plain.0), pos(&owned.0));
     }
 
     #[test]

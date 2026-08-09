@@ -277,6 +277,48 @@ fn title_case(s: &str) -> String {
         .join(" ")
 }
 
+/// A stack's rendered display name, `§`-coded: the rarity color, then either
+/// the custom NBT name (italic, vanilla `ItemStack.hasDisplayName`) or the
+/// item's own name for its metadata. Vanilla `ItemStack.getDisplayName` plus
+/// the italic that `GuiIngame`/tooltips add for renamed stacks — shared so the
+/// hotbar name banner and the tooltip's first line can never drift apart.
+pub fn stack_display_name(item: &SlotItem) -> String {
+    let nbt = item.nbt.as_ref();
+    let has_custom_name = has_display_name(nbt);
+    let name = if has_custom_name {
+        custom_display_name(nbt).unwrap_or_default()
+    } else {
+        item_display_name(item.id, item.damage)
+    };
+    let rarity_color = item_rarity_color(item);
+    if has_custom_name {
+        // Custom names are italic.
+        format!("{rarity_color}\u{00a7}o{name}\u{00a7}r")
+    } else {
+        format!("{rarity_color}{name}\u{00a7}r")
+    }
+}
+
+/// Whether an item id has durability (vanilla `ItemStack.isItemStackDamageable`,
+/// i.e. `maxDamage > 0`): the tools, weapons, bow, flint & steel, all four armor
+/// pieces of each material, fishing rod, shears and the carrot on a stick. For
+/// these the `damage` field is wear, not a variant — callers that compare two
+/// stacks must ignore it, or a pickaxe would read as a different item after
+/// every block broken.
+pub fn is_damageable(id: i16) -> bool {
+    matches!(id,
+        256..=259      // iron shovel/pickaxe/axe, flint and steel
+        | 261          // bow
+        | 267..=279    // iron + wooden + stone + diamond sword/shovel/pickaxe/axe
+        | 283..=286    // golden sword/shovel/pickaxe/axe
+        | 290..=294    // hoes
+        | 298..=317    // leather / chainmail / iron / diamond / golden armor
+        | 346          // fishing rod
+        | 359          // shears
+        | 398          // carrot on a stick
+    )
+}
+
 /// Build the vanilla-style tooltip lines for an item stack, including NBT data.
 /// Each line may contain `§` formatting codes (rarity color, enchant gray, lore
 /// purple/italic). The first line is always the display name with rarity color.
@@ -290,21 +332,7 @@ pub fn build_tooltip(item: &SlotItem) -> Vec<String> {
     let mut lines = Vec::new();
 
     // Line 1: display name with rarity color.
-    let has_custom_name = has_display_name(nbt);
-    let name = if has_custom_name {
-        custom_display_name(nbt).unwrap_or_default()
-    } else {
-        item_display_name(item.id, item.damage)
-    };
-
-    let rarity_color = item_rarity_color(item);
-    let name_line = if has_custom_name {
-        // Custom names are italic.
-        format!("{rarity_color}\u{00a7}o{name}\u{00a7}r")
-    } else {
-        format!("{rarity_color}{name}\u{00a7}r")
-    };
-    lines.push(name_line);
+    lines.push(stack_display_name(item));
 
     // Enchantments (flag bit 0).
     if hide_flags & 1 == 0 {

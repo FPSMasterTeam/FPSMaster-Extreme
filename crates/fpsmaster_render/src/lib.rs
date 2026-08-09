@@ -25,9 +25,9 @@ pub use chunk_mesh::{
     ChunkMeshBuffers, ChunkVertex, EmissiveLight, TintTable, Vertex, FULLBRIGHT,
 };
 pub use font::char_width;
-pub use item_names::{build_tooltip, item_display_name};
+pub use item_names::{build_tooltip, is_damageable, item_display_name, stack_display_name};
 pub use model::{
-    arm_attach, ArmAttach, ChestKind, EntityAnim, ModelMesh, ModelVertex, SignKind,
+    arm_attach, ArmAttach, ChestKind, EntityAnim, ModelMesh, ModelVertex, SignKind, SkullKind,
 };
 pub use particle::{build_particle_mesh, ParticleBillboard};
 pub use renderer::{
