@@ -19,9 +19,10 @@ use glam::{Mat4, Vec3};
 use fpsmaster_core::{BlockFace, BlockState, RenderShape, Tint};
 use fpsmaster_protocol::v1_8_9::packets::SlotItem;
 use fpsmaster_render::texture::item_texture_name;
-use fpsmaster_render::{ArmAttach, AtlasUv, BiomeColors, Camera, ModelMesh, Vertex};
+use fpsmaster_render::model::SKULL_ITEM_ROTATION;
+use fpsmaster_render::{ArmAttach, AtlasUv, BiomeColors, Camera, ModelMesh, SkullKind, Vertex};
 
-use crate::game::{FirstPersonView, ItemUseAction};
+use crate::game::{FirstPersonView, ItemUseAction, SKULL_ITEM_ID};
 
 /// One dropped item to render in the world: its stack, world position (entity
 /// feet) and animation phase (`age + partialTicks`) driving bob and spin.
@@ -151,36 +152,7 @@ impl ItemRenderer {
             return out;
         };
 
-        // Common head of the chain: swing translation and the base
-        // first-person pose. The item-model transforms below follow vanilla's
-        // RenderItem order per branch.
-        let mut m = first_person_base(view);
-        match view.use_action {
-            ItemUseAction::Block => {
-                // 1.8 locks the arm while blocking: no swing. 1.7 (old_animations)
-                // kept the swing playing during a block — layer the same swing
-                // translation + rotations vanilla uses for a free swing onto the
-                // block pose so a left-click visibly swings while right-blocking.
-                let swing = if old_animations { view.swing_progress } else { 0.0 };
-                if old_animations {
-                    do_item_used_transformations(&mut m, swing);
-                }
-                transform_first_person_item(&mut m, view.equip_progress, swing);
-                do_block_transformations(&mut m);
-            }
-            ItemUseAction::Eat | ItemUseAction::Drink => {
-                do_eat_drink_transformations(&mut m, view.use_ticks);
-                transform_first_person_item(&mut m, view.equip_progress, 0.0);
-            }
-            ItemUseAction::Bow => {
-                transform_first_person_item(&mut m, view.equip_progress, 0.0);
-                do_bow_transformations(&mut m, view.use_ticks);
-            }
-            ItemUseAction::None => {
-                do_item_used_transformations(&mut m, view.swing_progress);
-                transform_first_person_item(&mut m, view.equip_progress, view.swing_progress);
-            }
-        }
+        let mut m = first_person_hand_matrix(view, old_animations);
 
         if (0..256).contains(&item.id) {
             let block = BlockState::new(item.id as u16, (item.damage.max(0) & 15) as u8);
@@ -230,6 +202,31 @@ impl ItemRenderer {
         out
     }
 
+    /// Build the first-person geometry for a held skull. Skulls sample the
+    /// entity atlas, not the block atlas the item pass binds, so they ride the
+    /// model mesh alongside the arm instead of [`Self::build_held_item`]'s
+    /// buffer. The pose chain is the one a 3D block item takes; only the
+    /// centring differs — vanilla's `RenderItem` swaps the model-centring
+    /// `translate(-0.5, -0.5, -0.5)` for a half turn on builtin-entity models,
+    /// and `renderSkull(-0.5, 0, -0.5, ..)` then stands the head on the model
+    /// origin rather than centring it, so the head sits half a unit higher.
+    pub fn build_held_skull(
+        mesh: &mut ModelMesh,
+        camera: &Camera,
+        view: &FirstPersonView,
+        kind: SkullKind,
+        skin_row: Option<u32>,
+        old_animations: bool,
+    ) {
+        let mut m = first_person_hand_matrix(view, old_animations);
+        gl_scale(&mut m, 2.0, 2.0, 2.0);
+        finish_item_model(&mut m);
+        let to_world = |c: Vec3| {
+            view_to_world(camera, m.transform_point3(c + Vec3::new(0.0, 0.5, 0.0)))
+        };
+        mesh.push_skull_item(kind, skin_row, SKULL_ITEM_ROTATION, &to_world);
+    }
+
     /// Build geometry for every dropped item in the world this frame: block
     /// items spin as a small cube, sprite items billboard toward the camera, and
     /// all bob up and down like vanilla `RenderEntityItem`.
@@ -264,6 +261,11 @@ impl ItemRenderer {
             let mut v = Vec::new();
             let mut i = Vec::new();
             let item = &d.item;
+            if item.id == SKULL_ITEM_ID {
+                // Skulls sample the entity atlas, which this pass does not bind;
+                // `GameState::build_dropped_skull_models` draws them instead.
+                continue;
+            }
             if (0..256).contains(&item.id) {
                 let block = BlockState::new(item.id as u16, (item.damage.max(0) & 15) as u8);
                 if block.is_air() || block.render_shape() == RenderShape::None {
@@ -490,7 +492,23 @@ fn is_handheld_item(name: &str) -> bool {
 /// vanilla `LayerHeldItem`/`RenderItem` THIRD_PERSON transform chain in authored
 /// (y-down) space, then a Y reflection into fpsmaster's feet-up arm-pixel frame and
 /// the rigid arm attachment. See [`ItemRenderer::build_player_held_items`].
+/// The `[0,1]` item-model-space → world mapping for a gui3d (block-shaped) item
+/// held in the right hand. Exposed so a skull — a builtin-entity model that has
+/// to be drawn into the model pass rather than this module's block-atlas buffers
+/// — can hang off exactly the same arm as every other held item.
+pub fn held_item_block_transform(attach: &ArmAttach) -> impl Fn(Vec3) -> Vec3 + '_ {
+    item_to_world(attach, false, HeldItemKind::Block)
+}
+
 fn held_item_to_world(h: &PlayerHeldItem, kind: HeldItemKind) -> impl Fn(Vec3) -> Vec3 + '_ {
+    item_to_world(&h.attach, h.sneaking, kind)
+}
+
+fn item_to_world(
+    attach: &ArmAttach,
+    sneaking: bool,
+    kind: HeldItemKind,
+) -> impl Fn(Vec3) -> Vec3 + '_ {
     // THIRD_PERSON display: translation (already block units), rotation degrees
     // (x, y, z), uniform scale — straight from the 1.8.9 item model JSON.
     let (trans, rot, scale) = match kind {
@@ -503,7 +521,7 @@ fn held_item_to_world(h: &PlayerHeldItem, kind: HeldItemKind) -> impl Fn(Vec3) -
     // LayerHeldItem: postRenderArm anchor is supplied by ArmAttach; this is the
     // fixed post-arm offset, then the sneak nudge.
     gl_translate(&mut m, -0.0625, 0.4375, 0.0625);
-    if h.sneaking {
+    if sneaking {
         gl_translate(&mut m, 0.0, 0.203125, 0.0);
     }
     // ItemRenderer.renderItem: the single 2× (gui3d via renderItem, sprites via
@@ -528,7 +546,7 @@ fn held_item_to_world(h: &PlayerHeldItem, kind: HeldItemKind) -> impl Fn(Vec3) -
         let v = m.transform_point3(c);
         let arm_px =
             ArmAttach::SHOULDER_PX + Vec3::new(v.x * 16.0, -v.y * 16.0, -v.z * 16.0);
-        h.attach.to_world(arm_px)
+        attach.to_world(arm_px)
     }
 }
 
@@ -647,6 +665,41 @@ fn apply_first_person_display(m: &mut Mat4) {
 }
 
 /// `RenderItem.renderItem`: scale(0.5) then center the 0..1 model.
+/// The first-person hand pose shared by every held-item model: the swing
+/// translation and base pose, then the per-use-action chain in vanilla's
+/// `ItemRenderer.renderItemInFirstPerson` order. The caller adds the item
+/// model's own transforms on top.
+fn first_person_hand_matrix(view: &FirstPersonView, old_animations: bool) -> Mat4 {
+    let mut m = first_person_base(view);
+    match view.use_action {
+        ItemUseAction::Block => {
+            // 1.8 locks the arm while blocking: no swing. 1.7 (old_animations)
+            // kept the swing playing during a block — layer the same swing
+            // translation + rotations vanilla uses for a free swing onto the
+            // block pose so a left-click visibly swings while right-blocking.
+            let swing = if old_animations { view.swing_progress } else { 0.0 };
+            if old_animations {
+                do_item_used_transformations(&mut m, swing);
+            }
+            transform_first_person_item(&mut m, view.equip_progress, swing);
+            do_block_transformations(&mut m);
+        }
+        ItemUseAction::Eat | ItemUseAction::Drink => {
+            do_eat_drink_transformations(&mut m, view.use_ticks);
+            transform_first_person_item(&mut m, view.equip_progress, 0.0);
+        }
+        ItemUseAction::Bow => {
+            transform_first_person_item(&mut m, view.equip_progress, 0.0);
+            do_bow_transformations(&mut m, view.use_ticks);
+        }
+        ItemUseAction::None => {
+            do_item_used_transformations(&mut m, view.swing_progress);
+            transform_first_person_item(&mut m, view.equip_progress, view.swing_progress);
+        }
+    }
+    m
+}
+
 fn finish_item_model(m: &mut Mat4) {
     gl_scale(m, 0.5, 0.5, 0.5);
     gl_translate(m, -0.5, -0.5, -0.5);
@@ -971,7 +1024,7 @@ mod tests {
         use fpsmaster_render::{arm_attach, ArmAttach, EntityAnim};
         // A player at an offset position/holding pose: the item must sit at the
         // rendered hand, not at the origin or metres away (gross-anchor guard).
-        let anim = EntityAnim { held_item_right: 1, ..Default::default() };
+        let anim = fpsmaster_render::EntityAnim { held_item_right: 1, ..Default::default() };
         let attach = arm_attach(Vec3::new(10.0, 64.0, -3.0), 0.0, &anim);
         let hand = attach.to_world(ArmAttach::HAND_PX);
         let held = vec![PlayerHeldItem {
@@ -1214,5 +1267,92 @@ mod tests {
         let b = m.transform_point3(Vec3::new(1.0, 0.0, 8.5 / 16.0));
         let expected = 0.4 * 2.0 * 1.7 * 0.5;
         assert!((a.distance(b) - expected).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn a_preview_held_item_lands_in_the_hand_not_at_the_feet() {
+        // The inventory preview builds the held item at a feet origin of ZERO so
+        // it shares the biped's model space. A px-vs-blocks slip in the arm
+        // chain would throw it 16× out of the panel, so pin the bounds: it must
+        // hang off the right shoulder, at hand height, within arm's reach.
+        let anim = fpsmaster_render::EntityAnim { held_item_right: 1, ..Default::default() };
+        let attach = fpsmaster_render::arm_attach(Vec3::ZERO, 0.0, &anim);
+        let geo = ItemRenderer::build_player_held_items(
+            &[PlayerHeldItem {
+                item: SlotItem::new(1, 1, 0), // stone: a 3D block cube
+                attach,
+                sneaking: false,
+                light: fpsmaster_render::FULLBRIGHT,
+            }],
+            &atlas(),
+        );
+        assert!(!geo.vertices.is_empty(), "a held block must draw");
+        let (lo, hi) = geo.vertices.iter().fold(
+            (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)),
+            |(l, h), v| (l.min(Vec3::from(v.position)), h.max(Vec3::from(v.position))),
+        );
+        // A 1.8-block-tall biped stands at the origin; the hand is roughly
+        // shoulder-to-hip height on its right (−x at yaw 0).
+        assert!(lo.y > 0.5 && hi.y < 1.8, "hand height, got {}..{}", lo.y, hi.y);
+        assert!(hi.x < 0.0, "the right hand is at −x, got up to {}", hi.x);
+        assert!(lo.length() < 2.0 && hi.length() < 2.0, "within reach: {lo:?}..{hi:?}");
+    }
+
+    #[test]
+    fn the_preview_item_follows_the_bodys_yaw() {
+        // The item is welded to the arm, so turning the model turns the item —
+        // this is what keeps it in the hand as the preview tracks the cursor.
+        let anim = fpsmaster_render::EntityAnim { held_item_right: 1, ..Default::default() };
+        let build = |yaw: f32| {
+            ItemRenderer::build_player_held_items(
+                &[PlayerHeldItem {
+                    item: SlotItem::new(1, 1, 0),
+                    attach: fpsmaster_render::arm_attach(Vec3::ZERO, yaw, &anim),
+                    sneaking: false,
+                    light: fpsmaster_render::FULLBRIGHT,
+                }],
+                &atlas(),
+            )
+        };
+        let straight = centroid(&build(0.0));
+        let turned = centroid(&build(90.0));
+        // A quarter turn about Y swaps which axis the hand sticks out along.
+        assert!((straight.y - turned.y).abs() < 1e-4, "yaw must not change height");
+        assert!(turned.length() > 0.1 && (straight - turned).length() > 0.1, "{straight:?} {turned:?}");
+    }
+
+    #[test]
+    fn a_held_skull_hangs_off_the_same_arm_transform() {
+        // Skulls cannot use the block-atlas buffers, so they go through
+        // `held_item_block_transform` into the model mesh instead — but they
+        // must end up in the same place a held block would.
+        let anim = fpsmaster_render::EntityAnim { held_item_right: 1, ..Default::default() };
+        let attach = fpsmaster_render::arm_attach(Vec3::ZERO, 0.0, &anim);
+        let block = ItemRenderer::build_player_held_items(
+            &[PlayerHeldItem {
+                item: SlotItem::new(1, 1, 0),
+                attach,
+                sneaking: false,
+                light: fpsmaster_render::FULLBRIGHT,
+            }],
+            &atlas(),
+        );
+        let mut mesh = ModelMesh::new();
+        let to_world = held_item_block_transform(&attach);
+        mesh.push_skull_item(
+            fpsmaster_render::SkullKind::Skeleton,
+            None,
+            SKULL_ITEM_ROTATION,
+            &|c| to_world(c + Vec3::new(0.0, 0.5, 0.0)),
+        );
+        assert!(!mesh.vertices.is_empty());
+        let skull_mid = mesh.vertices.iter().map(|v| Vec3::from(v.position)).sum::<Vec3>()
+            / mesh.vertices.len() as f32;
+        // Same hand, so the two centroids sit within a few centimetres.
+        assert!(
+            (skull_mid - centroid(&block)).length() < 0.25,
+            "skull at {skull_mid:?} vs block at {:?}",
+            centroid(&block),
+        );
     }
 }

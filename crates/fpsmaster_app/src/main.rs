@@ -2234,10 +2234,14 @@ fn build_inventory_preview(
     let container = app.game.open_container().expect("player container open");
 
     let scale = gui::gui_scale(width, height);
-    // Window origin (vanilla `guiLeft`/`guiTop`): the panel is centred.
-    let origin_px = (
-        (width - container.x_size * scale) / 2,
-        (height - container.y_size * scale) / 2,
+    // Window origin (vanilla `guiLeft`/`guiTop`) — shared with the container
+    // screen so the preview tracks the 60-px shift the effect panel forces.
+    let origin_px = gui::inventory::window_origin(
+        width,
+        height,
+        container,
+        app.game.has_active_effects(),
+        scale,
     );
     let origin_gui = (origin_px.0 as f32 / scale as f32, origin_px.1 as f32 / scale as f32);
     let mouse_gui = (
@@ -2253,6 +2257,9 @@ fn build_inventory_preview(
     let anim = EntityAnim {
         net_head_yaw: pose.net_head_yaw,
         head_pitch: pose.head_pitch,
+        // Holding something lowers the right arm, so the preview matches the
+        // in-world model instead of showing an item hanging off a straight arm.
+        held_item_right: app.game.local_held_item_arm_state(),
         ..Default::default()
     };
     let skin_row = app
@@ -2261,8 +2268,58 @@ fn build_inventory_preview(
     let mut mesh = fpsmaster_render::ModelMesh::new();
     mesh.push_entity(EntityKind::LocalPlayer, glam::Vec3::ZERO, pose.body_yaw, &anim, skin_row);
 
+    // Vanilla draws the real player entity here, so every worn layer shows.
+    // Armor first, then a head worn in the helmet slot (`LayerCustomHead`) —
+    // which is not armor, so the two never both draw.
+    let armor = app.game.local_armor();
+    let armor_ids: [Option<i16>; 5] = std::array::from_fn(|i| armor[i].map(|s| s.id));
+    if armor_ids[1..].iter().any(Option::is_some) {
+        mesh.push_armor(&armor_ids, &anim, glam::Vec3::ZERO, pose.body_yaw);
+    }
+    if let Some(head) = armor[4].filter(|s| s.id == game::SKULL_ITEM_ID) {
+        let (kind, owner, _) = game::skull_item_profile(head);
+        mesh.push_worn_skull(
+            kind,
+            owner.and_then(|uuid| app.skin_manager.rows().get(&uuid).copied()),
+            &anim,
+            glam::Vec3::ZERO,
+            pose.body_yaw,
+        );
+    }
+
+    // The held item (vanilla `LayerHeldItem`), built on the same arm attachment
+    // the in-world third-person item uses — with the preview's feet origin, so
+    // it lands in the preview's model space and rides the same projection. Most
+    // items sample the block atlas and go to the preview's item stream; a skull
+    // is entity-atlas geometry, so it joins the biped's mesh instead.
+    let mut held_item = item_renderer::ItemGeometry::default();
+    if let Some(item) = app.game.held_item().cloned() {
+        let attach = fpsmaster_render::arm_attach(glam::Vec3::ZERO, pose.body_yaw, &anim);
+        if item.id == game::SKULL_ITEM_ID {
+            let (kind, owner, _) = game::skull_item_profile(&item);
+            let skin_row = owner.and_then(|uuid| app.skin_manager.rows().get(&uuid).copied());
+            let to_world = item_renderer::held_item_block_transform(&attach);
+            mesh.push_skull_item(kind, skin_row, fpsmaster_render::model::SKULL_ITEM_ROTATION, &|c| {
+                // The head stands on the model origin instead of being centred.
+                to_world(c + glam::Vec3::new(0.0, 0.5, 0.0))
+            });
+        } else {
+            held_item = ItemRenderer::build_player_held_items(
+                &[item_renderer::PlayerHeldItem {
+                    item,
+                    attach,
+                    sneaking: false,
+                    light: fpsmaster_render::FULLBRIGHT,
+                }],
+                renderer.atlas_uv(),
+            );
+        }
+    }
+
     renderer.set_inventory_preview(Some(&fpsmaster_render::InventoryPreview {
         mesh: &mesh,
+        item_vertices: &held_item.vertices,
+        item_indices: &held_item.indices,
         anchor,
         pixels_per_block,
         tilt_rad: pose.tilt.to_radians(),
@@ -2389,14 +2446,22 @@ fn render_frame(
                 game::MovingSoundCommand::Stop { id } => app.sound.stop_moving_sound(id),
             }
         }
-        // Start skin downloads for newly-seen textured players, then upload any
-        // that finished, so the entity model can sample their atlas rows.
+        // Start skin downloads for newly-seen textured players and for the
+        // owners of any player skulls in range, then upload any that finished,
+        // so the entity model can sample their atlas rows. Skull owners need
+        // their own pass: the head can name someone who never joined, so the
+        // tab-list roster alone would leave it on the default skin.
         let new_skins: Vec<([u8; 16], String)> = app
             .game
             .player_list
             .iter()
-            .filter(|(uuid, _)| !app.skin_manager.is_requested(uuid))
             .filter_map(|(uuid, info)| info.texture_property().map(|t| (*uuid, t.to_owned())))
+            .chain(
+                app.game
+                    .skull_skin_profiles()
+                    .map(|(uuid, property)| (*uuid, property.clone())),
+            )
+            .filter(|(uuid, _)| !app.skin_manager.is_requested(uuid))
             .collect();
         for (uuid, property) in new_skins {
             app.skin_manager.request(uuid, &property);
@@ -2410,6 +2475,11 @@ fn render_frame(
         // Cull mobs shorter than terrain (capped at ENTITY_RENDER_CHUNKS) so weak
         // machines skip the distant crowd's per-frame articulated build.
         let entity_start = Instant::now();
+        // Built before the entity mesh so skull stacks (entity atlas) can join
+        // the model pass while every other dropped item takes the block-atlas
+        // world-item pass below.
+        let mut dropped = app.game.dropped_items(tick_alpha);
+        dropped.extend(app.game.projectiles(tick_alpha));
         let entity_chunks = app.settings.render_distance.min(ENTITY_RENDER_CHUNKS);
         let entity_max_dist_sq = (entity_chunks as f64 * 16.0).powi(2);
         let entity_key = app.game.entity_render_fingerprint(
@@ -2448,8 +2518,18 @@ fn render_frame(
                 app.settings.brightness,
                 tick_alpha,
                 entity_max_dist_sq,
+                app.skin_manager.rows(),
             );
             renderer.set_sign_text(&sign_texts);
+            // Dropped skulls draw as their head model here rather than in the
+            // world-item pass, which binds the block atlas.
+            app.game.build_dropped_skull_models(
+                &mut app.entity_model,
+                &dropped,
+                app.settings.brightness,
+                tick_alpha,
+                app.skin_manager.rows(),
+            );
             app.entity_model.fill_motion([0.0, 0.0, 0.0, 0.0]);
             if hud_visible {
                 // Light the first-person hand + held item by the lightmap at the eye,
@@ -2465,6 +2545,20 @@ fn render_frame(
                 // item is held, since render_arm only emits the empty hand).
                 let arm_index_start = app.entity_model.indices.len() as u32;
                 ItemRenderer::render_arm(&mut app.entity_model, &app.game.camera, &first_person);
+                // A held skull joins the arm in the model pass (entity atlas)
+                // instead of the block-atlas first-person item buffer, so it
+                // lands in the same on-top range and picks up the hand lighting.
+                if let Some(skull) = first_person.item.as_ref().filter(|i| i.id == game::SKULL_ITEM_ID) {
+                    let (kind, owner, _) = game::skull_item_profile(skull);
+                    ItemRenderer::build_held_skull(
+                        &mut app.entity_model,
+                        &app.game.camera,
+                        &first_person,
+                        kind,
+                        owner.and_then(|uuid| app.skin_manager.rows().get(&uuid).copied()),
+                        app.settings.old_animations,
+                    );
+                }
                 for v in &mut app.entity_model.vertices[arm_start..] {
                     v.color[0] *= hand_light[0];
                     v.color[1] *= hand_light[1];
@@ -2511,8 +2605,6 @@ fn render_frame(
         // Dropped items, projectile sprites and falling-block cubes all share
         // the world-item pass (it binds the block/item atlas). Projectiles reuse
         // the dropped-item sprite path mapped to an item id.
-        let mut dropped = app.game.dropped_items(tick_alpha);
-        dropped.extend(app.game.projectiles(tick_alpha));
         let mut world_items =
             ItemRenderer::build_world_items(&app.game.camera, &dropped, atlas_uv);
         let mut falling = app.game.falling_block_cubes(tick_alpha);
@@ -2580,6 +2672,7 @@ fn render_frame(
         tab_open,
         ext,
         mod_textures,
+        skin_manager,
         ..
     } = app;
     // The overlay only makes sense in pure gameplay, never under an open screen.
@@ -2594,7 +2687,10 @@ fn render_frame(
         xp_level: game.xp_level(),
         selected_slot: game.selected_slot(),
         hotbar: game.hotbar_items(),
+        held_item_highlight: game.held_item_highlight(),
+        creative: game.is_creative(),
         inventory: game.inventory_slots(),
+        skin_rows: skin_manager.rows(),
         container: game.open_container(),
         cursor_item: game.cursor_item(),
         effects: &active_effects,

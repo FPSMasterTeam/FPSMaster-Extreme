@@ -48,6 +48,38 @@ const PREVIEW_LOOK_Y: i32 = PREVIEW_ANCHOR_Y - 50;
 /// Vanilla `drawEntityOnScreen` scale.
 pub const PREVIEW_SCALE: f32 = 30.0;
 
+/// How far right the player-inventory window slides while potion effects are
+/// active, in GUI px (vanilla `InventoryEffectRenderer.updateActivePotionEffects`:
+/// `guiLeft = 160 + (width - xSize - 200) / 2`, i.e. centred + 60).
+const EFFECT_PANEL_SHIFT: i32 = 60;
+
+/// Whether the active-effect panel is drawn beside this window — only the
+/// player inventory shows it, and only while an effect is active.
+pub fn effect_panel_shown(container: &Container, has_effects: bool) -> bool {
+    container.kind == WindowKind::Player && has_effects
+}
+
+/// The window origin (vanilla `guiLeft`/`guiTop`) in physical px: the panel is
+/// centred, then shifted right by [`EFFECT_PANEL_SHIFT`] when the effect panel
+/// takes the space on its left. Every consumer of the window position must go
+/// through this — the player preview is projected from the same origin, so a
+/// second, un-shifted copy of the centring maths left the biped drawn outside
+/// the window whenever a potion was active.
+pub fn window_origin(
+    width: i32,
+    height: i32,
+    container: &Container,
+    has_effects: bool,
+    scale: i32,
+) -> (i32, i32) {
+    let mut x = (width - container.x_size * scale) / 2;
+    let y = (height - container.y_size * scale) / 2;
+    if effect_panel_shown(container, has_effects) {
+        x += EFFECT_PANEL_SHIFT * scale;
+    }
+    (x, y)
+}
+
 /// The look pose from the cursor, mirroring vanilla `drawEntityOnScreen`:
 /// `f = atan((anchorX - mouseX)/40)`, `f1 = atan((lookY - mouseY)/40)`, with
 /// body yaw `f*20`, head total yaw `f*40` (so net head yaw `f*20`), head pitch
@@ -150,15 +182,9 @@ impl GuiScreen for GuiContainer {
         let scale = ctx.scale;
         let pw = container.x_size * scale;
         let ph = container.y_size * scale;
-        let mut px = (ctx.width - pw) / 2;
-        let py = (ctx.height - ph) / 2;
-        // Vanilla `InventoryEffectRenderer` shifts the player inventory window
-        // 60 GUI px to the right to make room for the active-effect panel on its
-        // left (guiLeft = 160 + (W - xSize - 200)/2, i.e. centered + 60).
-        let show_effects = container.kind == WindowKind::Player && !hud.effects.is_empty();
-        if show_effects {
-            px += 60 * scale;
-        }
+        let show_effects = effect_panel_shown(container, !hud.effects.is_empty());
+        let (px, py) =
+            window_origin(ctx.width, ctx.height, container, !hud.effects.is_empty(), scale);
         // Cache the layout so the input handlers can map cursor → slot.
         self.px = px;
         self.py = py;
@@ -180,7 +206,7 @@ impl GuiScreen for GuiContainer {
             draw_anvil_field(ui, container, hud.inventory, px, py, scale);
         }
         if container.kind == WindowKind::Villager {
-            super::merchant::draw_offer(ui, container, px, py, scale, ctx.mouse);
+            super::merchant::draw_offer(ui, container, px, py, scale, ctx.mouse, hud.skin_rows);
         }
 
         let icon = 16 * scale;
@@ -188,7 +214,7 @@ impl GuiScreen for GuiContainer {
         for (i, slot) in container.slots().iter().enumerate() {
             let cell = UiRect::new(px + slot.x * scale, py + slot.y * scale, icon, icon);
             if let Some(ref item) = container.slot_item(i, hud.inventory) {
-                draw_item_icon(ui, cell, item, scale.max(2), false);
+                draw_item_icon(ui, cell, item, scale.max(2), false, hud.skin_rows);
             }
             if hovered == Some(i as i16) {
                 // Vanilla highlights the hovered slot (white at ~50% alpha) —
@@ -205,7 +231,7 @@ impl GuiScreen for GuiContainer {
                 icon,
                 icon,
             );
-            draw_item_icon(ui, cell, item, scale.max(2), true);
+            draw_item_icon(ui, cell, item, scale.max(2), true, hud.skin_rows);
         } else if let Some(slot) = hovered {
             // Hovering an item with an empty cursor: show the vanilla tooltip.
             if let Some(ref item) = container.slot_item(slot as usize, hud.inventory) {
@@ -687,6 +713,57 @@ mod tests {
         // far to the right (`anchorX - mouseX` very negative) saturates negative.
         let pose = preview_pose((10_000.0, 0.0), (0.0, 0.0));
         assert!(pose.body_yaw <= -31.0 && pose.body_yaw >= -31.5, "{pose:?}");
+    }
+
+    #[test]
+    fn the_effect_panel_shifts_the_window_and_the_preview_together() {
+        // The preview is projected from `window_origin`, so both must see the
+        // same 60-GUI-px shift; when they disagreed the biped drew outside the
+        // window (and over the effect panel) whenever a potion was active.
+        let player = Container::player();
+        let (w, h, scale) = (1920, 1080, 3);
+        let centred = window_origin(w, h, &player, false, scale);
+        let shifted = window_origin(w, h, &player, true, scale);
+        assert_eq!(shifted.0 - centred.0, EFFECT_PANEL_SHIFT * scale);
+        assert_eq!(shifted.1, centred.1, "the shift is horizontal only");
+
+        // The preview panel and feet anchor ride the shifted origin.
+        let (scissor_a, anchor_a, _) = preview_layout(centred, scale);
+        let (scissor_b, anchor_b, _) = preview_layout(shifted, scale);
+        assert_eq!(scissor_b[0] - scissor_a[0], (EFFECT_PANEL_SHIFT * scale) as u32);
+        assert_eq!(anchor_b[0] - anchor_a[0], (EFFECT_PANEL_SHIFT * scale) as f32);
+    }
+
+    #[test]
+    fn only_the_player_window_makes_room_for_the_effect_panel() {
+        // Server containers (chest here) never draw the panel, so they stay
+        // centred even with effects running.
+        let chest = Container::open(1, "minecraft:chest", "Chest".into(), 27);
+        assert!(!effect_panel_shown(&chest, true));
+        assert_eq!(
+            window_origin(1920, 1080, &chest, true, 3),
+            window_origin(1920, 1080, &chest, false, 3),
+        );
+        assert!(effect_panel_shown(&Container::player(), true));
+        assert!(!effect_panel_shown(&Container::player(), false));
+    }
+
+    #[test]
+    fn worn_equipment_still_clears_the_preview_panel() {
+        // The preview is scissored to the panel box, so a layer taller than the
+        // bare biped gets clipped rather than overflowing. The tallest is a worn
+        // skull: `LayerCustomHead` grows the 8px head 1.1875× about the neck
+        // pivot at model y 24, reaching 33.5 against the biped's 32.
+        const WORN_HEAD_TOP_PX: f32 = 24.0 + 1.1875 * 8.0;
+        for scale in 1..=4 {
+            let (scissor, anchor, pixels_per_block) = preview_layout((0, 0), scale);
+            let top = anchor[1] - (WORN_HEAD_TOP_PX / 16.0) * pixels_per_block;
+            assert!(
+                top >= scissor[1] as f32,
+                "scale {scale}: a worn head reaches y={top}, above the panel top {}",
+                scissor[1],
+            );
+        }
     }
 
     #[test]
