@@ -18,3 +18,8 @@ logs/
 
 # Machine-local Claude Code config (settings.local.json, etc.)
 /.claude/
+.cursor/
+.cursor
+.idea/
+*.DS_Store
+docs/knowledge/

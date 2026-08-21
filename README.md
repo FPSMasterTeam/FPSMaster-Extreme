@@ -94,3 +94,6 @@ At startup the renderer tries to load vanilla block textures from `FPSMASTER_ASS
 - Linux: `~/.minecraft/versions/1.8.9/1.8.9.jar`
 
 If no extracted assets, jar, or resource pack is found, it uses a debug fallback atlas. Mojang assets are downloaded only into `local_assets/`, which is ignored by Git, and should not be committed to this repository.
+
+## 许可
+MIT License — Copyright (c) 2026 FPSMaster Team，见 [LICENSE](LICENSE)
