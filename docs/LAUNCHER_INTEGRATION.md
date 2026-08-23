@@ -100,10 +100,9 @@ sdk/                                # 可选，随包附带
 ## 4. 安装
 
 - 安装目录：`{gameDir}/apps/FPSMaster-Extreme/`（**独立目录，不进 `versions/<id>/mods/`**）。
-- 下载 tarball → 校验 SHA256 → 解压到安装目录 → 写 marker `.fpsmaster-launcher-app.json`。
-- 更新：比对 registry 的 `versionTag`/`checksum`，不一致则重装；一致则跳过。
-- macOS：解压后须清除隔离属性（`xattr -dr com.apple.quarantine`），否则已签名/公证的
-  二进制仍可能被 Gatekeeper 拦（取决于下载来源）。二进制本身在 CI 阶段已签名 + 公证。
+- 下载 tarball → 校验 SHA256 → 解压到临时目录 → 校验主二进制 → 原子替换安装目录 → 写 marker `.fpsmaster-launcher-app.json`。
+- 更新：比对 registry 的 `versionTag`/`checksum`，不一致则更新；一致则跳过。更新时保留用户的 `mods/`、`resourcepacks/`、`local_assets/` 和 `fpsmaster_options.txt`，失败时恢复旧目录。
+- macOS tag 发布的二进制使用 Developer ID Application 签名并提交 Apple 公证；PR/分支构建仅使用 ad-hoc 签名。Launcher 不再通过清除 `com.apple.quarantine` 绕过 Gatekeeper。
 
 ---
 
@@ -180,10 +179,10 @@ Launcher 通过 `std::process::Command` 直接 spawn 原生二进制（**不经 
 ## 8. 两侧改动清单（落地追踪）
 
 **Extreme 侧**
-- [ ] 跨平台打包脚本：产出 §2 的 tar.gz + sha256 + manifest（现 `scripts/package.ps1` 仅 Windows/zip）
-- [ ] macOS 代码签名 + 公证（strip 之后）
-- [ ] 分发包剔除 `local_assets/`
-- [ ] CI：三平台构建 → 上传后端 → 通知 registry
+- [x] 跨平台打包脚本：产出 §2 的 tar.gz + sha256 + manifest
+- [x] macOS 代码签名 + 公证（tag 发布；依赖 CI Secrets）
+- [x] 分发包剔除 `local_assets/`
+- [x] CI：三平台构建 → 上传后端 → 通知 registry
 - [ ] （v2）在线鉴权 + token 透传
 
 **Launcher 侧**

@@ -95,6 +95,16 @@ fi
 BIN_SRC="$REPO_ROOT/target/release/$BIN_NAME"
 [[ -f "$BIN_SRC" ]] || { echo "build succeeded but binary missing: $BIN_SRC" >&2; exit 1; }
 
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  signing_identity="${APPLE_SIGNING_IDENTITY:--}"
+  if [[ "$signing_identity" == "-" ]]; then
+    codesign --force --sign - "$BIN_SRC"
+  else
+    codesign --force --options runtime --timestamp --sign "$signing_identity" "$BIN_SRC"
+  fi
+  codesign --verify --strict --verbose=2 "$BIN_SRC"
+fi
+
 # --- 2. Fresh staging dir (this IS the tarball root / client working dir) ---
 OUT_ABS="$REPO_ROOT/$OUT_DIR"
 STAGE="$OUT_ABS/$STAMP"
