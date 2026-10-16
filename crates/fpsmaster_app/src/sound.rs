@@ -159,6 +159,9 @@ struct SoundEntry {
     volume: f32,
     pitch: f32,
     weight: u32,
+    /// `"stream": true` (records): a multi-minute clip, streamed instead of
+    /// decoded whole on the main thread.
+    stream: bool,
 }
 
 /// One `sounds.json` event: its category (shared by all variants, vanilla puts
@@ -295,21 +298,31 @@ impl SoundManager {
             return;
         }
 
-        let Some(data) = self.sound_data(&entry.name) else {
-            return;
-        };
         // Vanilla clamps the combined pitch to [0.5, 2.0] (MCP-919 line 421).
         let rate = clamp_pitch(sound.pitch * entry.pitch) as f64;
-        let data = data
-            .volume(amplitude_to_decibels(gain))
-            .panning(Panning(panning))
-            .playback_rate(PlaybackRate(rate));
-
-        if let Some(manager) = self.manager.as_mut() {
-            // The handle is dropped immediately; the sound plays to completion.
-            if let Err(err) = manager.play(data) {
-                log::debug!("audio: play failed: {err}");
-            }
+        // The handle is dropped immediately; the sound plays to completion.
+        let played = if entry.stream {
+            let Some(data) = open_ogg_stream(&self.asset_roots, &entry.name) else {
+                log::debug!("audio: missing sound asset {}", entry.name);
+                return;
+            };
+            let data = data
+                .volume(amplitude_to_decibels(gain))
+                .panning(Panning(panning))
+                .playback_rate(PlaybackRate(rate));
+            self.manager.as_mut().map(|m| m.play(data).map(drop).map_err(|e| e.to_string()))
+        } else {
+            let Some(data) = self.sound_data(&entry.name) else {
+                return;
+            };
+            let data = data
+                .volume(amplitude_to_decibels(gain))
+                .panning(Panning(panning))
+                .playback_rate(PlaybackRate(rate));
+            self.manager.as_mut().map(|m| m.play(data).map(drop).map_err(|e| e.to_string()))
+        };
+        if let Some(Err(err)) = played {
+            log::debug!("audio: play failed: {err}");
         }
     }
 
@@ -563,6 +576,7 @@ fn parse_sounds_json(text: &str) -> HashMap<String, SoundEvent> {
                     volume: 1.0,
                     pitch: 1.0,
                     weight: 1,
+                    stream: false,
                 },
                 serde_json::Value::Object(obj) => {
                     let Some(name) = obj.get("name").and_then(|n| n.as_str()) else {
@@ -573,6 +587,7 @@ fn parse_sounds_json(text: &str) -> HashMap<String, SoundEvent> {
                         volume: obj.get("volume").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32,
                         pitch: obj.get("pitch").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32,
                         weight: obj.get("weight").and_then(|v| v.as_u64()).unwrap_or(1) as u32,
+                        stream: obj.get("stream").and_then(|v| v.as_bool()).unwrap_or(false),
                     }
                 }
                 _ => continue,
@@ -754,6 +769,18 @@ mod tests {
         assert_eq!(rabbit.len(), 1);
         assert_eq!(rabbit[0].name, "mob/rabbit/idle1");
         assert!((rabbit[0].volume - 0.25).abs() < 1e-6);
+    }
+
+    /// Records are flagged `"stream": true` in vanilla's sounds.json; those
+    /// entries are streamed rather than decoded whole on the main thread.
+    #[test]
+    fn parses_stream_flag() {
+        let events = parse_sounds_json(
+            r#"{ "records.cat": { "category": "record",
+                 "sounds": [{"name": "records/cat", "stream": true}] } }"#,
+        );
+        assert!(events["records.cat"].entries[0].stream);
+        assert!(!parse_sounds_json(SAMPLE)["dig.stone"].entries[0].stream);
     }
 
     #[test]
