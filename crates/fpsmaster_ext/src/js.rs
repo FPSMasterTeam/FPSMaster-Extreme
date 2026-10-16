@@ -1,6 +1,7 @@
 //! JS extension backend (QuickJS via `rquickjs`).
 //!
-//! Each `.js` mod gets its own QuickJS [`Context`] (isolation + hot reload). The
+//! Each `.js` mod gets its own QuickJS [`Runtime`] and [`Context`] (isolation +
+//! hot reload; the heap cap and hook watchdog are per mod). The
 //! Rust<->JS interchange is the shared all-JSON [`crate::bridge`] protocol: three
 //! native globals `__rcf_cmd` / `__rcf_query` / `__rcf_hud`, and the host calls
 //! global `__rcf_dispatch_*` functions to fan out to registered handlers. The
@@ -227,7 +228,8 @@ const PRELUDE: &str = r#"
 const HOOK_BUDGET: Duration = Duration::from_millis(50);
 /// Budget for evaluating a mod's top-level source at load.
 const LOAD_BUDGET: Duration = Duration::from_secs(2);
-/// Cap on the JS heap shared by all JS mods.
+/// Cap on each JS mod's heap. Every mod has its own runtime, so one mod that
+/// leaks up to the cap cannot push the others into out-of-memory.
 const JS_HEAP_LIMIT: usize = 128 * 1024 * 1024;
 
 /// Deadline for the JS call in progress, read by the runtime's interrupt
@@ -315,7 +317,8 @@ unsafe impl Allocator for LimitedAllocator {
     }
 }
 
-/// Owns the shared QuickJS runtime. Mod contexts are created from it.
+/// A QuickJS runtime with its own heap cap and watchdog. [`JsRuntime::load`]
+/// consumes it, so each mod gets a runtime of its own.
 pub struct JsRuntime {
     rt: Runtime,
     watchdog: Rc<Watchdog>,
@@ -326,7 +329,7 @@ impl JsRuntime {
         Self::with_heap_limit(JS_HEAP_LIMIT)
     }
 
-    fn with_heap_limit(limit: usize) -> Result<Self, JsError> {
+    pub(crate) fn with_heap_limit(limit: usize) -> Result<Self, JsError> {
         let rt = Runtime::new_with_alloc(LimitedAllocator { used: 0, limit })
             .map_err(JsError::from_rquickjs)?;
         let watchdog = Rc::new(Watchdog::default());
@@ -339,7 +342,7 @@ impl JsRuntime {
     /// Registers the native globals, injects the mod's config dir + persisted
     /// `config.json` (for `mc.config`), evals the prelude, then evals the mod
     /// source (a syntax/runtime error at load is reported and the mod rejected).
-    pub fn load(&self, id: &str, source: &str, dir: &Path) -> Result<JsPlugin, JsError> {
+    pub fn load(self, id: &str, source: &str, dir: &Path) -> Result<JsPlugin, JsError> {
         let config_json =
             std::fs::read_to_string(dir.join("config.json")).unwrap_or_else(|_| "{}".to_string());
         let dir_str = dir.to_string_lossy().to_string();
@@ -392,12 +395,13 @@ impl JsRuntime {
         Ok(JsPlugin {
             id: id.to_string(),
             ctx,
-            watchdog: Rc::clone(&self.watchdog),
+            watchdog: self.watchdog,
         })
     }
 }
 
-/// A single loaded JS mod (its own QuickJS context).
+/// A single loaded JS mod (its own QuickJS runtime and context; the context
+/// keeps the runtime alive).
 pub struct JsPlugin {
     id: String,
     ctx: Context,

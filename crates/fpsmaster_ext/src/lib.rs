@@ -278,16 +278,38 @@ mod tests {
         assert!(start.elapsed() < std::time::Duration::from_secs(10));
     }
 
-    /// A mod that keeps growing its heap hits the JS heap cap instead of
-    /// taking the process down with it.
+    /// A mod that keeps growing its heap hits its own heap cap instead of
+    /// taking the process down, and a healthy mod loaded alongside it keeps
+    /// running: the cap is per mod, not shared.
     #[test]
-    fn js_heap_growth_is_capped() {
-        let mut mgr = js_mod(
-            "const keep = []; mc.on('tick', () => { for (let i = 0; i < 64; i++) keep.push(new Array(1 << 20).fill(1)); });",
-        );
+    fn js_heap_growth_is_capped_per_mod() {
+        let mut mgr = ExtManager::new();
+        for (id, source) in [
+            (
+                "leaker",
+                "const keep = []; mc.on('tick', () => { for (let i = 0; i < 4096; i++) keep.push(new Array(1 << 10).fill(i)); });",
+            ),
+            (
+                "healthy",
+                "mc.on('tick', () => { const a = new Array(1 << 16).fill(1); mc.log('ok', a.length); });",
+            ),
+        ] {
+            let rt = js::JsRuntime::with_heap_limit(16 << 20).expect("js runtime");
+            let plugin = rt.load(id, source, std::path::Path::new(".")).expect("load js mod");
+            mgr.register(Box::new(plugin));
+        }
         for _ in 0..64 {
             mgr.dispatch_tick(&MockViews);
         }
+        assert!(mgr.mods()[1].enabled, "a healthy mod must not pay for another mod's leak");
+        mgr.take_commands();
+        mgr.dispatch_tick(&MockViews);
+        let cmds = mgr.take_commands();
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, ExtCommand::Log(_, s) if s.contains("ok 65536"))),
+            "healthy mod should still run: {cmds:?}"
+        );
     }
 
     #[test]

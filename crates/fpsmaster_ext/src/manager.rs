@@ -62,7 +62,6 @@ pub struct ModInfo {
 pub struct ExtManager {
     plugins: Vec<LoadedPlugin>,
     commands: Vec<ExtCommand>,
-    js: Option<js::JsRuntime>,
 }
 
 impl ExtManager {
@@ -96,11 +95,10 @@ impl ExtManager {
         });
     }
 
-    /// Hot-reload directory mods: drop everything loaded from `mods/` (and the JS
-    /// runtime), then reload from disk. In-process registrations are kept.
+    /// Hot-reload directory mods: drop everything loaded from `mods/` (with their
+    /// JS runtimes), then reload from disk. In-process registrations are kept.
     pub fn reload_mods(&mut self, dir: &Path) -> Vec<String> {
         self.plugins.retain(|p| !p.from_dir);
-        self.js = None; // drops all JS contexts; load_mods recreates the runtime
         log::info!("[ext] hot-reloading mods from {}", dir.display());
         self.load_mods(dir)
     }
@@ -146,9 +144,13 @@ impl ExtManager {
                             continue;
                         }
                     };
-                    let rt = match self.js_runtime() {
-                        Some(rt) => rt,
-                        None => continue,
+                    // One runtime per mod: its heap cap and watchdog are its own.
+                    let rt = match js::JsRuntime::new() {
+                        Ok(rt) => rt,
+                        Err(e) => {
+                            log::error!("[ext] could not start a JS runtime for '{}': {e}", manifest.id);
+                            continue;
+                        }
                     };
                     match rt.load(&manifest.id, &source, path) {
                         Ok(plugin) => {
@@ -173,19 +175,6 @@ impl ExtManager {
             }
         }
         loaded
-    }
-
-    fn js_runtime(&mut self) -> Option<&js::JsRuntime> {
-        if self.js.is_none() {
-            match js::JsRuntime::new() {
-                Ok(rt) => self.js = Some(rt),
-                Err(e) => {
-                    log::error!("[ext] could not start the JS runtime: {e}");
-                    return None;
-                }
-            }
-        }
-        self.js.as_ref()
     }
 
     pub fn plugin_count(&self) -> usize {
