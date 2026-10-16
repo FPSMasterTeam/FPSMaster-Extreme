@@ -713,7 +713,7 @@ impl ApplicationHandler for WinitApp {
                 app.game.rotate_view(
                     delta.0 as f32,
                     delta.1 as f32,
-                    app.settings.clone().mouse_factor(),
+                    app.settings.mouse_factor(),
                 );
             }
         }
@@ -909,7 +909,7 @@ impl ApplicationHandler for WinitApp {
         }
 
         if self.pass_bench.is_none() {
-            if let Some(cap) = app.settings.clone().fps_limit() {
+            if let Some(cap) = app.settings.fps_limit() {
                 let deadline = self.last_frame + Duration::from_secs_f64(1.0 / cap as f64);
                 let now = Instant::now();
                 if now < deadline {
@@ -924,10 +924,13 @@ impl ApplicationHandler for WinitApp {
         // Per-frame extension hook (on_frame), e.g. native render geometry.
         app.ext.dispatch_frame(&GameViews(&app.game));
         apply_ext_commands(app);
-        // Apply pending extension block-tint overrides (re-meshes the loaded
-        // world once; future chunks read the renderer's global tint table).
+        // Apply pending extension block-tint overrides: install the global tint
+        // table the mesher reads, then re-mesh the loaded world through the
+        // budgeted background path (a synchronous rebuild froze the frame for
+        // hundreds of ms to seconds when tint mods reloaded in game).
         if app.tints_dirty && app.in_world {
-            renderer.set_block_tints(app.block_tints.clone(), &app.game.world);
+            fpsmaster_render::set_block_tints(app.block_tints.clone());
+            app.game.mark_all_sections_dirty();
             app.tints_dirty = false;
         }
         // Upload native render-hook geometry when a mod changed it.
@@ -1034,7 +1037,7 @@ impl ApplicationHandler for WinitApp {
             }
             let now = Instant::now();
             if self.adaptive_gpu_ms > 0.0 && (now - self.adaptive_last_adjust).as_secs_f32() >= 1.0 {
-                let target_fps = app.settings.clone().fps_limit().unwrap_or(60).min(120) as f32;
+                let target_fps = app.settings.fps_limit().unwrap_or(60).min(120) as f32;
                 let budget = 1000.0 / target_fps;
                 let max_scale = app.settings.render_scale;
                 let new_scale = if self.adaptive_gpu_ms > budget * 0.95 {
@@ -1576,7 +1579,7 @@ fn apply_ext_commands(app: &mut App) {
             fpsmaster_ext::ExtCommand::SetRotation { yaw, pitch, silent } => {
                 // The silent look is snapped to the player's own mouse-rotation
                 // quantum (sensitivity factor) so its deltas pass Grim's GCD check.
-                let step = app.settings.clone().mouse_factor();
+                let step = app.settings.mouse_factor();
                 app.game.ext_set_rotation(yaw, pitch, silent, step);
             }
             fpsmaster_ext::ExtCommand::ClearSilentRotation => {
@@ -2014,7 +2017,15 @@ fn pump_network(app: &mut App, window: &winit::window::Window, cursor_captured: 
                 disconnect = Some(message);
                 break;
             }
-            Err(_) => break,
+            Err(std::sync::mpsc::TryRecvError::Empty) => break,
+            // Every sender is gone without a Disconnected event: the network
+            // threads died (a panic). Treat it as a lost connection instead of
+            // leaving the player frozen in a world that no longer updates.
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                log::error!("network thread exited without a disconnect event");
+                disconnect = Some(i18n::tr("fpsmaster.network.threadStopped"));
+                break;
+            }
         }
     }
 
@@ -2420,6 +2431,11 @@ fn render_frame(
     // Single-player world streaming: generate the columns newly in range and
     // drop far ones (a no-op for demo/server sessions). New columns are marked
     // dirty and meshed through the budget below; dropped ones free their meshes.
+    // A dimension change discarded the whole world (server switch behind a
+    // proxy); drop every GPU mesh at once so the old terrain never draws.
+    if app.game.take_world_reset() {
+        renderer.clear_chunk_meshes();
+    }
     let stream_removed = app.game.stream_local_world(app.settings.render_distance);
     if !stream_removed.is_empty() {
         renderer.drop_chunk_sections(&stream_removed);
@@ -2440,7 +2456,12 @@ fn render_frame(
     if !urgent_chunks.is_empty() {
         renderer.queue_chunk_meshes(&app.game.world, urgent_chunks.iter().copied());
     }
-    let dirty_budget = MESH_SUBMITS_PER_FRAME.saturating_sub(urgent_chunks.len());
+    // Backpressure: each queued job pins a column snapshot, so stop pulling
+    // ordinary dirty sections once the worker backlog is full (they stay in the
+    // dirty set). Urgent local edits above always go through.
+    let dirty_budget = MESH_SUBMITS_PER_FRAME
+        .saturating_sub(urgent_chunks.len())
+        .min(renderer.mesh_submit_capacity());
     let dirty_chunks = app.game.take_dirty_chunks_budget(dirty_budget);
     if !dirty_chunks.is_empty() {
         renderer.queue_chunk_meshes(&app.game.world, dirty_chunks);
@@ -2509,22 +2530,26 @@ fn render_frame(
         // so the entity model can sample their atlas rows. Skull owners need
         // their own pass: the head can name someone who never joined, so the
         // tab-list roster alone would leave it on the default skin.
-        let new_skins: Vec<([u8; 16], String)> = app
+        // Filter before copying the base64 property, so a steady roster costs
+        // no per-frame allocation.
+        let profiles = app
             .game
             .player_list
             .iter()
-            .filter_map(|(uuid, info)| info.texture_property().map(|t| (*uuid, t.to_owned())))
+            .filter_map(|(uuid, info)| info.texture_property().map(|t| (uuid, t)))
             .chain(
                 app.game
                     .skull_skin_profiles()
-                    .map(|(uuid, property)| (*uuid, property.clone())),
-            )
-            .filter(|(uuid, _)| !app.skin_manager.is_requested(uuid))
-            .collect();
-        for (uuid, property) in new_skins {
-            app.skin_manager.request(uuid, &property);
+                    .map(|(uuid, property)| (uuid, property.as_str())),
+            );
+        for (uuid, property) in profiles {
+            if !app.skin_manager.is_requested(uuid) {
+                app.skin_manager.request(*uuid, property);
+            }
         }
-        app.skin_manager.poll(renderer);
+        let wanted = app.game.skin_owners_in_view(&app.username);
+        app.skin_manager
+            .poll(&mut |row, rgba| renderer.upload_player_skin(row, rgba), &wanted);
 
         // Skip the whole entity-model + hand + nametag rebuild and its GPU upload
         // when nothing that feeds them changed since last frame — the renderer

@@ -261,7 +261,11 @@ fn draw_debug_overlay(
         format!("submit {}us  acquire {}us", s.submit_us, s.acquire_us),
         format!("draws {}  visible {}", s.draw_calls, s.visible_chunks),
         format!("tris {}", s.chunk_indices / 3),
+        format!("mesh queue {}", s.mesh_in_flight),
     ];
+    if s.mesh_failures > 0 {
+        right.push(format!("mesh failures {} (see log)", s.mesh_failures));
+    }
     // Per-phase CPU frame breakdown (from the frame profiler): which subsystem owns
     // the frame. `avg/max ms` over the last ~1s. Phases under 0.05ms max are hidden.
     let p = &info.phases;

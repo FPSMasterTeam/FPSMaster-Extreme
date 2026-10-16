@@ -256,6 +256,64 @@ mod tests {
         mgr
     }
 
+    /// A JS hook stuck in an endless loop is interrupted after its time budget
+    /// (the JS try/catch around handlers cannot swallow it) and the mod is
+    /// disabled instead of freezing the render thread.
+    #[test]
+    fn js_endless_hook_is_interrupted_and_disabled() {
+        let mut mgr = js_mod("mc.on('tick', () => { while (true) {} });");
+        let start = std::time::Instant::now();
+        mgr.dispatch_tick(&MockViews);
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+        assert!(!mgr.mods()[0].enabled, "runaway mod must be disabled");
+        // Later dispatches skip it.
+        mgr.dispatch_tick(&MockViews);
+    }
+
+    #[test]
+    fn js_endless_top_level_code_fails_to_load() {
+        let rt = js::JsRuntime::new().expect("js runtime");
+        let start = std::time::Instant::now();
+        assert!(rt.load("spin", "for (;;) {}", std::path::Path::new(".")).is_err());
+        assert!(start.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    /// A mod that keeps growing its heap hits its own heap cap and is disabled
+    /// (although the prelude's try/catch swallows the JS out-of-memory error)
+    /// instead of taking the process down, and a healthy mod loaded alongside
+    /// it keeps running: the cap is per mod, not shared.
+    #[test]
+    fn js_heap_growth_is_capped_per_mod() {
+        let mut mgr = ExtManager::new();
+        for (id, source) in [
+            (
+                "leaker",
+                "const keep = []; mc.on('tick', () => { for (let i = 0; i < 4096; i++) keep.push(new Array(1 << 10).fill(i)); });",
+            ),
+            (
+                "healthy",
+                "mc.on('tick', () => { const a = new Array(1 << 16).fill(1); mc.log('ok', a.length); });",
+            ),
+        ] {
+            let rt = js::JsRuntime::with_heap_limit(16 << 20).expect("js runtime");
+            let plugin = rt.load(id, source, std::path::Path::new(".")).expect("load js mod");
+            mgr.register(Box::new(plugin));
+        }
+        for _ in 0..64 {
+            mgr.dispatch_tick(&MockViews);
+        }
+        assert!(!mgr.mods()[0].enabled, "the leaking mod is disabled at its cap");
+        assert!(mgr.mods()[1].enabled, "a healthy mod must not pay for another mod's leak");
+        mgr.take_commands();
+        mgr.dispatch_tick(&MockViews);
+        let cmds = mgr.take_commands();
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, ExtCommand::Log(_, s) if s.contains("ok 65536"))),
+            "healthy mod should still run: {cmds:?}"
+        );
+    }
+
     #[test]
     fn js_tick_reads_views_and_enqueues_chat() {
         let mut mgr =

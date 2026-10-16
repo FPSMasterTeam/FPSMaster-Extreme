@@ -1129,7 +1129,8 @@ impl ClientboundPlayPacket {
             0x22 => {
                 let chunk_x = body.read_i32()?;
                 let chunk_z = body.read_i32()?;
-                let count = body.read_var_i32()? as usize;
+                // Each record is a u16 position plus a VarInt state (>= 3 bytes).
+                let count = checked_count(body.read_var_i32()?, &body, 3)?;
                 let mut changes = Vec::with_capacity(count);
                 for _ in 0..count {
                     let packed = body.read_u16()?;
@@ -1190,7 +1191,8 @@ impl ClientboundPlayPacket {
             }
             0x26 => {
                 let sky_light_sent = body.read_bool()?;
-                let count = body.read_var_i32()? as usize;
+                // Each column header is two i32 coordinates plus a u16 mask.
+                let count = checked_count(body.read_var_i32()?, &body, 10)?;
                 let mut meta = Vec::with_capacity(count);
                 for _ in 0..count {
                     meta.push((body.read_i32()?, body.read_i32()?, body.read_u16()?));
@@ -1324,7 +1326,7 @@ impl ClientboundPlayPacket {
                 pitch: angle(body.read_i8()?),
             }),
             0x13 => {
-                let count = body.read_var_i32()? as usize;
+                let count = checked_count(body.read_var_i32()?, &body, 1)?;
                 let mut entity_ids = Vec::with_capacity(count);
                 for _ in 0..count {
                     entity_ids.push(body.read_var_i32()?);
@@ -1444,11 +1446,8 @@ impl ClientboundPlayPacket {
                 let name = body.read_string(64)?;
                 let mode = body.read_u8()?;
                 let read_players = |body: &mut PacketReader<'_>| -> Result<Vec<String>> {
-                    let count = body.read_var_i32()?;
-                    if count < 0 {
-                        return Err(ProtocolError::InvalidData("negative team player count"));
-                    }
-                    let mut players = Vec::with_capacity(count as usize);
+                    let count = checked_count(body.read_var_i32()?, body, 1)?;
+                    let mut players = Vec::with_capacity(count);
                     for _ in 0..count {
                         players.push(body.read_string(64)?);
                     }
@@ -1678,6 +1677,21 @@ impl ClientboundPlayPacket {
     }
 }
 
+/// Validate a server-supplied element count before it sizes an allocation:
+/// reject negatives (which cast to a huge `usize` and panic `with_capacity`)
+/// and counts that cannot fit in the rest of the packet, given each element
+/// takes at least `min_bytes`.
+fn checked_count(count: i32, body: &PacketReader<'_>, min_bytes: usize) -> Result<usize> {
+    if count < 0 {
+        return Err(ProtocolError::InvalidData("negative element count"));
+    }
+    let count = count as usize;
+    if count.saturating_mul(min_bytes) > body.remaining() {
+        return Err(ProtocolError::InvalidData("element count exceeds packet size"));
+    }
+    Ok(count)
+}
+
 fn read_title_action(body: &mut PacketReader<'_>) -> Result<TitleAction> {
     Ok(match body.read_var_i32()? {
         0 => TitleAction::Title {
@@ -1700,6 +1714,24 @@ fn read_title_action(body: &mut PacketReader<'_>) -> Result<TitleAction> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Hostile counts in list packets fail decoding instead of panicking in
+    /// `Vec::with_capacity` (negative -> huge usize) or aborting on allocation.
+    #[test]
+    fn hostile_element_counts_are_rejected() {
+        let frame = |id: i32, prefix: &[u8], count: i32| {
+            let mut body = PacketWriter::new();
+            body.write_bytes(prefix);
+            body.write_var_i32(count);
+            body.write_bytes(&[0; 8]);
+            PacketFrame::new(id, body.into_inner())
+        };
+        for count in [-1, i32::MAX] {
+            assert!(ClientboundPlayPacket::from_frame(frame(0x13, &[], count)).is_err());
+            assert!(ClientboundPlayPacket::from_frame(frame(0x22, &[0; 8], count)).is_err());
+            assert!(ClientboundPlayPacket::from_frame(frame(0x26, &[1], count)).is_err());
+        }
+    }
     use crate::v1_8_9::PROTOCOL_VERSION;
 
     #[test]

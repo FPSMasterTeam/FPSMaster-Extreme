@@ -1,12 +1,10 @@
 use std::{
     sync::mpsc::{self, Receiver, Sender},
     thread,
-    time::Duration,
 };
 
 use fpsmaster_protocol::{
-    io::ProtocolError,
-    net::BlockingClient,
+    net::{BlockingClient, ClientReader},
     v1_8_9::{
         chunk::{decode_chunk_column, ChunkColumnData},
         packets::{ClientboundPlayPacket, EntityAction, ServerboundPacket},
@@ -218,35 +216,53 @@ fn network_thread(
         username: login.username,
         uuid: login.uuid,
     });
-    let _ = client.set_read_timeout(Some(Duration::from_millis(10)));
 
+    // Reads and writes run on separate threads over the same socket: the
+    // writer blocks on the command queue and puts each packet on the wire the
+    // moment the main thread queues it, while this thread blocks on reads. (A
+    // single thread alternating a timed read with the queue delayed every
+    // outbound packet by up to the read timeout.) Acks/pongs (KeepAlive,
+    // ConfirmTransaction, teleport confirm) and the flying packet are produced on
+    // the MAIN thread at tick time, so their order matches vanilla's
+    // `NetHandlerPlayClient` — what transaction-based anti-cheats key off — and
+    // the single writer keeps that order on the wire.
+    let (mut reader, mut writer) = client.into_split();
+    let writer_events = events.clone();
+    thread::spawn(move || {
+        while let Ok(NetworkCommand::Send(packet)) = commands.recv() {
+            log::debug!("sending {}", packet_debug_name(&packet));
+            if let Err(err) = writer.write_packet(packet.into_frame()) {
+                let message = format!("write failed: {err}");
+                let _ = writer_events.send(NetworkEvent::Disconnected(message));
+                break;
+            }
+        }
+        // The handle was dropped (left the server) or a write failed: close the
+        // socket so the reader's blocking read returns and that thread ends too.
+        writer.shutdown();
+    });
+
+    // A panic while decoding a hostile packet must still reach the main thread
+    // as a disconnect; the writer thread keeps its own sender alive, so the
+    // channel alone would not show this thread is gone.
+    let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        read_loop(&mut reader, &events)
+    }));
+    let message = match read {
+        Ok(message) => message,
+        Err(_) => "network thread panicked".to_owned(),
+    };
+    let _ = events.send(NetworkEvent::Disconnected(message));
+}
+
+/// Forward every incoming packet to the main thread (in receipt order) until the
+/// connection fails; returns the failure message.
+fn read_loop(reader: &mut ClientReader, events: &Sender<NetworkEvent>) -> String {
     // Sky light presence is dimension-derived (overworld only); tracked here so
     // chunks can be decoded on this thread without the game state.
     let mut has_sky_light = true;
-
-    // This thread is a pure reader/writer: it writes whatever serverbound packets
-    // the main thread queues (in order) and forwards every incoming packet to the
-    // main thread (in receipt order). Acks/pongs (KeepAlive, ConfirmTransaction,
-    // teleport confirm) and the flying packet are produced on the MAIN thread, at
-    // tick time, so their order matches vanilla's `NetHandlerPlayClient` (which
-    // runs on the game thread) — what transaction-based anti-cheats key off.
     loop {
-        loop {
-            match commands.try_recv() {
-                Ok(NetworkCommand::Send(packet)) => {
-                    log::debug!("sending {}", packet_debug_name(&packet));
-                    if let Err(err) = client.write_packet(packet.into_frame()) {
-                        let _ =
-                            events.send(NetworkEvent::Disconnected(format!("write failed: {err}")));
-                        return;
-                    }
-                }
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => return,
-            }
-        }
-
-        match client.read_play_packet_1_8_9() {
+        match reader.read_play_packet_1_8_9() {
             Ok(packet) => {
                 // Track dimension-derived sky light (needed to decode chunks on
                 // this thread). The join handshake + every ack now happen on the
@@ -260,7 +276,6 @@ fn network_thread(
                     }
                     _ => {}
                 }
-
                 // Intercept chunk packets and decode them here, off the render
                 // thread, delivering ready-to-load columns; forward everything
                 // else (in receipt order, so block-change ordering is preserved).
@@ -321,11 +336,7 @@ fn network_thread(
                     }
                 }
             }
-            Err(ProtocolError::Io(message)) if is_timeout(&message) => {}
-            Err(err) => {
-                let _ = events.send(NetworkEvent::Disconnected(format!("read failed: {err}")));
-                return;
-            }
+            Err(err) => return format!("read failed: {err}"),
         }
     }
 }
@@ -349,14 +360,6 @@ pub fn initial_play_packets() -> Vec<ServerboundPacket> {
             skin_parts: 0x7f,
         },
     ]
-}
-
-fn is_timeout(message: &str) -> bool {
-    message.contains("timed out")
-        || message.contains("would block")
-        || message.contains("Resource temporarily unavailable")
-        || message.contains("os error 10060")
-        || message.contains("os error 10035")
 }
 
 fn packet_debug_name(packet: &ServerboundPacket) -> &'static str {
@@ -411,6 +414,64 @@ mod tests {
             sneaking: false,
             sprinting: false,
         }
+    }
+
+    /// Read one uncompressed frame (length-prefixed) from a fake server socket.
+    fn read_raw_frame(stream: &mut std::net::TcpStream) -> fpsmaster_protocol::codec::PacketFrame {
+        use std::io::Read;
+        let mut len = 0usize;
+        for shift in (0..35).step_by(7) {
+            let mut b = [0u8; 1];
+            stream.read_exact(&mut b).unwrap();
+            len |= ((b[0] & 0x7f) as usize) << shift;
+            if b[0] & 0x80 == 0 {
+                break;
+            }
+        }
+        let mut body = vec![0u8; len];
+        stream.read_exact(&mut body).unwrap();
+        fpsmaster_protocol::codec::PacketFrame::decode_payload(&body).unwrap()
+    }
+
+    /// Outbound packets reach the socket while the server is silent (no read
+    /// timeout gating the writer), and a closed connection surfaces as a
+    /// Disconnected event.
+    #[test]
+    fn writer_sends_immediately_and_close_reports_disconnect() {
+        use fpsmaster_protocol::codec::{encode_frame, Compression, PacketFrame};
+        use fpsmaster_protocol::io::PacketWriter;
+        use std::io::Write;
+        use std::time::{Duration, Instant};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = NetworkHandle::connect_offline_1_8_9("127.0.0.1".into(), port, "Tester".into());
+        let (mut server, _) = listener.accept().unwrap();
+        assert_eq!(read_raw_frame(&mut server).id, 0x00); // handshake
+        assert_eq!(read_raw_frame(&mut server).id, 0x00); // login start
+        let mut success = PacketWriter::new();
+        success.write_string("00000000-0000-0000-0000-000000000000");
+        success.write_string("Tester");
+        let frame = PacketFrame::new(0x02, success.into_inner());
+        server
+            .write_all(&encode_frame(&frame, Compression::Disabled).unwrap())
+            .unwrap();
+        assert!(matches!(
+            handle.events.recv_timeout(Duration::from_secs(5)).unwrap(),
+            NetworkEvent::Connected { .. }
+        ));
+
+        let sent = Instant::now();
+        handle.send_packet(ServerboundPacket::KeepAlive { id: 7 });
+        server.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        assert_eq!(read_raw_frame(&mut server).id, 0x00);
+        assert!(sent.elapsed() < Duration::from_secs(1));
+
+        drop(server);
+        assert!(matches!(
+            handle.events.recv_timeout(Duration::from_secs(5)).unwrap(),
+            NetworkEvent::Disconnected(_)
+        ));
     }
 
     #[test]

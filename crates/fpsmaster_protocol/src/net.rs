@@ -31,13 +31,7 @@ pub fn ping_status_1_8_9(host: &str, port: u16, timeout: Duration) -> Result<Sta
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
-    let mut client = BlockingClient {
-        stream,
-        compression: Compression::Disabled,
-        read_buf: Vec::new(),
-        encryptor: None,
-        decryptor: None,
-    };
+    let mut client = BlockingClient::from_stream(stream)?;
 
     client.write_packet(
         ServerboundPacket::Handshake {
@@ -92,27 +86,65 @@ pub struct PremiumSession {
     pub username: String,
 }
 
-pub struct BlockingClient {
+/// Vanilla's frame limit: `NettyCompressionDecoder` rejects an uncompressed
+/// length above this, and the frame-length VarInt is at most 3 bytes (< 2^21).
+pub const MAX_PACKET_LEN: usize = 2_097_152;
+
+/// The inbound half of a connection: frame reassembly, decryption, inflate.
+pub struct ClientReader {
     stream: TcpStream,
     compression: Compression,
     read_buf: Vec<u8>,
-    /// AES-128-CFB8 encryptor enabled after `EncryptionResponse`.
-    encryptor: Option<crate::crypto::Aes128Cfb8>,
     /// AES-128-CFB8 decryptor enabled after `EncryptionResponse`.
     decryptor: Option<crate::crypto::Aes128Cfb8>,
+}
+
+/// The outbound half of a connection: deflate, encryption, socket write.
+pub struct ClientWriter {
+    stream: TcpStream,
+    compression: Compression,
+    /// AES-128-CFB8 encryptor enabled after `EncryptionResponse`.
+    encryptor: Option<crate::crypto::Aes128Cfb8>,
+}
+
+pub struct BlockingClient {
+    reader: ClientReader,
+    writer: ClientWriter,
 }
 
 impl BlockingClient {
     pub fn connect<A: ToSocketAddrs>(addr: A) -> Result<Self> {
         let stream = TcpStream::connect(addr)?;
         stream.set_nodelay(true)?;
+        Self::from_stream(stream)
+    }
+
+    fn from_stream(stream: TcpStream) -> Result<Self> {
         Ok(Self {
-            stream,
-            compression: Compression::Disabled,
-            read_buf: Vec::new(),
-            encryptor: None,
-            decryptor: None,
+            writer: ClientWriter {
+                stream: stream.try_clone()?,
+                compression: Compression::Disabled,
+                encryptor: None,
+            },
+            reader: ClientReader {
+                stream,
+                compression: Compression::Disabled,
+                read_buf: Vec::new(),
+                decryptor: None,
+            },
         })
+    }
+
+    /// Split into independently owned read and write halves (same socket), so
+    /// one thread can block on reads while another writes immediately. Call
+    /// after login: compression and encryption state is fixed from here on.
+    pub fn into_split(self) -> (ClientReader, ClientWriter) {
+        (self.reader, self.writer)
+    }
+
+    fn set_compression(&mut self, compression: Compression) {
+        self.reader.compression = compression;
+        self.writer.compression = compression;
     }
 
     /// Offline (cracked) login — no encryption; works with `online-mode=false` servers.
@@ -142,13 +174,13 @@ impl BlockingClient {
             let frame = self.read_frame()?;
             match ClientboundLoginPacket::from_frame(frame)? {
                 ClientboundLoginPacket::SetCompression { threshold } => {
-                    self.compression = Compression::Enabled { threshold };
+                    self.set_compression(Compression::Enabled { threshold });
                 }
                 ClientboundLoginPacket::LoginSuccess { uuid, username } => {
                     return Ok(OfflineLoginResult {
                         uuid,
                         username,
-                        compression: self.compression,
+                        compression: self.reader.compression,
                     });
                 }
                 ClientboundLoginPacket::Disconnect { reason_json } => {
@@ -212,7 +244,7 @@ impl BlockingClient {
                     return Ok(OfflineLoginResult {
                         uuid,
                         username,
-                        compression: self.compression,
+                        compression: self.reader.compression,
                     });
                 }
                 ClientboundLoginPacket::SetCompression { .. } => {
@@ -261,21 +293,21 @@ impl BlockingClient {
         self.write_packet(encryption_response_frame(enc_secret, enc_token))?;
 
         // ── Enable AES-128-CFB8 on both stream directions ────────────────────
-        self.encryptor = Some(crate::crypto::Aes128Cfb8::encryptor(&shared_secret));
-        self.decryptor = Some(crate::crypto::Aes128Cfb8::decryptor(&shared_secret));
+        self.writer.encryptor = Some(crate::crypto::Aes128Cfb8::encryptor(&shared_secret));
+        self.reader.decryptor = Some(crate::crypto::Aes128Cfb8::decryptor(&shared_secret));
 
         // ── Read post-encryption login packets ────────────────────────────────
         loop {
             let frame = self.read_frame()?;
             match ClientboundLoginPacket::from_frame(frame)? {
                 ClientboundLoginPacket::SetCompression { threshold } => {
-                    self.compression = Compression::Enabled { threshold };
+                    self.set_compression(Compression::Enabled { threshold });
                 }
                 ClientboundLoginPacket::LoginSuccess { uuid, username } => {
                     return Ok(OfflineLoginResult {
                         uuid,
                         username,
-                        compression: self.compression,
+                        compression: self.reader.compression,
                     });
                 }
                 ClientboundLoginPacket::Disconnect { reason_json } => {
@@ -291,14 +323,24 @@ impl BlockingClient {
     }
 
     pub fn read_play_packet_1_8_9(&mut self) -> Result<ClientboundPlayPacket> {
-        ClientboundPlayPacket::from_frame(self.read_frame()?)
+        self.reader.read_play_packet_1_8_9()
     }
 
     pub fn set_read_timeout(&self, timeout: Option<Duration>) -> Result<()> {
-        self.stream.set_read_timeout(timeout)?;
+        self.reader.stream.set_read_timeout(timeout)?;
         Ok(())
     }
 
+    pub fn write_packet(&mut self, frame: PacketFrame) -> Result<()> {
+        self.writer.write_packet(frame)
+    }
+
+    fn read_frame(&mut self) -> Result<PacketFrame> {
+        self.reader.read_frame()
+    }
+}
+
+impl ClientWriter {
     pub fn write_packet(&mut self, frame: PacketFrame) -> Result<()> {
         let mut encoded = encode_frame(&frame, self.compression)?;
         if let Some(enc) = &mut self.encryptor {
@@ -308,11 +350,28 @@ impl BlockingClient {
         Ok(())
     }
 
+    /// Shut down both directions of the socket, unblocking a reader parked in
+    /// a blocking read on the other half.
+    pub fn shutdown(&self) {
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+impl ClientReader {
+    pub fn read_play_packet_1_8_9(&mut self) -> Result<ClientboundPlayPacket> {
+        ClientboundPlayPacket::from_frame(self.read_frame()?)
+    }
+
     fn read_frame(&mut self) -> Result<PacketFrame> {
         loop {
             if let Some((length, header_len)) = read_var_i32_prefix(&self.read_buf)? {
                 if length < 0 {
                     return Err(ProtocolError::InvalidData("negative packet length"));
+                }
+                // An oversized length would otherwise grow `read_buf` without
+                // bound waiting for bytes that may never come.
+                if length as usize > MAX_PACKET_LEN {
+                    return Err(ProtocolError::InvalidData("packet length exceeds 2097152"));
                 }
 
                 let frame_len = header_len + length as usize;
@@ -367,6 +426,22 @@ mod frame_read_tests {
     fn read_var_i32_prefix_waits_for_complete_varint() {
         assert_eq!(read_var_i32_prefix(&[0x80]).unwrap(), None);
         assert_eq!(read_var_i32_prefix(&[0x80, 0x01]).unwrap(), Some((128, 2)));
+    }
+
+    /// A frame length above vanilla's limit is rejected up front instead of
+    /// buffering forever (or until allocation fails) for its body.
+    #[test]
+    fn oversized_frame_length_is_rejected() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = BlockingClient::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        let mut len = PacketWriter::new();
+        len.write_var_i32(MAX_PACKET_LEN as i32 + 1);
+        server.write_all(&len.into_inner()).unwrap();
+        assert_eq!(
+            client.read_frame().unwrap_err(),
+            ProtocolError::InvalidData("packet length exceeds 2097152")
+        );
     }
 
     #[test]

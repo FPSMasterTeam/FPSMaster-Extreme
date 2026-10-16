@@ -110,6 +110,10 @@ pub struct BlockDebris {
     pub uv_off: [f32; 2],
 }
 
+/// Cap on live particles (per kind). `tick` trims the oldest beyond it, and
+/// `spawn` never creates more than this from one packet.
+const MAX_PARTICLES: usize = 4000;
+
 /// All live particles, ticked once per game tick.
 pub struct ParticleSystem {
     particles: Vec<Particle>,
@@ -130,6 +134,13 @@ impl ParticleSystem {
             rng: Rng::new(0x9E37_79B9_7F4A_7C15),
             density: 1.0,
         }
+    }
+
+    /// Drop every live particle (world change: the old world's effects must
+    /// not carry over, like vanilla `EffectRenderer.clearEffects`).
+    pub fn clear(&mut self) {
+        self.particles.clear();
+        self.block_particles.clear();
     }
 
     /// Set the spawn-count multiplier (extension `particleDensity` preset).
@@ -173,7 +184,6 @@ impl ParticleSystem {
         }
         self.block_particles.retain(|p| p.age < p.max_age);
         // Bound the working set so a particle storm can't grow without limit.
-        const MAX_PARTICLES: usize = 4000;
         if self.particles.len() > MAX_PARTICLES {
             let drop = self.particles.len() - MAX_PARTICLES;
             self.particles.drain(0..drop);
@@ -202,7 +212,16 @@ impl ParticleSystem {
         // handled inside `make_particle` (one particle, no positional jitter).
         let colour_carrying = matches!(type_id, 23 | 30 | 15 | 16 | 17);
         let base = if colour_carrying { 1 } else { count.max(1) };
-        let n = ((base as f32) * self.density).round() as usize;
+        // `count` is a server-supplied i32: a hostile or buggy S2A with a huge
+        // count would otherwise push millions of particles in one call (stall /
+        // OOM) before `tick` trims to MAX_PARTICLES. Anything past the cap would
+        // be trimmed anyway, so clamp here. The network pump drains every queued
+        // packet in one frame, so the per-packet clamp alone does not bound the
+        // total: also evict the oldest up front (the same rule as `tick`) so the
+        // live set never exceeds MAX_PARTICLES across a burst of packets.
+        let n = (((base as f32) * self.density).round() as usize).min(MAX_PARTICLES);
+        let evict = (self.particles.len() + n).saturating_sub(MAX_PARTICLES);
+        self.particles.drain(0..evict);
         for _ in 0..n {
             let p_pos = if colour_carrying {
                 pos
@@ -643,6 +662,33 @@ impl Rng {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A server particle packet with an absurd count is clamped at spawn time
+    /// instead of pushing millions of particles before `tick` trims them.
+    #[test]
+    fn huge_server_count_is_capped_at_spawn() {
+        let mut sys = ParticleSystem::new();
+        sys.set_density(4.0);
+        sys.spawn(0, Vec3::ZERO, Vec3::ONE, 0.1, i32::MAX, &[]);
+        assert_eq!(sys.particles.len(), MAX_PARTICLES);
+    }
+
+    /// Many huge packets in one frame (no `tick` in between) stay within the
+    /// cap in total, not just per packet.
+    #[test]
+    fn burst_of_huge_packets_is_capped_in_total() {
+        let mut sys = ParticleSystem::new();
+        sys.set_density(4.0);
+        for _ in 0..50 {
+            sys.spawn(0, Vec3::ZERO, Vec3::ONE, 0.1, i32::MAX, &[]);
+            assert!(sys.particles.len() <= MAX_PARTICLES);
+        }
+        let marker = Vec3::splat(100.0);
+        sys.spawn(26, marker, Vec3::ZERO, 0.0, 1, &[]);
+        assert_eq!(sys.particles.len(), MAX_PARTICLES);
+        // The oldest are evicted, so the newest spawn survives.
+        assert_eq!(sys.particles.last().unwrap().pos, marker);
+    }
 
     /// A flame's render scale shrinks as it ages (vanilla `1 - f*f*0.5`).
     #[test]

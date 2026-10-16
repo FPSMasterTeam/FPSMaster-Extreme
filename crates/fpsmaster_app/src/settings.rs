@@ -594,18 +594,18 @@ impl Settings {
 
     /// Degrees of view rotation per pixel of mouse motion. Reproduces the
     /// vanilla curve so 0.5 maps to the long-standing 0.15 default.
-    pub fn mouse_factor(self) -> f32 {
+    pub fn mouse_factor(&self) -> f32 {
         let f = self.sensitivity * 0.6 + 0.2;
         f * f * f * 8.0 * 0.15
     }
 
     /// Sensitivity shown to the player as a 0..=200% value, vanilla-style.
-    pub fn sensitivity_percent(self) -> f32 {
+    pub fn sensitivity_percent(&self) -> f32 {
         self.sensitivity * 200.0
     }
 
     /// The active frame cap, or `None` when the slider is at "unlimited".
-    pub fn fps_limit(self) -> Option<u32> {
+    pub fn fps_limit(&self) -> Option<u32> {
         if self.fps_cap >= FPS_MAX {
             None
         } else {
@@ -613,7 +613,7 @@ impl Settings {
         }
     }
 
-    pub fn fps_label(self) -> String {
+    pub fn fps_label(&self) -> String {
         match self.fps_limit() {
             None => crate::i18n::tr("options.framerateLimit.max"),
             Some(cap) => format!("{cap} FPS"),
@@ -621,7 +621,7 @@ impl Settings {
     }
 
     /// FPS slider fill fraction in 0..=1.
-    pub fn fps_fraction(self) -> f32 {
+    pub fn fps_fraction(&self) -> f32 {
         (self.fps_cap - FPS_MIN) as f32 / (FPS_MAX - FPS_MIN) as f32
     }
 
@@ -637,11 +637,11 @@ impl Settings {
     }
 
     /// Render-scale slider fill fraction in 0..=1.
-    pub fn render_scale_fraction(self) -> f32 {
+    pub fn render_scale_fraction(&self) -> f32 {
         (self.render_scale - RENDER_SCALE_MIN) / (1.0 - RENDER_SCALE_MIN)
     }
 
-    pub fn render_scale_percent(self) -> u32 {
+    pub fn render_scale_percent(&self) -> u32 {
         (self.render_scale * 100.0).round() as u32
     }
 
@@ -652,7 +652,7 @@ impl Settings {
     }
 
     /// DLSS-quality slider fill fraction in 0..=1 (knob snaps to the 4 stops).
-    pub fn dlss_quality_fraction(self) -> f32 {
+    pub fn dlss_quality_fraction(&self) -> f32 {
         self.dlss_quality.min(DLSS_QUALITY_MAX) as f32 / DLSS_QUALITY_MAX as f32
     }
 
@@ -661,7 +661,7 @@ impl Settings {
     }
 
     /// Render-distance slider fill fraction in 0..=1.
-    pub fn render_distance_fraction(self) -> f32 {
+    pub fn render_distance_fraction(&self) -> f32 {
         (self.render_distance - RENDER_DIST_MIN) as f32 / (RENDER_DIST_MAX - RENDER_DIST_MIN) as f32
     }
 
@@ -672,11 +672,11 @@ impl Settings {
     }
 
     /// Brightness slider fill fraction in 0..=1.
-    pub fn brightness_fraction(self) -> f32 {
+    pub fn brightness_fraction(&self) -> f32 {
         (self.brightness - BRIGHTNESS_MIN) / (BRIGHTNESS_MAX - BRIGHTNESS_MIN)
     }
 
-    pub fn brightness_percent(self) -> u32 {
+    pub fn brightness_percent(&self) -> u32 {
         (self.brightness * 100.0).round() as u32
     }
 
@@ -744,7 +744,7 @@ impl Settings {
         };
     }
 
-    pub fn mipmap_label(self) -> String {
+    pub fn mipmap_label(&self) -> String {
         if self.mipmap_levels == 0 {
             crate::i18n::tr("options.off")
         } else {
@@ -762,7 +762,7 @@ impl Settings {
     }
 
     /// Value label for the GUI-scale button: `Auto` at 0, else the number.
-    pub fn gui_scale_label(self) -> String {
+    pub fn gui_scale_label(&self) -> String {
         if self.gui_scale == 0 {
             crate::i18n::tr("options.guiScale.auto")
         } else {
@@ -779,7 +779,7 @@ impl Settings {
         self.resolution = RESOLUTION_PRESETS[(idx + 1) % RESOLUTION_PRESETS.len()];
     }
 
-    pub fn resolution_label(self) -> String {
+    pub fn resolution_label(&self) -> String {
         match self.resolution {
             None => crate::i18n::tr("fpsmaster.options.native"),
             Some((w, h)) => format!("{w}x{h}"),

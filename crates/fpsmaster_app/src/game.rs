@@ -799,6 +799,9 @@ pub struct GameState {
     /// Player chunk at the last `enforce_render_distance` pass, so the scan runs
     /// only when crossing a chunk boundary.
     last_residency_chunk: Option<ChunkPos>,
+    /// Set when a dimension-changing Respawn discarded the whole world; the host
+    /// must then drop every GPU chunk mesh (see `take_world_reset`).
+    world_reset: bool,
     /// Set for a built-in single-player world: the terrain generator that
     /// streams chunks around the player (`stream_local_world`). `None` for demo
     /// worlds and server sessions, which get their chunks elsewhere.
@@ -1332,6 +1335,7 @@ impl GameState {
             urgent_remesh: HashSet::new(),
             evicted_columns: HashSet::new(),
             last_residency_chunk: None,
+            world_reset: false,
             local_worldgen: None,
             pending_block_changes: std::collections::HashMap::new(),
             chest_lid_angles: std::collections::HashMap::new(),
@@ -5928,6 +5932,15 @@ impl GameState {
     }
 
     fn handle_respawn(&mut self, dimension: i32, game_mode: u8) -> bool {
+        // Vanilla builds a fresh WorldClient when the dimension changes. Bungee
+        // style proxies switch servers by sending a Respawn into another
+        // dimension and then the target one, and the old server never sends
+        // ChunkUnload — so without this the previous server's terrain and
+        // entities stay in memory and linger as ghosts in the new world.
+        // A same-dimension Respawn (death) keeps the world, as in vanilla.
+        if dimension as i8 != self.dimension {
+            self.reset_world();
+        }
         // The server resends chunks plus a fresh PlayerPositionLook at the
         // respawn point; wait for that position before reporting movement
         // again so we don't send a stale (death-location) position.
@@ -5946,6 +5959,47 @@ impl GameState {
         self.player.velocity = DVec3::ZERO;
         log::info!("respawned into dimension {dimension}");
         false
+    }
+
+    /// Discard every chunk, entity (except the local player) and per-world side
+    /// table, as vanilla does by replacing the WorldClient on a dimension
+    /// change. Flags `world_reset` so the host also drops all GPU meshes.
+    fn reset_world(&mut self) {
+        let mut world = World::new();
+        world.set_has_sky_light(self.world.has_sky_light());
+        world.upsert_entity(self.player.clone());
+        self.world = world;
+        self.world_reset = true;
+        self.dirty_chunks.clear();
+        self.urgent_remesh.clear();
+        self.evicted_columns.clear();
+        self.last_residency_chunk = None;
+        self.pending_block_changes.clear();
+        self.entity_uuids.clear();
+        self.entity_items.clear();
+        self.entity_xp.clear();
+        self.falling_blocks.clear();
+        self.entity_equipment.clear();
+        self.vehicles.clear();
+        self.entity_prev_render_pos.clear();
+        for s in self.entity_sounds.drain(..) {
+            self.moving_sound_commands
+                .push(MovingSoundCommand::Stop { id: s.sound_id });
+        }
+        self.chest_lid_angles.clear();
+        self.chest_open_targets.clear();
+        self.signs.clear();
+        self.skulls.clear();
+        self.lightning_bolts.clear();
+        self.weather = Weather::default();
+        self.particles.clear();
+    }
+
+    /// Whether the world was discarded (dimension change) since the last call;
+    /// the host then drops every GPU chunk mesh in one go instead of trickling
+    /// thousands of removals through the per-frame dirty budget.
+    pub fn take_world_reset(&mut self) -> bool {
+        std::mem::take(&mut self.world_reset)
     }
 
     fn handle_player_position_look(
@@ -6424,6 +6478,23 @@ impl GameState {
         for (uuid, property) in profiles {
             self.skull_skin_profiles.entry(uuid).or_insert(property);
         }
+    }
+
+    /// uuids whose skin is drawn in the loaded world: spawned players, block
+    /// skull owners and the local player (looked up by `local_name` in the tab
+    /// list). The skin manager keeps atlas rows for these first.
+    pub fn skin_owners_in_view(&self, local_name: &str) -> HashSet<[u8; 16]> {
+        let local = self
+            .player_list
+            .iter()
+            .find(|(_, info)| info.name == local_name)
+            .map(|(uuid, _)| *uuid);
+        self.entity_uuids
+            .values()
+            .copied()
+            .chain(self.skulls.values().filter_map(|skull| skull.owner))
+            .chain(local)
+            .collect()
     }
 
     /// Owner profiles seen on player skulls that carry a skin texture, for the
@@ -9256,6 +9327,58 @@ mod interaction_tests {
             hide_particles: 0,
         });
         assert_eq!(gs.hud_vitals().absorption, 0.0);
+    }
+
+    /// A proxy server switch (Respawn into another dimension, then the target
+    /// one) discards the previous server's chunks and entities; a same-dimension
+    /// Respawn (death) keeps them.
+    #[test]
+    fn dimension_change_respawn_discards_world() {
+        let mut gs = GameState::empty_for_server(1.0);
+        gs.apply_play_packet(ClientboundPlayPacket::JoinGame {
+            entity_id: 7,
+            game_mode: 0,
+            dimension: 0,
+            difficulty: 0,
+            max_players: 20,
+            level_type: "default".to_owned(),
+            reduced_debug_info: false,
+        });
+        gs.world.set_block(0, 64, 0, BlockState::new(1, 0));
+        gs.world.set_block(40, 64, 40, BlockState::new(1, 0));
+        gs.apply_play_packet(ClientboundPlayPacket::SpawnPlayer {
+            entity_id: 8,
+            uuid: [1u8; 16],
+            x: 0.5,
+            y: 65.0,
+            z: 0.5,
+            yaw: 0.0,
+            pitch: 0.0,
+        });
+        gs.pending_block_changes
+            .insert(ChunkPos::new(9, 9), vec![(144, 64, 144, BlockState::new(1, 0))]);
+        let respawn = |dimension| ClientboundPlayPacket::Respawn {
+            dimension,
+            difficulty: 0,
+            game_mode: 0,
+            level_type: "default".to_owned(),
+        };
+
+        // Death respawn in the same dimension keeps the world.
+        gs.apply_play_packet(respawn(0));
+        assert_eq!(gs.loaded_chunk_count(), 2);
+        assert!(!gs.take_world_reset());
+
+        gs.apply_play_packet(respawn(-1));
+        gs.apply_play_packet(respawn(0));
+        assert_eq!(gs.loaded_chunk_count(), 0);
+        assert!(gs.world.entity(EntityId(8)).is_none());
+        assert!(gs.world.entity(EntityId(7)).is_some(), "local player survives");
+        assert!(gs.entity_uuids.is_empty());
+        assert!(gs.pending_block_changes.is_empty());
+        assert!(gs.dirty_chunks.is_empty());
+        assert!(gs.take_world_reset());
+        assert!(!gs.take_world_reset());
     }
 
     #[test]

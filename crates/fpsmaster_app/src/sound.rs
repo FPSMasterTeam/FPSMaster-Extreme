@@ -16,11 +16,20 @@ use std::path::{Path, PathBuf};
 
 use glam::Vec3;
 use kira::sound::static_sound::StaticSoundData;
+use kira::sound::streaming::{StreamingSoundData, StreamingSoundHandle};
+use kira::sound::FromFileError;
 use kira::{AudioManager, AudioManagerSettings, DefaultBackend, Decibels, Panning, PlaybackRate};
 
 /// Vanilla rolloff: a positioned sound at volume `1.0` is inaudible past this
 /// many blocks; volume `> 1.0` extends the range proportionally.
 const ATTENUATION_RANGE: f32 = 16.0;
+
+/// Decoded clips longer than this many frames (~10 s at 44.1 kHz, ~3.5 MB of
+/// PCM) are played but not kept in the cache.
+const MAX_CACHED_CLIP_FRAMES: usize = 441_000;
+/// Total decoded frames the cache may hold (~64 MB of stereo f32 PCM). Past it
+/// the cache is flushed and refills on demand, so memory stays bounded.
+const MAX_CACHED_TOTAL_FRAMES: usize = 8_000_000;
 
 /// A sound request produced by `game.rs`, drained and played by `main.rs`.
 /// Carries no audio types so the game layer stays decoupled from the backend.
@@ -150,6 +159,9 @@ struct SoundEntry {
     volume: f32,
     pitch: f32,
     weight: u32,
+    /// `"stream": true` (records): a multi-minute clip, streamed instead of
+    /// decoded whole on the main thread.
+    stream: bool,
 }
 
 /// One `sounds.json` event: its category (shared by all variants, vanilla puts
@@ -193,8 +205,12 @@ pub struct SoundManager {
     manager: Option<AudioManager<DefaultBackend>>,
     /// Event key -> its category and weighted sound variants.
     events: HashMap<String, SoundEvent>,
-    /// Decoded ogg cache, keyed by sound asset name (e.g. `"dig/stone1"`).
+    /// Decoded ogg cache for short effects, keyed by sound asset name (e.g.
+    /// `"dig/stone1"`). Bounded: see `MAX_CACHED_*`. Music never goes here — it
+    /// is streamed.
     cache: HashMap<String, Option<StaticSoundData>>,
+    /// Total decoded frames currently held in `cache`.
+    cache_frames: usize,
     /// Resolved asset roots to read ogg files from (directories or jars).
     asset_roots: Vec<PathBuf>,
     listener: Listener,
@@ -205,7 +221,7 @@ pub struct SoundManager {
     /// The single background music track, if one is playing (MUSIC category).
     /// Driven by the music methods, which `main.rs` calls from the `MusicTicker`
     /// commands each frame.
-    music: Option<kira::sound::static_sound::StaticSoundHandle>,
+    music: Option<StreamingSoundHandle<FromFileError>>,
     /// Entity-attached positioned sounds, keyed by a game-assigned id.
     moving: HashMap<u64, MovingSound>,
 }
@@ -228,6 +244,7 @@ impl SoundManager {
             manager,
             events,
             cache: HashMap::new(),
+            cache_frames: 0,
             asset_roots,
             listener: Listener {
                 position: Vec3::ZERO,
@@ -281,21 +298,31 @@ impl SoundManager {
             return;
         }
 
-        let Some(data) = self.sound_data(&entry.name) else {
-            return;
-        };
         // Vanilla clamps the combined pitch to [0.5, 2.0] (MCP-919 line 421).
         let rate = clamp_pitch(sound.pitch * entry.pitch) as f64;
-        let data = data
-            .volume(amplitude_to_decibels(gain))
-            .panning(Panning(panning))
-            .playback_rate(PlaybackRate(rate));
-
-        if let Some(manager) = self.manager.as_mut() {
-            // The handle is dropped immediately; the sound plays to completion.
-            if let Err(err) = manager.play(data) {
-                log::debug!("audio: play failed: {err}");
-            }
+        // The handle is dropped immediately; the sound plays to completion.
+        let played = if entry.stream {
+            let Some(data) = open_ogg_stream(&self.asset_roots, &entry.name) else {
+                log::debug!("audio: missing sound asset {}", entry.name);
+                return;
+            };
+            let data = data
+                .volume(amplitude_to_decibels(gain))
+                .panning(Panning(panning))
+                .playback_rate(PlaybackRate(rate));
+            self.manager.as_mut().map(|m| m.play(data).map(drop).map_err(|e| e.to_string()))
+        } else {
+            let Some(data) = self.sound_data(&entry.name) else {
+                return;
+            };
+            let data = data
+                .volume(amplitude_to_decibels(gain))
+                .panning(Panning(panning))
+                .playback_rate(PlaybackRate(rate));
+            self.manager.as_mut().map(|m| m.play(data).map(drop).map_err(|e| e.to_string()))
+        };
+        if let Some(Err(err)) = played {
+            log::debug!("audio: play failed: {err}");
         }
     }
 
@@ -330,6 +357,15 @@ impl SoundManager {
         if data.is_none() {
             log::debug!("audio: missing sound asset {name}");
         }
+        let frames = data.as_ref().map_or(0, |d| d.frames.len());
+        if frames > MAX_CACHED_CLIP_FRAMES {
+            return data;
+        }
+        if self.cache_frames + frames > MAX_CACHED_TOTAL_FRAMES {
+            self.cache.clear();
+            self.cache_frames = 0;
+        }
+        self.cache_frames += frames;
         self.cache.insert(name.to_string(), data.clone());
         data
     }
@@ -337,7 +373,9 @@ impl SoundManager {
     // ─── Music channel ──────────────────────────────────────────────────────
 
     /// Start a background music track by its `sounds.json` asset name (e.g.
-    /// `"music/menu/menu"`), replacing any track already playing. Played
+    /// `"music/menu/menu"`), replacing any track already playing. Streamed:
+    /// kira decodes it incrementally off the main thread (a multi-minute track
+    /// decoded up front stalled the frame and held ~90 MB of PCM). Played
     /// non-positionally (centered) at the MUSIC category × master volume. The
     /// handle is kept so [`is_music_playing`](Self::is_music_playing) can poll it
     /// and [`stop_music`](Self::stop_music) can end it. No-op with no audio
@@ -349,7 +387,8 @@ impl SoundManager {
         if self.manager.is_none() {
             return;
         }
-        let Some(data) = self.sound_data(asset_name) else {
+        let Some(data) = open_ogg_stream(&self.asset_roots, asset_name) else {
+            log::debug!("audio: missing music asset {asset_name}");
             return;
         };
         let gain = (self.volumes.music * self.volumes.master).clamp(0.0, 1.0);
@@ -537,6 +576,7 @@ fn parse_sounds_json(text: &str) -> HashMap<String, SoundEvent> {
                     volume: 1.0,
                     pitch: 1.0,
                     weight: 1,
+                    stream: false,
                 },
                 serde_json::Value::Object(obj) => {
                     let Some(name) = obj.get("name").and_then(|n| n.as_str()) else {
@@ -547,6 +587,7 @@ fn parse_sounds_json(text: &str) -> HashMap<String, SoundEvent> {
                         volume: obj.get("volume").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32,
                         pitch: obj.get("pitch").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32,
                         weight: obj.get("weight").and_then(|v| v.as_u64()).unwrap_or(1) as u32,
+                        stream: obj.get("stream").and_then(|v| v.as_bool()).unwrap_or(false),
                     }
                 }
                 _ => continue,
@@ -647,6 +688,24 @@ fn load_ogg(roots: &[PathBuf], name: &str) -> Option<StaticSoundData> {
     None
 }
 
+/// Open an ogg for streaming playback by its `sounds.json` asset name. Only the
+/// container header is probed here; decoding happens on kira's stream thread.
+fn open_ogg_stream(roots: &[PathBuf], name: &str) -> Option<StreamingSoundData<FromFileError>> {
+    let asset = format!("assets/minecraft/sounds/{name}.ogg");
+    let stripped = asset.strip_prefix("assets/").unwrap_or(&asset);
+    for root in roots {
+        for path in [root.join(&asset), root.join(stripped)] {
+            if path.is_file() {
+                match StreamingSoundData::from_file(&path) {
+                    Ok(data) => return Some(data),
+                    Err(err) => log::debug!("audio: cannot stream {}: {err}", path.display()),
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Read an asset file from a directory root, also tolerating the `assets/`
 /// prefix being stripped (the texture loader does the same). The 1.8.9 ogg
 /// sounds ship as loose files (they are never inside the client jar), so a
@@ -710,6 +769,18 @@ mod tests {
         assert_eq!(rabbit.len(), 1);
         assert_eq!(rabbit[0].name, "mob/rabbit/idle1");
         assert!((rabbit[0].volume - 0.25).abs() < 1e-6);
+    }
+
+    /// Records are flagged `"stream": true` in vanilla's sounds.json; those
+    /// entries are streamed rather than decoded whole on the main thread.
+    #[test]
+    fn parses_stream_flag() {
+        let events = parse_sounds_json(
+            r#"{ "records.cat": { "category": "record",
+                 "sounds": [{"name": "records/cat", "stream": true}] } }"#,
+        );
+        assert!(events["records.cat"].entries[0].stream);
+        assert!(!parse_sounds_json(SAMPLE)["dig.stone"].entries[0].stream);
     }
 
     #[test]

@@ -184,14 +184,14 @@ impl GuiScreen for GuiOptions {
             self.sensitivity_rect,
             s,
             ctx.settings.sensitivity,
-            &format!("{}: {:.0}%", tr("options.sensitivity"), ctx.settings.clone().sensitivity_percent()),
+            &format!("{}: {:.0}%", tr("options.sensitivity"), ctx.settings.sensitivity_percent()),
         );
         draw_slider(
             ui,
             self.brightness_rect,
             s,
-            ctx.settings.clone().brightness_fraction(),
-            &format!("{}: {}%", tr("options.gamma"), ctx.settings.clone().brightness_percent()),
+            ctx.settings.brightness_fraction(),
+            &format!("{}: {}%", tr("options.gamma"), ctx.settings.brightness_percent()),
         );
         if let Some(b) = &self.video_btn {
             b.draw(ui, s, ctx.mouse, ctx.mouse_down);
@@ -210,7 +210,7 @@ impl GuiScreen for GuiOptions {
         }
         if let Some(gui_scale) = &mut self.gui_scale_btn {
             gui_scale.label =
-                format!("{}: {}", tr("options.guiScale"), ctx.settings.clone().gui_scale_label());
+                format!("{}: {}", tr("options.guiScale"), ctx.settings.gui_scale_label());
             gui_scale.draw(ui, s, ctx.mouse, ctx.mouse_down);
         }
         if let Some(done) = &self.done {
@@ -442,7 +442,7 @@ impl GuiScreen for GuiVideoSettings {
             ui,
             self.render_distance_rect,
             s,
-            ctx.settings.clone().render_distance_fraction(),
+            ctx.settings.render_distance_fraction(),
             &format!(
                 "{}: {} {}",
                 tr("options.renderDistance"),
@@ -454,8 +454,8 @@ impl GuiScreen for GuiVideoSettings {
             ui,
             self.fps_rect,
             s,
-            ctx.settings.clone().fps_fraction(),
-            &format!("{}: {}", tr("options.framerateLimit"), ctx.settings.clone().fps_label()),
+            ctx.settings.fps_fraction(),
+            &format!("{}: {}", tr("options.framerateLimit"), ctx.settings.fps_label()),
         );
         if let Some(vsync) = &mut self.vsync {
             vsync.label = format!("{}: {}", tr("options.vsync"), on_off(ctx.settings.vsync));
@@ -475,14 +475,14 @@ impl GuiScreen for GuiVideoSettings {
         }
         if let Some(mipmaps) = &mut self.mipmaps {
             mipmaps.label =
-                format!("{}: {}", tr("options.mipmapLevels"), ctx.settings.clone().mipmap_label());
+                format!("{}: {}", tr("options.mipmapLevels"), ctx.settings.mipmap_label());
             mipmaps.draw(ui, s, ctx.mouse, ctx.mouse_down);
         }
         if let Some(resolution) = &mut self.resolution {
             resolution.label = format!(
                 "{}: {}",
                 tr("fpsmaster.options.resolution"),
-                ctx.settings.clone().resolution_label()
+                ctx.settings.resolution_label()
             );
             resolution.draw(ui, s, ctx.mouse, ctx.mouse_down);
         }
