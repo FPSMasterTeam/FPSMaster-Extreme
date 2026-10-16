@@ -308,11 +308,70 @@ const CHUNK_VERTEX_SIZE: u64 = std::mem::size_of::<ChunkVertex>() as u64;
 const PAGE_VERTEX_CAP: u32 = 1 << 22; // 4M vertices
 const PAGE_INDEX_CAP: u32 = 1 << 23; // 8M indices = 16 MB
 
+/// First-fit range allocator over `[0, cap)` for one page buffer. Freed ranges
+/// are coalesced with their neighbours, and a free range that reaches the bump
+/// cursor is folded back into it, so churn (sections re-meshed at new sizes,
+/// columns unloaded while flying) reuses space instead of fragmenting a page
+/// until a fresh 128 MB page is needed.
+struct RangeAlloc {
+    cap: u32,
+    cursor: u32,
+    /// Free ranges below `cursor`: offset -> length, never adjacent.
+    free: std::collections::BTreeMap<u32, u32>,
+}
+
+impl RangeAlloc {
+    fn new(cap: u32) -> Self {
+        Self {
+            cap,
+            cursor: 0,
+            free: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn alloc(&mut self, len: u32) -> Option<u32> {
+        if let Some((&off, &free_len)) = self.free.iter().find(|(_, &l)| l >= len) {
+            self.free.remove(&off);
+            if free_len > len {
+                self.free.insert(off + len, free_len - len);
+            }
+            return Some(off);
+        }
+        if self.cap - self.cursor >= len {
+            let off = self.cursor;
+            self.cursor += len;
+            return Some(off);
+        }
+        None
+    }
+
+    fn free(&mut self, mut off: u32, mut len: u32) {
+        if len == 0 {
+            return;
+        }
+        if let Some((&prev, &prev_len)) = self.free.range(..off).next_back() {
+            if prev + prev_len == off {
+                self.free.remove(&prev);
+                off = prev;
+                len += prev_len;
+            }
+        }
+        if let Some(next_len) = self.free.remove(&(off + len)) {
+            len += next_len;
+        }
+        if off + len == self.cursor {
+            self.cursor = off;
+        } else {
+            self.free.insert(off, len);
+        }
+    }
+}
+
 struct ChunkPage {
     vertex_buf: wgpu::Buffer,
     index_buf: wgpu::Buffer,
-    vertex_cursor: u32,
-    index_cursor: u32,
+    vertices: RangeAlloc,
+    indices: RangeAlloc,
     active_slots: u32,
 }
 
@@ -320,13 +379,13 @@ struct ChunkPage {
 /// fixed-size pages (64 MB vertex, 16 MB index each) to stay within GPU
 /// buffer-size limits while still batching draws.
 ///
-/// Freed slot regions are tracked in a free list so new allocations can reuse
-/// them instead of always advancing the page cursor. When a page has zero
-/// active slots its cursors reset, reclaiming the entire page.
+/// Each page allocates its vertex and index ranges with a coalescing
+/// [`RangeAlloc`]; new sections go to the lowest page with room. Empty pages
+/// at the end of the list are released (page 0 is kept), so VRAM shrinks back
+/// after a large world is left behind.
 struct ChunkLayer {
     pages: Vec<ChunkPage>,
     slots: HashMap<SectionPos, LayerSlot>,
-    free_list: Vec<LayerSlot>,
     label: &'static str,
 }
 
@@ -335,7 +394,6 @@ impl ChunkLayer {
         Self {
             pages: Vec::new(),
             slots: HashMap::new(),
-            free_list: Vec::new(),
             label,
         }
     }
@@ -354,9 +412,21 @@ impl ChunkLayer {
                 usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }),
-            vertex_cursor: 0,
-            index_cursor: 0,
+            vertices: RangeAlloc::new(PAGE_VERTEX_CAP),
+            indices: RangeAlloc::new(PAGE_INDEX_CAP),
             active_slots: 0,
+        }
+    }
+
+    /// Reserve `vc` vertices and `ic` indices on one page.
+    fn page_alloc(page: &mut ChunkPage, vc: u32, ic: u32) -> Option<(u32, u32)> {
+        let vo = page.vertices.alloc(vc)?;
+        match page.indices.alloc(ic) {
+            Some(io) => Some((vo, io)),
+            None => {
+                page.vertices.free(vo, vc);
+                None
+            }
         }
     }
 
@@ -398,58 +468,28 @@ impl ChunkLayer {
             self.free_slot(old);
         }
 
-        // Try the free list (best-fit: smallest region that fits both dimensions).
-        let fit = self
-            .free_list
-            .iter()
-            .enumerate()
-            .filter(|(_, f)| f.vertex_alloc >= vc && f.index_alloc >= ic)
-            .min_by_key(|(_, f)| (f.vertex_alloc, f.index_alloc))
-            .map(|(i, _)| i);
-        if let Some(fi) = fit {
-            let free = self.free_list.swap_remove(fi);
-            let page = &self.pages[free.page as usize];
-            queue.write_buffer(
-                &page.vertex_buf,
-                free.vertex_offset as u64 * CHUNK_VERTEX_SIZE,
-                bytemuck::cast_slice(&buf.vertices),
-            );
-            queue.write_buffer(
-                &page.index_buf,
-                free.index_offset as u64 * 2,
-                bytemuck::cast_slice(&buf.indices),
-            );
-            self.pages[free.page as usize].active_slots += 1;
-            self.slots.insert(
-                pos,
-                LayerSlot {
-                    page: free.page,
-                    vertex_offset: free.vertex_offset,
-                    vertex_alloc: free.vertex_alloc,
-                    index_offset: free.index_offset,
-                    index_alloc: free.index_alloc,
-                    index_count: ic,
-                },
-            );
-            return;
+        // Lowest page with room, or a new one.
+        let mut placed = None;
+        for (pi, page) in self.pages.iter_mut().enumerate() {
+            if let Some(offsets) = Self::page_alloc(page, vc, ic) {
+                placed = Some((pi, offsets));
+                break;
+            }
         }
-
-        // Find a page with enough space, or create one.
-        let pi = self
-            .pages
-            .iter()
-            .position(|p| {
-                p.vertex_cursor + vc <= PAGE_VERTEX_CAP
-                    && p.index_cursor + ic <= PAGE_INDEX_CAP
-            })
-            .unwrap_or_else(|| {
-                self.pages.push(Self::create_page(device, self.label));
-                self.pages.len() - 1
-            });
+        let (pi, (vo, io)) = match placed {
+            Some(placed) => placed,
+            None => {
+                let mut page = Self::create_page(device, self.label);
+                let Some(offsets) = Self::page_alloc(&mut page, vc, ic) else {
+                    log::error!("section {pos:?} mesh exceeds a whole chunk page; not drawn");
+                    return;
+                };
+                self.pages.push(page);
+                (self.pages.len() - 1, offsets)
+            }
+        };
 
         let page = &mut self.pages[pi];
-        let vo = page.vertex_cursor;
-        let io = page.index_cursor;
         queue.write_buffer(
             &page.vertex_buf,
             vo as u64 * CHUNK_VERTEX_SIZE,
@@ -472,18 +512,16 @@ impl ChunkLayer {
                 index_count: ic,
             },
         );
-        page.vertex_cursor += vc;
-        page.index_cursor += ic;
     }
 
     fn free_slot(&mut self, slot: LayerSlot) {
-        self.pages[slot.page as usize].active_slots -= 1;
-        if self.pages[slot.page as usize].active_slots == 0 {
-            self.pages[slot.page as usize].vertex_cursor = 0;
-            self.pages[slot.page as usize].index_cursor = 0;
-            self.free_list.retain(|f| f.page != slot.page);
-        } else {
-            self.free_list.push(slot);
+        let page = &mut self.pages[slot.page as usize];
+        page.vertices.free(slot.vertex_offset, slot.vertex_alloc);
+        page.indices.free(slot.index_offset, slot.index_alloc);
+        page.active_slots -= 1;
+        // Release trailing empty pages (indices of the others stay valid).
+        while self.pages.len() > 1 && self.pages.last().is_some_and(|p| p.active_slots == 0) {
+            self.pages.pop();
         }
     }
 
@@ -495,10 +533,10 @@ impl ChunkLayer {
 
     fn clear(&mut self) {
         self.slots.clear();
-        self.free_list.clear();
+        self.pages.truncate(1);
         for page in &mut self.pages {
-            page.vertex_cursor = 0;
-            page.index_cursor = 0;
+            page.vertices = RangeAlloc::new(PAGE_VERTEX_CAP);
+            page.indices = RangeAlloc::new(PAGE_INDEX_CAP);
             page.active_slots = 0;
         }
     }
@@ -10910,7 +10948,7 @@ impl Renderer {
 
 #[cfg(test)]
 mod tests {
-    use super::{collect_layer_batches, glint_scroll, halton, ChunkLayer, LayerSlot};
+    use super::{collect_layer_batches, glint_scroll, halton, ChunkLayer, LayerSlot, RangeAlloc};
     use fpsmaster_core::SectionPos;
 
     /// A layer whose sections land on the given pages. `index_offset` doubles as
@@ -10934,6 +10972,28 @@ mod tests {
             visible.push(pos);
         }
         (layer, visible)
+    }
+
+    /// Freed neighbours coalesce, and space freed at the end rolls the cursor
+    /// back, so a page fully drained returns to empty and a hole can host an
+    /// allocation as large as the merged neighbours.
+    #[test]
+    fn range_alloc_coalesces_and_rewinds() {
+        let mut a = RangeAlloc::new(100);
+        let x = a.alloc(10).unwrap();
+        let y = a.alloc(20).unwrap();
+        let z = a.alloc(30).unwrap();
+        assert_eq!((x, y, z), (0, 10, 30));
+        assert_eq!(a.alloc(41), None, "only 40 left");
+        a.free(x, 10);
+        a.free(y, 20);
+        assert_eq!(a.free.get(&0), Some(&30), "neighbours merged into one hole");
+        assert_eq!(a.alloc(25), Some(0));
+        a.free(0, 25);
+        a.free(z, 30);
+        assert_eq!(a.cursor, 0, "freeing the tail rewinds the cursor");
+        assert!(a.free.is_empty());
+        assert_eq!(a.alloc(100), Some(0));
     }
 
     /// Alpha blending is order-dependent, so the back-to-front section list the
