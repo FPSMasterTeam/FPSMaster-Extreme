@@ -924,10 +924,13 @@ impl ApplicationHandler for WinitApp {
         // Per-frame extension hook (on_frame), e.g. native render geometry.
         app.ext.dispatch_frame(&GameViews(&app.game));
         apply_ext_commands(app);
-        // Apply pending extension block-tint overrides (re-meshes the loaded
-        // world once; future chunks read the renderer's global tint table).
+        // Apply pending extension block-tint overrides: install the global tint
+        // table the mesher reads, then re-mesh the loaded world through the
+        // budgeted background path (a synchronous rebuild froze the frame for
+        // hundreds of ms to seconds when tint mods reloaded in game).
         if app.tints_dirty && app.in_world {
-            renderer.set_block_tints(app.block_tints.clone(), &app.game.world);
+            fpsmaster_render::set_block_tints(app.block_tints.clone());
+            app.game.mark_all_sections_dirty();
             app.tints_dirty = false;
         }
         // Upload native render-hook geometry when a mod changed it.
