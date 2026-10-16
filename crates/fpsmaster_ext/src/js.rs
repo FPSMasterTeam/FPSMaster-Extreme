@@ -7,12 +7,15 @@
 //! ergonomic `mc.*` / `hud.*` API (modelled on vanilla `mc.player` / `mc.world`)
 //! is built on top in the JS [`PRELUDE`].
 
+use std::cell::Cell;
 use std::path::Path;
+use std::rc::Rc;
 
+use rquickjs::allocator::{Allocator, RustAllocator};
 use rquickjs::{CatchResultExt, Context, Function, Runtime};
 
 use std::sync::OnceLock;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::bridge::{self, cur};
 
@@ -219,15 +222,117 @@ const PRELUDE: &str = r#"
 })();
 "#;
 
+/// Wall-clock budget for one hook dispatch. Hooks run synchronously on the
+/// render thread, so a mod stuck in `while(true)` froze the whole client.
+const HOOK_BUDGET: Duration = Duration::from_millis(50);
+/// Budget for evaluating a mod's top-level source at load.
+const LOAD_BUDGET: Duration = Duration::from_secs(2);
+/// Cap on the JS heap shared by all JS mods.
+const JS_HEAP_LIMIT: usize = 128 * 1024 * 1024;
+
+/// Deadline for the JS call in progress, read by the runtime's interrupt
+/// handler. `tripped` records that the handler aborted a call.
+#[derive(Default)]
+struct Watchdog {
+    deadline: Cell<Option<Instant>>,
+    tripped: Cell<bool>,
+}
+
+impl Watchdog {
+    /// Run `f` with a deadline `budget` from now; returns its result and
+    /// whether the interrupt handler had to abort it.
+    fn run<R>(&self, budget: Duration, f: impl FnOnce() -> R) -> (R, bool) {
+        self.tripped.set(false);
+        self.deadline.set(Some(Instant::now() + budget));
+        let result = f();
+        self.deadline.set(None);
+        (result, self.tripped.take())
+    }
+
+    fn expired(&self) -> bool {
+        let expired = self.deadline.get().is_some_and(|d| Instant::now() >= d);
+        if expired {
+            self.tripped.set(true);
+        }
+        expired
+    }
+}
+
+/// The Rust global allocator with a cap on live bytes. rquickjs ignores
+/// `Runtime::set_memory_limit` under its `rust-alloc` feature, so the limit is
+/// enforced here: past it allocations fail and QuickJS throws "out of memory"
+/// in the mod that asked, instead of the heap growing until the process dies.
+struct LimitedAllocator {
+    used: usize,
+    limit: usize,
+}
+
+unsafe impl Allocator for LimitedAllocator {
+    fn alloc(&mut self, size: usize) -> *mut u8 {
+        if self.used.saturating_add(size) > self.limit {
+            return std::ptr::null_mut();
+        }
+        let ptr = RustAllocator.alloc(size);
+        if !ptr.is_null() {
+            self.used += unsafe { RustAllocator::usable_size(ptr) };
+        }
+        ptr
+    }
+
+    fn calloc(&mut self, count: usize, size: usize) -> *mut u8 {
+        if self.used.saturating_add(count.saturating_mul(size)) > self.limit {
+            return std::ptr::null_mut();
+        }
+        let ptr = RustAllocator.calloc(count, size);
+        if !ptr.is_null() {
+            self.used += unsafe { RustAllocator::usable_size(ptr) };
+        }
+        ptr
+    }
+
+    unsafe fn dealloc(&mut self, ptr: *mut u8) {
+        self.used -= RustAllocator::usable_size(ptr);
+        RustAllocator.dealloc(ptr);
+    }
+
+    unsafe fn realloc(&mut self, ptr: *mut u8, new_size: usize) -> *mut u8 {
+        if ptr.is_null() {
+            return self.alloc(new_size);
+        }
+        let old = RustAllocator::usable_size(ptr);
+        if new_size > old && (self.used - old).saturating_add(new_size) > self.limit {
+            return std::ptr::null_mut();
+        }
+        let new = RustAllocator.realloc(ptr, new_size);
+        if !new.is_null() {
+            self.used = self.used - old + RustAllocator::usable_size(new);
+        }
+        new
+    }
+
+    unsafe fn usable_size(ptr: *mut u8) -> usize {
+        RustAllocator::usable_size(ptr)
+    }
+}
+
 /// Owns the shared QuickJS runtime. Mod contexts are created from it.
 pub struct JsRuntime {
     rt: Runtime,
+    watchdog: Rc<Watchdog>,
 }
 
 impl JsRuntime {
     pub fn new() -> Result<Self, JsError> {
-        let rt = Runtime::new().map_err(JsError::from_rquickjs)?;
-        Ok(Self { rt })
+        Self::with_heap_limit(JS_HEAP_LIMIT)
+    }
+
+    fn with_heap_limit(limit: usize) -> Result<Self, JsError> {
+        let rt = Runtime::new_with_alloc(LimitedAllocator { used: 0, limit })
+            .map_err(JsError::from_rquickjs)?;
+        let watchdog = Rc::new(Watchdog::default());
+        let handler_watchdog = Rc::clone(&watchdog);
+        rt.set_interrupt_handler(Some(Box::new(move || handler_watchdog.expired())));
+        Ok(Self { rt, watchdog })
     }
 
     /// Build a [`JsPlugin`] from a mod id, its source and its directory.
@@ -271,14 +376,23 @@ impl JsRuntime {
             ctx.eval::<(), _>(PRELUDE)
                 .catch(&ctx)
                 .map_err(|e| JsError::Eval(e.to_string()))?;
-            ctx.eval::<(), _>(source)
-                .catch(&ctx)
-                .map_err(|e| JsError::Eval(e.to_string()))?;
-            Ok(())
+            let (result, tripped) = self.watchdog.run(LOAD_BUDGET, || {
+                ctx.eval::<(), _>(source)
+                    .catch(&ctx)
+                    .map_err(|e| JsError::Eval(e.to_string()))
+            });
+            if tripped {
+                return Err(JsError::Eval(format!(
+                    "top-level code ran longer than {} ms",
+                    LOAD_BUDGET.as_millis()
+                )));
+            }
+            result
         })?;
         Ok(JsPlugin {
             id: id.to_string(),
             ctx,
+            watchdog: Rc::clone(&self.watchdog),
         })
     }
 }
@@ -287,39 +401,60 @@ impl JsRuntime {
 pub struct JsPlugin {
     id: String,
     ctx: Context,
+    watchdog: Rc<Watchdog>,
 }
 
 impl JsPlugin {
     fn call_void(&self, name: &str, json: Option<&str>) {
-        let id = &self.id;
-        self.ctx.with(|ctx| {
-            let Ok(f) = ctx.globals().get::<_, Function>(name) else {
-                return;
-            };
-            let res = match json {
-                Some(j) => f.call::<_, ()>((j.to_string(),)).catch(&ctx),
-                None => f.call::<_, ()>(()).catch(&ctx),
-            };
-            if let Err(err) = res {
-                log::error!("[ext:{id}] dispatcher {name}: {err}");
-            }
+        self.call(name, |ctx, f| match json {
+            Some(j) => f.call::<_, ()>((j.to_string(),)).catch(ctx).map_err(|e| e.to_string()),
+            None => f.call::<_, ()>(()).catch(ctx).map_err(|e| e.to_string()),
         });
     }
 
     fn call_bool(&self, name: &str, json: &str) -> bool {
-        let id = &self.id;
-        self.ctx.with(|ctx| {
-            let Ok(f) = ctx.globals().get::<_, Function>(name) else {
-                return false;
-            };
-            match f.call::<_, bool>((json.to_string(),)).catch(&ctx) {
-                Ok(b) => b,
-                Err(err) => {
-                    log::error!("[ext:{id}] dispatcher {name}: {err}");
-                    false
-                }
-            }
+        self.call(name, |ctx, f| {
+            f.call::<_, bool>((json.to_string(),))
+                .catch(ctx)
+                .map_err(|e| e.to_string())
         })
+        .unwrap_or(false)
+    }
+
+    /// Call global dispatcher `name` under the hook budget. Errors are logged.
+    /// A call aborted for overrunning the budget, or one that exhausted the JS
+    /// heap, leaves the mod in an unknown state: it panics so the manager's
+    /// `catch_unwind` disables the mod, like any other faulting hook.
+    fn call<R>(
+        &self,
+        name: &str,
+        f: impl FnOnce(&rquickjs::Ctx<'_>, Function<'_>) -> Result<R, String>,
+    ) -> Option<R> {
+        let id = &self.id;
+        let (result, tripped) = self.watchdog.run(HOOK_BUDGET, || {
+            self.ctx.with(|ctx| {
+                let func = ctx.globals().get::<_, Function>(name).ok()?;
+                Some(f(&ctx, func))
+            })
+        });
+        let result = result?;
+        if tripped {
+            log::error!(
+                "[ext:{id}] {name} ran longer than {} ms and was interrupted",
+                HOOK_BUDGET.as_millis()
+            );
+            std::panic::panic_any(format!("js mod '{id}' exceeded its hook time budget"));
+        }
+        match result {
+            Ok(value) => Some(value),
+            Err(err) => {
+                log::error!("[ext:{id}] dispatcher {name}: {err}");
+                if err.contains("out of memory") {
+                    std::panic::panic_any(format!("js mod '{id}' exhausted the JS heap"));
+                }
+                None
+            }
+        }
     }
 }
 
