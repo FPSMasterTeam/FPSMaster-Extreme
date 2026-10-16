@@ -713,7 +713,7 @@ impl ApplicationHandler for WinitApp {
                 app.game.rotate_view(
                     delta.0 as f32,
                     delta.1 as f32,
-                    app.settings.clone().mouse_factor(),
+                    app.settings.mouse_factor(),
                 );
             }
         }
@@ -909,7 +909,7 @@ impl ApplicationHandler for WinitApp {
         }
 
         if self.pass_bench.is_none() {
-            if let Some(cap) = app.settings.clone().fps_limit() {
+            if let Some(cap) = app.settings.fps_limit() {
                 let deadline = self.last_frame + Duration::from_secs_f64(1.0 / cap as f64);
                 let now = Instant::now();
                 if now < deadline {
@@ -1034,7 +1034,7 @@ impl ApplicationHandler for WinitApp {
             }
             let now = Instant::now();
             if self.adaptive_gpu_ms > 0.0 && (now - self.adaptive_last_adjust).as_secs_f32() >= 1.0 {
-                let target_fps = app.settings.clone().fps_limit().unwrap_or(60).min(120) as f32;
+                let target_fps = app.settings.fps_limit().unwrap_or(60).min(120) as f32;
                 let budget = 1000.0 / target_fps;
                 let max_scale = app.settings.render_scale;
                 let new_scale = if self.adaptive_gpu_ms > budget * 0.95 {
@@ -1576,7 +1576,7 @@ fn apply_ext_commands(app: &mut App) {
             fpsmaster_ext::ExtCommand::SetRotation { yaw, pitch, silent } => {
                 // The silent look is snapped to the player's own mouse-rotation
                 // quantum (sensitivity factor) so its deltas pass Grim's GCD check.
-                let step = app.settings.clone().mouse_factor();
+                let step = app.settings.mouse_factor();
                 app.game.ext_set_rotation(yaw, pitch, silent, step);
             }
             fpsmaster_ext::ExtCommand::ClearSilentRotation => {

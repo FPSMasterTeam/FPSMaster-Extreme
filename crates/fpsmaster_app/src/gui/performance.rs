@@ -190,15 +190,15 @@ impl GuiScreen for GuiPerformance {
             ui,
             self.render_scale_rect,
             s,
-            st.clone().render_scale_fraction(),
-            &format!("{}: {}%", tr("fpsmaster.options.renderScale"), st.clone().render_scale_percent()),
+            st.render_scale_fraction(),
+            &format!("{}: {}%", tr("fpsmaster.options.renderScale"), st.render_scale_percent()),
         );
         if cfg!(feature = "dlss") {
             draw_slider(
                 ui,
                 self.dlss_quality_rect,
                 s,
-                st.clone().dlss_quality_fraction(),
+                st.dlss_quality_fraction(),
                 &format!("DLSS {}: {}", tr("fpsmaster.perf.rt.quality"), dlss_quality_label(st.dlss_quality)),
             );
         }
