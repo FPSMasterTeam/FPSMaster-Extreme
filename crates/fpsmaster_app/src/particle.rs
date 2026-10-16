@@ -110,6 +110,10 @@ pub struct BlockDebris {
     pub uv_off: [f32; 2],
 }
 
+/// Cap on live particles (per kind). `tick` trims the oldest beyond it, and
+/// `spawn` never creates more than this from one packet.
+const MAX_PARTICLES: usize = 4000;
+
 /// All live particles, ticked once per game tick.
 pub struct ParticleSystem {
     particles: Vec<Particle>,
@@ -173,7 +177,6 @@ impl ParticleSystem {
         }
         self.block_particles.retain(|p| p.age < p.max_age);
         // Bound the working set so a particle storm can't grow without limit.
-        const MAX_PARTICLES: usize = 4000;
         if self.particles.len() > MAX_PARTICLES {
             let drop = self.particles.len() - MAX_PARTICLES;
             self.particles.drain(0..drop);
@@ -202,7 +205,11 @@ impl ParticleSystem {
         // handled inside `make_particle` (one particle, no positional jitter).
         let colour_carrying = matches!(type_id, 23 | 30 | 15 | 16 | 17);
         let base = if colour_carrying { 1 } else { count.max(1) };
-        let n = ((base as f32) * self.density).round() as usize;
+        // `count` is a server-supplied i32: a hostile or buggy S2A with a huge
+        // count would otherwise push millions of particles in one call (stall /
+        // OOM) before `tick` trims to MAX_PARTICLES. Anything past the cap would
+        // be trimmed anyway, so clamp here.
+        let n = (((base as f32) * self.density).round() as usize).min(MAX_PARTICLES);
         for _ in 0..n {
             let p_pos = if colour_carrying {
                 pos
@@ -643,6 +650,16 @@ impl Rng {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A server particle packet with an absurd count is clamped at spawn time
+    /// instead of pushing millions of particles before `tick` trims them.
+    #[test]
+    fn huge_server_count_is_capped_at_spawn() {
+        let mut sys = ParticleSystem::new();
+        sys.set_density(4.0);
+        sys.spawn(0, Vec3::ZERO, Vec3::ONE, 0.1, i32::MAX, &[]);
+        assert_eq!(sys.particles.len(), MAX_PARTICLES);
+    }
 
     /// A flame's render scale shrinks as it ages (vanilla `1 - f*f*0.5`).
     #[test]
