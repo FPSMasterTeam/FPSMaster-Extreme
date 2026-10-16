@@ -519,15 +519,18 @@ impl ChunkLayer {
         page.vertices.free(slot.vertex_offset, slot.vertex_alloc);
         page.indices.free(slot.index_offset, slot.index_alloc);
         page.active_slots -= 1;
-        // Release trailing empty pages (indices of the others stay valid).
-        while self.pages.len() > 1 && self.pages.last().is_some_and(|p| p.active_slots == 0) {
-            self.pages.pop();
-        }
     }
 
     fn remove(&mut self, pos: SectionPos) {
         if let Some(slot) = self.slots.remove(&pos) {
             self.free_slot(slot);
+            // Release trailing empty pages (indices of the others stay valid).
+            // Only here, not when `insert` frees a slot it is about to replace:
+            // a growing section alone on the last page would otherwise drop and
+            // immediately recreate a 128 MB page on every re-mesh.
+            while self.pages.len() > 1 && self.pages.last().is_some_and(|p| p.active_slots == 0) {
+                self.pages.pop();
+            }
         }
     }
 
