@@ -276,6 +276,10 @@ pub struct RenderStats {
     pub draw_calls: u32,
     /// Total indices submitted across all chunk draws.
     pub chunk_indices: u32,
+    /// Section mesh jobs queued or finished but not yet uploaded.
+    pub mesh_in_flight: u32,
+    /// Section mesh builds that panicked (those sections render empty).
+    pub mesh_failures: u32,
 }
 
 /// A single `draw_indexed_indirect` command (matches the GPU layout).
@@ -6855,6 +6859,12 @@ impl Renderer {
     /// sections whose column is no longer loaded drop their GPU mesh now. The
     /// snapshot clone is the only main-thread cost; the mesh build itself runs
     /// off-thread, so chunk updates never stall the frame.
+    /// How many more dirty sections the background mesher accepts this frame
+    /// before its backlog cap; callers keep the rest dirty for later frames.
+    pub fn mesh_submit_capacity(&self) -> usize {
+        self.mesh_worker.capacity()
+    }
+
     pub fn queue_chunk_meshes<I>(&mut self, world: &World, sections: I)
     where
         I: IntoIterator<Item = SectionPos>,
@@ -10790,6 +10800,8 @@ impl Renderer {
             visible_chunks,
             draw_calls,
             chunk_indices,
+            mesh_in_flight: self.mesh_worker.in_flight() as u32,
+            mesh_failures: self.mesh_worker.failures() as u32,
         };
         Ok(())
     }

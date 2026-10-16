@@ -2453,7 +2453,12 @@ fn render_frame(
     if !urgent_chunks.is_empty() {
         renderer.queue_chunk_meshes(&app.game.world, urgent_chunks.iter().copied());
     }
-    let dirty_budget = MESH_SUBMITS_PER_FRAME.saturating_sub(urgent_chunks.len());
+    // Backpressure: each queued job pins a column snapshot, so stop pulling
+    // ordinary dirty sections once the worker backlog is full (they stay in the
+    // dirty set). Urgent local edits above always go through.
+    let dirty_budget = MESH_SUBMITS_PER_FRAME
+        .saturating_sub(urgent_chunks.len())
+        .min(renderer.mesh_submit_capacity());
     let dirty_chunks = app.game.take_dirty_chunks_budget(dirty_budget);
     if !dirty_chunks.is_empty() {
         renderer.queue_chunk_meshes(&app.game.world, dirty_chunks);
