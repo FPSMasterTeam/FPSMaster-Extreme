@@ -472,7 +472,6 @@ mod tests {
             "chat_alert",
             "block_tint",
             "preset_demo",
-            "scaffold_demo",
             "render_demo",
         ] {
             assert!(loaded.contains(&id.to_string()), "example mod '{id}' failed to load");

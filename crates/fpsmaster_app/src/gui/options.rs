@@ -100,6 +100,7 @@ pub struct GuiOptions {
     controls_btn: Option<GuiButton>,
     resource_packs_btn: Option<GuiButton>,
     language_btn: Option<GuiButton>,
+    gui_scale_btn: Option<GuiButton>,
     sound_btn: Option<GuiButton>,
     done: Option<GuiButton>,
     dragging: Option<Slider>,
@@ -134,8 +135,11 @@ impl GuiOptions {
             Some(GuiButton::at_px(x, top + 72 * s, 98 * s, s, tr("options.resourcepack")));
         self.sound_btn =
             Some(GuiButton::at_px(x + 102 * s, top + 72 * s, 98 * s, s, tr("options.sounds")));
+        // Language + GUI Scale share a row (left/right halves). GUI Scale is a
+        // cycle button (Auto/1/2/…), so its label is set at draw time.
         self.language_btn =
-            Some(GuiButton::at_px(x, top + 96 * s, 200 * s, s, tr("options.language")));
+            Some(GuiButton::at_px(x, top + 96 * s, 98 * s, s, tr("options.language")));
+        self.gui_scale_btn = Some(GuiButton::at_px(x + 102 * s, top + 96 * s, 98 * s, s, ""));
         // A gap above Done, echoing vanilla's separated bottom button.
         self.done = Some(GuiButton::at_px(x, top + 132 * s, 200 * s, s, tr("gui.done")));
     }
@@ -161,6 +165,7 @@ impl GuiScreen for GuiOptions {
             self.resource_packs_btn.as_ref(),
             self.sound_btn.as_ref(),
             self.language_btn.as_ref(),
+            self.gui_scale_btn.as_ref(),
             self.done.as_ref(),
         ]
         .into_iter()
@@ -202,6 +207,11 @@ impl GuiScreen for GuiOptions {
         }
         if let Some(b) = &self.language_btn {
             b.draw(ui, s, ctx.mouse, ctx.mouse_down);
+        }
+        if let Some(gui_scale) = &mut self.gui_scale_btn {
+            gui_scale.label =
+                format!("{}: {}", tr("options.guiScale"), ctx.settings.clone().gui_scale_label());
+            gui_scale.draw(ui, s, ctx.mouse, ctx.mouse_down);
         }
         if let Some(done) = &self.done {
             done.draw(ui, s, ctx.mouse, ctx.mouse_down);
@@ -256,6 +266,13 @@ impl GuiScreen for GuiOptions {
                     self.from_main_menu,
                 ))),
             ];
+        }
+        if self.gui_scale_btn.as_ref().is_some_and(|b| b.clicked(x, y)) {
+            // Cycle Auto → 1 → … → Auto. The new scale is picked up next frame
+            // when the render loop re-publishes the preference, so every menu and
+            // the HUD rescale together.
+            ctx.settings.cycle_gui_scale();
+            return vec![GuiAction::SaveSettings];
         }
         if self.done.as_ref().is_some_and(|b| b.clicked(x, y)) {
             return vec![

@@ -470,6 +470,22 @@ pub(super) fn pick_present_mode(present_modes: &[wgpu::PresentMode], vsync: bool
     }
 }
 
+/// How many frames the surface may keep in flight, chosen per present mode.
+///
+/// Fifo (vsync) wants 2: a queued frame absorbs an occasional frame-time spike so
+/// the vsync cadence doesn't hitch. The unsynced modes want 1: with a single
+/// in-flight frame the drawable back-pressure paces presentation to roughly the
+/// display rate (the render loop blocks acquiring the next drawable), which stops
+/// Immediate from scanning out multiple half-drawn frames per refresh — i.e. the
+/// tearing that reads as GUI "flicker". It also gives the lowest input latency,
+/// which is the whole point of running vsync off.
+pub(super) fn frame_latency_for(mode: wgpu::PresentMode) -> u32 {
+    match mode {
+        wgpu::PresentMode::Fifo | wgpu::PresentMode::FifoRelaxed => 2,
+        _ => 1,
+    }
+}
+
 // Depth32Float (not Depth24Plus) so the post pass can sample the world depth for
 // depth-of-field and motion blur (Depth24Plus is not reliably loadable).
 pub(super) const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
