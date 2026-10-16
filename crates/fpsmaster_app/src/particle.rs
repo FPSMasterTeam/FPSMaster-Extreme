@@ -136,6 +136,13 @@ impl ParticleSystem {
         }
     }
 
+    /// Drop every live particle (world change: the old world's effects must
+    /// not carry over, like vanilla `EffectRenderer.clearEffects`).
+    pub fn clear(&mut self) {
+        self.particles.clear();
+        self.block_particles.clear();
+    }
+
     /// Set the spawn-count multiplier (extension `particleDensity` preset).
     pub fn set_density(&mut self, density: f32) {
         self.density = density.clamp(0.0, 4.0);

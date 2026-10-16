@@ -6967,6 +6967,20 @@ impl Renderer {
         }
     }
 
+    /// Drop every chunk mesh and forget all in-flight mesh jobs (their results
+    /// are discarded on arrival) — the world they belonged to was replaced.
+    pub fn clear_chunk_meshes(&mut self) {
+        let sections: Vec<SectionPos> = self.chunk_sections.iter().copied().collect();
+        for pos in sections {
+            self.remove_section(pos);
+        }
+        self.chunk_mesh_generations.clear();
+        self.chunk_solid.clear();
+        self.chunk_cutout.clear();
+        self.chunk_transparent.clear();
+        self.chunk_water.clear();
+    }
+
     /// Free the GPU meshes of the given sections without touching their block
     /// data. Drives the client-side render-distance safety net
     /// ([`GameState::enforce_render_distance`]): sections beyond the view are

@@ -2420,6 +2420,11 @@ fn render_frame(
     // Single-player world streaming: generate the columns newly in range and
     // drop far ones (a no-op for demo/server sessions). New columns are marked
     // dirty and meshed through the budget below; dropped ones free their meshes.
+    // A dimension change discarded the whole world (server switch behind a
+    // proxy); drop every GPU mesh at once so the old terrain never draws.
+    if app.game.take_world_reset() {
+        renderer.clear_chunk_meshes();
+    }
     let stream_removed = app.game.stream_local_world(app.settings.render_distance);
     if !stream_removed.is_empty() {
         renderer.drop_chunk_sections(&stream_removed);
