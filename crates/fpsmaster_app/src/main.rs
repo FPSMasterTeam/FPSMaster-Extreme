@@ -2530,22 +2530,26 @@ fn render_frame(
         // so the entity model can sample their atlas rows. Skull owners need
         // their own pass: the head can name someone who never joined, so the
         // tab-list roster alone would leave it on the default skin.
-        let new_skins: Vec<([u8; 16], String)> = app
+        // Filter before copying the base64 property, so a steady roster costs
+        // no per-frame allocation.
+        let profiles = app
             .game
             .player_list
             .iter()
-            .filter_map(|(uuid, info)| info.texture_property().map(|t| (*uuid, t.to_owned())))
+            .filter_map(|(uuid, info)| info.texture_property().map(|t| (uuid, t)))
             .chain(
                 app.game
                     .skull_skin_profiles()
-                    .map(|(uuid, property)| (*uuid, property.clone())),
-            )
-            .filter(|(uuid, _)| !app.skin_manager.is_requested(uuid))
-            .collect();
-        for (uuid, property) in new_skins {
-            app.skin_manager.request(uuid, &property);
+                    .map(|(uuid, property)| (uuid, property.as_str())),
+            );
+        for (uuid, property) in profiles {
+            if !app.skin_manager.is_requested(uuid) {
+                app.skin_manager.request(*uuid, property);
+            }
         }
-        app.skin_manager.poll(renderer);
+        let wanted = app.game.skin_owners_in_view(&app.username);
+        app.skin_manager
+            .poll(&mut |row, rgba| renderer.upload_player_skin(row, rgba), &wanted);
 
         // Skip the whole entity-model + hand + nametag rebuild and its GPU upload
         // when nothing that feeds them changed since last frame — the renderer

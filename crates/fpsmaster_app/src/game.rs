@@ -6480,6 +6480,23 @@ impl GameState {
         }
     }
 
+    /// uuids whose skin is drawn in the loaded world: spawned players, block
+    /// skull owners and the local player (looked up by `local_name` in the tab
+    /// list). The skin manager keeps atlas rows for these first.
+    pub fn skin_owners_in_view(&self, local_name: &str) -> HashSet<[u8; 16]> {
+        let local = self
+            .player_list
+            .iter()
+            .find(|(_, info)| info.name == local_name)
+            .map(|(uuid, _)| *uuid);
+        self.entity_uuids
+            .values()
+            .copied()
+            .chain(self.skulls.values().filter_map(|skull| skull.owner))
+            .chain(local)
+            .collect()
+    }
+
     /// Owner profiles seen on player skulls that carry a skin texture, for the
     /// host to hand to the skin downloader (the same route the tab-list roster
     /// takes). Skulls can name players who were never in the player list, so
