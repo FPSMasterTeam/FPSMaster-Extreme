@@ -278,9 +278,10 @@ mod tests {
         assert!(start.elapsed() < std::time::Duration::from_secs(10));
     }
 
-    /// A mod that keeps growing its heap hits its own heap cap instead of
-    /// taking the process down, and a healthy mod loaded alongside it keeps
-    /// running: the cap is per mod, not shared.
+    /// A mod that keeps growing its heap hits its own heap cap and is disabled
+    /// (although the prelude's try/catch swallows the JS out-of-memory error)
+    /// instead of taking the process down, and a healthy mod loaded alongside
+    /// it keeps running: the cap is per mod, not shared.
     #[test]
     fn js_heap_growth_is_capped_per_mod() {
         let mut mgr = ExtManager::new();
@@ -301,6 +302,7 @@ mod tests {
         for _ in 0..64 {
             mgr.dispatch_tick(&MockViews);
         }
+        assert!(!mgr.mods()[0].enabled, "the leaking mod is disabled at its cap");
         assert!(mgr.mods()[1].enabled, "a healthy mod must not pay for another mod's leak");
         mgr.take_commands();
         mgr.dispatch_tick(&MockViews);
