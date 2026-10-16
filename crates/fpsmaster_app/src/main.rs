@@ -2014,7 +2014,15 @@ fn pump_network(app: &mut App, window: &winit::window::Window, cursor_captured: 
                 disconnect = Some(message);
                 break;
             }
-            Err(_) => break,
+            Err(std::sync::mpsc::TryRecvError::Empty) => break,
+            // Every sender is gone without a Disconnected event: the network
+            // threads died (a panic). Treat it as a lost connection instead of
+            // leaving the player frozen in a world that no longer updates.
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                log::error!("network thread exited without a disconnect event");
+                disconnect = Some(i18n::tr("fpsmaster.network.threadStopped"));
+                break;
+            }
         }
     }
 

@@ -81,6 +81,7 @@ fpsmaster.shaders.clouds=Clouds
 # Progress / connect / auth screens
 fpsmaster.progress.loadingWorld=Loading world...
 fpsmaster.progress.connecting=Connecting to server...
+fpsmaster.network.threadStopped=The network thread stopped unexpectedly (internal error)
 fpsmaster.progress.chunksLoaded=%s chunks loaded
 fpsmaster.server.startFailed=Failed to start server
 fpsmaster.server.startTimeout=Server did not respond within 60 seconds

@@ -74,7 +74,14 @@ pub fn decode_frame(packet_data: &[u8], compression: Compression) -> Result<Pack
             if uncompressed_len == 0 {
                 PacketFrame::decode_payload(remaining)
             } else {
-                let mut decoder = ZlibDecoder::new(remaining);
+                // Server-controlled: a negative value cast to usize panicked in
+                // `with_capacity`, a huge one let a zlib bomb inflate unbounded.
+                if uncompressed_len < 0 || uncompressed_len as usize > crate::net::MAX_PACKET_LEN {
+                    return Err(ProtocolError::InvalidData("bad uncompressed packet length"));
+                }
+                // Read at most one byte past the declared size so an over-long
+                // stream is detected as a mismatch without inflating all of it.
+                let mut decoder = ZlibDecoder::new(remaining).take(uncompressed_len as u64 + 1);
                 let mut payload = Vec::with_capacity(uncompressed_len as usize);
                 decoder.read_to_end(&mut payload)?;
                 if payload.len() != uncompressed_len as usize {
@@ -98,6 +105,31 @@ mod tests {
         let len = reader.read_var_i32().unwrap() as usize;
         let decoded = decode_frame(reader.read_bytes(len).unwrap(), Compression::Disabled).unwrap();
         assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn rejects_negative_or_oversized_uncompressed_length() {
+        let compression = Compression::Enabled { threshold: 32 };
+        for len in [-1, (crate::net::MAX_PACKET_LEN + 1) as i32] {
+            let mut writer = PacketWriter::new();
+            writer.write_var_i32(len);
+            writer.write_bytes(&[0x78, 0x9c, 0x03, 0x00]);
+            assert!(decode_frame(&writer.into_inner(), compression).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_payload_inflating_past_declared_length() {
+        let compression = Compression::Enabled { threshold: 32 };
+        let encoded = encode_frame(&PacketFrame::new(0x21, vec![7; 512]), compression).unwrap();
+        let mut reader = PacketReader::new(&encoded);
+        let len = reader.read_var_i32().unwrap() as usize;
+        let mut data = PacketReader::new(reader.read_bytes(len).unwrap());
+        let real = data.read_var_i32().unwrap();
+        let mut forged = PacketWriter::new();
+        forged.write_var_i32(real - 100);
+        forged.write_bytes(data.read_remaining());
+        assert!(decode_frame(&forged.into_inner(), compression).is_err());
     }
 
     #[test]

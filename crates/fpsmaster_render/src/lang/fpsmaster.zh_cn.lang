@@ -79,6 +79,7 @@ fpsmaster.shaders.clouds=云
 # 进度 / 连接 / 登录界面
 fpsmaster.progress.loadingWorld=正在加载世界…
 fpsmaster.progress.connecting=正在连接服务器…
+fpsmaster.network.threadStopped=网络线程意外停止（内部错误）
 fpsmaster.progress.chunksLoaded=已加载 %s 个区块
 fpsmaster.server.startFailed=服务器启动失败
 fpsmaster.server.startTimeout=服务器在 60 秒内未响应
