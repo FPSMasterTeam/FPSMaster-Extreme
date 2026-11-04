@@ -1,5 +1,15 @@
 # FPSMaster Extreme
 
+> **Archived research prototype — no longer maintained (2026).**
+>
+> Extreme was an experiment in rewriting a Minecraft Java Edition 1.8.9 client from scratch in Rust
+> (`wgpu` renderer, own protocol stack, JS + native extension system). It never reached a playable
+> release and was **not** part of the FPSMaster final release; the launcher no longer offers it.
+> The code is published as-is for reference. See "Current status" below for what works.
+>
+> 中文：Extreme 是用 Rust 从零重写 1.8.9 客户端的实验项目，没有达到可游玩的程度，未进入 FPSMaster 最终版，
+> 启动器中也已移除。代码按现状公开，仅供参考。
+
 **FPSMaster Extreme** is part of the FPSMaster ecosystem — a Rust rewrite experiment for a Minecraft Java client. The first hard target is Java Edition 1.8.9 / protocol 47.
 
 > The crates, extension API, and mod SDK are all namespaced `fpsmaster_*`.
@@ -24,6 +34,10 @@ Demo world with local vanilla textures:
 python3 scripts/setup_minecraft_1_8_9_assets.py
 cargo run -p fpsmaster_app
 ```
+
+The extraction script reads your own local copy of the vanilla 1.8.9 client jar. Mojang assets are
+not redistributed in this repository. Third-party resource packs go in `resourcepacks/`, which is
+git-ignored.
 
 Demo world without downloaded assets:
 
